@@ -1,0 +1,23 @@
+{
+  "name": "autodom-server",
+  "version": "1.2.0",
+  "description": "MCP bridge server for AutoDOM Chrome extension — enables AI agents to automate browser actions",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "autodom-server": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "stop": "node index.js --stop"
+  },
+  "dependencies": {
+    "fastmcp": "^3.34.0",
+    "ws": "^8.18.0",
+    "zod": "^3.24.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}

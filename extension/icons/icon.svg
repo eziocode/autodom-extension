@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="AutoDOM logo">
+  <defs>
+    <linearGradient id="bg" x1="14" y1="10" x2="116" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2a2f27"/>
+      <stop offset="1" stop-color="#121510"/>
+    </linearGradient>
+    <linearGradient id="focus" x1="58" y1="46" x2="90" y2="82" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f5d8aa"/>
+      <stop offset="1" stop-color="#d67f2c"/>
+    </linearGradient>
+    <linearGradient id="pointer" x1="74" y1="78" x2="101" y2="105" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff6e4"/>
+      <stop offset="1" stop-color="#f2c887"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#bg)"/>
+  <rect x="12" y="12" width="104" height="104" rx="24" fill="none" stroke="#3a4036" stroke-width="2"/>
+
+  <rect x="24" y="24" width="80" height="80" rx="18" fill="#181b16"/>
+  <rect x="24" y="24" width="80" height="80" rx="18" fill="none" stroke="#eef1e4" stroke-opacity=".16" stroke-width="2"/>
+  <path d="M24 40h80" stroke="#eef1e4" stroke-opacity=".15" stroke-width="2"/>
+  <circle cx="34" cy="32" r="3" fill="#f5d8aa" fill-opacity=".95"/>
+  <circle cx="44" cy="32" r="3" fill="#eef1e4" fill-opacity=".34"/>
+  <circle cx="54" cy="32" r="3" fill="#eef1e4" fill-opacity=".22"/>
+
+  <path d="M42 56v16m0 0v0M42 64h12m0 0h14" fill="none" stroke="#eef1e4" stroke-opacity=".72" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M42 72h12" fill="none" stroke="#eef1e4" stroke-opacity=".72" stroke-width="6" stroke-linecap="round"/>
+
+  <rect x="34" y="48" width="16" height="16" rx="5" fill="#f6f0df"/>
+  <rect x="34" y="64" width="16" height="16" rx="5" fill="#f6f0df"/>
+
+  <rect x="60" y="54" width="24" height="24" rx="8" fill="url(#focus)"/>
+  <rect x="60" y="54" width="24" height="24" rx="8" fill="none" stroke="#fff4de" stroke-opacity=".38" stroke-width="2"/>
+  <circle cx="72" cy="66" r="4" fill="#1a1c15"/>
+
+  <path d="M75 81 92 97l2-12 10-2-17-17-3 15-9 0Z" fill="url(#pointer)"/>
+  <path d="M75 81 92 97l2-12 10-2-17-17-3 15-9 0Z" fill="none" stroke="#1c1f18" stroke-opacity=".48" stroke-width="2.25" stroke-linejoin="round"/>
+</svg>

@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta name="color-scheme" content="light dark" />
+        <title>AutoDOM</title>
+        <link rel="stylesheet" href="popup.css" />
+    </head>
+    <body>
+        <div class="app">
+            <header class="app-header">
+                <div class="brand-block">
+                    <img
+                        class="brand-mark"
+                        src="../icons/icon.svg"
+                        alt="AutoDOM"
+                        width="28"
+                        height="28"
+                    />
+                    <div>
+                        <h1 class="app-title">AutoDOM</h1>
+                        <p class="app-subtitle">Browser automation bridge</p>
+                    </div>
+                </div>
+                <span class="version" id="appVersion">v1.2.0</span>
+            </header>
+
+            <nav class="tab-bar">
+                <button class="tab active" data-tab="status">Status</button>
+                <button class="tab" data-tab="config">Config</button>
+                <button class="tab" data-tab="logs">Logs</button>
+            </nav>
+
+            <main class="app-main">
+                <div class="tab-content active" id="tab-status">
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Status</span>
+                        </div>
+                        <div class="status-card" id="statusCard">
+                            <div class="status-indicator" id="statusIndicator">
+                                <span class="status-dot"></span>
+                                <span class="status-label" id="statusLabel"
+                                    >Disconnected</span
+                                >
+                            </div>
+                            <p class="status-detail" id="statusDetail">
+                                Click Connect or enable auto-connect to start
+                                the bridge
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-header">
+                            <label class="section-label" for="portInput"
+                                >Port</label
+                            >
+                        </div>
+                        <div class="field-row">
+                            <input
+                                type="number"
+                                id="portInput"
+                                value="9876"
+                                min="1024"
+                                max="65535"
+                                class="config-input"
+                            />
+                            <label class="checkbox-row" for="autoConnectToggle">
+                                <input type="checkbox" id="autoConnectToggle" />
+                                <span>Auto-connect</span>
+                            </label>
+                        </div>
+                        <p class="field-hint">Default WebSocket port: 9876</p>
+                    </section>
+
+                    <section class="panel">
+                        <div class="button-stack">
+                            <button class="action-btn" id="connectBtn">
+                                <span id="connectBtnText">Connect</span>
+                            </button>
+                            <button
+                                class="secondary-btn"
+                                id="aiChatBtn"
+                                title="Open AI Chat on active tab"
+                            >
+                                Open AI Chat
+                            </button>
+                            <button class="secondary-btn" id="actionBtn">
+                                <span id="actionBtnText"
+                                    >Show setup config</span
+                                >
+                            </button>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-header">
+                            <label class="section-label" for="providerSelect"
+                                >AI Provider</label
+                            >
+                        </div>
+                        <div class="field-stack">
+                            <select id="providerSelect" class="config-input">
+                                <option value="ide">IDE Agent (MCP)</option>
+                                <option value="openai">Connect with GPT</option>
+                                <option value="anthropic">
+                                    Connect with Claude
+                                </option>
+                                <option value="ollama">
+                                    Connect with Ollama (Local)
+                                </option>
+                            </select>
+                            <input
+                                type="text"
+                                id="providerModel"
+                                class="config-input"
+                                placeholder="Model"
+                            />
+                            <input
+                                type="password"
+                                id="providerApiKey"
+                                class="config-input"
+                                placeholder="API key"
+                            />
+                            <input
+                                type="text"
+                                id="providerBaseUrl"
+                                class="config-input"
+                                placeholder="Base URL (optional)"
+                            />
+                            <label
+                                class="checkbox-row"
+                                for="providerEnabledToggle"
+                            >
+                                <input
+                                    type="checkbox"
+                                    id="providerEnabledToggle"
+                                />
+                                <span>Enable direct provider</span>
+                            </label>
+                            <div class="inline-row">
+                                <button
+                                    id="saveProviderBtn"
+                                    class="secondary-btn"
+                                >
+                                    Save provider
+                                </button>
+                                <span
+                                    id="providerStatus"
+                                    class="field-hint"
+                                ></span>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Active Tab</span>
+                            <button
+                                id="refreshTabsBtn"
+                                class="text-btn"
+                                title="Refresh tabs"
+                            >
+                                Refresh
+                            </button>
+                        </div>
+                        <div class="field-stack">
+                            <select id="tabSelect" class="config-input">
+                                <option value="">Loading tabs...</option>
+                            </select>
+                            <div class="info-url" id="tabUrl">—</div>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Guardrails</span>
+                        </div>
+                        <div class="field-stack">
+                            <label class="checkbox-row" for="rateLimitToggle">
+                                <input type="checkbox" id="rateLimitToggle" />
+                                <span>Rate limiting per domain</span>
+                            </label>
+                            <div id="rateLimitSettings" class="nested-fields">
+                                <div class="field-row">
+                                    <input
+                                        type="number"
+                                        id="rateLimitMax"
+                                        value="100"
+                                        min="1"
+                                        max="10000"
+                                        class="config-input"
+                                    />
+                                    <select
+                                        id="rateLimitWindow"
+                                        class="config-input"
+                                    >
+                                        <option value="60000">1 min</option>
+                                        <option value="300000">5 min</option>
+                                        <option value="600000">10 min</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <label
+                                class="checkbox-row"
+                                for="confirmSubmitToggle"
+                            >
+                                <input
+                                    type="checkbox"
+                                    id="confirmSubmitToggle"
+                                />
+                                <span>Confirm before submit or purchase</span>
+                            </label>
+                        </div>
+                    </section>
+
+                    <section class="panel log-section">
+                        <div class="panel-header">
+                            <span class="section-label">Activity</span>
+                            <div class="log-toolbar">
+                                <select
+                                    id="logFilter"
+                                    class="config-input log-filter"
+                                    aria-label="Filter activity logs"
+                                >
+                                    <option value="all">All</option>
+                                    <option value="error">Errors</option>
+                                    <option value="warn">Warns</option>
+                                    <option value="info">Info</option>
+                                    <option value="success">OK</option>
+                                </select>
+                                <button class="text-btn" id="logClear">
+                                    Clear
+                                </button>
+                            </div>
+                        </div>
+                        <div class="log-container" id="logContainer">
+                            <div class="log-entry log-info">
+                                Extension loaded. Ready.
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <div class="tab-content" id="tab-config">
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Setup Config</span>
+                        </div>
+                        <div class="config-info">
+                            <div class="config-block">
+                                <div class="config-block-header">
+                                    <span class="config-block-label">Server Path</span>
+                                    <button class="copy-btn" data-copy="serverPath" title="Copy path">Copy</button>
+                                </div>
+                                <pre class="config-code" id="serverPath"></pre>
+                            </div>
+
+                            <div class="config-block">
+                                <div class="config-block-header">
+                                    <span class="config-block-label">MCP Config</span>
+                                    <button class="copy-btn" data-copy="mcpConfig" title="Copy config">Copy</button>
+                                </div>
+                                <pre class="config-code" id="mcpConfig"></pre>
+                            </div>
+
+                            <div class="config-destinations">
+                                <p class="field-hint">Paste into your IDE config file:</p>
+                                <table class="dest-table">
+                                    <tbody>
+                                        <tr><td class="dest-ide">VS Code / Cursor</td><td class="dest-file">.vscode/mcp.json</td></tr>
+                                        <tr><td class="dest-ide">IntelliJ / JetBrains</td><td class="dest-file">.junie/mcp.json</td></tr>
+                                        <tr><td class="dest-ide">Gemini CLI</td><td class="dest-file">~/.gemini/settings.json</td></tr>
+                                        <tr><td class="dest-ide">Claude Desktop</td><td class="dest-file">claude_desktop_config.json</td></tr>
+                                        <tr><td class="dest-ide">Codex</td><td class="dest-file">~/.codex/config.toml <span class="dest-note">(use TOML format)</span></td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+
+                            <div class="config-block">
+                                <div class="config-block-header">
+                                    <span class="config-block-label">Codex / TOML</span>
+                                    <button class="copy-btn" data-copy="tomlConfig" title="Copy TOML config">Copy</button>
+                                </div>
+                                <pre class="config-code" id="tomlConfig"></pre>
+                            </div>
+
+                            <div class="config-note">
+                                <span>54 tools · Port <span id="configPort">9876</span> · stdio</span>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+                <div class="tab-content" id="tab-logs">
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Tool Error Logs</span>
+                            <div class="log-toolbar">
+                                <select
+                                    id="logSourceFilter"
+                                    class="config-input log-filter"
+                                    aria-label="Log source"
+                                >
+                                    <option value="all">All</option>
+                                    <option value="extension">Ext</option>
+                                    <option value="server">Server</option>
+                                </select>
+                                <button class="text-btn" id="fetchLogsBtn">
+                                    Refresh
+                                </button>
+                                <button class="text-btn" id="clearToolLogsBtn">
+                                    Clear
+                                </button>
+                            </div>
+                        </div>
+                        <p class="field-hint" id="logFilePath"></p>
+                        <div class="log-container" id="toolLogContainer">
+                            <div class="log-entry log-info">
+                                Click Refresh to load tool error logs.
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </main>
+
+            <footer class="footer">
+                <span
+                    >54 MCP tools ·
+                    <a
+                        href="https://github.com/eziocode/IntelliJ-Plugins/tree/main/autodom-extension"
+                        target="_blank"
+                        rel="noopener"
+                        title="View on GitHub"
+                        style="
+                            display: inline-flex;
+                            align-items: center;
+                            vertical-align: middle;
+                        "
+                        ><svg
+                            height="14"
+                            width="14"
+                            viewBox="0 0 16 16"
+                            fill="currentColor"
+                            style="vertical-align: middle"
+                        >
+                            <path
+                                d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"
+                            /></svg
+                    ></a>
+                </span>
+            </footer>
+        </div>
+
+        <script src="popup.js"></script>
+    </body>
+</html>
