@@ -26,6 +26,25 @@ const activityStorage = (() => {
   }
 })();
 
+// ─── Activity Log — In-Memory Buffer ─────────────────────────
+// Keeps the in-memory log as the source of truth and batch-flushes
+// to storage instead of doing a get+set on every single log call.
+// This eliminates the high-frequency storage round-trips that the old
+// implementation caused (one get+set per debug log, per tool call, etc.).
+let _activityLog = [];       // In-memory ring buffer (authoritative)
+let _activityLogDirty = false; // True when log has unpersisted entries
+let _activityFlushTimer = null;
+const ACTIVITY_FLUSH_MS = 300; // Coalesce writes within a 300ms window
+
+// Seed the in-memory log from storage on startup so we don't lose
+// entries that were persisted in a previous service worker lifetime.
+activityStorage.get([ACTIVITY_LOG_KEY], (result) => {
+  const stored = result?.[ACTIVITY_LOG_KEY];
+  if (Array.isArray(stored) && stored.length > 0) {
+    _activityLog = stored;
+  }
+});
+
 // Detect Firefox by checking for Gecko-specific manifest entry.
 // chrome.debugger (CDP) is not available in Firefox; tools that depend on it
 // will throw a clear "not supported" error rather than crashing silently.
@@ -84,23 +103,27 @@ function _formatLogText(args) {
 function appendActivityLog(level, source, ...args) {
   const text = _formatLogText(args);
   if (!text) return;
-  const entry = {
+  _activityLog.push({
     ts: Date.now(),
     level: level || "info",
     source: source || "background",
     text,
-  };
-
-  activityStorage.get([ACTIVITY_LOG_KEY], (result) => {
-    const logs = Array.isArray(result?.[ACTIVITY_LOG_KEY])
-      ? result[ACTIVITY_LOG_KEY]
-      : [];
-    logs.push(entry);
-    if (logs.length > ACTIVITY_LOG_LIMIT) {
-      logs.splice(0, logs.length - ACTIVITY_LOG_LIMIT);
-    }
-    activityStorage.set({ [ACTIVITY_LOG_KEY]: logs }).catch(() => {});
   });
+  if (_activityLog.length > ACTIVITY_LOG_LIMIT) {
+    _activityLog.splice(0, _activityLog.length - ACTIVITY_LOG_LIMIT);
+  }
+  _activityLogDirty = true;
+  if (!_activityFlushTimer) {
+    _activityFlushTimer = setTimeout(_flushActivityLog, ACTIVITY_FLUSH_MS);
+  }
+}
+
+function _flushActivityLog() {
+  _activityFlushTimer = null;
+  if (!_activityLogDirty) return;
+  _activityLogDirty = false;
+  // Write the current snapshot; no read needed since we own the in-memory state.
+  activityStorage.set({ [ACTIVITY_LOG_KEY]: _activityLog.slice() }).catch(() => {});
 }
 
 function _debugLog(...args) {
@@ -436,6 +459,19 @@ chrome.storage.onChanged.addListener((changes) => {
     };
     _debugLog("[AutoDOM] Rate limit config updated:", rateLimitConfig);
   }
+  // Sync in-memory log when cleared externally (e.g. popup Clear button).
+  // This prevents a pending flush from resurrecting logs after a clear.
+  if (changes[ACTIVITY_LOG_KEY]) {
+    const newVal = changes[ACTIVITY_LOG_KEY].newValue;
+    if (!Array.isArray(newVal) || newVal.length === 0) {
+      _activityLog = [];
+      _activityLogDirty = false;
+      if (_activityFlushTimer) {
+        clearTimeout(_activityFlushTimer);
+        _activityFlushTimer = null;
+      }
+    }
+  }
 });
 
 function getDomainFromTab(tab) {
@@ -689,7 +725,7 @@ function isSensitiveInput(details) {
   const type = (details.type || "").toLowerCase();
   const name = (details.name || "").toLowerCase();
   const autocomplete = (details.autocomplete || "").toLowerCase();
-  if (SENSITIVE_INPUT_TYPES.has(type) || type === "password") return true;
+  if (SENSITIVE_INPUT_TYPES.has(type)) return true;
   if (SENSITIVE_FIELD_NAMES.some((s) => name.includes(s))) return true;
   if (
     [...SENSITIVE_INPUT_TYPES].some((s) => autocomplete.includes(s)) ||
@@ -717,9 +753,10 @@ function recordAction(
       safeDetails[k] = v;
     }
   }
+  const now = Date.now();
   sessionRecording.actions.push({
-    timestamp: Date.now(),
-    elapsed: Date.now() - sessionRecording.startTime,
+    timestamp: now,
+    elapsed: now - sessionRecording.startTime,
     type,
     description: safeDescription,
     details: safeDetails,
@@ -3349,58 +3386,6 @@ function isInjectableTab(tab) {
   );
 }
 
-async function showBorderOnAllTabs() {
-  try {
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      if (isInjectableTab(tab)) {
-        chrome.tabs
-          .sendMessage(tab.id, { type: "SHOW_SESSION_BORDER" })
-          .catch(() => {});
-      }
-    }
-  } catch {}
-}
-
-async function hideBorderOnAllTabs() {
-  try {
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      if (isInjectableTab(tab)) {
-        chrome.tabs
-          .sendMessage(tab.id, { type: "HIDE_SESSION_BORDER" })
-          .catch(() => {});
-      }
-    }
-  } catch {}
-}
-
-async function showChatPanelOnAllTabs() {
-  try {
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      if (isInjectableTab(tab)) {
-        chrome.tabs
-          .sendMessage(tab.id, { type: "SHOW_CHAT_PANEL" })
-          .catch(() => {});
-      }
-    }
-  } catch {}
-}
-
-async function hideChatPanelOnAllTabs() {
-  try {
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      if (isInjectableTab(tab)) {
-        chrome.tabs
-          .sendMessage(tab.id, { type: "HIDE_CHAT_PANEL" })
-          .catch(() => {});
-      }
-    }
-  } catch {}
-}
-
 // Combined broadcast to avoid multiple chrome.tabs.query calls
 async function broadcastToAllTabs(messages) {
   try {
@@ -3906,17 +3891,11 @@ async function toolGetDomState(params) {
         if (elements.length >= maxElements) break;
       }
 
-      // Build compact indexed map
-      const indexed = {};
-      for (let i = 0; i < elements.length; i++) {
-        indexed[i] = elements[i];
-      }
-
       return {
         title: document.title,
         url: location.href,
         elementCount: elements.length,
-        elements: indexed,
+        elements: Object.fromEntries(elements.entries()),
       };
     },
     [includeHidden, maxElements],
@@ -4529,13 +4508,11 @@ async function toolIframeInteract(params) {
             elements.push(entry);
             if (elements.length >= 200) break;
           }
-          const indexed = {};
-          for (let i = 0; i < elements.length; i++) indexed[i] = elements[i];
           return {
             title: document.title,
             url: location.href,
             elementCount: elements.length,
-            elements: indexed,
+            elements: Object.fromEntries(elements.entries()),
           };
         }
 
@@ -4808,9 +4785,7 @@ async function toolShadowInteract(params) {
           elements.push(entry);
           if (elements.length >= 200) break;
         }
-        const indexed = {};
-        for (let i = 0; i < elements.length; i++) indexed[i] = elements[i];
-        return { elementCount: elements.length, elements: indexed };
+        return { elementCount: elements.length, elements: Object.fromEntries(elements.entries()) };
       }
 
       return { error: `Unknown shadow action: ${action}` };

@@ -265,7 +265,7 @@
     });
   }
 
-  async function injectScript(details) {
+  function injectScript(details) {
     const scripting = rawApi.scripting;
     if (scripting && typeof scripting.executeScript === "function") {
       return callMethod(scripting, "executeScript", [details]);
@@ -276,7 +276,7 @@
     );
   }
 
-  async function sendDebuggerCommand(target, method, commandParams) {
+  function sendDebuggerCommand(target, method, commandParams) {
     const debuggerApi = rawApi.debugger;
     if (!debuggerApi || typeof debuggerApi.sendCommand !== "function") {
       return Promise.reject(

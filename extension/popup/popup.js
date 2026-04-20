@@ -281,15 +281,14 @@ document.addEventListener("DOMContentLoaded", async () => {
 
 // ─── Tab Switching ───────────────────────────────────────────
 function initTabs() {
-  $$(".tab").forEach((tab) => {
+  const tabs = $$(".tab");
+  const tabContents = $$(".tab-content");
+  tabs.forEach((tab) => {
     tab.addEventListener("click", () => {
-      // Deactivate all tabs
-      $$(".tab").forEach((t) => t.classList.remove("active"));
-      $$(".tab-content").forEach((tc) => tc.classList.remove("active"));
-      // Activate clicked tab
+      tabs.forEach((t) => t.classList.remove("active"));
+      tabContents.forEach((tc) => tc.classList.remove("active"));
       tab.classList.add("active");
-      const target = tab.dataset.tab;
-      $(`#tab-${target}`).classList.add("active");
+      $(`#tab-${tab.dataset.tab}`).classList.add("active");
     });
   });
 
@@ -492,49 +491,35 @@ DOM.logClear.addEventListener("click", () => {
 });
 
 // ─── Guardrails Event Listeners ──────────────────────────────
+function sendRateLimitConfig(enabled) {
+  sendRuntimeMessage({
+    type: "UPDATE_GUARDRAILS",
+    rateLimitConfig: {
+      enabled,
+      maxCallsPerDomain: parseInt(DOM.rateLimitMax?.value || "100", 10),
+      windowMs: parseInt(DOM.rateLimitWindow?.value || "60000", 10),
+    },
+  });
+}
+
 if (DOM.rateLimitToggle) {
   DOM.rateLimitToggle.addEventListener("change", () => {
     const enabled = DOM.rateLimitToggle.checked;
     if (DOM.rateLimitSettings)
       DOM.rateLimitSettings.style.display = enabled ? "block" : "none";
-    sendRuntimeMessage({
-      type: "UPDATE_GUARDRAILS",
-      rateLimitConfig: {
-        enabled,
-        maxCallsPerDomain: parseInt(DOM.rateLimitMax?.value || "100", 10),
-        windowMs: parseInt(DOM.rateLimitWindow?.value || "60000", 10),
-      },
-    });
+    sendRateLimitConfig(enabled);
   });
 }
 
 if (DOM.rateLimitMax) {
   DOM.rateLimitMax.addEventListener("change", () => {
-    if (DOM.rateLimitToggle?.checked) {
-      sendRuntimeMessage({
-        type: "UPDATE_GUARDRAILS",
-        rateLimitConfig: {
-          enabled: true,
-          maxCallsPerDomain: parseInt(DOM.rateLimitMax.value || "100", 10),
-          windowMs: parseInt(DOM.rateLimitWindow?.value || "60000", 10),
-        },
-      });
-    }
+    if (DOM.rateLimitToggle?.checked) sendRateLimitConfig(true);
   });
 }
 
 if (DOM.rateLimitWindow) {
   DOM.rateLimitWindow.addEventListener("change", () => {
-    if (DOM.rateLimitToggle?.checked) {
-      sendRuntimeMessage({
-        type: "UPDATE_GUARDRAILS",
-        rateLimitConfig: {
-          enabled: true,
-          maxCallsPerDomain: parseInt(DOM.rateLimitMax?.value || "100", 10),
-          windowMs: parseInt(DOM.rateLimitWindow.value || "60000", 10),
-        },
-      });
-    }
+    if (DOM.rateLimitToggle?.checked) sendRateLimitConfig(true);
   });
 }
 
