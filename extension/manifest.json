@@ -51,12 +51,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["common/webext-api.js", "content/session-border.js"],
-      "run_at": "document_idle"
-    },
-    {
-      "matches": ["<all_urls>"],
-      "js": ["common/webext-api.js", "content/chat-panel.js"],
+      "js": ["common/webext-api.js", "content/session-border.js", "content/chat-panel.js"],
       "run_at": "document_idle"
     }
   ],

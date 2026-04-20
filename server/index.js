@@ -84,9 +84,7 @@ function _logToolError(tool, error, params) {
   if (_toolErrorBuf.length >= TOOL_ERROR_LOG_MAX) _toolErrorBuf.shift();
   _toolErrorBuf.push(entry);
   const line = `[${entry.ts}] [${tool}] ${entry.error}${entry.params ? " | params=" + entry.params : ""}\n`;
-  import("fs").then(({ promises: fsp }) =>
-    fsp.appendFile(TOOL_ERROR_LOG_PATH, line).catch(() => {}),
-  );
+  fs.appendFile(TOOL_ERROR_LOG_PATH, line).catch(() => {});
 }
 
 // ─── Crash Protection ────────────────────────────────────────

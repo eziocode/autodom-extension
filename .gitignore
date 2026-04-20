@@ -13,3 +13,5 @@ dist/firefox/
 dist/*.xpi
 dist/*.zip
 
+autodom-extension/.envrc
+autodom-extension/scripts/copilot.sh
