@@ -79,6 +79,14 @@ document.addEventListener("DOMContentLoaded", async () => {
     DOM.appVersion.textContent = `v${chrome.runtime.getManifest().version}`;
   }
 
+// API keys live in chrome.storage.session (RAM-only). Falls back to local
+// on browsers that don't yet expose `session` storage.
+const _secretArea = (chrome.storage && chrome.storage.session) || chrome.storage.local;
+const _secretAreaName =
+  chrome.storage && chrome.storage.session && _secretArea === chrome.storage.session
+    ? "session"
+    : "local";
+
   // Load saved port, server path, auto-connect preference, and provider settings
   const stored = await chrome.storage.local.get([
     "mcpPort",
@@ -89,13 +97,28 @@ document.addEventListener("DOMContentLoaded", async () => {
     "aiProviderModel",
     "aiProviderBaseUrl",
   ]);
+  const secretStored = await new Promise((resolve) => {
+    try {
+      _secretArea.get(["aiProviderApiKey"], (r) => resolve(r || {}));
+    } catch (_) {
+      resolve({});
+    }
+  });
+  // Migrate legacy plaintext key from local → session storage.
+  const apiKey = secretStored.aiProviderApiKey || stored.aiProviderApiKey || "";
+  if (!secretStored.aiProviderApiKey && stored.aiProviderApiKey) {
+    try {
+      _secretArea.set({ aiProviderApiKey: apiKey });
+      chrome.storage.local.remove("aiProviderApiKey");
+    } catch (_) {}
+  }
   const port = stored.mcpPort || 9876;
   const serverPath = stored.serverPath || null;
   const autoConnect = stored.autoConnect === true;
 
   providerSettings = {
     source: stored.aiProviderSource || "ide",
-    apiKey: stored.aiProviderApiKey || "",
+    apiKey,
     model: stored.aiProviderModel || "",
     baseUrl: stored.aiProviderBaseUrl || "",
   };
@@ -193,8 +216,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
-  // Listen for path/provider updates
-  chrome.storage.onChanged.addListener((changes) => {
+  // Listen for path/provider updates (both local and session areas)
+  chrome.storage.onChanged.addListener((changes, areaName) => {
     if (changes.serverPath) {
       generateConfigs(
         parseInt(DOM.portInput.value, 10) || 9876,
@@ -215,9 +238,12 @@ document.addEventListener("DOMContentLoaded", async () => {
       renderActivityLogs(activityLogs);
     }
 
+    // API key changes arrive on the session area; other settings on local.
+    const apiKeyChange =
+      areaName === _secretAreaName ? changes.aiProviderApiKey : undefined;
     if (
       changes.aiProviderSource ||
-      changes.aiProviderApiKey ||
+      apiKeyChange ||
       changes.aiProviderModel ||
       changes.aiProviderBaseUrl
     ) {
@@ -225,8 +251,8 @@ document.addEventListener("DOMContentLoaded", async () => {
         source: changes.aiProviderSource
           ? changes.aiProviderSource.newValue
           : providerSettings.source,
-        apiKey: changes.aiProviderApiKey
-          ? changes.aiProviderApiKey.newValue
+        apiKey: apiKeyChange
+          ? apiKeyChange.newValue
           : providerSettings.apiKey,
         model: changes.aiProviderModel
           ? changes.aiProviderModel.newValue
@@ -410,10 +436,14 @@ async function saveProviderSettings() {
 
   await chrome.storage.local.set({
     aiProviderSource: providerSettings.source,
-    aiProviderApiKey: providerSettings.apiKey,
     aiProviderModel: providerSettings.model,
     aiProviderBaseUrl: providerSettings.baseUrl,
   });
+  // Persist API key into RAM-only session storage (never written to disk).
+  try {
+    _secretArea.set({ aiProviderApiKey: providerSettings.apiKey });
+    chrome.storage.local.remove("aiProviderApiKey");
+  } catch (_) {}
 
   const response = await sendRuntimeMessage({
     type: "SET_AI_PROVIDER",

@@ -6,6 +6,18 @@
  * Uses chrome.scripting, chrome.tabs, and chrome.debugger APIs.
  */
 
+// Load shared modules. importScripts() works in Chrome MV3 service workers
+// (non-module workers); Firefox MV3 declares the same files in its
+// manifest.firefox.json `background.scripts` array, so this call is a no-op
+// because the scripts have already been evaluated globally.
+try {
+  if (typeof importScripts === "function" && !globalThis.AutoDOMProviders) {
+    importScripts("providers.js");
+  }
+} catch (_) {
+  // Already loaded (Firefox path) — ignore.
+}
+
 let ws = null;
 let wsPort = 9876;
 let _requestedPort = 9876; // Port the user/startup explicitly asked for — never mutated by fallback logic
@@ -25,6 +37,42 @@ const activityStorage = (() => {
     return chrome.storage.local;
   }
 })();
+
+// API keys live in chrome.storage.session (RAM-only) so they are never
+// persisted to disk. Falls back to chrome.storage.local on browsers that
+// don't yet expose `session` storage. The non-secret provider settings
+// (source, model, baseUrl) stay in chrome.storage.local so the user's
+// choice survives a browser restart — only the secret has to be re-entered.
+const secretStorage = (() => {
+  try {
+    return chrome.storage.session || chrome.storage.local;
+  } catch (_) {
+    return chrome.storage.local;
+  }
+})();
+const _secretStorageIsSession =
+  typeof chrome !== "undefined" &&
+  chrome.storage &&
+  chrome.storage.session &&
+  secretStorage === chrome.storage.session;
+
+function _readApiKey() {
+  return new Promise((resolve) => {
+    try {
+      secretStorage.get(["aiProviderApiKey"], (r) =>
+        resolve((r && r.aiProviderApiKey) || ""),
+      );
+    } catch (_) {
+      resolve("");
+    }
+  });
+}
+
+function _writeApiKey(value) {
+  try {
+    secretStorage.set({ aiProviderApiKey: value || "" });
+  } catch (_) {}
+}
 
 // ─── Activity Log — In-Memory Buffer ─────────────────────────
 // Keeps the in-memory log as the source of truth and batch-flushes
@@ -139,45 +187,8 @@ function _debugError(...args) {
 }
 
 // ─── Direct AI Provider Calls ────────────────────────────────
-// These functions let the service worker call OpenAI, Anthropic, or
-// Ollama APIs directly — no bridge server needed.  The service worker
-// has host_permissions: ["<all_urls>"] so cross-origin fetch works.
-
-function _buildSystemPrompt(context) {
-  let p =
-    "You are AutoDOM, a helpful browser AI assistant. " +
-    "You help users understand and interact with the current web page.\n\n";
-  if (context) {
-    if (context.title) p += `Page title: ${context.title}\n`;
-    if (context.url) p += `Page URL: ${context.url}\n`;
-    if (context.interactiveElements) {
-      const ie = context.interactiveElements;
-      p += `Interactive elements: ${ie.links || 0} links, ${ie.buttons || 0} buttons, ${ie.inputs || 0} inputs, ${ie.forms || 0} forms\n`;
-    }
-  }
-  p +=
-    "\nRespond clearly and concisely. If the user asks about page content, " +
-    "use the page context provided. For browser actions, suggest using " +
-    "slash commands like /dom, /click, /screenshot, /nav.";
-  return p;
-}
-
-function _buildMessages(text, context, conversationHistory) {
-  const msgs = [{ role: "system", content: _buildSystemPrompt(context) }];
-  // Add recent conversation history
-  if (Array.isArray(conversationHistory) && conversationHistory.length > 0) {
-    conversationHistory.slice(-12).forEach((m) => {
-      if (m && m.role && m.content) {
-        msgs.push({
-          role: m.role === "assistant" || m.role === "system" ? m.role : "user",
-          content: String(m.content),
-        });
-      }
-    });
-  }
-  msgs.push({ role: "user", content: text });
-  return msgs;
-}
+// Provider clients live in providers.js (loaded above via importScripts).
+// The wrappers below adapt the SW's settings + logger to the shared API.
 
 async function _callDirectProvider(
   providerType,
@@ -185,225 +196,39 @@ async function _callDirectProvider(
   context,
   conversationHistory,
 ) {
-  const normalized =
-    providerType === "gpt" || providerType === "chatgpt"
-      ? "openai"
-      : providerType === "claude"
-        ? "anthropic"
-        : providerType;
-
-  if (normalized === "openai") {
-    return _callOpenAI(text, context, conversationHistory);
-  }
-  if (normalized === "anthropic") {
-    return _callAnthropic(text, context, conversationHistory);
-  }
-  if (normalized === "ollama") {
-    return _callOllama(text, context, conversationHistory);
-  }
-  throw new Error(`Unknown direct provider: ${providerType}`);
-}
-
-async function _callOpenAI(text, context, conversationHistory) {
   const apiKey = (aiProviderSettings.apiKey || "").trim();
-  if (!apiKey) throw new Error("No OpenAI API key configured");
-
-  const baseUrl = (
-    aiProviderSettings.baseUrl || "https://api.openai.com/v1"
-  ).replace(/\/+$/, "");
-  const model = aiProviderSettings.model || "gpt-4.1-mini";
-  const messages = _buildMessages(text, context, conversationHistory);
-
-  _debugLog(
-    "[AutoDOM SW] Calling OpenAI:",
-    baseUrl + "/chat/completions",
-    "model:",
-    model,
-  );
-
-  const resp = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({ model, messages, max_tokens: 4096 }),
+  return globalThis.AutoDOMProviders.callDirectProvider(providerType, {
+    apiKey,
+    baseUrl: aiProviderSettings.baseUrl,
+    model: aiProviderSettings.model,
+    text,
+    context,
+    conversationHistory,
+    debug: _debugLog,
   });
-
-  if (!resp.ok) {
-    const errText = await resp.text().catch(() => "");
-    throw new Error(`OpenAI ${resp.status}: ${errText.substring(0, 300)}`);
-  }
-
-  const data = await resp.json();
-  const content = data?.choices?.[0]?.message?.content || "";
-  return {
-    response: content || "OpenAI returned an empty response.",
-    toolCalls: [{ tool: "_direct_provider", via: "openai", model }],
-  };
-}
-
-async function _callAnthropic(text, context, conversationHistory) {
-  const apiKey = (aiProviderSettings.apiKey || "").trim();
-  if (!apiKey) throw new Error("No Anthropic API key configured");
-
-  const model = aiProviderSettings.model || "claude-3-5-sonnet-latest";
-  const systemPrompt = _buildSystemPrompt(context);
-  const msgs = [];
-  if (Array.isArray(conversationHistory) && conversationHistory.length > 0) {
-    conversationHistory.slice(-12).forEach((m) => {
-      if (m && m.role && m.content) {
-        msgs.push({
-          role: m.role === "assistant" ? "assistant" : "user",
-          content: String(m.content),
-        });
-      }
-    });
-  }
-  msgs.push({ role: "user", content: text });
-
-  _debugLog("[AutoDOM SW] Calling Anthropic, model:", model);
-
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model,
-      max_tokens: 4096,
-      system: systemPrompt,
-      messages: msgs,
-    }),
-  });
-
-  if (!resp.ok) {
-    const errText = await resp.text().catch(() => "");
-    throw new Error(`Anthropic ${resp.status}: ${errText.substring(0, 300)}`);
-  }
-
-  const data = await resp.json();
-  const content = Array.isArray(data?.content)
-    ? data.content
-        .filter((p) => p?.type === "text" && p?.text)
-        .map((p) => p.text)
-        .join("\n")
-        .trim()
-    : "";
-  return {
-    response: content || "Anthropic returned an empty response.",
-    toolCalls: [{ tool: "_direct_provider", via: "anthropic", model }],
-  };
-}
-
-async function _callOllama(text, context, conversationHistory) {
-  const baseUrl = (
-    aiProviderSettings.baseUrl || "http://localhost:11434"
-  ).replace(/\/+$/, "");
-  const model = aiProviderSettings.model || "llama3.2";
-  const messages = _buildMessages(text, context, conversationHistory);
-
-  _debugLog(
-    "[AutoDOM SW] Calling Ollama:",
-    baseUrl + "/api/chat",
-    "model:",
-    model,
-  );
-
-  const resp = await fetch(`${baseUrl}/api/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, messages, stream: false }),
-  });
-
-  if (!resp.ok) {
-    const errText = await resp.text().catch(() => "");
-    throw new Error(`Ollama ${resp.status}: ${errText.substring(0, 300)}`);
-  }
-
-  const data = await resp.json();
-  const content = data?.message?.content || "";
-  return {
-    response: content || "Ollama returned an empty response.",
-    toolCalls: [{ tool: "_direct_provider", via: "ollama", model }],
-  };
 }
 
 // ─── Inactivity Timeout ─────────────────────────────────────
-// Auto-disconnect after 10 minutes of no tool calls.
-// Any tool call resets the timer. Keepalives do NOT reset it —
-// only real user/agent activity counts.
-const INACTIVITY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-let lastToolActivityTime = Date.now();
-let inactivityCheckInterval = null;
-
+// The bridge server is now the single source of truth for inactivity
+// timeouts (see server/index.js startInactivityTimer). It sends
+// INACTIVITY_WARNING messages at 80% of the timeout and SESSION_TIMEOUT
+// when it actually shuts down — both of which are handled in ws.onmessage.
+//
+// The previous extension-side timer was a parallel implementation that
+// raced with the server timer (different "what counts as activity" rules),
+// so it has been removed in favour of the server-driven flow.
 function touchToolActivity() {
-  lastToolActivityTime = Date.now();
+  // Retained as a no-op so existing call sites stay compile-safe; the
+  // server already resets its own timer whenever a tool result is sent
+  // back over the WebSocket.
 }
 
 function startInactivityTimer() {
-  stopInactivityTimer();
-  lastToolActivityTime = Date.now();
-  inactivityCheckInterval = setInterval(() => {
-    const idleMs = Date.now() - lastToolActivityTime;
-    const idleMins = (idleMs / 60000).toFixed(1);
-
-    if (idleMs >= INACTIVITY_TIMEOUT_MS) {
-      if (autoConnectEnabled) {
-        _debugLog(
-          `[AutoDOM] Session idle for ${idleMins} minutes — auto-connect is enabled, keeping the bridge connected`,
-        );
-        lastToolActivityTime = Date.now();
-        return;
-      }
-      _debugWarn(
-        `[AutoDOM] Session idle for ${idleMins} minutes — auto-disconnecting`,
-      );
-      // Mark as timed out BEFORE disconnect so onclose treats this as a final stop
-      _sessionTimedOut = true;
-      shouldRunMcp = false;
-      stopAutoConnect();
-      stopInactivityTimer();
-      disconnectWebSocket();
-      chrome.storage.local.set({ mcpRunning: false });
-      // Explicitly hide border and chat on ALL tabs (including non-active)
-      broadcastToAllTabs([
-        { type: "HIDE_SESSION_BORDER" },
-        { type: "HIDE_CHAT_PANEL" },
-      ]);
-      // Broadcast after disconnect so popup and content scripts know
-      broadcastStatus(
-        false,
-        `Session auto-closed after ${idleMins} min of inactivity. Click Connect to start again.`,
-        "warn",
-      );
-      // Also send explicit MCP stop to all tabs so chat-panel tears down
-      broadcastMcpStopToAllTabs();
-      return;
-    }
-
-    // Warn at 80% of timeout (8 minutes)
-    if (idleMs >= INACTIVITY_TIMEOUT_MS * 0.8) {
-      const remainingSecs = Math.round((INACTIVITY_TIMEOUT_MS - idleMs) / 1000);
-      _debugLog(
-        `[AutoDOM] Inactivity warning: idle ${idleMins}m, auto-disconnect in ${remainingSecs}s`,
-      );
-      broadcastStatus(
-        true,
-        `Idle ${idleMins}m — session will close in ${remainingSecs}s. Use any tool to keep alive.`,
-        "warn",
-      );
-    }
-  }, 60000); // Check every 60s — sufficient for 10min timeout
+  // No-op — server-driven now (see header comment above).
 }
 
 function stopInactivityTimer() {
-  if (inactivityCheckInterval) {
-    clearInterval(inactivityCheckInterval);
-    inactivityCheckInterval = null;
-  }
+  // No-op — server-driven now (see header comment above).
 }
 
 // ─── Indexed Element Cache ───────────────────────────────────
@@ -1137,7 +962,7 @@ function disconnectWebSocket() {
 // MV3 keep-alive: send a small message to keep the service worker alive
 // and detect dead connections via response timeout.
 let _lastPongTime = 0;
-const KEEPALIVE_INTERVAL_MS = 20000;
+const KEEPALIVE_INTERVAL_MS = 45000;
 const KEEPALIVE_TIMEOUT_MS = 10000; // If no pong within this time, disconnect
 
 const _KEEPALIVE_MSG = JSON.stringify({ type: "KEEPALIVE" });
@@ -1316,16 +1141,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     chrome.storage.local.set(
       {
         aiProviderSource: aiProviderSettings.source,
-        aiProviderApiKey: aiProviderSettings.apiKey,
         aiProviderModel: aiProviderSettings.model,
         aiProviderBaseUrl: aiProviderSettings.baseUrl,
       },
       () => {
         _debugLog(
-          "[AutoDOM SW] Provider settings persisted to chrome.storage.local",
+          "[AutoDOM SW] Provider settings persisted (apiKey kept in session storage only)",
         );
       },
     );
+    _writeApiKey(aiProviderSettings.apiKey);
+    // Defensive: drop any legacy plaintext key that may still be in
+    // chrome.storage.local from prior versions.
+    try {
+      chrome.storage.local.remove("aiProviderApiKey");
+    } catch (_) {}
 
     sendResponse({
       success: true,
@@ -3390,8 +3220,10 @@ function isInjectableTab(tab) {
 async function broadcastToAllTabs(messages) {
   try {
     const tabs = await chrome.tabs.query({});
+    const needsPanel = messages.some(_messageNeedsChatPanel);
     for (const tab of tabs) {
       if (isInjectableTab(tab)) {
+        if (needsPanel) await ensureChatPanelInjected(tab.id);
         for (const msg of messages) {
           chrome.tabs.sendMessage(tab.id, msg).catch(() => {});
         }
@@ -3400,12 +3232,40 @@ async function broadcastToAllTabs(messages) {
   } catch {}
 }
 
+// Messages that target the chat-panel content script. When any of these
+// are sent we make sure chat-panel.js is loaded into the target tab —
+// it's lazy-loaded (not in `content_scripts`) to avoid paying the 2.8k
+// LOC parse cost on every page load.
+const _CHAT_PANEL_MESSAGE_TYPES = new Set([
+  "SHOW_CHAT_PANEL",
+  "HIDE_CHAT_PANEL",
+  "TOGGLE_CHAT_PANEL",
+  "TOGGLE_INLINE_AI",
+  "MCP_STATUS_CHANGED",
+  "AI_PROVIDER_STATUS",
+]);
+function _messageNeedsChatPanel(msg) {
+  return msg && _CHAT_PANEL_MESSAGE_TYPES.has(msg.type);
+}
+
+async function ensureChatPanelInjected(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["common/webext-api.js", "content/chat-panel.js"],
+    });
+  } catch (_) {
+    // Restricted page (chrome://, file://, etc.) or tab gone — silent skip.
+  }
+}
+
 // Show border and chat panel on new tabs when MCP is connected
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status === "complete" && isConnected && isInjectableTab(tab)) {
     chrome.tabs
       .sendMessage(tabId, { type: "SHOW_SESSION_BORDER" })
       .catch(() => {});
+    await ensureChatPanelInjected(tabId);
     chrome.tabs.sendMessage(tabId, { type: "SHOW_CHAT_PANEL" }).catch(() => {});
   }
 });
@@ -3420,6 +3280,7 @@ chrome.commands.onCommand.addListener(async (command) => {
     if (!tab || !tab.url || !isInjectableTab(tab)) return;
 
     if (command === "toggle-chat-panel") {
+      await ensureChatPanelInjected(tab.id);
       chrome.tabs
         .sendMessage(tab.id, {
           type: "TOGGLE_CHAT_PANEL",
@@ -3429,6 +3290,7 @@ chrome.commands.onCommand.addListener(async (command) => {
     }
 
     if (command === "toggle-inline-ai") {
+      await ensureChatPanelInjected(tab.id);
       chrome.tabs
         .sendMessage(tab.id, {
           type: "TOGGLE_INLINE_AI",
@@ -3497,7 +3359,7 @@ chrome.storage.local.get(
     "aiProviderModel",
     "aiProviderBaseUrl",
   ],
-  (result) => {
+  async (result) => {
     const port = result.mcpPort || 9876;
     const autoConnect = result.autoConnect === true;
     autoConnectEnabled = autoConnect;
@@ -3509,15 +3371,30 @@ chrome.storage.local.get(
     shouldRunMcp = autoConnect;
     _startupRestoreOnly = autoConnect;
 
+    // Migrate legacy plaintext key (chrome.storage.local) → session storage.
+    let apiKey = await _readApiKey();
+    if (!apiKey && result.aiProviderApiKey) {
+      apiKey = result.aiProviderApiKey;
+      _writeApiKey(apiKey);
+      try {
+        chrome.storage.local.remove("aiProviderApiKey");
+        _debugLog(
+          "[AutoDOM SW] Migrated legacy plaintext API key from local → session storage",
+        );
+      } catch (_) {}
+    }
+
     aiProviderSettings = {
       source: result.aiProviderSource || "ide",
-      apiKey: result.aiProviderApiKey || "",
+      apiKey,
       model: result.aiProviderModel || "",
       baseUrl: result.aiProviderBaseUrl || "",
     };
 
     _debugLog(
-      "[AutoDOM SW] Startup: loaded provider settings from storage:",
+      "[AutoDOM SW] Startup: loaded provider settings (apiKey from " +
+        (_secretStorageIsSession ? "session" : "local-fallback") +
+        " storage):",
       JSON.stringify({
         source: aiProviderSettings.source,
         hasApiKey: !!aiProviderSettings.apiKey,

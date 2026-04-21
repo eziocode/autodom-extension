@@ -25,7 +25,7 @@
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
-    "scripts": ["background/service-worker.js"]
+    "scripts": ["background/providers.js", "background/service-worker.js"]
   },
   "action": {
     "default_popup": "popup/popup.html",
@@ -60,11 +60,6 @@
     {
       "matches": ["<all_urls>"],
       "js": ["common/webext-api.js", "content/session-border.js"],
-      "run_at": "document_idle"
-    },
-    {
-      "matches": ["<all_urls>"],
-      "js": ["common/webext-api.js", "content/chat-panel.js"],
       "run_at": "document_idle"
     }
   ],

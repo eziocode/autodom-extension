@@ -10,9 +10,7 @@
     "storage",
     "debugger",
     "cookies",
-    "nativeMessaging",
     "clipboardWrite",
-    "sidePanel",
     "webNavigation"
   ],
   "host_permissions": ["<all_urls>"],
@@ -51,7 +49,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["common/webext-api.js", "content/session-border.js", "content/chat-panel.js"],
+      "js": ["common/webext-api.js", "content/session-border.js"],
       "run_at": "document_idle"
     }
   ],

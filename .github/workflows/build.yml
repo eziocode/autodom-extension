@@ -31,7 +31,46 @@ jobs:
         working-directory: server
         run: npm ci
 
-      - name: Verify server loads
+      - name: Audit (fail on high+)
         working-directory: server
-        run: node --input-type=module -e "await import('./index.js')" || true
-        timeout-minutes: 1
+        run: npm audit --audit-level=high
+
+      - name: Syntax check (server)
+        working-directory: server
+        run: node --check index.js && node --check cli.js && node --check wrapper.js
+
+      - name: Syntax check (extension)
+        run: |
+          for f in extension/background/service-worker.js \
+                   extension/common/webext-api.js \
+                   extension/content/chat-panel.js \
+                   extension/content/session-border.js \
+                   extension/popup/popup.js; do
+            node --check "$f"
+          done
+
+      - name: Validate manifests
+        run: |
+          python3 -c "import json; json.load(open('extension/manifest.json'))"
+          python3 -c "import json; json.load(open('extension/manifest.firefox.json'))"
+
+      - name: WebSocket auth test
+        working-directory: server
+        run: node test/test-wsauth.mjs
+
+      - name: End-to-end smoke test
+        working-directory: server
+        run: node test/e2e.cjs
+
+      - name: web-ext lint (Chrome manifest)
+        run: npx --yes web-ext@8 lint --source-dir=extension --self-hosted
+
+      - name: Build firefox artefact
+        run: bash scripts/build-firefox.sh
+
+      - name: Upload firefox xpi
+        uses: actions/upload-artifact@v4
+        with:
+          name: autodom-firefox
+          path: dist/*.xpi
+          if-no-files-found: warn

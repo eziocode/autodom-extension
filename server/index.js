@@ -23,6 +23,7 @@ import { promises as fs, readFileSync, rmSync, createWriteStream } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { promisify } from "util";
+import { randomBytes, timingSafeEqual } from "crypto";
 
 const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 
@@ -250,6 +251,44 @@ const BLOCKED_DOMAINS = (
   .split(",")
   .map((d) => d.trim().toLowerCase())
   .filter(Boolean);
+
+// ─── WebSocket Auth ──────────────────────────────────────────
+// Two layers of defence:
+//   1. Origin allowlist — browser-attached WebSocket clients always send an
+//      Origin header. The extension service worker sends `chrome-extension://`
+//      or `moz-extension://`; a malicious web page would send its own origin
+//      and be rejected. This blocks page-based attacks.
+//   2. Bearer token — for non-browser local clients (proxy mode, CLI, tests).
+//      The token is written to the mode-0600 lockfile so only the current
+//      user can read it. Clients send it via `?token=` query string.
+const AUTH_TOKEN =
+  process.env.AUTODOM_TOKEN || randomBytes(32).toString("hex");
+const ALLOWED_ORIGIN_PREFIXES = ["chrome-extension://", "moz-extension://"];
+
+function isAllowedOrigin(origin) {
+  if (!origin) return false;
+  return ALLOWED_ORIGIN_PREFIXES.some((p) => origin.startsWith(p));
+}
+
+function tokenFromRequest(req) {
+  // Accept token via `?token=` query string or `Authorization: Bearer <t>`.
+  try {
+    const url = new URL(req.url, "http://localhost");
+    const q = url.searchParams.get("token");
+    if (q) return q;
+  } catch (_) {}
+  const auth = req.headers["authorization"];
+  if (auth && auth.startsWith("Bearer ")) return auth.slice(7);
+  return null;
+}
+
+function safeTokenEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
 
 // Confirm mode: when enabled, destructive tools return a confirmation
 // request instead of executing directly. The agent must call
@@ -575,11 +614,17 @@ async function writeLockFile() {
         port: WS_PORT,
         serverPath,
         startedAt: new Date().toISOString(),
+        token: AUTH_TOKEN,
       },
       null,
       2,
     ),
+    { mode: 0o600 },
   );
+  // Defensive: ensure perms are 0600 even if the file already existed.
+  try {
+    await fs.chmod(lockFilePath, 0o600);
+  } catch (_) {}
 }
 
 async function removeLockFileIfOwned() {
@@ -1000,7 +1045,20 @@ async function cleanupStaleProcesses() {
 // Function to start the WebSocket server gracefully or act as a proxy client
 async function startWebSocketServer() {
   return await new Promise((resolve, reject) => {
-    const wss = new WebSocketServer({ port: WS_PORT, host: "127.0.0.1" });
+    const wss = new WebSocketServer({
+      port: WS_PORT,
+      host: "127.0.0.1",
+      verifyClient: (info, cb) => {
+        const origin = info.origin || info.req.headers.origin || "";
+        if (isAllowedOrigin(origin)) return cb(true);
+        const token = tokenFromRequest(info.req);
+        if (token && safeTokenEqual(token, AUTH_TOKEN)) return cb(true);
+        process.stderr.write(
+          `[AutoDOM] Rejected WS connection (origin=${origin || "(none)"}, token=${token ? "invalid" : "missing"})\n`,
+        );
+        cb(false, 401, "Unauthorized");
+      },
+    });
 
     wss.once("listening", () => {
       isPrimaryServer = true;
@@ -1042,7 +1100,17 @@ async function startWebSocketServer() {
 }
 
 function setupProxyClient(resolve) {
-  proxyClient = new WebSocket(`ws://127.0.0.1:${WS_PORT}`);
+  // Read the primary's token from the lockfile so we can authenticate.
+  let token = AUTH_TOKEN;
+  try {
+    const lock = JSON.parse(readFileSync(lockFilePath, "utf8"));
+    if (lock?.token) token = lock.token;
+  } catch (_) {
+    // Fall back to our own AUTH_TOKEN (likely won't match, but try anyway).
+  }
+  proxyClient = new WebSocket(
+    `ws://127.0.0.1:${WS_PORT}/?token=${encodeURIComponent(token)}`,
+  );
 
   proxyClient.on("open", () => {
     process.stderr.write(

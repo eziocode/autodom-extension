@@ -27,6 +27,13 @@
  */
 
 (function () {
+  // Idempotency guard — chat-panel.js is now lazy-injected via
+  // chrome.scripting.executeScript; the SW may inject it more than once
+  // per tab (e.g. on toggle after navigation). Bail out if we've already
+  // installed our DOM + listeners for this realm.
+  if (window.__autodomChatPanelLoaded) return;
+  window.__autodomChatPanelLoaded = true;
+
   const PANEL_ID = "__autodom_chat_panel";
   const STYLE_ID = "__autodom_chat_style";
   const INLINE_OVERLAY_ID = "__autodom_inline_overlay";
