@@ -1367,26 +1367,40 @@ function _processWsMessage(socket, message) {
         } else if (
           lower.includes("summarize") ||
           lower.includes("summary") ||
+          lower === "tldr" ||
+          lower === "tl;dr" ||
           lower.includes("what's on this page") ||
           lower.includes("what is this page")
         ) {
           const result = await callExtensionTool("execute_code", {
-            code: "return { title: document.title, text: document.body.innerText.substring(0, 4000), h1: [...document.querySelectorAll('h1')].map(h => h.textContent).join(', '), h2: [...document.querySelectorAll('h2')].map(h => h.textContent).slice(0, 10).join(', ') };",
+            code: "return { title: document.title, url: location.href, text: document.body.innerText.substring(0, 4000), h1: [...document.querySelectorAll('h1')].map(h => h.textContent.trim()).filter(Boolean).slice(0, 5), h2: [...document.querySelectorAll('h2')].map(h => h.textContent.trim()).filter(Boolean).slice(0, 10), counts: { links: document.querySelectorAll('a[href]').length, buttons: document.querySelectorAll('button, [role=\"button\"]').length, inputs: document.querySelectorAll('input, textarea, select').length, forms: document.querySelectorAll('form').length } };",
           });
           toolCalls.push({ tool: "execute_code" });
-          if (result?.result) {
-            const r = result.result;
-            responseText = `Page Summary: "${r.title || context?.title}"\n\n`;
-            if (r.h1) responseText += `Main heading: ${r.h1}\n`;
-            if (r.h2) responseText += `Sections: ${r.h2}\n\n`;
-            if (r.text) {
-              const preview = r.text.substring(0, 1500).trim();
-              responseText += `Content preview:\n${preview}`;
-              if (r.text.length > 1500) responseText += "\n\n... (truncated)";
-            }
-          } else {
-            responseText = `Page summary for "${context?.title || "this page"}":\n${JSON.stringify(result, null, 2)}`;
+          const r = result?.result || {};
+          const title =
+            (r.title || context?.title || "this page").toString().trim();
+          responseText = `## ${title}\n\n`;
+          if (Array.isArray(r.h1) && r.h1.length) {
+            responseText += `**Main heading**\n- ${r.h1.join("\n- ")}\n\n`;
           }
+          if (Array.isArray(r.h2) && r.h2.length) {
+            responseText += `**Sections**\n- ${r.h2.join("\n- ")}\n\n`;
+          }
+          if (typeof r.text === "string" && r.text.trim()) {
+            const preview = r.text.substring(0, 1500).trim();
+            responseText += `**Excerpt**\n\n${preview}`;
+            if (r.text.length > 1500) responseText += "\n\n_(truncated)_";
+            responseText += "\n\n";
+          }
+          if (r.counts) {
+            const c = r.counts;
+            responseText +=
+              `**Page stats** — ${c.links || 0} links, ${c.buttons || 0} ` +
+              `buttons, ${c.inputs || 0} inputs, ${c.forms || 0} forms.\n\n`;
+          }
+          responseText +=
+            "_For a smarter summary, configure a direct AI provider " +
+            "(GPT, Claude, or Ollama) in the extension popup._";
         } else if (lower.includes("accessibility") || lower.includes("a11y")) {
           const result = await callExtensionTool("execute_code", {
             code: `
