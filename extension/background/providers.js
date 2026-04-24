@@ -29,6 +29,12 @@
     if (context) {
       if (context.title) p += `Page: ${context.title}\n`;
       if (context.url) p += `URL: ${context.url}\n`;
+      // Outline is dense and cheap (~150 tokens). Send it on every turn,
+      // including unchanged ones, so the model has structural anchors
+      // even after we drop the visible-text body for dedup.
+      if (context.outline) {
+        p += `Outline:\n${String(context.outline).substring(0, 800)}\n`;
+      }
       if (context._pageUnchanged) {
         // Page-context dedup: SW detected this page is identical to the
         // previous turn's, so we skip re-pasting the visible-text block
@@ -41,14 +47,15 @@
           p += `Interactive: ${ie.links || 0}L ${ie.buttons || 0}B ${ie.inputs || 0}I ${ie.forms || 0}F\n`;
         }
       } else {
-        // Page-context truncation — heaviest per-turn cost. Halved from
-        // 1500/2500 → 600/1200 chars (saves ~700 tokens/turn). The model
-        // can always re-read more via get_dom_state when it needs detail.
+        // Page-context truncation — heaviest per-turn cost. With the
+        // outline doing structural duty above, the visible-text block
+        // can be tighter still: 600/800 chars. Model can call
+        // get_dom_state for full content when it needs detail.
         if (context.visibleOverlayText) {
           p += `Popup text:\n${String(context.visibleOverlayText).substring(0, 600)}\n`;
         }
         if (context.visibleTextPreview) {
-          p += `Page text:\n${String(context.visibleTextPreview).substring(0, 1200)}\n`;
+          p += `Page text:\n${String(context.visibleTextPreview).substring(0, 800)}\n`;
         }
         if (context.interactiveElements) {
           const ie = context.interactiveElements;

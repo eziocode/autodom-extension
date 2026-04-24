@@ -985,15 +985,19 @@ function _ctxFingerprint(ctx) {
   if (!ctx) return "";
   const t = String(ctx.visibleTextPreview || "");
   const o = String(ctx.visibleOverlayText || "");
+  const ol = String(ctx.outline || "");
   // url+title catches navigation; text length+head catches in-place
-  // mutation; overlay catches modal opens. Cheap to compute, stable
-  // enough that scroll/blur events don't bust the cache.
+  // mutation; overlay catches modal opens; outline catches heading
+  // changes (e.g. SPA route swap that keeps the visible-text head). All
+  // cheap; cache stays stable across scroll/blur events.
   return [
     ctx.url || "",
     ctx.title || "",
     t.length,
     t.slice(0, 96),
     o.length,
+    ol.length,
+    ol.slice(0, 64),
   ].join("|");
 }
 
@@ -1003,6 +1007,7 @@ function _slimContextForRepeat(ctx) {
     url: ctx.url,
     title: ctx.title,
     interactiveElements: ctx.interactiveElements,
+    outline: ctx.outline, // keep — it's tiny and structurally useful
     _pageUnchanged: true,
   };
 }
