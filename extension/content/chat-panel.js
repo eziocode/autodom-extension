@@ -1585,6 +1585,10 @@
       fill: currentColor !important;
       stroke: none !important;
     }
+    .autodom-chat-force-stop.just-pressed {
+      transform: scale(0.92) !important;
+      transition: transform 0.12s ease !important;
+    }
     .autodom-chat-toast {
       position: absolute !important;
       left: 50% !important;
@@ -3111,7 +3115,39 @@
     return btn;
   }
 
+  // Tiny in-panel toast for ephemeral feedback (e.g. "No automation
+  // is running" when the force-stop button is tapped while idle). Lives
+  // above the input area; auto-hides after a short delay.
+  let _toastTimer = null;
+  function _showChatToast(text, durationMs = 1800) {
+    try {
+      const toast = document.getElementById("__autodom_chat_toast");
+      if (!toast) return;
+      toast.textContent = text;
+      toast.classList.add("is-visible");
+      toast.setAttribute("aria-hidden", "false");
+      if (_toastTimer) clearTimeout(_toastTimer);
+      _toastTimer = setTimeout(() => {
+        toast.classList.remove("is-visible");
+        toast.setAttribute("aria-hidden", "true");
+      }, durationMs);
+    } catch (_) {}
+  }
+
+  // Quick visual confirmation pulse on the force-stop button.
+  function _flashForceStop(btn) {
+    if (!btn) return;
+    btn.classList.add("just-pressed");
+    setTimeout(() => btn.classList.remove("just-pressed"), 280);
+  }
+
   function _updateAutomationUi() {
+    // Keep the in-bar force-stop visually armed while a run is active,
+    // so the user has an obvious "kill switch" affordance.
+    try {
+      const fs = document.querySelector(".autodom-chat-force-stop");
+      if (fs) fs.classList.toggle("is-armed", !!isProcessing);
+    } catch (_) {}
     if (isProcessing) {
       _ensureAutomationOverlay();
       if (!isOpen) {
@@ -5755,7 +5791,26 @@
     const btn = e.target.closest(
       ".autodom-chat-quick-btn, .autodom-chat-icon-btn",
     );
-    if (!btn || isProcessing) return;
+    if (!btn) return;
+
+    // Force-stop must be handled BEFORE the isProcessing guard — the
+    // whole point of this button is that it works while a run is in
+    // flight. If nothing is running, surface a minimal toast instead
+    // of silently doing nothing.
+    if (btn.dataset.action === "force_stop") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (isProcessing) {
+        _flashForceStop(btn);
+        abortChat();
+        _showChatToast("Stopping automation\u2026");
+      } else {
+        _showChatToast("No automation is running.");
+      }
+      return;
+    }
+
+    if (isProcessing) return;
 
     // Prompt chips: feed natural-language text into the AI flow via the
     // composer so it shares the same routing/abort/typing UI.
