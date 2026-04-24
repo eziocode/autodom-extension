@@ -533,7 +533,15 @@
 
   // User-adjustable runtime settings (persisted to chrome.storage.local so
   // the choice survives tab reloads + applies across tabs).
-  const _chatSettings = { verboseLogs: true };
+  const _chatSettings = { verboseLogs: true, panelWidth: 440 };
+  const PANEL_WIDTH_MIN = 320;
+  const PANEL_WIDTH_MAX = 800;
+  function _clampPanelWidth(w) {
+    const n = Number(w);
+    if (!Number.isFinite(n)) return 440;
+    const ceiling = Math.min(PANEL_WIDTH_MAX, Math.floor(window.innerWidth * 0.8));
+    return Math.max(PANEL_WIDTH_MIN, Math.min(ceiling, Math.round(n)));
+  }
   function _loadChatSettings() {
     try {
       chrome.storage?.local?.get?.([STORAGE_KEY_SETTINGS], (items) => {
@@ -541,6 +549,8 @@
         if (s && typeof s === "object") {
           if (typeof s.verboseLogs === "boolean")
             _chatSettings.verboseLogs = s.verboseLogs;
+          if (typeof s.panelWidth === "number")
+            _chatSettings.panelWidth = _clampPanelWidth(s.panelWidth);
         }
         try { _applySettingsToUI(); } catch (_) {}
       });
@@ -557,6 +567,7 @@
     const toggle = document.getElementById("__autodom_verbose_toggle");
     if (toggle) toggle.checked = !!_chatSettings.verboseLogs;
     _applyVerboseAttr();
+    _applyPanelWidth();
   }
   // Reflect the verbose preference onto the panel + inline overlay as a
   // data attribute so a single CSS rule can hide every per-step tool card
@@ -568,6 +579,18 @@
       const el = document.getElementById(id);
       if (el) el.setAttribute("data-verbose", value);
     });
+  }
+  // Push the panel width onto :root so both the panel itself (which reads
+  // width from the variable) and the html `margin-right` rule stay in sync.
+  function _applyPanelWidth() {
+    try {
+      const w = _clampPanelWidth(_chatSettings.panelWidth);
+      _chatSettings.panelWidth = w;
+      document.documentElement.style.setProperty(
+        "--autodom-panel-w",
+        w + "px",
+      );
+    } catch (_) {}
   }
   const MAX_PERSISTED_MESSAGES = 50;
   const THEME_VALUES = new Set(["system", "dark", "light"]);
@@ -718,13 +741,20 @@
     }
 
     /* ─── Chat Panel (Sidebar) ────────────────────────────────── */
+    /* Page push: when the panel is open, shift the host page's <html>
+       over by the panel width so the panel never obscures content.
+       Closing the panel removes the class and the page reflows back. */
+    html.__autodom_panel_open {
+      margin-right: var(--autodom-panel-w, 440px) !important;
+      transition: margin-right 0.32s var(--ease-out, cubic-bezier(0.22, 1, 0.36, 1));
+    }
     #${PANEL_ID} {
       position: fixed !important;
       top: 0 !important;
       right: 0 !important;
       bottom: 0 !important;
       left: auto !important;
-      width: 440px !important;
+      width: var(--autodom-panel-w, 440px) !important;
       max-width: 100vw !important;
       height: 100vh !important;
       max-height: 100vh !important;
@@ -747,6 +777,44 @@
     }
     #${PANEL_ID}.open {
       transform: translateX(0) !important;
+    }
+    /* Resize handle on the left edge — invisible 6px hit target, with
+       a thin 1px line on hover/active for affordance. While dragging,
+       transitions are disabled so the panel tracks the cursor 1:1. */
+    #${PANEL_ID} .autodom-chat-resize-handle {
+      position: absolute !important;
+      top: 0 !important;
+      left: 0 !important;
+      width: 6px !important;
+      height: 100% !important;
+      cursor: ew-resize !important;
+      z-index: 2 !important;
+      background: transparent !important;
+      transition: background-color 0.15s ease !important;
+    }
+    #${PANEL_ID} .autodom-chat-resize-handle::after {
+      content: "" !important;
+      position: absolute !important;
+      top: 0 !important;
+      left: 2px !important;
+      width: 1px !important;
+      height: 100% !important;
+      background: transparent !important;
+      transition: background-color 0.15s ease !important;
+    }
+    #${PANEL_ID} .autodom-chat-resize-handle:hover::after,
+    #${PANEL_ID}.is-resizing .autodom-chat-resize-handle::after {
+      background: var(--c-accent, #6aa4ff) !important;
+    }
+    #${PANEL_ID}.is-resizing,
+    html.__autodom_panel_resizing,
+    html.__autodom_panel_resizing.__autodom_panel_open {
+      transition: none !important;
+    }
+    html.__autodom_panel_resizing,
+    html.__autodom_panel_resizing * {
+      cursor: ew-resize !important;
+      user-select: none !important;
     }
     #${PANEL_ID} * {
       box-sizing: border-box;
@@ -3534,6 +3602,8 @@
   panel.setAttribute("role", "complementary");
   panel.setAttribute("aria-label", "AutoDOM AI Chat");
   panel.innerHTML = `
+    <!-- Resize handle (left edge — drag to widen/narrow). Skipped in inline overlay. -->
+    <div class="autodom-chat-resize-handle" id="__autodom_resize_handle" role="separator" aria-orientation="vertical" aria-label="Resize chat panel" tabindex="-1"></div>
     <!-- Header -->
     <div class="autodom-chat-header" role="banner">
       <div class="autodom-chat-header-left">
@@ -3963,11 +4033,28 @@
   }
 
   // ─── Panel Toggle ──────────────────────────────────────────
+  // Pushing the page over via an `html` class keeps the panel from
+  // obscuring the host page (Claude/ChatGPT-style). The class is only
+  // applied to the regular fixed sidebar — the inline overlay variant
+  // already lives inside another popup container and shouldn't reflow
+  // the host document.
+  function _setHtmlPushed(pushed) {
+    if (inlineMode) return;
+    try {
+      document.documentElement.classList.toggle(
+        "__autodom_panel_open",
+        !!pushed,
+      );
+    } catch (_) {}
+  }
+
   function openPanel() {
     _log("openPanel called, isOpen was:", isOpen);
     // Allow opening even without MCP — slash commands work offline.
     // The panel will show connection status to the user.
     isOpen = true;
+    _applyPanelWidth();
+    _setHtmlPushed(true);
     panel.classList.add("open");
     if (chatInput) {
       chatInput.focus();
@@ -3982,6 +4069,7 @@
     _log("closePanel called");
     isOpen = false;
     panel.classList.remove("open");
+    _setHtmlPushed(false);
     persistChatState();
     _updateAutomationUi();
     // Closing the panel should not kill automation; _updateAutomationUi()
@@ -3989,6 +4077,71 @@
   }
 
   closeBtn.addEventListener("click", closePanel);
+
+  // ─── Resize handle ─────────────────────────────────────────
+  // Drag the left edge of the panel to set its width. The width is
+  // committed to chrome.storage on mouseup so it persists across tabs
+  // and reloads. While dragging, transitions are disabled so the panel
+  // tracks the cursor 1:1 and the page reflow stays in lock-step.
+  (function _wireResizeHandle() {
+    const handle = panel.querySelector("#__autodom_resize_handle");
+    if (!handle) return;
+    let dragging = false;
+    let startX = 0;
+    let startW = 0;
+    const onMove = (e) => {
+      if (!dragging) return;
+      // Width grows as the cursor moves left (panel is anchored to the right).
+      const delta = startX - e.clientX;
+      const next = _clampPanelWidth(startW + delta);
+      _chatSettings.panelWidth = next;
+      document.documentElement.style.setProperty(
+        "--autodom-panel-w",
+        next + "px",
+      );
+      e.preventDefault();
+    };
+    const onUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      panel.classList.remove("is-resizing");
+      document.documentElement.classList.remove("__autodom_panel_resizing");
+      document.removeEventListener("mousemove", onMove, true);
+      document.removeEventListener("mouseup", onUp, true);
+      _saveChatSettings();
+    };
+    handle.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      dragging = true;
+      startX = e.clientX;
+      startW = _clampPanelWidth(_chatSettings.panelWidth);
+      panel.classList.add("is-resizing");
+      document.documentElement.classList.add("__autodom_panel_resizing");
+      document.addEventListener("mousemove", onMove, true);
+      document.addEventListener("mouseup", onUp, true);
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    // Double-click resets to the default width.
+    handle.addEventListener("dblclick", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      _chatSettings.panelWidth = 440;
+      _applyPanelWidth();
+      _saveChatSettings();
+    });
+  })();
+
+  // If the viewport shrinks below the current panel width (e.g. user
+  // narrows the window), re-clamp so the panel never exceeds 80vw.
+  window.addEventListener("resize", () => {
+    const before = _chatSettings.panelWidth;
+    const after = _clampPanelWidth(before);
+    if (after !== before) {
+      _chatSettings.panelWidth = after;
+      _applyPanelWidth();
+    }
+  });
 
   // ─── Model Picker wiring ───────────────────────────────────
   const _modelPickerBtn = document.getElementById("__autodom_model_picker");
@@ -4099,16 +4252,14 @@
   _refreshModelPickerUI = function () {
     if (!_modelPickerBtn || !_modelPickerLabel) return;
     const src = _modelPickerState.providerSource;
-    const cli = (_modelPickerState.cliKind || "").toLowerCase();
-    const hasKnownCliModels =
-      cli === "copilot" || cli === "claude" || cli === "codex";
-    // Hide only when there is genuinely nothing to pick. Direct providers have
-    // live/static model lists, and recognised local CLIs reuse curated lists.
+    // Only direct providers honour a model selection at request time.
+    // Local CLI bridges (claude/codex/copilot) ignore --model in practice
+    // (unknown ids fall back silently, sessions are pinned to whatever the
+    // CLI was configured with), so a dropdown there would be a lie. The
+    // model used by those CLIs is surfaced read-only on each reply badge
+    // via _reconcileActualModel.
     const hasModels =
-      src === "openai" ||
-      src === "anthropic" ||
-      src === "ollama" ||
-      ((src === "ide" || src === "cli") && hasKnownCliModels);
+      src === "openai" || src === "anthropic" || src === "ollama";
     if (!hasModels) {
       _modelPickerBtn.hidden = true;
       _modelPickerClose();
