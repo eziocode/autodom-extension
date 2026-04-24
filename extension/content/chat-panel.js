@@ -5661,8 +5661,20 @@
 
   // ─── Quick Actions ─────────────────────────────────────────
   quickActions.addEventListener("click", async (e) => {
-    const btn = e.target.closest(".autodom-chat-quick-btn");
+    const btn = e.target.closest(
+      ".autodom-chat-quick-btn, .autodom-chat-icon-btn",
+    );
     if (!btn || isProcessing) return;
+
+    // Prompt chips: feed natural-language text into the AI flow via the
+    // composer so it shares the same routing/abort/typing UI.
+    const prompt = btn.dataset.prompt;
+    if (prompt) {
+      chatInput.value = prompt;
+      autoResizeInput();
+      await sendMessage();
+      return;
+    }
 
     const action = btn.dataset.action;
     let command;

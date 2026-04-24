@@ -702,6 +702,49 @@ select.config-input {
     gap: 8px;
 }
 
+.ai-chat-btn-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    color: oklch(78% 0.16 65);
+    flex-shrink: 0;
+}
+
+.ai-chat-btn-icon svg {
+    width: 16px;
+    height: 16px;
+    overflow: visible;
+}
+
+.ai-chat-icon-bubble {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.6;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+}
+
+.ai-chat-icon-spark {
+    fill: currentColor;
+    transform-origin: 17px 6px;
+    animation: ai-chat-icon-spark 2.4s ease-in-out infinite;
+}
+
+@keyframes ai-chat-icon-spark {
+    0%, 100% { opacity: 0.55; transform: scale(0.85); }
+    50%      { opacity: 1;    transform: scale(1.1); }
+}
+
+.ai-chat-btn:hover .ai-chat-btn-icon {
+    color: oklch(85% 0.17 75);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .ai-chat-icon-spark { animation: none; }
+}
+
 .ai-chat-btn-label {
     display: inline-flex;
     align-items: center;
