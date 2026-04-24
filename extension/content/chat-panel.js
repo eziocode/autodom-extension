@@ -5624,10 +5624,49 @@
 
   // ─── Context Update ────────────────────────────────────────
   function updateContext() {
-    const title = document.title || "(untitled)";
-    const url = location.href;
+    if (SIDE_PANEL_MODE && chrome?.tabs?.query) {
+      // In side-panel mode `document` is the panel itself — show the
+      // active tab the user is actually looking at.
+      try {
+        chrome.tabs.query(
+          { active: true, lastFocusedWindow: true },
+          (tabs) => {
+            if (chrome.runtime.lastError) {
+              _renderContextLine(document.title || "(untitled)", location.href);
+              return;
+            }
+            const tab = (tabs && tabs[0]) || null;
+            if (!tab) {
+              _renderContextLine("(no active tab)", "");
+              return;
+            }
+            _renderContextLine(tab.title || "(untitled)", tab.url || "");
+          },
+        );
+        return;
+      } catch (_) {}
+    }
+    _renderContextLine(document.title || "(untitled)", location.href);
+  }
+  function _renderContextLine(title, url) {
+    if (!contextText) return;
     const truncUrl = url.length > 60 ? url.substring(0, 57) + "..." : url;
-    contextText.textContent = `${title} \u00B7 ${truncUrl}`;
+    contextText.textContent = url ? `${title} \u00B7 ${truncUrl}` : title;
+  }
+
+  // Refresh the context line whenever the active tab changes / URL
+  // updates / focus moves to another window — keeps the side panel
+  // in sync with whatever tab the user is currently looking at.
+  if (SIDE_PANEL_MODE && chrome?.tabs && !window.__autodom_panel_tab_bound) {
+    window.__autodom_panel_tab_bound = true;
+    try {
+      chrome.tabs.onActivated?.addListener(() => updateContext());
+      chrome.tabs.onUpdated?.addListener((_id, changeInfo) => {
+        if (changeInfo && (changeInfo.url || changeInfo.title))
+          updateContext();
+      });
+      chrome.windows?.onFocusChanged?.addListener(() => updateContext());
+    } catch (_) {}
   }
 
   // ─── Get Page Context for AI ───────────────────────────────
@@ -7963,38 +8002,54 @@
   }
 
   function buildLocalSummary() {
-    const title = (document.title || "(untitled)").trim();
-    const headings = Array.from(document.querySelectorAll("h1, h2, h3"))
-      .map((h) => (h.textContent || "").trim().replace(/\s+/g, " "))
-      .filter((t) => t && t.length > 2 && t.length < 140)
-      .slice(0, 12)
-      .map((t) => `- ${t}`);
-    const paragraphs = Array.from(document.querySelectorAll("p"))
-      .map((p) => (p.textContent || "").trim().replace(/\s+/g, " "))
-      .filter((t) => t.length > 60)
-      .slice(0, 4);
-    const ie = {
-      links: document.querySelectorAll("a[href]").length,
-      buttons: document.querySelectorAll('button, [role="button"]').length,
-      inputs: document.querySelectorAll("input, textarea, select").length,
-      forms: document.querySelectorAll("form").length,
-    };
+    return buildLocalSummaryFromInfo({
+      title: (document.title || "(untitled)").trim(),
+      headings: Array.from(document.querySelectorAll("h1, h2, h3"))
+        .map((h) => (h.textContent || "").trim().replace(/\s+/g, " "))
+        .filter((t) => t && t.length > 2 && t.length < 140)
+        .slice(0, 12),
+      paragraphs: Array.from(document.querySelectorAll("p"))
+        .map((p) => (p.textContent || "").trim().replace(/\s+/g, " "))
+        .filter((t) => t.length > 60)
+        .slice(0, 4),
+      counts: {
+        links: document.querySelectorAll("a[href]").length,
+        buttons: document.querySelectorAll('button, [role="button"]').length,
+        inputs: document.querySelectorAll("input, textarea, select").length,
+        forms: document.querySelectorAll("form").length,
+      },
+      text: extractMainPageText(),
+      local: true,
+    });
+  }
 
+  function buildLocalSummaryFromInfo(info) {
+    const title = (info && info.title) || "(untitled)";
+    const headings = (info && info.headings) || [];
+    const paragraphs = (info && info.paragraphs) || [];
+    const counts = (info && info.counts) || {
+      links: 0,
+      buttons: 0,
+      inputs: 0,
+      forms: 0,
+    };
     let out = `## ${title}\n\n`;
     if (headings.length) {
-      out += `**Sections**\n${headings.join("\n")}\n\n`;
+      out +=
+        `**Sections**\n` + headings.map((h) => `- ${h}`).join("\n") + `\n\n`;
     }
     if (paragraphs.length) {
-      out += `**Excerpt**\n\n${paragraphs.join("\n\n").substring(0, 1400)}\n\n`;
+      out +=
+        `**Excerpt**\n\n${paragraphs.join("\n\n").substring(0, 1400)}\n\n`;
     }
     if (!headings.length && !paragraphs.length) {
-      const fallback = extractMainPageText().substring(0, 1600);
+      const fallback = ((info && info.text) || "").substring(0, 1600);
       if (fallback) out += `${fallback}\n\n`;
       else out += `_(no readable content found on this page)_\n\n`;
     }
     out +=
-      `**Page stats** — ${ie.links} links, ${ie.buttons} buttons, ` +
-      `${ie.inputs} inputs, ${ie.forms} forms.`;
+      `**Page stats** — ${counts.links} links, ${counts.buttons} buttons, ` +
+      `${counts.inputs} inputs, ${counts.forms} forms.`;
     return out;
   }
 
