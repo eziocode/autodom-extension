@@ -406,6 +406,26 @@ const _agentRunLocks = new Set();
 // Only one run can be active at a time (the lock above enforces this).
 let _activeAgentRun = null; // { runId, aborter: AbortController, aborted: boolean, panelTabId }
 let _agentRunIdCounter = 0;
+const _chatPanelReadyTabs = new Set();
+const _chatPanelInjectingTabs = new Map();
+
+function _getActiveRunStatePayload() {
+  if (!_activeAgentRun) return { active: false };
+  return {
+    active: true,
+    runId: _activeAgentRun.runId,
+    panelTabId: _activeAgentRun.panelTabId,
+    toolRunning: !!_activeAgentRun.toolRunning,
+  };
+}
+
+function _getAgentRunStateMessage() {
+  return {
+    type: "AGENT_RUN_STATE_CHANGED",
+    ..._getActiveRunStatePayload(),
+  };
+}
+
 function _startAgentRunHandle(panelTabId) {
   const runId = `run_${Date.now()}_${++_agentRunIdCounter}`;
   _activeAgentRun = {
@@ -441,15 +461,14 @@ function _stopActiveAgentRun(reason) {
 // switched to.
 function _broadcastAgentRunState() {
   try {
+    const stateMessage = _getAgentRunStateMessage();
     chrome.tabs.query({ active: true }, (tabs) => {
       try { void chrome.runtime.lastError; } catch (_) {}
       if (!tabs) return;
       for (const t of tabs) {
         if (!t || t.id == null) continue;
         try {
-          chrome.tabs
-            .sendMessage(t.id, { type: "AGENT_RUN_STATE_CHANGED" })
-            .catch(() => {});
+          chrome.tabs.sendMessage(t.id, stateMessage).catch(() => {});
         } catch (_) {}
       }
     });
@@ -491,11 +510,9 @@ async function executeAgentTool(toolName, params) {
     }
   } catch (_) {}
 
-  // Mark the active run as "mid-tool" so the panel-tab navigation
-  // listeners don't abort when the *agent itself* navigates (e.g.
-  // the `navigate` / `click` tool triggers a page load). The listeners
-  // only abort when navigation happens while NO tool is running —
-  // that's the user-initiated case (refresh, URL change, close).
+  // Mark the active run as "mid-tool" so the UI can distinguish a run
+  // that's actively executing a browser tool from one that's merely
+  // unwinding / finalizing after the last tool result.
   if (_activeAgentRun) _activeAgentRun.toolRunning = true;
   try {
     touchToolActivity();
@@ -1322,6 +1339,10 @@ function recordAction(
 // ─── Tab Activity Listeners (for session recording) ─────────
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === "loading") {
+    _chatPanelReadyTabs.delete(tabId);
+    _chatPanelInjectingTabs.delete(tabId);
+  }
   if (changeInfo.status === "complete" && tab.url) {
     recordAction(
       "navigation",
@@ -1352,12 +1373,12 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
     // If an agent run is active, make sure the chat panel content
     // script is mounted on the tab the user just switched to so the
     // automation overlay + floating Stop appear there too. The panel's
-    // own init queries GET_ACTIVE_RUN and restores busy state.
+    // own init restores busy state from the current run-state payload.
     if (_activeAgentRun && isInjectableTab(tab)) {
       try {
         await ensureChatPanelInjected(activeInfo.tabId);
         chrome.tabs
-          .sendMessage(activeInfo.tabId, { type: "AGENT_RUN_STATE_CHANGED" })
+          .sendMessage(activeInfo.tabId, _getAgentRunStateMessage())
           .catch(() => {});
       } catch (_) {}
     }
@@ -1375,6 +1396,8 @@ chrome.tabs.onCreated.addListener((tab) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   recordAction("tab_closed", `Tab closed`, {}, tabId);
+  _chatPanelReadyTabs.delete(tabId);
+  _chatPanelInjectingTabs.delete(tabId);
   // Don't kill the agent run when its panel tab is closed — the user
   // may want automation to keep running on whichever tab they switch
   // to next. Just unpin so getActiveTab() can fall back to whatever
@@ -1396,7 +1419,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // for the OPPOSITE behavior: keep the run alive across refresh / new
 // tab / tab close so that long-running automation can't be killed by
 // accident. The chat panel's overlay re-appears on the new page via
-// PANEL_LOADED_RESET_RUN -> GET_ACTIVE_RUN -> _setBusy(true).
+// PANEL_LOADED_RESET_RUN -> _applyAgentRunState(resp).
 
 // ─── WebSocket Management ────────────────────────────────────
 
@@ -1793,19 +1816,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // We NEVER abort an active run here — the user wants the overlay to
   // persist across refresh / new tab / tab close. Just rebind
   // panelTabId so future tool stream events reach the freshly mounted
-  // panel, then let the panel call GET_ACTIVE_RUN to restore its UI.
+  // panel, then return the current run state so the panel can restore
+  // its UI without an extra round-trip.
   if (message.type === "PANEL_LOADED_RESET_RUN") {
     const tid = sender?.tab?.id ?? null;
     let wasActive = false;
     let kept = false;
     try {
+      if (tid != null) {
+        _chatPanelReadyTabs.add(tid);
+        _chatPanelInjectingTabs.delete(tid);
+      }
       if (_activeAgentRun) {
         wasActive = true;
         kept = true;
         if (tid != null) _activeAgentRun.panelTabId = tid;
       }
     } catch (_) {}
-    sendResponse({ ok: true, wasActive, kept });
+    sendResponse({ ok: true, wasActive, kept, ..._getActiveRunStatePayload() });
     return false;
   }
 
@@ -1813,16 +1841,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // so it can show the floating "automation running" overlay if a run
   // is genuinely still in flight.
   if (message.type === "GET_ACTIVE_RUN") {
-    if (_activeAgentRun) {
-      sendResponse({
-        active: true,
-        runId: _activeAgentRun.runId,
-        panelTabId: _activeAgentRun.panelTabId,
-        toolRunning: !!_activeAgentRun.toolRunning,
-      });
-    } else {
-      sendResponse({ active: false });
-    }
+    sendResponse(_getActiveRunStatePayload());
     return false;
   }
 
@@ -4383,24 +4402,49 @@ function _messageNeedsChatPanel(msg) {
 }
 
 async function ensureChatPanelInjected(tabId) {
-  try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["common/webext-api.js", "content/chat-panel.js"],
-    });
-  } catch (_) {
-    // Restricted page (chrome://, file://, etc.) or tab gone — silent skip.
+  if (_chatPanelReadyTabs.has(tabId)) return true;
+  if (_chatPanelInjectingTabs.has(tabId)) {
+    return _chatPanelInjectingTabs.get(tabId);
   }
+  const injectionPromise = (async () => {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ["common/webext-api.js", "content/chat-panel.js"],
+      });
+      return true;
+    } catch (_) {
+      // Restricted page (chrome://, file://, etc.) or tab gone — silent skip.
+      _chatPanelReadyTabs.delete(tabId);
+      return false;
+    } finally {
+      _chatPanelInjectingTabs.delete(tabId);
+    }
+  })();
+  _chatPanelInjectingTabs.set(tabId, injectionPromise);
+  return injectionPromise;
 }
 
-// Show border and chat panel on new tabs when MCP is connected
+// Show border / chat state on refreshed tabs when MCP is connected, and
+// always remount the chat panel when an agent run is active so the
+// automation overlay + stop affordances survive reloads.
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (changeInfo.status === "complete" && isConnected && isInjectableTab(tab)) {
+  if (changeInfo.status !== "complete" || !isInjectableTab(tab)) return;
+  if (!isConnected && !_activeAgentRun) return;
+  if (isConnected) {
     chrome.tabs
       .sendMessage(tabId, { type: "SHOW_SESSION_BORDER" })
       .catch(() => {});
-    await ensureChatPanelInjected(tabId);
+  }
+  const injected = await ensureChatPanelInjected(tabId);
+  if (!injected) return;
+  if (isConnected) {
     chrome.tabs.sendMessage(tabId, { type: "SHOW_CHAT_PANEL" }).catch(() => {});
+  }
+  if (_activeAgentRun) {
+    chrome.tabs
+      .sendMessage(tabId, _getAgentRunStateMessage())
+      .catch(() => {});
   }
 });
 

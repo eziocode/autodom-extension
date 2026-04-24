@@ -3164,6 +3164,22 @@
     }
   }
 
+  function _applyAgentRunState(state) {
+    if (state && state.active) {
+      _activeRunId = state.runId || null;
+      if (!isProcessing) _setBusy(true);
+      showTyping();
+      _showRunIndicator(
+        state.toolRunning ? "Automation running" : "Automation finishing",
+      );
+      return;
+    }
+    _activeRunId = null;
+    hideTyping();
+    _hideRunIndicator();
+    if (isProcessing) _setBusy(false);
+  }
+
   // Cancel any in-flight AI request. Tells the SW (which forwards to
   // the bridge) to suppress the response and any further automation,
   // marks the local _userAborted flag so a late response is dropped,
@@ -3229,69 +3245,24 @@
     panel.classList.remove("open");
     persistChatState();
     _updateAutomationUi();
-    // If automation is still running when the user closes the panel,
-    // stop it — there's no UI left to surface progress and the user
-    // clearly wants to bail. SW-side tab listeners cover refresh/close,
-    // this covers the explicit "X button" path.
-    if (_activeRunId) {
-      try {
-        chrome.runtime.sendMessage(
-          { type: "STOP_AGENT_RUN", runId: _activeRunId, reason: "panel_closed" },
-          () => { try { void chrome.runtime.lastError; } catch (_) {} },
-        );
-      } catch (_) {}
-      _activeRunId = null;
-    }
+    // Closing the panel should not kill automation; _updateAutomationUi()
+    // swaps to the floating Stop button so the run can continue safely.
   }
 
   closeBtn.addEventListener("click", closePanel);
 
   // Fresh content-script load (hard refresh, SPA route change, first
-  // inject). Ask the SW whether any agent run is still active:
-  //   - if the run was bound to *this* tab, SW aborts it (stale)
-  //   - if another tab is still running, surface the floating pill so
-  //     the user has a manual Stop without needing to leave this tab.
+  // inject). Ask the SW whether any agent run is still active so this
+  // page can restore the overlay / stop affordances immediately.
   try {
     chrome.runtime.sendMessage(
       { type: "PANEL_LOADED_RESET_RUN" },
       (resp) => {
         try { void chrome.runtime.lastError; } catch (_) {}
-        // After the reset, re-query; anything still active is a real
-        // in-flight run that we should surface a stop handle for.
-        try {
-          chrome.runtime.sendMessage({ type: "GET_ACTIVE_RUN" }, (s) => {
-            try { void chrome.runtime.lastError; } catch (_) {}
-            if (s && s.active) {
-              _activeRunId = s.runId || null;
-              // Restore full busy state so the page-wide automation
-              // overlay re-mounts (warning the user that automation is
-              // still acting on this page after the reload). _setBusy
-              // also calls _updateAutomationUi() which mounts overlay +
-              // floating Stop.
-              _setBusy(true);
-              showTyping();
-              _showRunIndicator(
-                s.toolRunning ? "Automation running" : "Automation finishing",
-              );
-            }
-          });
-        } catch (_) {}
+        _applyAgentRunState(resp);
       },
     );
   } catch (_) {}
-
-  // Best-effort beforeunload beacon — message delivery before unload
-  // is not guaranteed in MV3 content scripts, but when it lands it's
-  // faster than waiting for webNavigation to fire.
-  window.addEventListener("beforeunload", () => {
-    if (!_activeRunId) return;
-    try {
-      chrome.runtime.sendMessage(
-        { type: "STOP_AGENT_RUN", runId: _activeRunId, reason: "panel_unloading" },
-        () => {},
-      );
-    } catch (_) {}
-  });
 
   // ─── Settings Sheet ────────────────────────────────────────
   const settingsBtn = document.getElementById("__autodom_settings_btn");
@@ -5985,22 +5956,17 @@
     }
     // ─── Agent run state changed (e.g. user switched to this tab
     // mid-run, or the SW just rebound panelTabId after a refresh).
-    // Re-query the SW so the overlay + busy state matches reality
-    // even on a tab where this panel never started a run.
+    // Apply the worker's current state directly so the overlay + busy
+    // UI stays in sync without an extra runtime round-trip.
     if (message.type === "AGENT_RUN_STATE_CHANGED") {
+      if (typeof message.active === "boolean") {
+        _applyAgentRunState(message);
+        return;
+      }
       try {
         chrome.runtime.sendMessage({ type: "GET_ACTIVE_RUN" }, (s) => {
           try { void chrome.runtime.lastError; } catch (_) {}
-          if (s && s.active) {
-            _activeRunId = s.runId || null;
-            if (!isProcessing) _setBusy(true);
-            _showRunIndicator(
-              s.toolRunning ? "Automation running" : "Automation finishing",
-            );
-          } else if (isProcessing) {
-            _setBusy(false);
-            _hideRunIndicator();
-          }
+          _applyAgentRunState(s);
         });
       } catch (_) {}
       return;
