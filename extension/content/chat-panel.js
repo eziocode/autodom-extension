@@ -245,7 +245,13 @@
   const STORAGE_KEY_HISTORY = "__autodom_chat_history";
   const STORAGE_KEY_OPEN = "__autodom_chat_open";
   const STORAGE_KEY_THEME = "__autodom_chat_theme";
-  const STORAGE_KEY_SETTINGS = "__autodom_chat_settings"; // { verboseLogs: bool, panelWidth: number }
+  const STORAGE_KEY_SETTINGS = "__autodom_chat_settings"; // { verboseLogs: bool, panelWidth: number, persistAcrossSessions: bool, widthByHost: {host:number}, collapsedByHost: {host:bool} }
+  // chrome.storage.local mirrors of the chat (survives tab close + browser
+  // restart). Only written when the "Keep chat across browser sessions"
+  // toggle is ON. Tab-local sessionStorage above is always used; this
+  // long-lived layer is opt-in for privacy.
+  const PERSIST_KEY_MESSAGES = "__autodom_chat_messages_persist";
+  const PERSIST_KEY_HISTORY = "__autodom_chat_history_persist";
   const STORAGE_KEY_MODEL_OVERRIDES = "__autodom_chat_model_overrides"; // { [providerSource]: modelId }
 
   // Static fallback catalog, keyed by provider "source" or "ide:<cliKind>".
@@ -549,7 +555,39 @@
   const PANEL_WIDTH_MIN = 320;
   const PANEL_WIDTH_MAX = 800;
   const PANEL_WIDTH_DEFAULT = 440;
-  const _chatSettings = { verboseLogs: true, panelWidth: PANEL_WIDTH_DEFAULT };
+  const PANEL_RAIL_WIDTH = 44;
+  // Snap presets used by the keyboard width-cycle shortcuts and right-click
+  // resets. Kept in ascending order — _cyclePanelWidth assumes that.
+  const PANEL_WIDTH_PRESETS = [320, 440, 560, 680, 800];
+  const _chatSettings = {
+    verboseLogs: true,
+    panelWidth: PANEL_WIDTH_DEFAULT,
+    persistAcrossSessions: false,
+    // Per-hostname overrides. Resolved via _resolvedPanelWidth(); falls back
+    // to `panelWidth` (the global default) when the current host has no
+    // explicit entry. Hostnames are normalised by stripping a leading "www.".
+    widthByHost: {},
+    collapsedByHost: {},
+  };
+  // Normalise the current hostname so "www.github.com" and "github.com"
+  // share the same per-site preference.
+  function _currentHost() {
+    try {
+      const h = (location.hostname || "").toLowerCase();
+      return h.replace(/^www\./, "") || "__default";
+    } catch (_) {
+      return "__default";
+    }
+  }
+  function _resolvedPanelWidth() {
+    const host = _currentHost();
+    const v = _chatSettings.widthByHost && _chatSettings.widthByHost[host];
+    return _clampPanelWidth(typeof v === "number" ? v : _chatSettings.panelWidth);
+  }
+  function _isCollapsedForHost() {
+    const host = _currentHost();
+    return !!(_chatSettings.collapsedByHost && _chatSettings.collapsedByHost[host]);
+  }
   function _clampPanelWidth(w) {
     const n = Number(w);
     if (!Number.isFinite(n)) return PANEL_WIDTH_DEFAULT;
@@ -565,8 +603,18 @@
             _chatSettings.verboseLogs = s.verboseLogs;
           if (typeof s.panelWidth === "number")
             _chatSettings.panelWidth = _clampPanelWidth(s.panelWidth);
+          if (typeof s.persistAcrossSessions === "boolean")
+            _chatSettings.persistAcrossSessions = s.persistAcrossSessions;
+          if (s.widthByHost && typeof s.widthByHost === "object")
+            _chatSettings.widthByHost = { ...s.widthByHost };
+          if (s.collapsedByHost && typeof s.collapsedByHost === "object")
+            _chatSettings.collapsedByHost = { ...s.collapsedByHost };
         }
         try { _applySettingsToUI(); } catch (_) {}
+        // If long-lived persistence is on and the per-tab session was
+        // empty (fresh tab / browser restart), pull the last saved
+        // chat back from chrome.storage.local and re-render it.
+        try { _restoreLongLivedIfNeeded(); } catch (_) {}
       });
     } catch (_) {}
   }
@@ -580,6 +628,8 @@
   function _applySettingsToUI() {
     const toggle = document.getElementById("__autodom_verbose_toggle");
     if (toggle) toggle.checked = !!_chatSettings.verboseLogs;
+    const persistToggle = document.getElementById("__autodom_persist_toggle");
+    if (persistToggle) persistToggle.checked = !!_chatSettings.persistAcrossSessions;
     _applyVerboseAttr();
     _applyPanelWidth();
   }
@@ -596,15 +646,71 @@
   }
   // Push the panel width onto :root so both the panel itself (which reads
   // width from the variable) and the html `margin-right` rule stay in sync.
+  // When the panel is in collapsed (rail) state, the variable shrinks to
+  // PANEL_RAIL_WIDTH so the host page reflows back to (almost) full width.
   function _applyPanelWidth() {
     try {
-      const w = _clampPanelWidth(_chatSettings.panelWidth);
-      _chatSettings.panelWidth = w;
+      const collapsed = _isCollapsedForHost();
+      const w = collapsed ? PANEL_RAIL_WIDTH : _resolvedPanelWidth();
       document.documentElement.style.setProperty(
         "--autodom-panel-w",
         w + "px",
       );
+      const panelEl = document.getElementById(PANEL_ID);
+      if (panelEl) {
+        panelEl.classList.toggle("is-collapsed", collapsed);
+        panelEl.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      }
+      // Keep the resize handle's ARIA values current with the resolved width
+      // so screen readers announce the right number after a host switch.
+      const handle = document.getElementById("__autodom_resize_handle");
+      if (handle) {
+        handle.setAttribute("aria-valuemin", String(PANEL_WIDTH_MIN));
+        handle.setAttribute(
+          "aria-valuemax",
+          String(Math.min(PANEL_WIDTH_MAX, Math.floor(window.innerWidth * 0.8))),
+        );
+        handle.setAttribute("aria-valuenow", String(_resolvedPanelWidth()));
+      }
     } catch (_) {}
+  }
+  // Per-host width setter — every drag/keyboard adjust funnels through here
+  // so the value is clamped and stored under the current hostname.
+  function _setPanelWidthForHost(next, persist) {
+    const w = _clampPanelWidth(next);
+    const host = _currentHost();
+    if (!_chatSettings.widthByHost) _chatSettings.widthByHost = {};
+    _chatSettings.widthByHost[host] = w;
+    _chatSettings.panelWidth = w; // mirror so legacy callers still work
+    _applyPanelWidth();
+    if (persist) _saveChatSettings();
+    return w;
+  }
+  function _setCollapsedForHost(collapsed, persist) {
+    const host = _currentHost();
+    if (!_chatSettings.collapsedByHost) _chatSettings.collapsedByHost = {};
+    _chatSettings.collapsedByHost[host] = !!collapsed;
+    _applyPanelWidth();
+    if (persist) _saveChatSettings();
+  }
+  // Cycle the current per-host width to the next preset in `dir` direction
+  // (-1 = narrower, +1 = wider). Used by the keyboard width shortcuts.
+  function _cyclePanelWidth(dir) {
+    const cur = _resolvedPanelWidth();
+    const presets = PANEL_WIDTH_PRESETS;
+    let target = cur;
+    if (dir > 0) {
+      target = presets.find((p) => p > cur + 4) || presets[presets.length - 1];
+    } else {
+      // Walk backwards to find the largest preset strictly smaller than cur.
+      for (let i = presets.length - 1; i >= 0; i--) {
+        if (presets[i] < cur - 4) {
+          target = presets[i];
+          break;
+        }
+      }
+    }
+    _setPanelWidthForHost(target, true);
   }
   const MAX_PERSISTED_MESSAGES = 50;
   const THEME_VALUES = new Set(["system", "dark", "light"]);
@@ -623,6 +729,32 @@
         JSON.stringify(trimmedHistory),
       );
       sessionStorage.setItem(STORAGE_KEY_OPEN, isOpen ? "1" : "0");
+      // Long-lived mirror — only when the user opted in. Debounced
+      // because chrome.storage.local writes are async + cross-tab and
+      // we don't want to thrash on every keystroke / token.
+      if (_chatSettings.persistAcrossSessions) {
+        _scheduleLongLivedPersist(trimmedMessages, trimmedHistory);
+      }
+    } catch (_) {}
+  }
+  let _persistDebounce = null;
+  function _scheduleLongLivedPersist(msgs, hist) {
+    try { clearTimeout(_persistDebounce); } catch (_) {}
+    _persistDebounce = setTimeout(() => {
+      try {
+        chrome.storage?.local?.set?.({
+          [PERSIST_KEY_MESSAGES]: msgs,
+          [PERSIST_KEY_HISTORY]: hist,
+        });
+      } catch (_) {}
+    }, 250);
+  }
+  function _clearLongLivedPersist() {
+    try {
+      chrome.storage?.local?.remove?.([
+        PERSIST_KEY_MESSAGES,
+        PERSIST_KEY_HISTORY,
+      ]);
     } catch (_) {}
   }
 
@@ -644,6 +776,50 @@
     } catch (_) {
       return { hadMessages: false, wasOpen: false };
     }
+  }
+
+  // After settings load, if the per-tab session was empty (fresh tab or
+  // browser restart) and the user opted into long-lived persistence,
+  // pull the last saved chat back from chrome.storage.local and re-render
+  // it through the same addMessage path so markdown/tool-result cards
+  // rebuild identically. Idempotent — bails if messages are already
+  // present (covers the normal in-tab reload case).
+  function _restoreLongLivedIfNeeded() {
+    if (!_chatSettings.persistAcrossSessions) return;
+    if (messages && messages.length > 0) return;
+    try {
+      chrome.storage?.local?.get?.(
+        [PERSIST_KEY_MESSAGES, PERSIST_KEY_HISTORY],
+        (items) => {
+          const m = items && items[PERSIST_KEY_MESSAGES];
+          const h = items && items[PERSIST_KEY_HISTORY];
+          if (!Array.isArray(m) || m.length === 0) return;
+          messages = m;
+          conversationHistory = Array.isArray(h) ? h : [];
+          // Rebuild the DOM through addMessage — same path the in-tab
+          // restore uses (line 7567-ish), so markdown, copy buttons and
+          // tool-result <details> all re-render correctly.
+          try {
+            if (!messagesContainer) return;
+            const snapshot = messages.slice();
+            messages.length = 0;
+            messagesContainer.innerHTML = "";
+            const parent = messagesContainer.parentNode;
+            const nextSibling = messagesContainer.nextSibling;
+            if (parent) parent.removeChild(messagesContainer);
+            snapshot.forEach((msg) => {
+              const extra = msg.toolName ? { toolName: msg.toolName } : undefined;
+              addMessage(msg.role, msg.content, extra);
+            });
+            if (parent) parent.insertBefore(messagesContainer, nextSibling);
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            // Mirror back to sessionStorage so subsequent in-tab reloads
+            // are served from the fast synchronous path.
+            persistChatState();
+          } catch (_) {}
+        },
+      );
+    } catch (_) {}
   }
 
   // ─── Inject Styles ─────────────────────────────────────────
@@ -1211,6 +1387,26 @@
       opacity: 0.32;
       cursor: not-allowed;
       pointer-events: none;
+    }
+    /* Armed (confirmation) state for the Clear button — first click
+       turns it red so the user sees the second click really wipes. */
+    #${PANEL_ID} .autodom-chat-header-btn.is-armed {
+      background: rgba(239, 68, 68, 0.18);
+      border-color: rgba(239, 68, 68, 0.55);
+      color: #fca5a5;
+      animation: autodom-clear-pulse 0.9s ease-in-out infinite;
+    }
+    #${PANEL_ID} .autodom-chat-header-btn.is-armed:hover {
+      background: rgba(239, 68, 68, 0.28);
+      border-color: rgba(239, 68, 68, 0.75);
+      color: #fee2e2;
+    }
+    #${PANEL_ID} .autodom-chat-header-btn.is-armed svg {
+      stroke: currentColor;
+    }
+    @keyframes autodom-clear-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.45); }
+      50%      { box-shadow: 0 0 0 4px rgba(239, 68, 68, 0); }
     }
 
     /* Hidden helper kept for AI Badge */
@@ -3703,6 +3899,16 @@
           <span class="acss-switch" aria-hidden="true"><span class="acss-switch-knob"></span></span>
         </label>
       </div>
+      <div class="acss-row">
+        <label class="acss-toggle" for="__autodom_persist_toggle">
+          <span class="acss-toggle-info">
+            <span class="acss-toggle-title">Keep chat across browser sessions</span>
+            <span class="acss-toggle-desc">Save chat to extension storage so it survives tab close &amp; browser restart. Off = chat lives only for this tab.</span>
+          </span>
+          <input type="checkbox" id="__autodom_persist_toggle" />
+          <span class="acss-switch" aria-hidden="true"><span class="acss-switch-knob"></span></span>
+        </label>
+      </div>
       <div class="acss-foot">
         <span class="acss-foot-hint">Stop button is always shown while automation is running.</span>
       </div>
@@ -4338,10 +4544,26 @@
   }
 
   function _sanitizeAiResponseText(text) {
-    let out = String(text || "").replace(
-      /(^|[^\w`])IC(\d+)(?=[^\w`]|$)/g,
-      (_m, prefix, idx) => `${prefix}element #${idx}`,
-    );
+    let out = String(text || "");
+    // Hard scrub: the model sometimes leaks the internal element shorthand
+    // ("IC0", "IC7", `IC12`, etc. — used by get_dom_state to give every
+    // interactive element a stable numeric index) directly into its
+    // user-facing reply. It's never useful to a human and, worse, the
+    // model has been seen quoting it back as a value (e.g. "Build URL:
+    // IC0") or hallucinating it as its own model ID. Replace every
+    // standalone IC<digits> with a plain "element #N" so the rendered
+    // text is at least readable; downstream prose like "URL: element #0"
+    // makes it obvious to the user that the AI failed to resolve a real
+    // value, instead of looking like a valid identifier.
+    //
+    // Match in any context (incl. inside backticks/code spans) but only
+    // when IC is on a word boundary so we don't mangle words like
+    // "logIC0" or genuine identifiers ending in IC followed by digits.
+    out = out.replace(/\bIC(\d+)\b/g, "element #$1");
+    // Also strip any code-span that ends up containing only the now-
+    // expanded form, e.g. `element #0` left behind from `IC0` — keeps
+    // the prose clean without breaking real code references.
+    out = out.replace(/`element #(\d+)`/g, "element #$1");
     // When the user has turned "Verbose automation logs" off, also strip the
     // CLI-style inline tool-call trace that Claude Code / Codex / Copilot
     // CLIs print into stdout and which is forwarded verbatim into the
@@ -4500,19 +4722,64 @@
       _applyVerboseAttr();
     });
   }
+  const persistToggle = document.getElementById("__autodom_persist_toggle");
+  if (persistToggle) {
+    persistToggle.addEventListener("change", () => {
+      const wasOn = _chatSettings.persistAcrossSessions;
+      _chatSettings.persistAcrossSessions = !!persistToggle.checked;
+      _saveChatSettings();
+      if (_chatSettings.persistAcrossSessions) {
+        // Toggling ON: snapshot the current chat into long-lived storage
+        // immediately so the user gets the protection right away.
+        _scheduleLongLivedPersist(
+          messages.slice(-MAX_PERSISTED_MESSAGES),
+          conversationHistory.slice(-MAX_PERSISTED_MESSAGES),
+        );
+      } else if (wasOn) {
+        // Toggling OFF: don't keep stale data in chrome.storage.local.
+        _clearLongLivedPersist();
+      }
+    });
+  }
   // Load persisted settings now that DOM refs exist
   _loadChatSettings();
 
   // ─── Clear Conversation ────────────────────────────────────
+  // Two-step confirmation to prevent accidental wipes — a single click
+  // arms a 3-second "Click again to confirm" state; a second click
+  // within that window actually clears. Auto-disarms on timeout.
+  let _clearArmed = false;
+  let _clearArmTimer = null;
+  const _origClearTitle = clearBtn.getAttribute("title") || "Clear conversation";
+  const _origClearLabel = clearBtn.getAttribute("aria-label") || _origClearTitle;
+  function _disarmClear() {
+    _clearArmed = false;
+    clearBtn.classList.remove("is-armed");
+    clearBtn.setAttribute("title", _origClearTitle);
+    clearBtn.setAttribute("aria-label", _origClearLabel);
+    if (_clearArmTimer) {
+      clearTimeout(_clearArmTimer);
+      _clearArmTimer = null;
+    }
+  }
   clearBtn.addEventListener("click", () => {
     // Hard guard: never wipe history while a request is in flight.
-    // _setBusy() also disables the button, but we double-check here in
-    // case the disabled state is bypassed (e.g. keyboard activation
-    // racing the busy flip).
     if (isProcessing) return;
+    if (!_clearArmed) {
+      _clearArmed = true;
+      clearBtn.classList.add("is-armed");
+      clearBtn.setAttribute("title", "Click again to confirm clear");
+      clearBtn.setAttribute("aria-label", "Click again to confirm clear");
+      _clearArmTimer = setTimeout(_disarmClear, 3000);
+      return;
+    }
+    _disarmClear();
     messages = [];
     conversationHistory = [];
     persistChatState();
+    // Always wipe the long-lived mirror too — "Clear" should mean
+    // cleared everywhere, regardless of the persistence toggle.
+    _clearLongLivedPersist();
     messagesContainer.innerHTML = getWelcomeMarkup({
       subtitle:
         "Conversation cleared. Start with a quick task below or ask anything about this page.",
