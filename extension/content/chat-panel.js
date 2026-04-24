@@ -4293,7 +4293,7 @@
         <button class="autodom-chat-header-btn" id="__autodom_collapse_btn" title="Collapse panel (Ctrl/⌘+Alt+\\)" aria-label="Collapse chat panel" aria-controls="${PANEL_ID}">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
-        <button class="autodom-chat-header-btn" id="__autodom_settings_btn" title="Chat settings" aria-label="Chat settings" aria-haspopup="true" aria-expanded="false">
+        <button class="autodom-chat-header-btn" id="__autodom_settings_btn" title="Extension settings" aria-label="Extension settings" aria-haspopup="dialog" aria-expanded="false">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         </button>
         <button class="autodom-chat-header-btn" id="__autodom_clear_btn" title="Clear conversation" aria-label="Clear conversation">
@@ -4503,6 +4503,117 @@
       #${PANEL_ID} #__autodom_close_btn,
       #${PANEL_ID} #__autodom_collapse_btn {
         display: none !important;
+      }
+
+      /* ─── Modern / minimal scale-down for the side panel ──────
+         Side panels are typically 320–400 px wide, so the in-page
+         panel's 14 px / generous-padding scale feels oversized. Drop
+         the base font, tighten paddings, and shrink ornamental
+         affordances to match the JetBrains AI / Claude side-panel
+         aesthetic. Targeted at concrete selectors rather than
+         html/body to avoid re-layout surprises in components that
+         already use fixed px sizing. */
+      #${PANEL_ID} {
+        font-size: 13px !important;
+        line-height: 1.5 !important;
+      }
+      #${PANEL_ID} .autodom-chat-header {
+        padding: 8px 10px !important;
+        gap: 8px !important;
+      }
+      #${PANEL_ID} .autodom-chat-header-title {
+        font-size: 12.5px !important;
+        font-weight: 600 !important;
+      }
+      #${PANEL_ID} .autodom-chat-header-status {
+        font-size: 10.5px !important;
+      }
+      #${PANEL_ID} .autodom-chat-header-logo {
+        width: 22px !important;
+        height: 22px !important;
+      }
+      #${PANEL_ID} .autodom-chat-header-btn,
+      #${PANEL_ID} .autodom-chat-close-btn {
+        width: 26px !important;
+        height: 26px !important;
+        min-width: 26px !important;
+      }
+      #${PANEL_ID} .autodom-chat-context {
+        padding: 4px 10px !important;
+        font-size: 10.5px !important;
+      }
+      #${PANEL_ID} .autodom-chat-messages {
+        padding: 8px 10px 10px !important;
+        gap: 10px !important;
+      }
+      #${PANEL_ID} .autodom-chat-message {
+        font-size: 13px !important;
+        line-height: 1.55 !important;
+        padding: 8px 11px !important;
+        border-radius: 12px !important;
+        max-width: 92% !important;
+      }
+      #${PANEL_ID} .autodom-chat-quick-prompts {
+        padding: 4px 8px !important;
+        gap: 6px !important;
+      }
+      #${PANEL_ID} .autodom-chat-quick-btn {
+        font-size: 11.5px !important;
+        padding: 4px 9px !important;
+        border-radius: 999px !important;
+      }
+      #${PANEL_ID} .autodom-chat-input-area {
+        padding: 6px 8px 8px !important;
+        gap: 6px !important;
+      }
+      #${PANEL_ID} .autodom-chat-input-shell {
+        padding: 4px 6px !important;
+        align-items: center !important;
+        gap: 4px !important;
+        border-radius: 12px !important;
+      }
+      /* Attachment paperclip: vertically center against a single-line
+         textarea (was align-self: flex-end which drifted down). Tighter
+         hit target reads as more minimalist at side-panel widths. */
+      #${PANEL_ID} .autodom-chat-attach-btn {
+        width: 26px !important;
+        height: 26px !important;
+        min-width: 26px !important;
+        align-self: center !important;
+        margin-right: 0 !important;
+      }
+      #${PANEL_ID} .autodom-chat-attach-btn svg {
+        width: 15px !important;
+        height: 15px !important;
+      }
+      #${PANEL_ID} .autodom-chat-input {
+        font-size: 13px !important;
+        line-height: 1.45 !important;
+        padding: 6px 4px !important;
+      }
+      #${PANEL_ID} .autodom-chat-send-btn {
+        width: 30px !important;
+        height: 30px !important;
+        min-width: 30px !important;
+        align-self: center !important;
+      }
+      /* Attachment chips: smaller previews so the composer stays
+         compact when an image is queued. */
+      #${PANEL_ID} .autodom-chat-attachment-chip {
+        width: 44px !important;
+        height: 44px !important;
+        border-radius: 6px !important;
+      }
+      #${PANEL_ID} .autodom-chat-attachments {
+        gap: 6px !important;
+      }
+      /* Model picker / footer hints: shrink the secondary chrome too. */
+      #${PANEL_ID} .autodom-model-row {
+        font-size: 10.5px !important;
+      }
+      #${PANEL_ID} .autodom-model-picker {
+        font-size: 11px !important;
+        padding: 3px 7px !important;
       }
     `;
     // Append AFTER the panel's main <style> (which lives on
@@ -5429,7 +5540,12 @@
     );
   } catch (_) {}
 
-  // ─── Settings Sheet ────────────────────────────────────────
+  // ─── Settings Sheet (legacy — kept for storage sync wiring) ─
+  // The gear button now opens the inline extension-settings overlay
+  // directly. The legacy in-panel "settings sheet" is no longer
+  // surfaced; its DOM is left in place but stays hidden so the
+  // existing verbose/persist toggle wiring (which mirrors
+  // chrome.storage onChanged events to the chat) keeps working.
   const settingsBtn = document.getElementById("__autodom_settings_btn");
   const settingsSheet = document.getElementById("__autodom_settings_sheet");
   const verboseToggle = document.getElementById("__autodom_verbose_toggle");
@@ -5440,29 +5556,6 @@
       settingsBtn.setAttribute("aria-expanded", "false");
       settingsBtn.classList.remove("active");
     }
-  }
-  function _openSettingsSheet() {
-    if (!settingsSheet) return;
-    _applySettingsToUI();
-    settingsSheet.removeAttribute("hidden");
-    if (settingsBtn) {
-      settingsBtn.setAttribute("aria-expanded", "true");
-      settingsBtn.classList.add("active");
-    }
-  }
-  if (settingsBtn && settingsSheet) {
-    settingsBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      if (settingsSheet.hasAttribute("hidden")) _openSettingsSheet();
-      else _closeSettingsSheet();
-    });
-    // Close when clicking elsewhere in the panel (not inside the sheet)
-    panel.addEventListener("click", (e) => {
-      if (settingsSheet.hasAttribute("hidden")) return;
-      if (settingsSheet.contains(e.target)) return;
-      if (settingsBtn.contains(e.target)) return;
-      _closeSettingsSheet();
-    });
   }
   if (verboseToggle) {
     verboseToggle.addEventListener("change", () => {
@@ -5548,6 +5641,22 @@
   }
   if (settingsOverlayBack) {
     settingsOverlayBack.addEventListener("click", _closeSettingsOverlay);
+  }
+  // The header gear icon now goes straight to the extension settings
+  // overlay (which hosts the full popup UI, including the Chat tab
+  // for verbose / persist toggles). The legacy in-panel sheet is no
+  // longer surfaced — one settings surface keeps the mental model
+  // simple and matches the popup-toolbar entry point.
+  if (settingsBtn) {
+    settingsBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        _openSettingsOverlay();
+      } catch (err) {
+        _err("[settings-overlay] gear-open failed", err);
+      }
+    });
   }
   // Esc closes the overlay (only when it's open and focus is inside it
   // or on the back button) — avoids hijacking Esc for the rest of the

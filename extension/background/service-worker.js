@@ -615,6 +615,87 @@ function _debugError(...args) {
   appendActivityLog("error", "background", ...args);
 }
 
+// ─── Conversation history compaction ─────────────────────────
+// Single source of truth for how the panel's full conversationHistory
+// is reduced before being handed to either a direct AI provider or the
+// CLI/MCP bridge. Goals:
+//   • Bound payload size: cap on number of recent turns + per-turn char
+//     limits on older user content (assistant turns are preserved verbatim
+//     because they often summarize tool-state continuity).
+//   • Optional attachment binary stripping: CLI/bridge providers can't
+//     consume image bytes, so leave a short text marker like
+//     "[image attached: name]" instead of forwarding multi-MB data URLs.
+//   • Earlier-turn awareness: if turns were dropped, prepend a synthetic
+//     assistant note so the model knows context exists beyond the window
+//     (otherwise long sessions feel amnesic — JetBrains AI does the same
+//     "summary of earlier conversation" thing).
+function _compactHistoryForOutbound(history, opts) {
+  const sliceN = Math.max(2, opts?.sliceN ?? 12);
+  const stripAttachmentBinaries = !!opts?.stripAttachmentBinaries;
+  const maxOldUserChars = Math.max(120, opts?.maxOldUserChars ?? 800);
+  const keepRecentVerbatim = Math.max(2, opts?.keepRecentVerbatim ?? 4);
+
+  const arr = Array.isArray(history) ? history : [];
+  if (arr.length === 0) return [];
+
+  const recent = arr.slice(-sliceN);
+  const droppedCount = arr.length - recent.length;
+
+  // Determine the boundary inside `recent` beyond which we'll truncate
+  // older user turns. The most recent N user turns stay full-length so
+  // tool-state continuity isn't lost.
+  let userTurnsSeen = 0;
+  const oldUserBoundary = (() => {
+    for (let i = recent.length - 1; i >= 0; i--) {
+      if (recent[i]?.role === "user") {
+        userTurnsSeen++;
+        if (userTurnsSeen >= keepRecentVerbatim) return i;
+      }
+    }
+    return 0;
+  })();
+
+  const sanitized = recent.map((m, i) => {
+    if (!m || !m.role) return m;
+    let content = String(m.content ?? "");
+    const atts = Array.isArray(m.attachments) ? m.attachments : null;
+
+    // Strip attachment binaries; keep a short text marker so the model
+    // still knows an image was part of that turn.
+    if (stripAttachmentBinaries && atts && atts.length > 0) {
+      const markers = atts
+        .map((a) => `image:${a?.name || "untitled"}`)
+        .join(", ");
+      const note = `[attached ${atts.length} image(s) — ${markers}; bytes not forwarded to this AI bridge]`;
+      content = content ? `${content}\n${note}` : note;
+    }
+
+    // Truncate older user turns; leave assistant turns alone (they may
+    // hold the only surviving record of prior tool calls / summaries).
+    if (
+      m.role === "user" &&
+      i < oldUserBoundary &&
+      content.length > maxOldUserChars
+    ) {
+      content = content.slice(0, maxOldUserChars) + "\n…[truncated]";
+    }
+
+    const out = { role: m.role, content };
+    if (atts && !stripAttachmentBinaries) out.attachments = atts;
+    return out;
+  });
+
+  if (droppedCount > 0) {
+    sanitized.unshift({
+      role: "assistant",
+      content: `[earlier conversation: ${droppedCount} prior turn(s) elided to keep context manageable. Ask the user if you need details from before this point.]`,
+    });
+  }
+
+  return sanitized;
+}
+
+
 // ─── Direct AI Provider Calls ────────────────────────────────
 // Provider clients live in providers.js (loaded above via importScripts).
 // The wrappers below adapt the SW's settings + logger to the shared API.
@@ -1073,19 +1154,21 @@ async function runAgentLoop({
       const providerInfo = { model: _model, provider: providerType };
       const sys = _agentSystemPrompt(context, providerInfo);
       const messages = [{ role: "system", content: sys }];
-      // Carry recent conversation context so the model remembers previous
-      // turns. The client-side panel pushes the just-typed user message to
-      // conversationHistory BEFORE sending, so the trailing entry is
-      // typically the same as `text` — dedupe to avoid the model seeing
-      // its current prompt twice (which historically caused the agent to
-      // ignore prior turns and ask "what were we talking about?").
-      const histSlice = Array.isArray(conversationHistory)
-        ? conversationHistory.slice(-12)
-        : [];
-      const last = histSlice[histSlice.length - 1];
+      // Compact + dedupe the prior turns. _compactHistoryForOutbound
+      // bounds payload size and (for very long sessions) prepends a
+      // synthetic note that earlier turns existed — JetBrains-AI style.
+      const compacted = _compactHistoryForOutbound(conversationHistory, {
+        sliceN: 12,
+        stripAttachmentBinaries: false,
+        maxOldUserChars: 800,
+      });
+      // The client pushes the just-typed user message to history BEFORE
+      // sending, so the trailing entry is typically the same as `text` —
+      // dedupe to avoid the model seeing its current prompt twice.
+      const last = compacted[compacted.length - 1];
       const lastIsCurrentUser =
         last && last.role === "user" && String(last.content) === String(text);
-      const trimmed = lastIsCurrentUser ? histSlice.slice(0, -1) : histSlice;
+      const trimmed = lastIsCurrentUser ? compacted.slice(0, -1) : compacted;
       trimmed.forEach((m) => {
         if (!m?.role || !m?.content) return;
         messages.push({
@@ -1213,15 +1296,17 @@ async function runAgentLoop({
     if (providerType === "anthropic") {
       const providerInfo = { model: _model, provider: "anthropic" };
       const messages = [];
-      // See OpenAI/Ollama branch above for why we dedupe the trailing
-      // user message — same client-side push-then-send pattern applies.
-      const histSlice = Array.isArray(conversationHistory)
-        ? conversationHistory.slice(-12)
-        : [];
-      const last = histSlice[histSlice.length - 1];
+      // Compact + dedupe the prior turns — same JetBrains-AI style
+      // bounding logic as the OpenAI/Ollama branch above.
+      const compacted = _compactHistoryForOutbound(conversationHistory, {
+        sliceN: 12,
+        stripAttachmentBinaries: false,
+        maxOldUserChars: 800,
+      });
+      const last = compacted[compacted.length - 1];
       const lastIsCurrentUser =
         last && last.role === "user" && String(last.content) === String(text);
-      const trimmed = lastIsCurrentUser ? histSlice.slice(0, -1) : histSlice;
+      const trimmed = lastIsCurrentUser ? compacted.slice(0, -1) : compacted;
       trimmed.forEach((m) => {
         if (!m?.role || !m?.content) return;
         messages.push({
@@ -3067,19 +3152,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     // ─── IDE / MCP Path (requires bridge server) ─────────────
-    // Image attachments aren't supported over the bridge protocol — the
-    // CLI providers (Claude/Copilot/Codex) don't accept inline image
-    // payloads from us. Refuse explicitly instead of silently dropping
-    // the images so the user understands the model didn't actually see
-    // them.
+    // Image attachments: the CLI/MCP bridge can't pipe image bytes to
+    // the underlying CLI (Claude Code / Copilot / Codex). We used to
+    // hard-fail the whole turn here — that broke the conversation flow.
+    // Instead, gracefully degrade: drop the binaries, prepend a clear
+    // note to the outbound text so the model knows an image existed
+    // (and is told NOT to claim it saw it), and continue. The user's
+    // chat bubble in the UI still shows the original image.
+    let outboundText = text || "";
     if (Array.isArray(attachments) && attachments.length > 0) {
-      sendResponse({
-        type: "AI_CHAT_RESPONSE",
-        error:
-          "Image attachments require a Direct AI provider (OpenAI / Anthropic / Ollama vision model). " +
-          "The IDE / MCP bridge currently routes text only — please pick a vision-capable Direct provider in the extension settings.",
-      });
-      return false;
+      const summary = attachments
+        .map((a) => `${a?.name || "untitled"} (${a?.mime || "image"})`)
+        .join(", ");
+      const note =
+        `[The user attached ${attachments.length} image(s) — ${summary}. ` +
+        `This AI bridge cannot receive image bytes, so you did NOT see the actual pixels. ` +
+        `Do not pretend to have viewed the image. Ask the user to describe it, or suggest switching to a vision-capable Direct provider (OpenAI / Anthropic / Ollama vision) in the extension settings.]`;
+      outboundText = outboundText
+        ? `${note}\n\n${outboundText}`
+        : note;
     }
 
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -3098,12 +3189,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     const aiRequestId = ++aiCallIdCounter;
 
+    // Sanitize the outbound history: bound size, truncate older user
+    // turns, and STRIP attachment binaries from prior turns so we don't
+    // balloon the WS payload (or leak unsupported fields to the CLI).
+    const sanitizedHistory = _compactHistoryForOutbound(conversationHistory, {
+      sliceN: 20,
+      stripAttachmentBinaries: true,
+      maxOldUserChars: 800,
+    });
+
     const aiMessage = {
       type: "AI_CHAT_REQUEST",
       id: aiRequestId,
-      text: text,
+      text: outboundText,
       context: context || {},
-      conversationHistory: conversationHistory || [],
+      conversationHistory: sanitizedHistory,
       provider: providerType,
       providerConfig: {
         provider: aiProviderSettings.source || "ide",

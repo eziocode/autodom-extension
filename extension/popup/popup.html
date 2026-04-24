@@ -31,6 +31,7 @@
 	                <button class="tab" data-tab="scripts">Scripts</button>
 	                <button class="tab" data-tab="security">Security</button>
 	                <button class="tab" data-tab="config">Config</button>
+	                <button class="tab" data-tab="chat">Chat</button>
 	                <button class="tab" data-tab="logs">Logs</button>
 	            </nav>
 
@@ -511,6 +512,33 @@ return { title: document.title, url: location.href };"
                             <div class="log-entry log-info">
                                 Click Refresh to load tool error logs.
                             </div>
+                        </div>
+                    </section>
+                <div class="tab-content" id="tab-chat">
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Chat panel behavior</span>
+                        </div>
+                        <div class="field-stack">
+                            <label class="chat-toggle-row" for="chatVerboseToggle">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Verbose automation logs</span>
+                                    <span class="chat-toggle-desc">Show each tool call &amp; result in the chat, like Claude CLI.</span>
+                                </span>
+                                <input type="checkbox" id="chatVerboseToggle" class="chat-toggle-input" />
+                                <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
+                            </label>
+                            <label class="chat-toggle-row" for="chatPersistToggle">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Keep chat across browser sessions</span>
+                                    <span class="chat-toggle-desc">Save chat to extension storage so it survives tab close &amp; browser restart. Off = chat lives only for this tab.</span>
+                                </span>
+                                <input type="checkbox" id="chatPersistToggle" class="chat-toggle-input" />
+                                <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
+                            </label>
+                            <p class="field-hint">
+                                Stop button is always shown while automation is running.
+                            </p>
                         </div>
                     </section>
                 </div>

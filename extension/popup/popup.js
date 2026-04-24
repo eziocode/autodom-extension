@@ -527,7 +527,68 @@ const _secretAreaName =
 
   initScriptRunner();
   initSecurityTab();
+  initChatSettingsTab();
 });
+
+// ─── Chat panel settings (mirrors __autodom_chat_settings used by chat-panel.js) ───
+// chat-panel.js owns the storage shape; we only touch the two boolean
+// fields that map to UI toggles here. A storage.onChanged listener
+// keeps the popup in sync if the user flips the same toggle from
+// another window/tab.
+function initChatSettingsTab() {
+  const STORAGE_KEY = "__autodom_chat_settings";
+  const verboseToggle = document.getElementById("chatVerboseToggle");
+  const persistToggle = document.getElementById("chatPersistToggle");
+  if (!verboseToggle || !persistToggle) return;
+
+  function applyToUI(s) {
+    if (!s || typeof s !== "object") return;
+    if (typeof s.verboseLogs === "boolean")
+      verboseToggle.checked = s.verboseLogs;
+    if (typeof s.persistAcrossSessions === "boolean")
+      persistToggle.checked = s.persistAcrossSessions;
+  }
+
+  // Initial load — defaults match chat-panel.js (verboseLogs:true,
+  // persistAcrossSessions:false) so first-time users see the same
+  // state regardless of which surface they look at first.
+  chrome.storage?.local?.get?.([STORAGE_KEY], (items) => {
+    const s = (items && items[STORAGE_KEY]) || {
+      verboseLogs: true,
+      persistAcrossSessions: false,
+    };
+    applyToUI({
+      verboseLogs:
+        typeof s.verboseLogs === "boolean" ? s.verboseLogs : true,
+      persistAcrossSessions:
+        typeof s.persistAcrossSessions === "boolean"
+          ? s.persistAcrossSessions
+          : false,
+    });
+  });
+
+  function persistField(field, value) {
+    chrome.storage?.local?.get?.([STORAGE_KEY], (items) => {
+      const cur = (items && items[STORAGE_KEY]) || {};
+      const next = { ...cur, [field]: value };
+      chrome.storage.local.set({ [STORAGE_KEY]: next });
+    });
+  }
+
+  verboseToggle.addEventListener("change", () => {
+    persistField("verboseLogs", !!verboseToggle.checked);
+  });
+  persistToggle.addEventListener("change", () => {
+    persistField("persistAcrossSessions", !!persistToggle.checked);
+  });
+
+  if (chrome.storage?.onChanged?.addListener) {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local" || !changes[STORAGE_KEY]) return;
+      applyToUI(changes[STORAGE_KEY].newValue);
+    });
+  }
+}
 
 // ─── Tab Switching ───────────────────────────────────────────
 function initTabs() {
