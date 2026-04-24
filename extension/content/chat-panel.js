@@ -330,6 +330,30 @@
     return key;
   }
 
+  // Human-friendly fallback name for the model badge / "what model are
+  // you" answers, derived from the active provider source. Used when
+  // the exact model id can't be resolved (CLI bridges, unknown
+  // overrides) so we never have to show a raw token or hallucinated
+  // value to the user.
+  function _friendlyProviderLabel() {
+    const src = String(_modelPickerState.providerSource || "").toLowerCase();
+    const cli = String(_modelPickerState.cliKind || "").toLowerCase();
+    if (src === "ide" || src === "cli") {
+      if (cli.includes("claude")) return "Claude";
+      if (cli.includes("copilot")) return "Copilot";
+      if (cli.includes("codex")) return "Codex";
+      if (cli.includes("gemini")) return "Gemini";
+      if (cli.includes("ollama")) return "Ollama";
+      return "AI";
+    }
+    if (src === "anthropic") return "Claude";
+    if (src === "openai") return "ChatGPT";
+    if (src === "gemini" || src === "google") return "Gemini";
+    if (src === "ollama") return "Ollama";
+    if (src === "copilot") return "Copilot";
+    return "AI";
+  }
+
   function _currentModelId() {
     const key = _catalogKey();
     const baseKey = _catalogBaseKey();
@@ -5611,11 +5635,33 @@
       msg.appendChild(md);
       msg.appendChild(_makeCopyBtn(rendered));
       const modelId = (extra && extra.model) || _currentModelId();
-      if (modelId) {
-        const modelMeta = _modelsForCurrentProvider().find((m) => m.id === modelId);
+      // Always render a model badge so the user sees what's answering
+      // them. Order of preference:
+      //   1) The model picker's friendly label (matches a known catalog
+      //      entry like "Claude Sonnet 4.5", "GPT-5.4", etc.)
+      //   2) The raw model id if it looks human-readable (no internal
+      //      shorthand leaks like "IC0").
+      //   3) A friendly provider-based name ("Claude", "Copilot",
+      //      "GPT", "Gemini", "Ollama", "AI") derived from the
+      //      currently-selected provider source / CLI kind. This is the
+      //      fallback used when we can't fetch the exact model — better
+      //      than showing nothing or a hallucinated id.
+      const friendlyLabel = _friendlyProviderLabel();
+      let badgeText = "";
+      const knownMeta = modelId
+        ? _modelsForCurrentProvider().find((m) => m.id === modelId)
+        : null;
+      if (knownMeta && knownMeta.label) {
+        badgeText = knownMeta.label;
+      } else if (modelId && /^[\w./@:+-]+$/.test(modelId) && !/\bIC\d+\b/.test(modelId)) {
+        badgeText = modelId;
+      } else {
+        badgeText = friendlyLabel;
+      }
+      if (badgeText) {
         const badge = document.createElement("span");
         badge.className = "autodom-model-badge";
-        badge.textContent = modelMeta?.label || modelId;
+        badge.textContent = badgeText;
         msg.appendChild(badge);
       }
       content = rendered;
@@ -5668,7 +5714,12 @@
     container.textContent = "";
     if (!src) return;
 
-    let s = String(src);
+    // Defense-in-depth: even though addMessage() already sanitizes
+    // assistant text, some callers (inline overlay, AI summarizer,
+    // streaming preview spans) call renderMarkdownInto directly. Strip
+    // the internal IC<digits> shorthand here too so the user never sees
+    // it, regardless of which code path produced the markdown.
+    let s = String(src).replace(/\bIC(\d+)\b/g, "element #$1");
 
     // 1) Extract fenced code blocks first so their contents are not
     //    misinterpreted as other markdown tokens.
