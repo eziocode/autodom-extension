@@ -117,12 +117,192 @@
   let inlineMode = false; // inline overlay mode (like browser atlas)
   let _statusPollInterval = null;
 
+  const WELCOME_SUGGESTIONS_HTML = `
+    <button class="autodom-chat-suggestion" type="button" data-prompt="__summarize__" role="listitem">Summarize page</button>
+    <button class="autodom-chat-suggestion" type="button" data-prompt="What is this page about and what can I do here?" role="listitem">Explain page</button>
+    <button class="autodom-chat-suggestion" type="button" data-prompt="List the most important interactive elements on this page." role="listitem">Key controls</button>
+    <button class="autodom-chat-suggestion" type="button" data-prompt="Find any forms on this page and describe their fields." role="listitem">Inspect forms</button>
+  `;
+
+  function getWelcomeMarkup(options = {}) {
+    const {
+      subtitle,
+      includeCapabilities = false,
+      includeTips = false,
+      suggestionsId = "",
+    } = options;
+    const suggestionsIdAttr = suggestionsId ? ` id="${suggestionsId}"` : "";
+
+    return `
+      <div class="autodom-chat-welcome">
+        <h3>How can I help?</h3>
+        <p class="welcome-sub">${subtitle}</p>
+        ${
+          includeCapabilities
+            ? `
+        <div class="welcome-section-label">What you can do</div>
+        <ul class="welcome-bullets">
+          <li><span><b>Summarize &amp; explain</b> — ask about this page, its forms, buttons, or flows.</span></li>
+          <li><span><b>Automate actions</b> — "click the login button", "fill the search with …", navigate, scroll.</span></li>
+          <li><span><b>Inspect the DOM</b> — live tool calls stream as cards so you can see what ran.</span></li>
+          <li><span><b>Stay in control</b> — hit <b>Stop</b> anytime; dangerous actions ask first.</span></li>
+        </ul>
+        `
+            : ""
+        }
+        <div class="welcome-section-label">Try something</div>
+        <div class="autodom-chat-welcome-suggestions"${suggestionsIdAttr} role="list" aria-label="Suggested prompts">
+          ${WELCOME_SUGGESTIONS_HTML}
+        </div>
+        ${
+          includeTips
+            ? `
+        <details class="welcome-tips">
+          <summary>Tips &amp; shortcuts</summary>
+          <div class="welcome-tips-body">
+            <div class="welcome-tips-row">
+              <span class="tip-label">Toggle panel</span>
+              <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd></span>
+            </div>
+            <div class="welcome-tips-row">
+              <span class="tip-label">Quick prompt</span>
+              <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd></span>
+            </div>
+            <div class="welcome-tips-row">
+              <span class="tip-label">Send</span>
+              <span><kbd>Enter</kbd> · newline <kbd>Shift</kbd>+<kbd>Enter</kbd></span>
+            </div>
+            <div class="welcome-tips-row">
+              <span class="tip-label">Commands</span>
+              <span><code>/dom</code> <code>/screenshot</code> <code>/click</code> <code>/type</code> <code>/nav</code> <code>/help</code></span>
+            </div>
+            <div class="welcome-tips-row">
+              <span class="tip-label">Settings</span>
+              <span>gear icon in the header — toggle verbose tool logs.</span>
+            </div>
+          </div>
+        </details>
+        `
+            : ""
+        }
+      </div>
+    `;
+  }
+
   // ─── Persistence Helpers ─────────────────────────────────
   const STORAGE_KEY_MESSAGES = "__autodom_chat_messages";
   const STORAGE_KEY_HISTORY = "__autodom_chat_history";
   const STORAGE_KEY_OPEN = "__autodom_chat_open";
   const STORAGE_KEY_THEME = "__autodom_chat_theme";
   const STORAGE_KEY_SETTINGS = "__autodom_chat_settings"; // { verboseLogs: bool }
+  const STORAGE_KEY_MODEL_OVERRIDES = "__autodom_chat_model_overrides"; // { [providerSource]: modelId }
+
+  // Curated model catalog keyed by provider "source". The list is
+  // intentionally short — we surface the commonly-used tiers and let the
+  // configured default (set in the extension popup) be the fallback for
+  // anything outside the catalog.
+  const MODEL_CATALOG = {
+    openai: [
+      { id: "gpt-4o-mini",   label: "GPT-4o mini",   description: "Fast · lowest cost" },
+      { id: "gpt-4o",        label: "GPT-4o",        description: "Most capable" },
+      { id: "gpt-4.1-mini",  label: "GPT-4.1 mini",  description: "Balanced" },
+    ],
+    anthropic: [
+      { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5",  description: "Fastest" },
+      { id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6", description: "Balanced" },
+      { id: "claude-opus-4-7",           label: "Claude Opus 4.7",   description: "Most capable" },
+    ],
+    ollama: [
+      { id: "llama3.2", label: "Llama 3.2", description: "Local" },
+      { id: "qwen2.5",  label: "Qwen 2.5",  description: "Local" },
+    ],
+  };
+
+  // Runtime state the model picker reads/writes.
+  const _modelPickerState = {
+    providerSource: "ide",  // snapshotted from popup's aiProviderSource
+    defaultModel: "",       // snapshotted from popup's aiProviderModel
+    overrides: {},          // per-provider user overrides
+  };
+
+  function _normalizeProviderSource(src) {
+    const s = (src || "").toLowerCase();
+    if (s === "gpt" || s === "chatgpt") return "openai";
+    if (s === "claude") return "anthropic";
+    return s || "ide";
+  }
+
+  function _currentModelId() {
+    const src = _modelPickerState.providerSource;
+    return _modelPickerState.overrides[src] || _modelPickerState.defaultModel || "";
+  }
+
+  function _modelsForCurrentProvider() {
+    const src = _modelPickerState.providerSource;
+    const list = MODEL_CATALOG[src] ? [...MODEL_CATALOG[src]] : [];
+    // If the configured default isn't in our curated list, prepend it so
+    // the user can always pick their own model back.
+    const def = _modelPickerState.defaultModel;
+    if (def && !list.find((m) => m.id === def)) {
+      list.unshift({ id: def, label: def, description: "Configured default" });
+    }
+    return list;
+  }
+
+  function _loadModelPickerState() {
+    try {
+      chrome.storage?.local?.get?.(
+        [
+          "aiProviderSource",
+          "aiProviderModel",
+          STORAGE_KEY_MODEL_OVERRIDES,
+        ],
+        (items) => {
+          _modelPickerState.providerSource = _normalizeProviderSource(
+            items?.aiProviderSource,
+          );
+          _modelPickerState.defaultModel = items?.aiProviderModel || "";
+          _modelPickerState.overrides = items?.[STORAGE_KEY_MODEL_OVERRIDES] || {};
+          try { _refreshModelPickerUI(); } catch (_) {}
+        },
+      );
+      // Stay in sync with changes from the popup.
+      chrome.storage?.onChanged?.addListener?.((changes, area) => {
+        if (area !== "local") return;
+        if (changes.aiProviderSource) {
+          _modelPickerState.providerSource = _normalizeProviderSource(
+            changes.aiProviderSource.newValue,
+          );
+        }
+        if (changes.aiProviderModel) {
+          _modelPickerState.defaultModel = changes.aiProviderModel.newValue || "";
+        }
+        if (changes[STORAGE_KEY_MODEL_OVERRIDES]) {
+          _modelPickerState.overrides =
+            changes[STORAGE_KEY_MODEL_OVERRIDES].newValue || {};
+        }
+        try { _refreshModelPickerUI(); } catch (_) {}
+      });
+    } catch (_) {}
+  }
+
+  function _setModelOverride(modelId) {
+    const src = _modelPickerState.providerSource;
+    _modelPickerState.overrides = {
+      ..._modelPickerState.overrides,
+      [src]: modelId,
+    };
+    try {
+      chrome.storage?.local?.set?.({
+        [STORAGE_KEY_MODEL_OVERRIDES]: _modelPickerState.overrides,
+      });
+    } catch (_) {}
+    try { _refreshModelPickerUI(); } catch (_) {}
+  }
+
+  // Forward declaration so _loadModelPickerState can call it before the
+  // picker is wired up. Replaced below when the panel DOM exists.
+  let _refreshModelPickerUI = () => {};
 
   // User-adjustable runtime settings (persisted to chrome.storage.local so
   // the choice survives tab reloads + applies across tabs).
@@ -740,10 +920,6 @@
       font-weight: 400;
       line-height: 1.3;
     }
-    .autodom-chat-context-mcp,
-    .autodom-chat-context-mcp .dot { display: none !important; }
-    #__autodom_mcp_indicator { display: none !important; }
-
     /* ─── Messages ────────────────────────────────────────────── */
     .autodom-chat-messages {
       flex: 1 1 auto !important;
@@ -1772,6 +1948,96 @@
     .autodom-chat-input-shell:focus-within ~ .autodom-chat-input-hint {
       opacity: 1;
       color: var(--c-text-2);
+    }
+
+    /* ─── Model Picker (composer footer) ───────────────────── */
+    .autodom-model-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 4px 0 4px;
+    }
+    .autodom-model-picker {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 10px;
+      border: 1px solid var(--c-border);
+      border-radius: 999px;
+      background: var(--c-surface);
+      color: var(--c-text-2);
+      font-size: 11px;
+      line-height: 1.3;
+      cursor: pointer;
+      user-select: none;
+      transition: border-color 0.15s ease, background-color 0.15s ease;
+    }
+    .autodom-model-picker:hover,
+    .autodom-model-picker:focus-visible {
+      border-color: var(--c-accent);
+      background: var(--c-surface-2);
+      color: var(--c-text-1);
+      outline: none;
+    }
+    .autodom-model-picker[hidden] { display: none !important; }
+    .autodom-model-picker::after {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-right: 1.5px solid currentColor;
+      border-bottom: 1.5px solid currentColor;
+      transform: rotate(45deg);
+      margin-left: 2px;
+      opacity: 0.7;
+    }
+    .autodom-model-menu {
+      position: absolute;
+      bottom: calc(100% + 6px);
+      left: 0;
+      min-width: 220px;
+      background: var(--c-surface-2, #1c1c1e);
+      border: 1px solid var(--c-border);
+      border-radius: 10px;
+      padding: 4px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+      z-index: 10;
+    }
+    .autodom-model-menu[hidden] { display: none !important; }
+    .autodom-model-item {
+      display: block;
+      width: 100%;
+      text-align: left;
+      padding: 6px 10px;
+      border: 0;
+      background: transparent;
+      color: var(--c-text-1);
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .autodom-model-item:hover,
+    .autodom-model-item:focus-visible {
+      background: rgba(255, 255, 255, 0.06);
+      outline: none;
+    }
+    .autodom-model-item .mi-desc {
+      display: block;
+      font-size: 10px;
+      color: var(--c-text-3);
+      margin-top: 1px;
+    }
+    .autodom-model-item.is-active {
+      background: var(--c-accent-soft, rgba(37, 99, 235, 0.15));
+      color: var(--c-text-1);
+    }
+    .autodom-model-badge {
+      display: inline-block;
+      margin-top: 6px;
+      font-size: 10px;
+      color: var(--c-text-3);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      opacity: 0.75;
     }
 
     /* ─── Welcome Screen ──────────────────────────────────────
@@ -2984,52 +3250,13 @@
 
     <!-- Messages Area -->
     <div class="autodom-chat-messages" id="__autodom_messages" role="log" aria-label="Chat messages" aria-live="polite">
-      <div class="autodom-chat-welcome">
-        <h3>How can I help?</h3>
-        <p class="welcome-sub">Type naturally, tap a suggestion, or drop to <code style="font-family:var(--mono);font-size:11px;">/commands</code> — AutoDOM reads the page and runs safe browser actions.</p>
-
-        <div class="welcome-section-label">What you can do</div>
-        <ul class="welcome-bullets">
-          <li><span><b>Summarize &amp; explain</b> — ask about this page, its forms, buttons, or flows.</span></li>
-          <li><span><b>Automate actions</b> — "click the login button", "fill the search with …", navigate, scroll.</span></li>
-          <li><span><b>Inspect the DOM</b> — live tool calls stream as cards so you can see what ran.</span></li>
-          <li><span><b>Stay in control</b> — hit <b>Stop</b> anytime; dangerous actions ask first.</span></li>
-        </ul>
-
-        <div class="welcome-section-label">Try something</div>
-        <div class="autodom-chat-welcome-suggestions" id="__autodom_welcome_suggestions" role="list" aria-label="Suggested prompts">
-          <button class="autodom-chat-suggestion" type="button" data-prompt="__summarize__" role="listitem">Summarize page</button>
-          <button class="autodom-chat-suggestion" type="button" data-prompt="What is this page about and what can I do here?" role="listitem">Explain page</button>
-          <button class="autodom-chat-suggestion" type="button" data-prompt="List the most important interactive elements on this page." role="listitem">Key controls</button>
-          <button class="autodom-chat-suggestion" type="button" data-prompt="Find any forms on this page and describe their fields." role="listitem">Inspect forms</button>
-        </div>
-
-        <details class="welcome-tips">
-          <summary>Tips &amp; shortcuts</summary>
-          <div class="welcome-tips-body">
-            <div class="welcome-tips-row">
-              <span class="tip-label">Toggle panel</span>
-              <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd></span>
-            </div>
-            <div class="welcome-tips-row">
-              <span class="tip-label">Quick prompt</span>
-              <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd></span>
-            </div>
-            <div class="welcome-tips-row">
-              <span class="tip-label">Send</span>
-              <span><kbd>Enter</kbd> · newline <kbd>Shift</kbd>+<kbd>Enter</kbd></span>
-            </div>
-            <div class="welcome-tips-row">
-              <span class="tip-label">Commands</span>
-              <span><code>/dom</code> <code>/screenshot</code> <code>/click</code> <code>/type</code> <code>/nav</code> <code>/help</code></span>
-            </div>
-            <div class="welcome-tips-row">
-              <span class="tip-label">Settings</span>
-              <span>gear icon in the header — toggle verbose tool logs.</span>
-            </div>
-          </div>
-        </details>
-      </div>
+      ${getWelcomeMarkup({
+        subtitle:
+          'Type naturally, tap a suggestion, or drop to <code style="font-family:var(--mono);font-size:11px;">/commands</code> — AutoDOM reads the page and runs safe browser actions.',
+        includeCapabilities: true,
+        includeTips: true,
+        suggestionsId: "__autodom_welcome_suggestions",
+      })}
     </div>
 
     <!-- Quick Actions -->
@@ -3067,6 +3294,25 @@
           <svg class="send-icon" viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
           <span class="stop-icon" aria-hidden="true"></span>
         </button>
+      </div>
+      <div class="autodom-model-row">
+        <button
+          type="button"
+          class="autodom-model-picker"
+          id="__autodom_model_picker"
+          aria-haspopup="listbox"
+          aria-expanded="false"
+          title="Select model (Ctrl/Cmd+M)"
+        >
+          <span id="__autodom_model_picker_label">Model</span>
+        </button>
+        <div
+          class="autodom-model-menu"
+          id="__autodom_model_menu"
+          role="listbox"
+          aria-label="Available models"
+          hidden
+        ></div>
       </div>
       <div class="autodom-chat-input-hint"><kbd>Shift</kbd>+<kbd>Enter</kbd> for newline</div>
     </div>
@@ -3140,7 +3386,6 @@
   const themeSelect = document.getElementById("__autodom_theme_select");
   const statusBadge = document.getElementById("__autodom_status_badge");
   const contextText = document.getElementById("__autodom_context_text");
-  const mcpIndicator = document.getElementById("__autodom_mcp_indicator");
   const quickActions = document.getElementById("__autodom_quick_actions");
 
   // Inline overlay refs
@@ -3400,6 +3645,132 @@
 
   closeBtn.addEventListener("click", closePanel);
 
+  // ─── Model Picker wiring ───────────────────────────────────
+  const _modelPickerBtn = document.getElementById("__autodom_model_picker");
+  const _modelPickerLabel = document.getElementById("__autodom_model_picker_label");
+  const _modelPickerMenu = document.getElementById("__autodom_model_menu");
+
+  function _modelPickerOpen() {
+    if (!_modelPickerMenu || !_modelPickerBtn) return;
+    _renderModelMenu();
+    _modelPickerMenu.hidden = false;
+    _modelPickerBtn.setAttribute("aria-expanded", "true");
+    // Focus the active item so arrow keys navigate immediately.
+    const active =
+      _modelPickerMenu.querySelector(".autodom-model-item.is-active") ||
+      _modelPickerMenu.querySelector(".autodom-model-item");
+    try { active?.focus(); } catch (_) {}
+  }
+  function _modelPickerClose() {
+    if (!_modelPickerMenu || !_modelPickerBtn) return;
+    _modelPickerMenu.hidden = true;
+    _modelPickerBtn.setAttribute("aria-expanded", "false");
+  }
+  function _modelPickerToggle() {
+    if (_modelPickerMenu?.hidden) _modelPickerOpen();
+    else _modelPickerClose();
+  }
+
+  function _renderModelMenu() {
+    if (!_modelPickerMenu) return;
+    _modelPickerMenu.innerHTML = "";
+    const current = _currentModelId();
+    const models = _modelsForCurrentProvider();
+    if (!models.length) {
+      const empty = document.createElement("div");
+      empty.className = "autodom-model-item";
+      empty.style.color = "var(--c-text-3)";
+      empty.textContent = "No models configured for this provider.";
+      _modelPickerMenu.appendChild(empty);
+      return;
+    }
+    models.forEach((m) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "autodom-model-item" + (m.id === current ? " is-active" : "");
+      btn.setAttribute("role", "option");
+      btn.setAttribute("aria-selected", m.id === current ? "true" : "false");
+      btn.innerHTML = `${_escapeHtml(m.label)}<span class="mi-desc">${_escapeHtml(m.description || m.id)}</span>`;
+      btn.addEventListener("click", () => {
+        _setModelOverride(m.id);
+        _modelPickerClose();
+        try { _modelPickerBtn?.focus(); } catch (_) {}
+      });
+      _modelPickerMenu.appendChild(btn);
+    });
+  }
+
+  function _escapeHtml(s) {
+    return String(s ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  // Replace the forward-declared stub now that the DOM exists.
+  _refreshModelPickerUI = function () {
+    if (!_modelPickerBtn || !_modelPickerLabel) return;
+    const src = _modelPickerState.providerSource;
+    // For the IDE path, the IDE dictates the model — hide the picker to
+    // avoid misleading the user.
+    if (src === "ide" || !src) {
+      _modelPickerBtn.hidden = true;
+      return;
+    }
+    _modelPickerBtn.hidden = false;
+    const id = _currentModelId();
+    const models = _modelsForCurrentProvider();
+    const match = models.find((m) => m.id === id);
+    _modelPickerLabel.textContent = match ? match.label : id || "Model";
+    if (!_modelPickerMenu?.hidden) _renderModelMenu();
+  };
+
+  _modelPickerBtn?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    _modelPickerToggle();
+  });
+  // Close on outside click.
+  document.addEventListener("click", (e) => {
+    if (!_modelPickerMenu || _modelPickerMenu.hidden) return;
+    if (
+      _modelPickerMenu.contains(e.target) ||
+      _modelPickerBtn?.contains(e.target)
+    )
+      return;
+    _modelPickerClose();
+  });
+  // Keyboard navigation within the menu.
+  _modelPickerMenu?.addEventListener("keydown", (e) => {
+    const items = Array.from(
+      _modelPickerMenu.querySelectorAll(".autodom-model-item"),
+    );
+    const idx = items.indexOf(document.activeElement);
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      (items[idx + 1] || items[0])?.focus();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      (items[idx - 1] || items[items.length - 1])?.focus();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      _modelPickerClose();
+      try { _modelPickerBtn?.focus(); } catch (_) {}
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      document.activeElement?.click?.();
+    }
+  });
+  // Cmd/Ctrl+M opens the picker from anywhere inside the panel.
+  panel.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && (e.key === "m" || e.key === "M")) {
+      e.preventDefault();
+      _modelPickerToggle();
+    }
+  });
+
+  _loadModelPickerState();
+  _refreshModelPickerUI();
+
   // Fresh content-script load (hard refresh, SPA route change, first
   // inject). Ask the SW whether any agent run is still active so this
   // page can restore the overlay / stop affordances immediately.
@@ -3467,19 +3838,10 @@
     messages = [];
     conversationHistory = [];
     persistChatState();
-    messagesContainer.innerHTML = `
-      <div class="autodom-chat-welcome">
-        <h3>How can I help?</h3>
-        <p class="welcome-sub">Conversation cleared. Ask anything about this page, tap a suggestion, or use a slash command.</p>
-        <div class="welcome-section-label">Try something</div>
-        <div class="autodom-chat-welcome-suggestions" role="list" aria-label="Suggested prompts">
-          <button class="autodom-chat-suggestion" type="button" data-prompt="__summarize__" role="listitem">Summarize page</button>
-          <button class="autodom-chat-suggestion" type="button" data-prompt="What is this page about and what can I do here?" role="listitem">Explain page</button>
-          <button class="autodom-chat-suggestion" type="button" data-prompt="List the most important interactive elements on this page." role="listitem">Key controls</button>
-          <button class="autodom-chat-suggestion" type="button" data-prompt="Find any forms on this page and describe their fields." role="listitem">Inspect forms</button>
-        </div>
-      </div>
-    `;
+    messagesContainer.innerHTML = getWelcomeMarkup({
+      subtitle:
+        "Conversation cleared. Ask anything about this page, tap a suggestion, or use a slash command.",
+    });
   });
 
   // ─── Inline Overlay Toggle ─────────────────────────────────
@@ -4067,6 +4429,13 @@
       renderMarkdownInto(md, String(content || ""));
       msg.appendChild(md);
       msg.appendChild(_makeCopyBtn(String(content || "")));
+      const modelId = (extra && extra.model) || _currentModelId();
+      if (modelId) {
+        const badge = document.createElement("span");
+        badge.className = "autodom-model-badge";
+        badge.textContent = modelId;
+        msg.appendChild(badge);
+      }
     } else {
       const textNode = document.createTextNode(content);
       msg.appendChild(textNode);
@@ -5033,6 +5402,7 @@
             text: text,
             context: context,
             conversationHistory: conversationHistory.slice(-20), // Last 20 messages
+            model: _currentModelId() || undefined,
           },
           (response) => {
             let lastError = null;
@@ -5731,7 +6101,10 @@
           toolCalls.length,
         );
 
-        addMessage("ai-response", responseText, { toolCalls });
+        addMessage("ai-response", responseText, {
+          toolCalls,
+          model: aiResult.model,
+        });
         conversationHistory.push({ role: "assistant", content: responseText });
       } else if (aiResult && aiResult.fallback) {
         _log("AI fallback, trying local NLP...");

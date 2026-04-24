@@ -672,6 +672,7 @@ async function runAgentLoop({
   context,
   conversationHistory,
   initialTabId,
+  modelOverride,
 }) {
   const ProvidersApi = globalThis.AutoDOMProviders;
   const AgentApi = globalThis.AutoDOMAgent;
@@ -679,6 +680,10 @@ async function runAgentLoop({
     throw new Error("Agent modules not loaded");
   }
   const apiKey = (aiProviderSettings.apiKey || "").trim();
+  // Per-run model override from the chat panel's model picker. Falls back
+  // to the globally configured default in chrome.storage.
+  const _model = (modelOverride && String(modelOverride).trim()) ||
+    aiProviderSettings.model;
   const tools = _toolsForProvider(providerType);
   if (!tools) {
     throw new Error(`Agent loop not supported for provider: ${providerType}`);
@@ -761,7 +766,7 @@ async function runAgentLoop({
           resp = await callFn({
             apiKey,
             baseUrl: aiProviderSettings.baseUrl,
-            model: aiProviderSettings.model,
+            model: _model,
             tools,
             messagesOverride: messages,
             debug: _debugLog,
@@ -885,7 +890,7 @@ async function runAgentLoop({
           resp = await ProvidersApi.callAnthropic({
             apiKey,
             baseUrl: aiProviderSettings.baseUrl,
-            model: aiProviderSettings.model,
+            model: _model,
             context: agentContext, // buildSystemPrompt is called inside; we patch via agent prompt below
             messagesOverride: messages,
             tools,
@@ -2623,6 +2628,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             context: context || {},
             conversationHistory: conversationHistory || [],
             initialTabId: sender?.tab?.id,
+            modelOverride: message.model || null,
           });
           _debugLog(
             "[AutoDOM SW] Agent loop finished, length:",
@@ -2634,6 +2640,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             type: "AI_CHAT_RESPONSE",
             response: result.response,
             toolCalls: result.toolCalls || [],
+            model: message.model || aiProviderSettings.model || null,
             error: null,
           });
         } catch (err) {
