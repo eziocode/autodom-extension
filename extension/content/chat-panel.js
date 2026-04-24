@@ -184,10 +184,28 @@
     <button class="autodom-chat-suggestion" type="button" data-prompt="Find any forms on this page and describe their fields." role="listitem">Inspect forms</button>
   `;
 
+  // Rotating placeholder hints shown inside the chat textarea. These
+  // replace the verbose "What you can do" homepage block — the same
+  // ideas now surface one-at-a-time as a randomized prompt nudge.
+  const CHAT_PLACEHOLDERS = [
+    "Summarize this page or explain a form…",
+    'Try "click the login button" or "fill the search with…"',
+    "Ask about any button, field, or flow on this page",
+    "Inspect the DOM — tool calls stream live as cards",
+    "Hit Stop anytime; dangerous actions ask first",
+    "Navigate, scroll, or extract anything you can see",
+    "What forms are on this page? What do they do?",
+    "Message AutoDOM…",
+  ];
+  function pickChatPlaceholder() {
+    return CHAT_PLACEHOLDERS[
+      Math.floor(Math.random() * CHAT_PLACEHOLDERS.length)
+    ];
+  }
+
   function getWelcomeMarkup(options = {}) {
     const {
       subtitle,
-      includeCapabilities = false,
       includeTips = false,
       suggestionsId = "",
     } = options;
@@ -197,19 +215,6 @@
       <div class="autodom-chat-welcome">
         <h3>How can I help?</h3>
         <p class="welcome-sub">${subtitle}</p>
-        ${
-          includeCapabilities
-            ? `
-        <div class="welcome-section-label">What you can do</div>
-        <ul class="welcome-bullets">
-          <li><span><b>Summarize &amp; explain</b> — ask about this page, its forms, buttons, or flows.</span></li>
-          <li><span><b>Automate actions</b> — "click the login button", "fill the search with …", navigate, scroll.</span></li>
-          <li><span><b>Inspect the DOM</b> — live tool calls stream as cards so you can see what ran.</span></li>
-          <li><span><b>Stay in control</b> — hit <b>Stop</b> anytime; dangerous actions ask first.</span></li>
-        </ul>
-        `
-            : ""
-        }
         <div class="welcome-section-label">Try something</div>
         <div class="autodom-chat-welcome-suggestions"${suggestionsIdAttr} role="list" aria-label="Suggested prompts">
           ${WELCOME_SUGGESTIONS_HTML}
@@ -4199,7 +4204,6 @@
       ${getWelcomeMarkup({
         subtitle:
           'Ask naturally, tap a suggestion, or use <code>/commands</code>. AutoDOM understands the current page and can run safe browser actions for you.',
-        includeCapabilities: true,
         includeTips: true,
         suggestionsId: "__autodom_welcome_suggestions",
       })}
@@ -4551,6 +4555,16 @@
     "__autodom_inline_response_content",
   );
   const inlineHints = document.getElementById("__autodom_inline_hints");
+
+  // Pick a random placeholder for the textarea (and the inline quick
+  // input) on each chat reset / first paint. Surfaces the same hints
+  // that used to clutter the welcome panel, one at a time.
+  function rotateChatPlaceholder() {
+    const text = pickChatPlaceholder();
+    if (chatInput) chatInput.setAttribute("placeholder", text);
+    if (inlineInput) inlineInput.setAttribute("placeholder", text);
+  }
+  rotateChatPlaceholder();
 
   function applyChatTheme(theme) {
     const nextTheme = THEME_VALUES.has(theme) ? theme : "system";
@@ -5571,9 +5585,9 @@
     messagesContainer.innerHTML = getWelcomeMarkup({
       subtitle:
         "Conversation cleared. Start with a quick task below or ask anything about this page.",
-      includeCapabilities: true,
       includeTips: true,
     });
+    rotateChatPlaceholder();
   });
 
   // ─── Inline Overlay Toggle ─────────────────────────────────

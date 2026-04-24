@@ -1040,6 +1040,55 @@ function _agentSystemPrompt(context, providerInfo, cacheKey) {
   );
 }
 
+// ─── Tool-result dedup within an agent loop (jcodemunch hash trick) ──
+// Inside a single agent run the model often re-invokes the same read
+// tool (get_dom_state, get_page_info) and gets the same payload back.
+// Replaying the full payload each time wastes a lot of tokens — a
+// fresh DOM dump can be 4-8 KB. We hash each result; on collision we
+// replace the body with a short pointer ("same as step N") so the
+// model still sees a result entry but the bytes drop to <100 chars.
+//
+// Per-loop scope is intentional: stale-cache risk is bounded because
+// the helper is reset every agent invocation. Cross-loop dedup would
+// require invalidation on every page mutation, which isn't worth it.
+function _makeToolResultDeduper() {
+  const seen = new Map(); // hash -> { stepNumber, toolName }
+  let stepCounter = 0;
+  function hash(s) {
+    // FNV-1a 32-bit — fast, good distribution for short JSON.
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+    }
+    return h.toString(36);
+  }
+  return {
+    /**
+     * @param toolName tool that produced the result
+     * @param resultJson JSON-stringified result body
+     * @returns either the original resultJson, or a short dedup pointer.
+     */
+    process(toolName, resultJson) {
+      stepCounter++;
+      // Don't dedup tiny payloads — the pointer would be longer than
+      // the value and the saving is noise. 200 chars is the rough
+      // crossover where dedup actually pays off.
+      if (!resultJson || resultJson.length < 200) return resultJson;
+      const h = hash(resultJson);
+      const prev = seen.get(h);
+      if (prev) {
+        return JSON.stringify({
+          ok: true,
+          _dedup: `Identical to step ${prev.stepNumber} (${prev.toolName}). See that result above.`,
+        });
+      }
+      seen.set(h, { stepNumber: stepCounter, toolName });
+      return resultJson;
+    },
+  };
+}
+
 // Detect if the same tool+args has been called repeatedly without progress.
 // Caches the last serialized key so we don't pay a JSON.stringify hit on
 // every tool call in the hot agent loop — args can be large (DOM extracts,
@@ -1161,6 +1210,7 @@ async function runAgentLoop({
     const startedAt = Date.now();
     const callHistory = []; // for repeat-loop detection
     const accumulatedToolCalls = []; // surfaced as chips in final response
+    const deduper = _makeToolResultDeduper();
 
     // ── Abort / Stop plumbing ───────────────────────────────────
     // A single active run handle lets the chat panel send STOP_AGENT_RUN
@@ -1322,7 +1372,7 @@ async function runAgentLoop({
           messages.push({
             role: "tool",
             tool_call_id: tc.id,
-            content: JSON.stringify(result),
+            content: deduper.process(tc.name, JSON.stringify(result)),
           });
         }
       }
@@ -1452,7 +1502,7 @@ async function runAgentLoop({
           toolResultBlocks.push({
             type: "tool_result",
             tool_use_id: tc.id,
-            content: JSON.stringify(result),
+            content: deduper.process(tc.name, JSON.stringify(result)),
             is_error: !rawResult?.ok || !!rawResult?.error,
           });
         }
