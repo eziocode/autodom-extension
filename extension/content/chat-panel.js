@@ -294,6 +294,8 @@
   // Takes precedence over MODEL_CATALOG when non-empty.
   const _liveModels = {};
   const _modelFetchState = {}; // key → "idle" | "loading" | "error"
+  const _modelFetchFreshUntil = {}; // key → epoch ms
+  const MODEL_FETCH_TTL_MS = 30 * 1000;
   let _modelPickerStateLoaded = false;
   let _pendingActualModelId = "";
 
@@ -392,7 +394,15 @@
 
   function _requestProviderModels(force = false) {
     const key = _catalogKey();
-    if (!force && (_liveModels[key]?.length || _modelFetchState[key] === "loading")) return;
+    const hasFreshModels =
+      Array.isArray(_liveModels[key]) &&
+      _liveModels[key].length > 0 &&
+      Date.now() < (_modelFetchFreshUntil[key] || 0);
+    if (_modelFetchState[key] === "loading") return;
+    if (!force && hasFreshModels) {
+      _modelFetchState[key] = "idle";
+      return;
+    }
     _modelFetchState[key] = "loading";
     try {
       chrome.runtime.sendMessage(
@@ -401,6 +411,7 @@
           try { void chrome.runtime.lastError; } catch (_) {}
           if (resp && resp.ok && Array.isArray(resp.models) && resp.models.length) {
             _liveModels[key] = resp.models;
+            _modelFetchFreshUntil[key] = Date.now() + MODEL_FETCH_TTL_MS;
             _modelFetchState[key] = "idle";
           } else {
             _modelFetchState[key] = "error";
@@ -714,42 +725,89 @@
   }
   const MAX_PERSISTED_MESSAGES = 50;
   const THEME_VALUES = new Set(["system", "dark", "light"]);
+  const CHAT_STATE_PERSIST_MS = 120;
+  const LONG_LIVED_PERSIST_MS = 250;
+  let _chatStatePersistTimer = null;
+  let _pendingChatStateSnapshot = null;
+  let _longLivedPersistTimer = null;
+  let _pendingLongLivedSnapshot = null;
 
-  function persistChatState() {
-    if (_contextInvalidated) return;
+  function _buildChatStateSnapshot() {
+    return {
+      messages: messages.slice(-MAX_PERSISTED_MESSAGES),
+      history: conversationHistory.slice(-MAX_PERSISTED_MESSAGES),
+      open: isOpen ? "1" : "0",
+    };
+  }
+
+  function _writeSessionChatState(snapshot) {
+    sessionStorage.setItem(
+      STORAGE_KEY_MESSAGES,
+      JSON.stringify(snapshot.messages),
+    );
+    sessionStorage.setItem(
+      STORAGE_KEY_HISTORY,
+      JSON.stringify(snapshot.history),
+    );
+    sessionStorage.setItem(STORAGE_KEY_OPEN, snapshot.open);
+  }
+
+  function _flushLongLivedPersist() {
+    try { clearTimeout(_longLivedPersistTimer); } catch (_) {}
+    _longLivedPersistTimer = null;
+    const snapshot = _pendingLongLivedSnapshot;
+    _pendingLongLivedSnapshot = null;
+    if (!_chatSettings.persistAcrossSessions || !snapshot) return;
     try {
-      const trimmedMessages = messages.slice(-MAX_PERSISTED_MESSAGES);
-      const trimmedHistory = conversationHistory.slice(-MAX_PERSISTED_MESSAGES);
-      sessionStorage.setItem(
-        STORAGE_KEY_MESSAGES,
-        JSON.stringify(trimmedMessages),
-      );
-      sessionStorage.setItem(
-        STORAGE_KEY_HISTORY,
-        JSON.stringify(trimmedHistory),
-      );
-      sessionStorage.setItem(STORAGE_KEY_OPEN, isOpen ? "1" : "0");
-      // Long-lived mirror — only when the user opted in. Debounced
-      // because chrome.storage.local writes are async + cross-tab and
-      // we don't want to thrash on every keystroke / token.
+      chrome.storage?.local?.set?.({
+        [PERSIST_KEY_MESSAGES]: snapshot.messages,
+        [PERSIST_KEY_HISTORY]: snapshot.history,
+      });
+    } catch (_) {}
+  }
+
+  function _scheduleLongLivedPersist(snapshot, immediate = false) {
+    if (!_chatSettings.persistAcrossSessions || !snapshot) return;
+    _pendingLongLivedSnapshot = snapshot;
+    try { clearTimeout(_longLivedPersistTimer); } catch (_) {}
+    if (immediate) {
+      _flushLongLivedPersist();
+      return;
+    }
+    _longLivedPersistTimer = setTimeout(() => {
+      _flushLongLivedPersist();
+    }, LONG_LIVED_PERSIST_MS);
+  }
+
+  function _flushChatStatePersist(immediateLongLived = false) {
+    try { clearTimeout(_chatStatePersistTimer); } catch (_) {}
+    _chatStatePersistTimer = null;
+    const snapshot = _pendingChatStateSnapshot || _buildChatStateSnapshot();
+    _pendingChatStateSnapshot = null;
+    try {
+      _writeSessionChatState(snapshot);
       if (_chatSettings.persistAcrossSessions) {
-        _scheduleLongLivedPersist(trimmedMessages, trimmedHistory);
+        _scheduleLongLivedPersist(snapshot, immediateLongLived);
       }
     } catch (_) {}
   }
-  let _persistDebounce = null;
-  function _scheduleLongLivedPersist(msgs, hist) {
-    try { clearTimeout(_persistDebounce); } catch (_) {}
-    _persistDebounce = setTimeout(() => {
-      try {
-        chrome.storage?.local?.set?.({
-          [PERSIST_KEY_MESSAGES]: msgs,
-          [PERSIST_KEY_HISTORY]: hist,
-        });
-      } catch (_) {}
-    }, 250);
+
+  function persistChatState(immediate = false) {
+    if (_contextInvalidated) return;
+    _pendingChatStateSnapshot = _buildChatStateSnapshot();
+    if (immediate) {
+      _flushChatStatePersist(true);
+      return;
+    }
+    if (_chatStatePersistTimer) return;
+    _chatStatePersistTimer = setTimeout(() => {
+      _flushChatStatePersist();
+    }, CHAT_STATE_PERSIST_MS);
   }
   function _clearLongLivedPersist() {
+    try { clearTimeout(_longLivedPersistTimer); } catch (_) {}
+    _longLivedPersistTimer = null;
+    _pendingLongLivedSnapshot = null;
     try {
       chrome.storage?.local?.remove?.([
         PERSIST_KEY_MESSAGES,
@@ -815,12 +873,16 @@
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
             // Mirror back to sessionStorage so subsequent in-tab reloads
             // are served from the fast synchronous path.
-            persistChatState();
+            persistChatState(true);
           } catch (_) {}
         },
       );
     } catch (_) {}
   }
+
+  window.addEventListener("pagehide", () => {
+    try { persistChatState(true); } catch (_) {}
+  });
 
   // ─── Inject Styles ─────────────────────────────────────────
   const style = document.createElement("style");
@@ -1025,6 +1087,62 @@
     html.__autodom_panel_resizing * {
       cursor: ew-resize !important;
       user-select: none !important;
+    }
+    /* ─── Collapsed (rail) state ──────────────────────────────
+       When the user collapses the panel it shrinks to a 44px vertical
+       rail showing just the AutoDOM logo + an expand affordance. The
+       full chat surface stays mounted (preserves scroll position,
+       composer draft, in-flight requests) but is visually hidden;
+       clicking the rail or hitting the keyboard shortcut restores
+       the previous width. Per-host preference, persisted. */
+    #${PANEL_ID}.is-collapsed {
+      cursor: pointer !important;
+    }
+    #${PANEL_ID}.is-collapsed > *:not(.autodom-chat-resize-handle):not(.autodom-chat-rail) {
+      visibility: hidden !important;
+      pointer-events: none !important;
+    }
+    #${PANEL_ID}.is-collapsed .autodom-chat-resize-handle {
+      pointer-events: none !important;
+    }
+    .autodom-chat-rail {
+      display: none !important;
+      position: absolute !important;
+      inset: 0 !important;
+      flex-direction: column !important;
+      align-items: center !important;
+      justify-content: flex-start !important;
+      padding: 14px 0 !important;
+      gap: 12px !important;
+      background: transparent !important;
+      pointer-events: auto !important;
+      z-index: 3 !important;
+    }
+    #${PANEL_ID}.is-collapsed .autodom-chat-rail {
+      display: flex !important;
+    }
+    .autodom-chat-rail-logo {
+      width: 24px !important;
+      height: 24px !important;
+      border-radius: 6px !important;
+      background: linear-gradient(135deg, #6aa4ff, #c46aff) !important;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3) !important;
+    }
+    .autodom-chat-rail-icon {
+      width: 18px !important;
+      height: 18px !important;
+      color: var(--c-text-muted, #a0a0a8) !important;
+      transition: color 0.15s ease !important;
+    }
+    #${PANEL_ID}.is-collapsed:hover .autodom-chat-rail-icon {
+      color: var(--c-text, #e8e8ec) !important;
+    }
+    /* Header collapse toggle — chevron flips when collapsed. */
+    #__autodom_collapse_btn svg {
+      transition: transform 0.2s ease !important;
+    }
+    #${PANEL_ID}.is-collapsed #__autodom_collapse_btn svg {
+      transform: rotate(180deg) !important;
     }
     #${PANEL_ID} * {
       box-sizing: border-box;
@@ -3853,6 +3971,13 @@
          aria-valuemax="800"
          aria-valuenow="440"
          tabindex="0"></div>
+    <!-- Collapsed-state rail (only visible when panel.is-collapsed). -->
+    <div class="autodom-chat-rail" id="__autodom_rail" role="button" tabindex="0" aria-label="Expand chat panel" title="Expand panel (Ctrl/⌘+Alt+\\)">
+      <div class="autodom-chat-rail-logo" aria-hidden="true"></div>
+      <svg class="autodom-chat-rail-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M15 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </div>
     <!-- Header -->
     <div class="autodom-chat-header" role="banner">
       <div class="autodom-chat-header-left">
@@ -3875,6 +4000,9 @@
           <option value="dark">Dark</option>
           <option value="light">Light</option>
         </select>
+        <button class="autodom-chat-header-btn" id="__autodom_collapse_btn" title="Collapse panel (Ctrl/⌘+Alt+\\)" aria-label="Collapse chat panel" aria-controls="${PANEL_ID}">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
         <button class="autodom-chat-header-btn" id="__autodom_settings_btn" title="Chat settings" aria-label="Chat settings" aria-haspopup="true" aria-expanded="false">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         </button>
@@ -4320,7 +4448,7 @@
     }
     updateContext();
     checkConnectionStatus();
-    persistChatState();
+    persistChatState(true);
     _updateAutomationUi();
   }
 
@@ -4329,7 +4457,7 @@
     isOpen = false;
     panel.classList.remove("open");
     _setHtmlPushed(false);
-    persistChatState();
+    persistChatState(true);
     _updateAutomationUi();
     // Closing the panel should not kill automation; _updateAutomationUi()
     // swaps to the floating Stop button so the run can continue safely.
@@ -4353,34 +4481,13 @@
   //   from claiming the gesture for page scroll on touchscreens.
   // - Keyboard: Left/Right adjust by 16px, Shift+arrow by 64px, Home/End
   //   jump to min/max. ARIA value attrs keep AT in sync.
+  // - All width writes go through _setPanelWidthForHost so the per-host
+  //   override map stays the source of truth.
   (function _wireResizeHandle() {
     const handle = panel.querySelector("#__autodom_resize_handle");
     if (!handle) return;
     const STEP = 16;
     const STEP_LARGE = 64;
-
-    function _syncAria() {
-      const w = _clampPanelWidth(_chatSettings.panelWidth);
-      handle.setAttribute("aria-valuemin", String(PANEL_WIDTH_MIN));
-      handle.setAttribute(
-        "aria-valuemax",
-        String(Math.min(PANEL_WIDTH_MAX, Math.floor(window.innerWidth * 0.8))),
-      );
-      handle.setAttribute("aria-valuenow", String(w));
-      handle.setAttribute("aria-valuetext", w + " pixels");
-    }
-    _syncAria();
-
-    function _commitWidth(next, persist) {
-      const w = _clampPanelWidth(next);
-      _chatSettings.panelWidth = w;
-      document.documentElement.style.setProperty(
-        "--autodom-panel-w",
-        w + "px",
-      );
-      _syncAria();
-      if (persist) _saveChatSettings();
-    }
 
     let dragging = false;
     let startX = 0;
@@ -4391,7 +4498,7 @@
       if (!dragging || e.pointerId !== activePointerId) return;
       // Width grows as the cursor moves left (panel anchored to the right).
       const delta = startX - e.clientX;
-      _commitWidth(startW + delta, false);
+      _setPanelWidthForHost(startW + delta, false);
       e.preventDefault();
     };
     const onEnd = (e) => {
@@ -4410,10 +4517,13 @@
     handle.addEventListener("pointerdown", (e) => {
       // Primary button only (mouse left / touch contact / pen tip).
       if (e.pointerType === "mouse" && e.button !== 0) return;
+      // Don't allow drag-resize while in collapsed (rail) state — clicking
+      // the rail should expand, not subtly drag a hidden width slider.
+      if (_isCollapsedForHost()) return;
       dragging = true;
       activePointerId = e.pointerId;
       startX = e.clientX;
-      startW = _clampPanelWidth(_chatSettings.panelWidth);
+      startW = _resolvedPanelWidth();
       panel.classList.add("is-resizing");
       document.documentElement.classList.add("__autodom_panel_resizing");
       try { handle.setPointerCapture(e.pointerId); } catch (_) {}
@@ -4423,16 +4533,15 @@
       e.preventDefault();
       e.stopPropagation();
     });
-    // Double-click resets to the default width.
+    // Double-click resets to the default width for this host.
     handle.addEventListener("dblclick", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      _commitWidth(PANEL_WIDTH_DEFAULT, true);
+      _setPanelWidthForHost(PANEL_WIDTH_DEFAULT, true);
     });
     // Keyboard accessibility: focus the handle then nudge with arrows.
-    handle.setAttribute("tabindex", "0");
     handle.addEventListener("keydown", (e) => {
-      const w = _clampPanelWidth(_chatSettings.panelWidth);
+      const w = _resolvedPanelWidth();
       const step = e.shiftKey ? STEP_LARGE : STEP;
       let next = null;
       // Left arrow widens the panel (since panel is anchored right);
@@ -4448,9 +4557,97 @@
       } else return;
       e.preventDefault();
       e.stopPropagation();
-      _commitWidth(next, true);
+      _setPanelWidthForHost(next, true);
     });
   })();
+
+  // ─── Collapse / rail wiring ────────────────────────────────
+  // The collapse button (header) and the rail (visible only when
+  // collapsed) both toggle/expand respectively. Per-host preference,
+  // persisted via _setCollapsedForHost.
+  (function _wireCollapse() {
+    const collapseBtn = document.getElementById("__autodom_collapse_btn");
+    const rail = document.getElementById("__autodom_rail");
+    if (collapseBtn) {
+      collapseBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        _setCollapsedForHost(!_isCollapsedForHost(), true);
+      });
+    }
+    if (rail) {
+      const expand = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        _setCollapsedForHost(false, true);
+      };
+      rail.addEventListener("click", expand);
+      rail.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") expand(e);
+      });
+    }
+  })();
+
+  // ─── Cross-tab settings sync ───────────────────────────────
+  // When another tab changes width / collapse / verbose flags, mirror the
+  // change here so two tabs on the same site stay visually in lock-step.
+  if (chrome?.storage?.onChanged && !window.__autodom_panel_storage_bound) {
+    window.__autodom_panel_storage_bound = true;
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local") return;
+      const c = changes[STORAGE_KEY_SETTINGS];
+      if (!c || !c.newValue || typeof c.newValue !== "object") return;
+      const s = c.newValue;
+      if (typeof s.verboseLogs === "boolean") _chatSettings.verboseLogs = s.verboseLogs;
+      if (typeof s.panelWidth === "number")
+        _chatSettings.panelWidth = _clampPanelWidth(s.panelWidth);
+      if (s.widthByHost && typeof s.widthByHost === "object")
+        _chatSettings.widthByHost = { ...s.widthByHost };
+      if (s.collapsedByHost && typeof s.collapsedByHost === "object")
+        _chatSettings.collapsedByHost = { ...s.collapsedByHost };
+      try { _applyVerboseAttr(); } catch (_) {}
+      try { _applyPanelWidth(); } catch (_) {}
+    });
+  }
+
+  // ─── Width / collapse keyboard shortcuts ───────────────────
+  // In-page listener (no manifest commands consumed) so we don't burn
+  // through Chrome's 4-shortcut quota — the panel-toggle and inline-AI
+  // toggle already use two of those slots.
+  //   Ctrl/Cmd+Alt+\  → toggle collapse
+  //   Ctrl/Cmd+Alt+[  → cycle to narrower preset
+  //   Ctrl/Cmd+Alt+]  → cycle to wider preset
+  // Alt is in the combo specifically to avoid clobbering host-page bindings
+  // like Cmd+[ (Back) and Cmd+] (Forward).
+  if (!window.__autodom_panel_keys_bound) {
+    window.__autodom_panel_keys_bound = true;
+    window.addEventListener(
+      "keydown",
+      (e) => {
+        // Only act when the panel is actually open (or rail visible).
+        if (!isOpen) return;
+        const mod = e.metaKey || e.ctrlKey;
+        if (!mod || !e.altKey || e.shiftKey) return;
+        const k = e.key;
+        if (k === "\\" || e.code === "Backslash") {
+          e.preventDefault();
+          e.stopPropagation();
+          _setCollapsedForHost(!_isCollapsedForHost(), true);
+        } else if (k === "[" || e.code === "BracketLeft") {
+          e.preventDefault();
+          e.stopPropagation();
+          if (_isCollapsedForHost()) _setCollapsedForHost(false, true);
+          _cyclePanelWidth(-1);
+        } else if (k === "]" || e.code === "BracketRight") {
+          e.preventDefault();
+          e.stopPropagation();
+          if (_isCollapsedForHost()) _setCollapsedForHost(false, true);
+          _cyclePanelWidth(+1);
+        }
+      },
+      true,
+    );
+  }
 
   // If the viewport shrinks below the current panel width (e.g. user
   // narrows the window or rotates a tablet), re-clamp so the panel
@@ -4462,12 +4659,14 @@
   if (!window.__autodom_panel_resize_bound) {
     window.__autodom_panel_resize_bound = true;
     window.addEventListener("resize", () => {
-      const before = _chatSettings.panelWidth;
+      const before = _resolvedPanelWidth();
       const after = _clampPanelWidth(before);
       if (after !== before) {
-        _chatSettings.panelWidth = after;
+        _setPanelWidthForHost(after, true);
+      } else {
+        // Even when the resolved width didn't change, the dynamic ceiling
+        // (80vw) used by ARIA may have shifted — refresh attributes.
         _applyPanelWidth();
-        _saveChatSettings();
       }
     });
   }
@@ -4480,8 +4679,9 @@
   function _modelPickerOpen() {
     if (!_modelPickerMenu || !_modelPickerBtn) return;
     // Refresh from the provider on every open so newly pulled Ollama
-    // models / revoked OpenAI keys / switched CLI kinds show up.
-    _requestProviderModels(true);
+    // models / revoked OpenAI keys / switched CLI kinds show up, without
+    // doing a network/storage round-trip on every single open.
+    _requestProviderModels();
     _renderModelMenu();
     _modelPickerMenu.hidden = false;
     _modelPickerBtn.setAttribute("aria-expanded", "true");
@@ -4731,10 +4931,7 @@
       if (_chatSettings.persistAcrossSessions) {
         // Toggling ON: snapshot the current chat into long-lived storage
         // immediately so the user gets the protection right away.
-        _scheduleLongLivedPersist(
-          messages.slice(-MAX_PERSISTED_MESSAGES),
-          conversationHistory.slice(-MAX_PERSISTED_MESSAGES),
-        );
+        _scheduleLongLivedPersist(_buildChatStateSnapshot(), true);
       } else if (wasOn) {
         // Toggling OFF: don't keep stale data in chrome.storage.local.
         _clearLongLivedPersist();
@@ -4776,7 +4973,7 @@
     _disarmClear();
     messages = [];
     conversationHistory = [];
-    persistChatState();
+    persistChatState(true);
     // Always wipe the long-lived mirror too — "Clear" should mean
     // cleared everywhere, regardless of the persistence toggle.
     _clearLongLivedPersist();
@@ -4913,6 +5110,7 @@
     if (_contextInvalidated) return;
     const wasOpen = isOpen;
     const wasInline = inlineMode;
+    try { persistChatState(true); } catch (_) {}
     _contextInvalidated = true;
     if (_statusPollInterval) {
       clearInterval(_statusPollInterval);

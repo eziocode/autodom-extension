@@ -3592,7 +3592,10 @@ async function toolScreenshot(params) {
 
   // Temporarily hide AutoDOM's own injected UI (chat panel, overlays,
   // stop button, run indicator) so the screenshot reflects what the
-  // user is automating — not our own widgets.
+  // user is automating — not our own widgets. We also need to drop the
+  // page-push class on <html> so the host page reflows to the full
+  // viewport width; otherwise hiding the panel leaves a blank band on
+  // the right where the panel's margin was reserving space.
   const HIDE_IDS = [
     "__autodom_chat_panel",
     "__autodom_inline_overlay",
@@ -3603,13 +3606,15 @@ async function toolScreenshot(params) {
     "__bmcp_session_border_badge",
   ];
   const HIDE_MARK = "data-autodom-screenshot-hidden";
+  const PUSH_CLASS = "__autodom_panel_open";
+  const PUSH_MARK = "data-autodom-screenshot-unpushed";
 
   async function setHiddenState(hidden) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        args: [HIDE_IDS, HIDE_MARK, hidden],
-        func: (ids, mark, on) => {
+        args: [HIDE_IDS, HIDE_MARK, PUSH_CLASS, PUSH_MARK, hidden],
+        func: (ids, mark, pushClass, pushMark, on) => {
           for (const id of ids) {
             const el = document.getElementById(id);
             if (!el) continue;
@@ -3623,6 +3628,23 @@ async function toolScreenshot(params) {
               el.removeAttribute(mark);
             }
           }
+          // Drop / restore the html.__autodom_panel_open class so the
+          // host page reflows to the full viewport width during the
+          // capture and snaps back afterwards. Marker attribute remembers
+          // whether the class was originally present so we don't add it
+          // back on pages where the panel was closed.
+          const html = document.documentElement;
+          if (html) {
+            if (on) {
+              if (html.classList.contains(pushClass)) {
+                html.setAttribute(pushMark, "1");
+                html.classList.remove(pushClass);
+              }
+            } else if (html.hasAttribute(pushMark)) {
+              html.classList.add(pushClass);
+              html.removeAttribute(pushMark);
+            }
+          }
         },
       });
     } catch (_e) {
@@ -3634,8 +3656,9 @@ async function toolScreenshot(params) {
   try {
     await setHiddenState(true);
     hidden = true;
-    // One animation frame so the visibility change paints before capture.
-    await new Promise((r) => setTimeout(r, 30));
+    // Two animation frames so the reflow + visibility change paint
+    // before capture. 60ms covers most layout settles on slow pages.
+    await new Promise((r) => setTimeout(r, 60));
 
     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
       format: params?.format || "png",
