@@ -91,6 +91,10 @@ body {
     font: 13px/1.5 var(--font);
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
+    /* Flex column so .app stretches to the viewport — keeps the
+       footer pinned at the bottom when content is short. */
+    display: flex;
+    flex-direction: column;
 }
 
 /* ─── App Shell ─────────────────────────── */
@@ -98,16 +102,49 @@ body {
 .app {
     display: flex;
     flex-direction: column;
+    flex: 1 0 auto;
     min-height: 480px;
     padding: 14px;
     gap: 10px;
 }
 
 .app-main {
-    flex: 1;
+    flex: 1 0 auto;
     display: flex;
     flex-direction: column;
     gap: 10px;
+}
+
+/* Sticky header + tab bar — they always remain visible while the
+   main content scrolls. Chained sticky: tab-bar sits directly
+   beneath the header so the offsets stack naturally. */
+.app-header {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    background: var(--bg);
+    /* Bleed the sticky band over the .app padding so content
+       scrolling underneath doesn't peek out at the edges. */
+    margin: -14px -14px 0;
+    padding: 14px 14px 8px;
+}
+.tab-bar {
+    position: sticky;
+    /* Sits flush under .app-header (which renders ~58px tall in
+       practice incl. its padding). Using a slightly smaller offset
+       keeps a 1px overlap so there's no transparent seam. */
+    top: 58px;
+    z-index: 29;
+    background: var(--bg);
+    /* Same bleed treatment so the sticky band paints edge-to-edge. */
+    margin: 0 -14px;
+    padding: 0 14px 6px;
+}
+
+/* Footer — always docks to the bottom of the viewport even when the
+   tab body is short; scrolls away naturally on long tabs. */
+.footer {
+    margin-top: auto;
 }
 
 /* ─── Header ────────────────────────────── */
@@ -117,7 +154,6 @@ body {
     align-items: flex-start;
     justify-content: space-between;
     gap: 12px;
-    padding-bottom: 2px;
 }
 
 .brand-block {
@@ -1176,10 +1212,13 @@ select.config-input {
 body.embedded {
     width: auto !important;
     min-width: 0 !important;
-    min-height: 0 !important;
+    /* Match the iframe height so the sticky header / pinned footer
+       behave the same in embedded mode as they do in the toolbar
+       popup — short tabs still dock the footer to the bottom. */
+    min-height: 100vh !important;
 }
 body.embedded .app {
-    min-height: 0;
+    min-height: 100vh;
     width: 100%;
     box-sizing: border-box;
 }
