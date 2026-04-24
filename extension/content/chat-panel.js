@@ -792,11 +792,11 @@
     } catch (_) {}
   }
 
-  function persistChatState(immediate = false) {
+  function persistChatState(immediate = false, flushLongLived = false) {
     if (_contextInvalidated) return;
     _pendingChatStateSnapshot = _buildChatStateSnapshot();
     if (immediate) {
-      _flushChatStatePersist(true);
+      _flushChatStatePersist(flushLongLived);
       return;
     }
     if (_chatStatePersistTimer) return;
@@ -880,9 +880,12 @@
     } catch (_) {}
   }
 
-  window.addEventListener("pagehide", () => {
-    try { persistChatState(true); } catch (_) {}
-  });
+  if (!window.__autodom_chat_persist_flush_bound) {
+    window.__autodom_chat_persist_flush_bound = true;
+    window.addEventListener("pagehide", () => {
+      try { persistChatState(true, true); } catch (_) {}
+    });
+  }
 
   // ─── Inject Styles ─────────────────────────────────────────
   const style = document.createElement("style");
@@ -1289,6 +1292,8 @@
       flex-direction: column;
       gap: 1px;
       min-width: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
     }
     .autodom-chat-header-title {
       font-size: 14px;
@@ -1296,7 +1301,10 @@
       color: var(--c-text);
       letter-spacing: -0.01em;
       white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
       line-height: 1.2;
+      max-width: 100%;
     }
 
     /* Status: now a tiny dot + label living UNDER the title */
@@ -1311,7 +1319,10 @@
       text-transform: none;
       transition: color 0.15s ease;
       white-space: nowrap;
-      flex-shrink: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      flex-shrink: 1;
+      max-width: 100%;
       line-height: 1.2;
       display: inline-flex;
       align-items: center;
@@ -1442,6 +1453,8 @@
       display: flex;
       align-items: center;
       gap: 6px;
+      flex-shrink: 0;
+      flex-wrap: nowrap;
     }
     .autodom-chat-theme-select {
       appearance: none !important;
@@ -4443,7 +4456,9 @@
     _applyPanelWidth();
     _setHtmlPushed(true);
     panel.classList.add("open");
-    if (chatInput) {
+    // Skip focus when opening into collapsed (rail) state — focusing an
+    // invisible textarea steals focus from the host page for no benefit.
+    if (chatInput && !_isCollapsedForHost()) {
       chatInput.focus();
     }
     updateContext();
@@ -5110,7 +5125,7 @@
     if (_contextInvalidated) return;
     const wasOpen = isOpen;
     const wasInline = inlineMode;
-    try { persistChatState(true); } catch (_) {}
+    try { persistChatState(true, true); } catch (_) {}
     _contextInvalidated = true;
     if (_statusPollInterval) {
       clearInterval(_statusPollInterval);

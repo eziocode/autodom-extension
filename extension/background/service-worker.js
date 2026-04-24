@@ -254,6 +254,60 @@ async function _testProviderConnection(p) {
 // Returns an array of { id, label, description } suitable for the picker.
 // Always resolves (never rejects) — errors just become an empty list so the
 // UI falls back to its static catalog.
+const PROVIDER_MODEL_CACHE_TTL_MS = 60 * 1000;
+const _providerModelCache = new Map();
+
+function _providerModelCacheFingerprint(value) {
+  const s = String(value || "");
+  let hash = 0;
+  for (let i = 0; i < s.length; i += 1) {
+    hash = ((hash << 5) - hash + s.charCodeAt(i)) | 0;
+  }
+  return String(hash >>> 0);
+}
+
+function _providerModelCacheKey(p) {
+  const rawSource = (p?.source || "ide").toLowerCase();
+  const source =
+    rawSource === "gpt" ? "openai" : rawSource === "claude" ? "anthropic" : rawSource;
+  const baseUrlRaw = String(p?.baseUrl || "").trim();
+  const cliKind = String(p?.cliKind || "").toLowerCase();
+  const parts = [source];
+  if (source === "openai") {
+    const base = (baseUrlRaw || "https://api.openai.com/v1")
+      .toLowerCase()
+      .replace(/\/+$/, "");
+    parts.push(base, _providerModelCacheFingerprint(p?.apiKey || ""));
+  } else if (source === "ollama") {
+    const base = (baseUrlRaw || "http://localhost:11434")
+      .toLowerCase()
+      .replace(/\/+$/, "");
+    parts.push(base);
+  } else if (source === "ide" || source === "cli") {
+    parts.push(cliKind || "custom");
+  }
+  return parts.join("::");
+}
+
+function _getCachedProviderModels(p) {
+  const key = _providerModelCacheKey(p);
+  const entry = _providerModelCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    _providerModelCache.delete(key);
+    return null;
+  }
+  return entry.models.map((model) => ({ ...model }));
+}
+
+function _setCachedProviderModels(p, models) {
+  if (!Array.isArray(models) || models.length === 0) return;
+  _providerModelCache.set(_providerModelCacheKey(p), {
+    expiresAt: Date.now() + PROVIDER_MODEL_CACHE_TTL_MS,
+    models: models.map((model) => ({ ...model })),
+  });
+}
+
 async function _fetchProviderModels(p) {
   const TIMEOUT_MS = 6000;
   const source = (p?.source || "ide").toLowerCase();
@@ -2168,7 +2222,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // anthropic and CLI-backed IDE providers (no public list endpoint).
   if (message.type === "LIST_PROVIDER_MODELS") {
     _readCurrentProviderSettings()
-      .then((settings) => _fetchProviderModels(settings))
+      .then((settings) => {
+        const cached = _getCachedProviderModels(settings);
+        if (cached !== null) return cached;
+        return _fetchProviderModels(settings).then((models) => {
+          _setCachedProviderModels(settings, models);
+          return models;
+        });
+      })
       .then((models) => sendResponse({ ok: true, models }))
       .catch((err) =>
         sendResponse({ ok: false, error: err?.message || String(err), models: [] }),
