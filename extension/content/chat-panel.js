@@ -1934,8 +1934,8 @@
       pointer-events: auto;
       transform: translate(-50%, 0) scale(1);
     }
-    /* Hard reset to defeat host page CSS leakage onto generic class names like .title/.logo/.dot */
-    #${INLINE_OVERLAY_ID},
+    /* Hard reset to defeat host page CSS leakage onto generic class names like .title/.logo/.dot.
+       Scoped to descendants only — the overlay container itself keeps its bg/border/shadow. */
     #${INLINE_OVERLAY_ID} * {
       box-sizing: border-box;
       margin: 0;
