@@ -46,6 +46,15 @@ const DOM = {
   rateLimitWindow: $("#rateLimitWindow"),
   rateLimitSettings: $("#rateLimitSettings"),
   confirmSubmitToggle: $("#confirmSubmitToggle"),
+  scriptBackend: $("#scriptBackend"),
+  scriptFile: $("#scriptFile"),
+  scriptSource: $("#scriptSource"),
+  scriptTimeout: $("#scriptTimeout"),
+  validateScriptBtn: $("#validateScriptBtn"),
+  runScriptBtn: $("#runScriptBtn"),
+  scriptStatus: $("#scriptStatus"),
+  scriptOutput: $("#scriptOutput"),
+  clearScriptOutputBtn: $("#clearScriptOutputBtn"),
 };
 
 let isRunning = false;
@@ -515,6 +524,8 @@ const _secretAreaName =
       saveProviderSettings();
     });
   }
+
+  initScriptRunner();
 });
 
 // ─── Tab Switching ───────────────────────────────────────────
@@ -1006,6 +1017,125 @@ if (DOM.confirmSubmitToggle) {
       type: "UPDATE_GUARDRAILS",
       confirmBeforeSubmit: DOM.confirmSubmitToggle.checked,
     });
+  });
+}
+
+// ─── Local Automation Script Runner ─────────────────────────
+
+function getScriptRequestPayload() {
+  const backend = DOM.scriptBackend?.value || "browser-extension";
+  const source = DOM.scriptSource?.value || "";
+  const timeoutMs = Math.max(
+    1000,
+    parseInt(DOM.scriptTimeout?.value || "15000", 10) || 15000,
+  );
+  return {
+    backend,
+    source,
+    timeoutMs,
+    browser: "chromium",
+    headless: true,
+    params: {},
+  };
+}
+
+function setScriptStatus(text, level = "info") {
+  if (!DOM.scriptStatus) return;
+  DOM.scriptStatus.textContent = text;
+  DOM.scriptStatus.dataset.level = level;
+}
+
+function renderScriptOutput(result) {
+  if (!DOM.scriptOutput) return;
+  DOM.scriptOutput.textContent =
+    typeof result === "string" ? result : JSON.stringify(result, null, 2);
+}
+
+async function validateScriptSource() {
+  const { backend, source } = getScriptRequestPayload();
+  if (!source.trim()) {
+    return { ok: false, error: "Choose a local file or paste script source." };
+  }
+  return await sendRuntimeMessage({
+    type: "VALIDATE_AUTOMATION_SCRIPT",
+    params: getScriptRequestPayload(),
+  });
+}
+
+function initScriptRunner() {
+  if (!DOM.scriptBackend || !DOM.scriptSource) return;
+
+  DOM.scriptFile?.addEventListener("change", async () => {
+    const file = DOM.scriptFile.files && DOM.scriptFile.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      DOM.scriptSource.value = text;
+      setScriptStatus(`Loaded ${file.name} (${text.length} chars).`, "success");
+      addLog(`Loaded automation script: ${file.name}`, "success");
+    } catch (err) {
+      setScriptStatus(`Failed to read file: ${err.message}`, "error");
+      addLog(`Script file read failed: ${err.message}`, "error");
+    }
+  });
+
+  DOM.validateScriptBtn?.addEventListener("click", async () => {
+    const result = await validateScriptSource();
+    if (result.ok) {
+      setScriptStatus(`Validation OK · ${result.backend}`, "success");
+      addLog(`Automation script validated (${result.backend})`, "success");
+    } else {
+      setScriptStatus(result.error, "error");
+      addLog(`Automation validation failed: ${result.error}`, "error");
+    }
+    renderScriptOutput(result);
+  });
+
+  DOM.runScriptBtn?.addEventListener("click", async () => {
+    const validation = await validateScriptSource();
+    if (!validation.ok) {
+      setScriptStatus(validation.error, "error");
+      renderScriptOutput(validation);
+      return;
+    }
+
+    const payload = getScriptRequestPayload();
+    DOM.runScriptBtn.disabled = true;
+    DOM.validateScriptBtn.disabled = true;
+    setScriptStatus(`Running ${payload.backend} script...`, "info");
+    renderScriptOutput("Running...");
+    try {
+      const result = await sendRuntimeMessage({
+        type: "RUN_AUTOMATION_SCRIPT",
+        params: payload,
+      });
+      renderScriptOutput(result);
+      if (result?.ok || result?.success) {
+        setScriptStatus(
+          `Completed in ${result.elapsedMs || 0}ms · ${payload.backend}`,
+          "success",
+        );
+        addLog(`Automation completed (${payload.backend})`, "success");
+      } else {
+        const err = result?.error || "Automation failed";
+        setScriptStatus(err.substring(0, 160), "error");
+        addLog(`Automation failed: ${err}`, "error");
+      }
+    } catch (err) {
+      setScriptStatus(err.message || String(err), "error");
+      renderScriptOutput({ ok: false, error: err.message || String(err) });
+    } finally {
+      DOM.runScriptBtn.disabled = false;
+      DOM.validateScriptBtn.disabled = false;
+    }
+  });
+
+  DOM.clearScriptOutputBtn?.addEventListener("click", () => {
+    renderScriptOutput("No script run yet.");
+    setScriptStatus(
+      "Browser extension scripts run in the active tab. Playwright/Node scripts run locally through MCP.",
+      "info",
+    );
   });
 }
 

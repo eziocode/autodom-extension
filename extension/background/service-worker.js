@@ -609,6 +609,7 @@ function _agentSystemPrompt(context) {
     "Plan briefly, then call tools to get fresh page state (get_dom_state / get_page_info), " +
     "and act (click_by_index, type_text, navigate, etc.). Prefer click_by_index/type_by_index " +
     "after a get_dom_state for reliability. When a task spans tabs, use list_tabs/switch_tab/open_new_tab. " +
+    "When content opens in a browser popup/window, use wait_for_popup/list_popups and switch_to_popup before reading or acting there. " +
     "Tool results may be truncated. When you have a final answer or finished the user's task, " +
     "STOP calling tools and return your final markdown reply (Anthropic/OpenAI: stop after " +
     "your last tool result; or call respond_to_user to end explicitly). Don't repeat the same " +
@@ -1484,6 +1485,24 @@ function connectWebSocket(port) {
           return;
         }
 
+        if (message.type === "AUTOMATION_SCRIPT_RESULT") {
+          const pending = pendingAutomationRuns.get(message.id);
+          if (pending) {
+            pendingAutomationRuns.delete(message.id);
+            pending.resolve(message.result || { ok: false, error: "Empty automation result" });
+          }
+          return;
+        }
+
+        if (message.type === "AUTOMATION_SCRIPT_VALIDATION") {
+          const pending = pendingAutomationValidations.get(message.id);
+          if (pending) {
+            pendingAutomationValidations.delete(message.id);
+            pending.resolve(message.result || { ok: false, error: "Empty validation result" });
+          }
+          return;
+        }
+
         // Handle AI chat responses from the bridge server
         if (message.type === "AI_CHAT_RESPONSE") {
           _debugLog(
@@ -1928,6 +1947,124 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: err.message });
     }
     return true; // async
+  }
+
+  if (message.type === "RUN_AUTOMATION_SCRIPT") {
+    const params = message.params || {};
+    if ((params.backend || "browser-extension") === "browser-extension") {
+      (async () => {
+        try {
+          const result = await toolRunBrowserScript({
+            source: params.source || "",
+            params: params.params || {},
+            timeoutMs: params.timeoutMs || 15000,
+          });
+          sendResponse(result);
+        } catch (err) {
+          sendResponse({ ok: false, status: "error", error: err?.message || String(err) });
+        }
+      })();
+      return true;
+    }
+
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      sendResponse({
+        ok: false,
+        status: "error",
+        error:
+          "MCP bridge not connected. Connect MCP first to run Playwright/Node automation scripts locally.",
+      });
+      return false;
+    }
+
+    const id = ++automationRunIdCounter;
+    const timeoutMs = params.timeoutMs || 60000;
+    const timer = setTimeout(() => {
+      if (pendingAutomationRuns.has(id)) {
+        pendingAutomationRuns.delete(id);
+        sendResponse({
+          ok: false,
+          status: "timeout",
+          error: `Automation did not respond within ${timeoutMs}ms`,
+        });
+      }
+    }, timeoutMs + 3000);
+    pendingAutomationRuns.set(id, {
+      resolve: (result) => {
+        clearTimeout(timer);
+        sendResponse(result);
+      },
+    });
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "RUN_AUTOMATION_SCRIPT",
+          id,
+          params,
+        }),
+      );
+    } catch (err) {
+      pendingAutomationRuns.delete(id);
+      clearTimeout(timer);
+      sendResponse({ ok: false, status: "error", error: err.message });
+    }
+    return true;
+  }
+
+  if (message.type === "VALIDATE_AUTOMATION_SCRIPT") {
+    const params = message.params || {};
+    if ((params.backend || "browser-extension") === "browser-extension") {
+      try {
+        new Function(
+          "params",
+          "log",
+          `"use strict"; return (async () => {\n${params.source || ""}\n})()`,
+        );
+        sendResponse({ ok: true, backend: "browser-extension" });
+      } catch (err) {
+        sendResponse({
+          ok: false,
+          backend: "browser-extension",
+          error: `JavaScript syntax error: ${err.message}`,
+        });
+      }
+      return false;
+    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      sendResponse({
+        ok: false,
+        error:
+          "MCP bridge not connected. Connect MCP first to validate Playwright/Node scripts.",
+      });
+      return false;
+    }
+    const id = ++automationValidationIdCounter;
+    const timer = setTimeout(() => {
+      if (pendingAutomationValidations.has(id)) {
+        pendingAutomationValidations.delete(id);
+        sendResponse({ ok: false, error: "Validation did not respond in time" });
+      }
+    }, 8000);
+    pendingAutomationValidations.set(id, {
+      resolve: (result) => {
+        clearTimeout(timer);
+        sendResponse(result);
+      },
+    });
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "VALIDATE_AUTOMATION_SCRIPT",
+          id,
+          params,
+        }),
+      );
+    } catch (err) {
+      pendingAutomationValidations.delete(id);
+      clearTimeout(timer);
+      sendResponse({ ok: false, error: err.message });
+    }
+    return true;
   }
 
   if (message.type === "ACTIVITY_LOG_APPEND") {
@@ -2665,6 +2802,10 @@ function refreshAiRequestActivity() {
 // Pending CLI presence-check requests (popup → SW → bridge → spawn → back)
 const pendingCliChecks = new Map();
 let cliCheckIdCounter = 0;
+const pendingAutomationRuns = new Map();
+let automationRunIdCounter = 0;
+const pendingAutomationValidations = new Map();
+let automationValidationIdCounter = 0;
 
 function resolvePendingAiRequests(error) {
   for (const [id, pending] of pendingAiRequests.entries()) {
@@ -2775,6 +2916,7 @@ const TOOL_HANDLERS = new Map([
   ["performance_analyze_insight", toolPerformanceAnalyzeInsight],
   // ─── Token-Efficient Tools ─────────────────────────────────
   ["execute_code", toolExecuteCode],
+  ["run_browser_script", toolRunBrowserScript],
   ["get_dom_state", toolGetDomState],
   ["click_by_index", toolClickByIndex],
   ["type_by_index", toolTypeByIndex],
@@ -3340,7 +3482,7 @@ async function toolWaitForText(params) {
     );
     if (found)
       return { success: true, found: true, elapsed: Date.now() - startTime };
-    await new Promise((r) => setTimeout(r, 500));
+    await new Promise((r) => setTimeout(r, 150));
   }
 
   return {
@@ -3574,7 +3716,7 @@ async function toolScroll(params) {
       const target = selector ? document.querySelector(selector) : window;
       if (selector && !target)
         return { error: `Element not found: ${selector}` };
-      const scrollBehavior = behavior || "smooth";
+      const scrollBehavior = behavior || "auto";
 
       if (selector && direction === "into_view") {
         target.scrollIntoView({ behavior: scrollBehavior, block: "center" });
@@ -3609,7 +3751,7 @@ async function toolScroll(params) {
         scrollX: window.scrollX,
       };
     },
-    [direction ?? "down", amount ?? 500, selector ?? null, behavior ?? "smooth"],
+    [direction ?? "down", amount ?? 500, selector ?? null, behavior ?? "auto"],
   );
 }
 
@@ -3677,7 +3819,7 @@ async function toolWaitForElement(params) {
         elapsed: Date.now() - startTime,
         state: desiredState,
       };
-    await new Promise((r) => setTimeout(r, 250));
+    await new Promise((r) => setTimeout(r, 100));
   }
   return {
     success: false,
@@ -4857,6 +4999,89 @@ async function toolExecuteCode(params) {
   );
 }
 
+async function toolRunBrowserScript(params) {
+  const tab = await getActiveTab();
+  const source = String(params?.source || "");
+  const scriptParams = params?.params || {};
+  const timeoutMs = params?.timeoutMs || params?.timeout || 15000;
+  if (!source.trim()) {
+    return { ok: false, status: "validation_error", error: "Script source is empty" };
+  }
+
+  return await executeInTab(
+    tab.id,
+    (source, scriptParams, timeoutMs) => {
+      return new Promise((resolve) => {
+        const logs = [];
+        const startedAt = Date.now();
+        const log = (...args) => {
+          logs.push(
+            args
+              .map((v) => {
+                try {
+                  return typeof v === "string" ? v : JSON.stringify(v);
+                } catch (_) {
+                  return String(v);
+                }
+              })
+              .join(" "),
+          );
+        };
+        const finish = (payload) => {
+          clearTimeout(timer);
+          resolve({
+            backend: "browser-extension",
+            elapsedMs: Date.now() - startedAt,
+            logs,
+            ...payload,
+          });
+        };
+        const timer = setTimeout(() => {
+          finish({
+            ok: false,
+            status: "timeout",
+            error: `Browser script timed out after ${timeoutMs}ms`,
+          });
+        }, timeoutMs);
+
+        try {
+          const fn = new Function(
+            "params",
+            "log",
+            `"use strict"; return (async () => {\n${source}\n})()`,
+          );
+          Promise.resolve(fn(scriptParams, log))
+            .then((value) => {
+              try {
+                finish({
+                  ok: true,
+                  status: "completed",
+                  result: JSON.parse(JSON.stringify(value ?? null)),
+                });
+              } catch (_) {
+                finish({ ok: true, status: "completed", result: String(value) });
+              }
+            })
+            .catch((err) => {
+              finish({
+                ok: false,
+                status: "failed",
+                error: err?.message || String(err),
+              });
+            });
+        } catch (err) {
+          finish({
+            ok: false,
+            status: "validation_error",
+            error: err?.message || String(err),
+          });
+        }
+      });
+    },
+    [source, scriptParams, timeoutMs],
+  );
+}
+
 // get_dom_state: Compact map of interactive elements with numeric indices.
 // Returns ~2-5K chars instead of 500K+ for full snapshots.
 async function toolGetDomState(params) {
@@ -4927,6 +5152,17 @@ async function toolGetDomState(params) {
         '[data-testid*="main"]',
         '[data-testid*="content"]',
         '[data-role="main"]',
+      ];
+      const OVERLAY_CANDIDATE_SELECTORS = [
+        '[role="dialog"]',
+        '[aria-modal="true"]',
+        ".modal",
+        ".popup",
+        ".popover",
+        ".dialog",
+        ".dropdown-menu",
+        "[data-popup]",
+        "[data-modal]",
       ];
 
       function isVisible(el) {
@@ -5073,10 +5309,37 @@ async function toolGetDomState(params) {
         return best;
       }
 
+      function pickVisibleOverlay() {
+        let best = null;
+        let bestScore = 0;
+        document
+          .querySelectorAll(OVERLAY_CANDIDATE_SELECTORS.join(","))
+          .forEach((el) => {
+            if (isExtensionUi(el) || !isVisible(el)) return;
+            const text = (el.textContent || "").trim();
+            if (!text && el.querySelectorAll(INTERACTIVE_QUERY).length === 0) {
+              return;
+            }
+            const rect = el.getBoundingClientRect();
+            const score = Math.max(1, rect.width) * Math.max(1, rect.height);
+            if (score > bestScore) {
+              best = el;
+              bestScore = score;
+            }
+          });
+        return best;
+      }
+
       let scope = { strategy: "document-filtered", label: "document body" };
       let elements = [];
 
-      const preferredRoot = pickPreferredRoot();
+      const overlayRoot = pickVisibleOverlay();
+      if (overlayRoot) {
+        elements = collectElements(overlayRoot, false);
+        scope = describeRoot(overlayRoot, "visible-overlay");
+      }
+
+      const preferredRoot = elements.length ? null : pickPreferredRoot();
       if (preferredRoot) {
         elements = collectElements(preferredRoot, true);
         scope = describeRoot(preferredRoot, "main-root");
@@ -5440,8 +5703,8 @@ async function toolWaitForPopup(params) {
         resolved = true;
         clearTimeout(timer);
         chrome.windows.onCreated.removeListener(listener);
-        // Wait for the window to fully load
-        await new Promise((r) => setTimeout(r, 1500));
+        // Let Chrome attach the initial tab, then return promptly.
+        await new Promise((r) => setTimeout(r, 300));
         const updatedWin = await chrome.windows.get(win.id, {
           populate: true,
         });

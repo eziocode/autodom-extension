@@ -26,11 +26,12 @@
                 <span class="version" id="appVersion">v1.3.0</span>
             </header>
 
-            <nav class="tab-bar">
-                <button class="tab active" data-tab="status">Status</button>
-                <button class="tab" data-tab="config">Config</button>
-                <button class="tab" data-tab="logs">Logs</button>
-            </nav>
+	            <nav class="tab-bar">
+	                <button class="tab active" data-tab="status">Status</button>
+	                <button class="tab" data-tab="scripts">Scripts</button>
+	                <button class="tab" data-tab="config">Config</button>
+	                <button class="tab" data-tab="logs">Logs</button>
+	            </nav>
 
             <main class="app-main">
                 <div class="tab-content active" id="tab-status">
@@ -330,9 +331,59 @@
                             </div>
                         </div>
                     </section>
-                </div>
-
-                <div class="tab-content" id="tab-config">
+	                </div>
+	
+	                <div class="tab-content" id="tab-scripts">
+	                    <section class="panel">
+	                        <div class="panel-header">
+	                            <span class="section-label">Automation Script</span>
+	                        </div>
+	                        <div class="field-stack">
+	                            <label class="field-label" for="scriptBackend">Backend</label>
+	                            <select id="scriptBackend" class="config-input">
+	                                <option value="browser-extension">Browser extension</option>
+	                                <option value="playwright">Playwright via MCP</option>
+	                                <option value="node">Node via MCP</option>
+	                            </select>
+	                            <label class="field-label" for="scriptFile">Local script file</label>
+	                            <input id="scriptFile" class="config-input file-input" type="file" accept=".js,.mjs,.cjs,.txt" />
+	                            <label class="field-label" for="scriptSource">Script source</label>
+	                            <textarea
+	                                id="scriptSource"
+	                                class="config-input script-editor"
+	                                spellcheck="false"
+	                                placeholder="log('Title:', document.title);
+return { title: document.title, url: location.href };"
+	                            ></textarea>
+	                            <div class="field-row">
+	                                <input
+	                                    type="number"
+	                                    id="scriptTimeout"
+	                                    class="config-input"
+	                                    min="1000"
+	                                    max="300000"
+	                                    value="15000"
+	                                />
+	                                <span class="field-hint">timeout ms</span>
+	                            </div>
+	                            <div class="button-row">
+	                                <button class="secondary-btn" id="validateScriptBtn">Validate</button>
+	                                <button class="action-btn" id="runScriptBtn">Run</button>
+	                            </div>
+	                            <p class="field-hint" id="scriptStatus">Browser extension scripts run in the active tab. Playwright/Node scripts run locally through MCP.</p>
+	                        </div>
+	                    </section>
+	
+	                    <section class="panel">
+	                        <div class="panel-header">
+	                            <span class="section-label">Execution Output</span>
+	                            <button class="text-btn" id="clearScriptOutputBtn">Clear</button>
+	                        </div>
+	                        <pre class="script-output" id="scriptOutput">No script run yet.</pre>
+	                    </section>
+	                </div>
+	
+	                <div class="tab-content" id="tab-config">
                     <section class="panel">
                         <div class="panel-header">
                             <span class="section-label">Setup Config</span>
@@ -376,7 +427,7 @@
                             </div>
 
                             <div class="config-note">
-                                <span>66 tools · Port <span id="configPort">9876</span> · stdio</span>
+                                <span>70 tools · Port <span id="configPort">9876</span> · stdio</span>
                             </div>
                         </div>
                     </section>
@@ -415,7 +466,7 @@
 
             <footer class="footer">
                 <span
-                    >66 MCP tools ·
+                    >70 MCP tools ·
                     <a
                         href="https://github.com/eziocode/autodom-extension"
                         target="_blank"

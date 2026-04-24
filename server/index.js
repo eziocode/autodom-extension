@@ -24,6 +24,11 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { promisify } from "util";
 import { randomBytes, timingSafeEqual } from "crypto";
+import {
+  listAutomationBackends,
+  runAutomationScript,
+  validateAutomationScript,
+} from "./automation/backends.js";
 
 const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 
@@ -407,6 +412,8 @@ const TOOL_TIERS = new Map([
   ["execute_async_script", "read"],
   ["performance_analyze_insight", "read"],
   ["get_pending_chat_requests", "read"],
+  ["list_automation_backends", "read"],
+  ["validate_automation_script", "read"],
 
   // Write tools — modify page state but are generally reversible
   ["click", "write"],
@@ -433,6 +440,8 @@ const TOOL_TIERS = new Map([
   ["upload_file", "write"],
   ["performance_start_trace", "write"],
   ["performance_stop_trace", "write"],
+  ["run_browser_script", "write"],
+  ["run_automation_script", "write"],
 
   // Destructive tools — irreversible actions (navigation, form submission)
   ["navigate", "destructive"],
@@ -1894,6 +1903,45 @@ function _processWsMessage(socket, message) {
     } catch (_) {}
     return;
   }
+
+  if (message.type === "RUN_AUTOMATION_SCRIPT" && message.id != null) {
+    (async () => {
+      let result;
+      try {
+        result = await runAutomationScript(message.params || {});
+      } catch (err) {
+        result = {
+          ok: false,
+          status: "error",
+          error: err?.message || String(err),
+        };
+      }
+      try {
+        socket.send(
+          JSON.stringify({
+            type: "AUTOMATION_SCRIPT_RESULT",
+            id: message.id,
+            result,
+          }),
+        );
+      } catch (_) {}
+    })();
+    return;
+  }
+
+  if (message.type === "VALIDATE_AUTOMATION_SCRIPT" && message.id != null) {
+    const result = validateAutomationScript(message.params || {});
+    try {
+      socket.send(
+        JSON.stringify({
+          type: "AUTOMATION_SCRIPT_VALIDATION",
+          id: message.id,
+          result,
+        }),
+      );
+    } catch (_) {}
+    return;
+  }
 }
 
 process.on("exit", removeLockFileIfOwnedSync);
@@ -2169,6 +2217,12 @@ function buildProviderSystemPrompt(context) {
     "Respond clearly and actionably. If you need more precise browser control, instruct the user to use AutoDOM tools such as /dom, /click, /type, /nav, or IDE agent mode.\n\n";
   prompt += `Page title: ${context?.title || "Unknown"}\n`;
   prompt += `Page URL: ${context?.url || "Unknown"}\n`;
+  if (context?.visibleOverlayText) {
+    prompt += `Visible popup/dialog text:\n${String(context.visibleOverlayText).substring(0, 1500)}\n`;
+  }
+  if (context?.visibleTextPreview) {
+    prompt += `Visible page text preview:\n${String(context.visibleTextPreview).substring(0, 2500)}\n`;
+  }
   if (context?.interactiveElements) {
     const ie = context.interactiveElements;
     prompt += `Interactive elements: links=${ie.links || 0}, buttons=${ie.buttons || 0}, inputs=${ie.inputs || 0}, forms=${ie.forms || 0}\n`;
@@ -2629,6 +2683,95 @@ async function callCliProvider({
 const server = new FastMCP({
   name: "autodom",
   version: "1.0.0",
+});
+
+// ─── Local Automation Script Tools ───────────────────────────
+// Non-AI workflow: validate and run user-provided local scripts through a
+// backend registry. Playwright is the first-class backend; more backends can be
+// added in server/automation/backends.js without changing MCP tool callers.
+
+server.addTool({
+  name: "list_automation_backends",
+  description:
+    "List local automation backends available to run user-provided scripts. This does not call external AI or cloud services.",
+  parameters: z.object({}),
+  execute: async () => JSON.stringify({ backends: listAutomationBackends() }, null, 2),
+});
+
+server.addTool({
+  name: "validate_automation_script",
+  description:
+    "Validate a local automation script before execution. Accepts either a local scriptPath or inline source.",
+  parameters: z.object({
+    backend: z
+      .enum(["playwright", "node"])
+      .optional()
+      .default("playwright")
+      .describe("Automation backend"),
+    scriptPath: z
+      .string()
+      .optional()
+      .describe("Absolute or relative local path to the script"),
+    source: z.string().optional().describe("Inline script source"),
+  }),
+  execute: async (params) =>
+    JSON.stringify(validateAutomationScript(params), null, 2),
+});
+
+server.addTool({
+  name: "run_automation_script",
+  description:
+    "Run a user-provided local automation script through the selected backend. For backend='playwright', install Playwright locally and export default async function({ page, browser, context, params, log }).",
+  parameters: z.object({
+    backend: z
+      .enum(["playwright", "node"])
+      .optional()
+      .default("playwright")
+      .describe("Automation backend"),
+    scriptPath: z
+      .string()
+      .optional()
+      .describe("Absolute or relative local path to a local script"),
+    source: z.string().optional().describe("Inline script source"),
+    cwd: z.string().optional().describe("Working directory for the run"),
+    timeoutMs: z
+      .number()
+      .optional()
+      .default(60000)
+      .describe("Execution timeout in milliseconds"),
+    browser: z
+      .enum(["chromium", "firefox", "webkit"])
+      .optional()
+      .default("chromium")
+      .describe("Playwright browser launcher"),
+    headless: z.boolean().optional().default(true),
+    params: z
+      .record(z.any())
+      .optional()
+      .default({})
+      .describe("JSON parameters passed to the script"),
+  }),
+  execute: async (params) => {
+    const result = await runAutomationScript(params);
+    if (!result.ok) _logToolError("run_automation_script", result.error, params);
+    return JSON.stringify(result, null, 2);
+  },
+});
+
+server.addTool({
+  name: "run_browser_script",
+  description:
+    "Run JavaScript source in the active browser tab through the AutoDOM browser extension. This is browser-extension-based execution and requires no AI/cloud service.",
+  parameters: z.object({
+    source: z.string().describe("Browser JavaScript source to run in the active tab"),
+    params: z.record(z.any()).optional().default({}),
+    timeoutMs: z.number().optional().default(15000),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("run_browser_script", params);
+    if (result?.error) _logToolError("run_browser_script", result.error, params);
+    return JSON.stringify(result, null, 2);
+  },
 });
 
 // ─── Token-Efficient Tools (inspired by OpenBrowser-AI) ──────

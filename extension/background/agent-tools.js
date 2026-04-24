@@ -277,6 +277,52 @@
         properties: { timeout: { type: "integer" } },
       },
     },
+    {
+      name: "list_popups",
+      description:
+        "List browser windows, including popup windows opened with window.open. Use when page content appears in a separate popup/window.",
+      parameters: {
+        type: "object",
+        properties: {
+          popupsOnly: { type: "boolean", description: "Return only popup windows" },
+        },
+      },
+    },
+    {
+      name: "switch_to_popup",
+      description:
+        "Focus a popup/window and pin subsequent tool calls to its active tab.",
+      parameters: {
+        type: "object",
+        properties: {
+          windowId: { type: "integer" },
+          tabId: { type: "integer" },
+        },
+        required: ["windowId"],
+      },
+    },
+    {
+      name: "wait_for_popup",
+      description:
+        "Wait for a new popup/window to appear after an action, then optionally switch to it.",
+      parameters: {
+        type: "object",
+        properties: {
+          timeout: { type: "integer" },
+          switchTo: { type: "boolean" },
+        },
+      },
+    },
+    {
+      name: "close_popup",
+      description: "Close a popup/window by windowId.",
+      parameters: {
+        type: "object",
+        properties: { windowId: { type: "integer" } },
+        required: ["windowId"],
+      },
+      danger: "write",
+    },
 
     // ── Tabs ──
     {

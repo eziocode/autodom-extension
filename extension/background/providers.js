@@ -24,6 +24,12 @@
     if (context) {
       if (context.title) p += `Page title: ${context.title}\n`;
       if (context.url) p += `Page URL: ${context.url}\n`;
+      if (context.visibleOverlayText) {
+        p += `Visible popup/dialog text:\n${String(context.visibleOverlayText).substring(0, 1500)}\n`;
+      }
+      if (context.visibleTextPreview) {
+        p += `Visible page text preview:\n${String(context.visibleTextPreview).substring(0, 2500)}\n`;
+      }
       if (context.interactiveElements) {
         const ie = context.interactiveElements;
         p += `Interactive elements: ${ie.links || 0} links, ${ie.buttons || 0} buttons, ${ie.inputs || 0} inputs, ${ie.forms || 0} forms\n`;

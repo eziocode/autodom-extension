@@ -4,9 +4,14 @@
 
 AutoDOM is a [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server + browser extension that lets your IDE's AI agent — GitHub Copilot, JetBrains AI Assistant, Claude Desktop, Cursor, Gemini CLI, and others — drive a real Chromium or Firefox browser.
 
-It exposes **66 browser-automation tools** (click, type, navigate, screenshot, evaluate JS, intercept network requests, inspect the DOM, manage cookies and tabs, and more) over a local WebSocket bridge between a Node.js MCP server and a Manifest V3 browser extension.
+It exposes **70 browser-automation tools** (click, type, navigate, screenshot, evaluate JS, intercept network requests, inspect the DOM, manage cookies and tabs, run local scripts, and more) over a local WebSocket bridge between a Node.js MCP server and a Manifest V3 browser extension.
 
 The extension also ships with an in-page AI chat panel and an inline AI overlay so you can talk to your agent without leaving the browser.
+
+AutoDOM also supports **local user-provided automation scripts** without AI or
+external cloud services. Use the popup Scripts tab to upload/paste browser
+scripts, or use MCP tools from an IDE to run local Playwright scripts. See
+**[AUTOMATION.md](AUTOMATION.md)**.
 
 ---
 
@@ -21,6 +26,8 @@ The extension also ships with an in-page AI chat panel and an inline AI overlay 
 ```
 
 - **`server/`** — Node.js MCP server (`fastmcp` + `ws`). Speaks MCP over stdio to the IDE and proxies tool calls to the browser over a local WebSocket on port `9876`.
+- **`server/automation/`** — Local automation backend registry. Includes
+  Playwright and Node script runners and can be extended with more backends.
 - **`extension/`** — Manifest V3 extension (Chromium + Firefox-flavored manifest). Service worker connects to the bridge, content scripts host the chat panel and session indicator, popup shows connection status.
 - **`scripts/build-firefox.sh`** — Repackages the extension with a Gecko-compatible manifest and produces an unpacked build plus an `.xpi`.
 - **`setup.sh`** — One-shot installer that installs server deps and writes MCP config for every IDE it can detect.
@@ -70,7 +77,7 @@ Then:
 2. Pin AutoDOM to the toolbar.
 3. **Restart your IDE** so it picks up the new MCP config.
 4. Open the AutoDOM popup → confirm it says **Connected**.
-5. Your AI agent now has 66 browser-automation tools.
+5. Your AI agent now has 70 browser-automation tools.
 
 For a step-by-step walkthrough, see **[GETTING-STARTED.md](GETTING-STARTED.md)**.
 For per-IDE setup, manual install, ports, and uninstall, see **[INSTALL.md](INSTALL.md)**.
