@@ -7769,6 +7769,167 @@
     return parts.length ? parts.join("\n") : "";
   }
 
+  // ── Active-tab bridge (side-panel mode) ─────────────────
+  // When this script runs inside the side panel, `document`/`location`
+  // refer to the side panel HTML (chrome-extension://...), NOT the
+  // tab the user is looking at. These helpers query the currently
+  // active tab and reach into it via chrome.scripting so summarize /
+  // context / local-summary all describe the *real* page.
+  async function _queryActiveTabForSummary() {
+    if (!chrome?.tabs?.query) return null;
+    try {
+      const tabs = await chrome.tabs.query({
+        active: true,
+        lastFocusedWindow: true,
+      });
+      let tab = tabs && tabs[0];
+      // The side panel itself is a chrome-extension:// page; skip it
+      // and any privileged URLs that scripting can't touch.
+      const isOurOwn = (t) =>
+        t &&
+        typeof t.url === "string" &&
+        t.url.startsWith(`chrome-extension://${chrome.runtime.id}`);
+      const isPrivileged = (t) =>
+        !t ||
+        !t.url ||
+        /^(chrome|edge|brave|opera|about|chrome-extension|view-source|devtools):/i.test(
+          t.url,
+        );
+      if (!tab || isOurOwn(tab) || isPrivileged(tab)) {
+        // Fall back to any non-privileged active tab in any window
+        const all = await chrome.tabs.query({ active: true });
+        tab =
+          (all || []).find((t) => !isOurOwn(t) && !isPrivileged(t)) || tab;
+      }
+      if (!tab || !tab.id) return null;
+      if (isOurOwn(tab) || isPrivileged(tab)) {
+        return { tab, blocked: true };
+      }
+      return { tab, blocked: false };
+    } catch (err) {
+      _log("active-tab query failed:", err && err.message);
+      return null;
+    }
+  }
+
+  // Runs inside the active tab to extract the same shape that the
+  // local helpers produce. Kept self-contained — no closures, no
+  // imports — because chrome.scripting serializes the function source.
+  function _activeTabExtractorPayload(maxText) {
+    function norm(t) {
+      return (t || "").replace(/\s+/g, " ").trim();
+    }
+    function readableText() {
+      const candidates = [
+        document.querySelector("main"),
+        document.querySelector("article"),
+        document.querySelector('[role="main"]'),
+        document.querySelector(
+          "#main, #content, #main-content, .main, .content",
+        ),
+      ].filter(Boolean);
+      let root = candidates[0] || document.body;
+      let text = "";
+      try {
+        text = (root && (root.innerText || root.textContent)) || "";
+      } catch (_) {}
+      if (text.length < 200 && document.body) {
+        try {
+          text = document.body.innerText || document.body.textContent || "";
+        } catch (_) {}
+      }
+      return text.replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    }
+    const headings = Array.from(
+      document.querySelectorAll("h1, h2, h3"),
+    )
+      .map((h) => norm(h.textContent))
+      .filter((t) => t && t.length > 2 && t.length < 140)
+      .slice(0, 12);
+    const paragraphs = Array.from(document.querySelectorAll("p"))
+      .map((p) => norm(p.textContent))
+      .filter((t) => t.length > 60)
+      .slice(0, 4);
+    const counts = {
+      links: document.querySelectorAll("a[href]").length,
+      buttons: document.querySelectorAll('button, [role="button"]').length,
+      inputs: document.querySelectorAll("input, textarea, select").length,
+      forms: document.querySelectorAll("form").length,
+    };
+    const text = readableText();
+    return {
+      title: (document.title || "(untitled)").trim(),
+      url: location.href,
+      text: text.substring(0, maxText || 40000),
+      headings,
+      paragraphs,
+      counts,
+    };
+  }
+
+  // Public async helper — returns { title, url, text, headings,
+  // paragraphs, counts } for the active tab when in side-panel mode,
+  // or null when the active tab is privileged / the side panel itself.
+  // In normal (content-script) mode this just reads from `document`.
+  async function getActivePageInfo(maxText) {
+    if (!SIDE_PANEL_MODE) {
+      // Content-script path: local document IS the page.
+      return {
+        title: (document.title || "(untitled)").trim(),
+        url: location.href,
+        text: extractMainPageText().substring(0, maxText || _MAX_PAGE_TEXT),
+        headings: Array.from(document.querySelectorAll("h1, h2, h3"))
+          .map((h) => (h.textContent || "").trim().replace(/\s+/g, " "))
+          .filter((t) => t && t.length > 2 && t.length < 140)
+          .slice(0, 12),
+        paragraphs: Array.from(document.querySelectorAll("p"))
+          .map((p) => (p.textContent || "").trim().replace(/\s+/g, " "))
+          .filter((t) => t.length > 60)
+          .slice(0, 4),
+        counts: {
+          links: document.querySelectorAll("a[href]").length,
+          buttons: document.querySelectorAll('button, [role="button"]').length,
+          inputs: document.querySelectorAll("input, textarea, select").length,
+          forms: document.querySelectorAll("form").length,
+        },
+        local: true,
+      };
+    }
+    const found = await _queryActiveTabForSummary();
+    if (!found || !found.tab) return null;
+    if (found.blocked) {
+      return {
+        title: found.tab.title || "(restricted page)",
+        url: found.tab.url || "",
+        text: "",
+        headings: [],
+        paragraphs: [],
+        counts: { links: 0, buttons: 0, inputs: 0, forms: 0 },
+        blocked: true,
+      };
+    }
+    if (!chrome?.scripting?.executeScript) return null;
+    try {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: found.tab.id },
+        func: _activeTabExtractorPayload,
+        args: [maxText || _MAX_PAGE_TEXT],
+      });
+      return (result && result.result) || null;
+    } catch (err) {
+      _log("active-tab extractor failed:", err && err.message);
+      return {
+        title: found.tab.title || "(unreachable page)",
+        url: found.tab.url || "",
+        text: "",
+        headings: [],
+        paragraphs: [],
+        counts: { links: 0, buttons: 0, inputs: 0, forms: 0 },
+        blocked: true,
+      };
+    }
+  }
+
   function extractMainPageText() {
     const overlayText = getVisibleOverlayText();
     const candidates = [
@@ -7844,15 +8005,35 @@
     addMessage("user", displayLabel);
     _pushHistory({ role: "user", content: displayLabel });
 
+    // Resolve the *real* page first so all branches below — connected,
+    // unavailable, errored — describe the active tab and not the side
+    // panel itself when running in side-panel mode.
+    const pageInfo = await getActivePageInfo(_MAX_PAGE_TEXT);
+    if (!pageInfo) {
+      addMessage(
+        "error",
+        "Couldn't read the active tab. Open or focus a regular web page (not chrome://, chrome-extension://, or the New Tab page) and try again.",
+      );
+      return;
+    }
+    if (pageInfo.blocked) {
+      addMessage(
+        "ai-response",
+        `**Can't summarize this tab.**\n\nThe active tab (\`${pageInfo.url || "unknown URL"}\`) is a browser/internal page that extensions are not allowed to read. Switch to a regular web page and try again.`,
+      );
+      _pushHistory({
+        role: "assistant",
+        content: "[blocked: cannot read browser/internal page]",
+      });
+      return;
+    }
+
     const freshConnected = await checkConnectionStatus();
     if (!freshConnected) {
-      // Raise a proper alert so the user knows AI is unavailable, then
-      // still hand them a best-effort local summary so the click wasn't
-      // wasted.
       showAiUnavailableAlert(
         "Can't generate a smart summary without a connected AI provider. A quick local summary follows.",
       );
-      const summary = buildLocalSummary();
+      const summary = buildLocalSummaryFromInfo(pageInfo);
       addMessage("ai-response", summary);
       _pushHistory({
         role: "assistant",
@@ -7861,9 +8042,9 @@
       return;
     }
 
-    const title = (document.title || "(untitled)").trim();
-    const url = location.href;
-    const pageText = extractMainPageText();
+    const title = pageInfo.title || "(untitled)";
+    const url = pageInfo.url || "";
+    const pageText = pageInfo.text || "";
 
     // Wrap the page text as untrusted data and explicitly tell the
     // model to ignore any instructions inside it (basic prompt-injection
@@ -7900,14 +8081,12 @@
         addMessage("ai-response", responseText, {
           toolCalls: aiResult.toolCalls || [],
         });
-        // Persist only a short label, NOT the giant prompt.
         _pushHistory({
           role: "assistant",
           content: responseText,
         });
       } else {
-        // AI path failed — degrade gracefully to local summary.
-        const summary = buildLocalSummary();
+        const summary = buildLocalSummaryFromInfo(pageInfo);
         const why =
           aiResult && aiResult.error
             ? `_AI error: ${aiResult.error}. Showing a local summary instead._\n\n`
