@@ -1156,3 +1156,30 @@ select.config-input {
     outline: 2px solid var(--accent, #3b82f6);
     outline-offset: 2px;
 }
+
+/* ─── Embedded mode (rendered inside the chat panel via iframe) ─── */
+/* The toolbar popup needs a fixed width for Chrome's auto-sizing,
+   but when this same page is hosted in an <iframe> inside the chat
+   panel we want it to fill (and shrink with) the iframe. The
+   chat-panel passes ?embedded=1 in the iframe src; popup.js then
+   adds the .embedded class to <body> on load. */
+body.embedded {
+    width: auto !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+}
+body.embedded .app {
+    min-height: 0;
+    width: 100%;
+    box-sizing: border-box;
+}
+body.embedded .app-main {
+    min-width: 0;
+}
+body.embedded #aiChatBtn {
+    /* The chat panel is already open right next to us in embedded
+       mode — surfacing another "Open AI Chat" button there would be
+       redundant (and trying to use it can spawn an overlapping
+       chat window). */
+    display: none !important;
+}

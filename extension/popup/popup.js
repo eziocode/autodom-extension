@@ -183,6 +183,18 @@ function sendRuntimeMessage(message) {
 
 // ─── Init ────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", async () => {
+  // Embedded mode: when popup.html is rendered inside the chat
+  // panel via iframe (?embedded=1), we relax the fixed 360px width
+  // so the iframe content reflows with the side panel, and we hide
+  // affordances that would conflict with the surrounding chat
+  // (e.g. the "Open AI Chat" button that would spawn a second chat).
+  try {
+    const params = new URLSearchParams(location.search);
+    if (params.get("embedded") === "1") {
+      document.body.classList.add("embedded");
+    }
+  } catch (_) {}
+
   if (DOM.appVersion) {
     DOM.appVersion.textContent = `v${chrome.runtime.getManifest().version}`;
   }

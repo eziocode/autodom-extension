@@ -678,10 +678,9 @@
     } catch (_) {}
   }
   function _applySettingsToUI() {
-    const toggle = document.getElementById("__autodom_verbose_toggle");
-    if (toggle) toggle.checked = !!_chatSettings.verboseLogs;
-    const persistToggle = document.getElementById("__autodom_persist_toggle");
-    if (persistToggle) persistToggle.checked = !!_chatSettings.persistAcrossSessions;
+    // The verbose/persist toggle DOM lives in popup.html now (Chat
+    // tab) — the chat panel just needs to reflect the resolved state
+    // onto the panel's data-verbose attribute and the panel width.
     _applyVerboseAttr();
     _applyPanelWidth();
   }
@@ -1446,115 +1445,6 @@
     /* Hide BETA + MCP badges — keep nodes for compatibility */
     .autodom-chat-beta-badge,
     .autodom-ai-badge { display: none !important; }
-
-    /* ─── Settings Sheet (slides down from header) ─── */
-    .autodom-chat-settings-sheet {
-      flex-shrink: 0 !important;
-      background: var(--c-raised) !important;
-      border-bottom: 1px solid var(--c-border) !important;
-      padding: 12px 14px !important;
-      display: flex !important;
-      flex-direction: column !important;
-      gap: 8px !important;
-      animation: __autodom_slide_in 0.18s var(--ease-out);
-    }
-    .autodom-chat-settings-sheet[hidden] { display: none !important; }
-    .autodom-chat-settings-sheet .acss-row {
-      display: flex !important;
-      align-items: center !important;
-    }
-    .autodom-chat-settings-sheet .acss-toggle {
-      display: flex !important;
-      align-items: center !important;
-      gap: 12px !important;
-      width: 100% !important;
-      cursor: pointer !important;
-      user-select: none !important;
-    }
-    .autodom-chat-settings-sheet .acss-toggle-info {
-      display: flex !important;
-      flex-direction: column !important;
-      gap: 2px !important;
-      flex: 1 1 auto !important;
-      min-width: 0 !important;
-    }
-    .autodom-chat-settings-sheet .acss-toggle-title {
-      font-size: 12.5px !important;
-      font-weight: 600 !important;
-      color: var(--c-text) !important;
-      line-height: 1.3 !important;
-    }
-    .autodom-chat-settings-sheet .acss-toggle-desc {
-      font-size: 11px !important;
-      color: var(--c-text-3) !important;
-      line-height: 1.35 !important;
-    }
-    .autodom-chat-settings-sheet input[type="checkbox"] {
-      position: absolute !important;
-      opacity: 0 !important;
-      pointer-events: none !important;
-      width: 0 !important; height: 0 !important;
-    }
-    .autodom-chat-settings-sheet .acss-switch {
-      flex: 0 0 32px !important;
-      width: 32px !important;
-      height: 18px !important;
-      border-radius: 999px !important;
-      background: var(--c-border-s) !important;
-      position: relative !important;
-      transition: background-color 0.18s ease;
-    }
-    .autodom-chat-settings-sheet .acss-switch-knob {
-      position: absolute !important;
-      top: 2px !important;
-      left: 2px !important;
-      width: 14px !important;
-      height: 14px !important;
-      border-radius: 50% !important;
-      background: #fff !important;
-      transition: transform 0.18s ease;
-      box-shadow: 0 1px 2px rgba(0,0,0,0.25);
-    }
-    .autodom-chat-settings-sheet .acss-toggle input:checked ~ .acss-switch {
-      background: var(--c-accent) !important;
-    }
-    .autodom-chat-settings-sheet .acss-toggle input:checked ~ .acss-switch .acss-switch-knob {
-      transform: translateX(14px);
-    }
-    .autodom-chat-settings-sheet .acss-toggle input:focus-visible ~ .acss-switch {
-      outline: 2px solid var(--c-accent);
-      outline-offset: 2px;
-    }
-    .autodom-chat-settings-sheet .acss-foot {
-      font-size: 10.5px !important;
-      color: var(--c-text-3) !important;
-      border-top: 1px dashed var(--c-border) !important;
-      padding-top: 6px !important;
-      display: flex !important;
-      flex-direction: column !important;
-      gap: 6px !important;
-    }
-    .autodom-chat-settings-sheet .acss-foot-hint { line-height: 1.4 !important; }
-    .autodom-chat-settings-sheet .acss-foot-btn {
-      align-self: flex-start !important;
-      font: inherit !important;
-      font-size: 11.5px !important;
-      color: var(--c-text-1) !important;
-      background: color-mix(in oklch, var(--c-accent) 10%, transparent) !important;
-      border: 1px solid var(--c-border) !important;
-      border-radius: 6px !important;
-      padding: 4px 10px !important;
-      cursor: pointer !important;
-      transition: background-color 0.15s ease, border-color 0.15s ease !important;
-    }
-    .autodom-chat-settings-sheet .acss-foot-btn:hover {
-      background: color-mix(in oklch, var(--c-accent) 18%, transparent) !important;
-      border-color: var(--c-accent) !important;
-    }
-    .autodom-chat-settings-sheet .acss-foot-btn:focus-visible {
-      outline: 2px solid var(--c-accent) !important;
-      outline-offset: 2px !important;
-    }
 
     /* ─── Inline Settings Overlay (hosts popup.html in an iframe) ─── */
     .autodom-chat-settings-overlay {
@@ -2805,18 +2695,35 @@
       box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.06) inset !important;
     }
     .autodom-chat-input-hint {
-      position: static;
-      align-self: flex-end;
-      font-size: 10px;
-      color: var(--c-text-3);
-      pointer-events: none;
-      opacity: 0.75;
-      line-height: 1;
-      transition: opacity 0.18s ease, color 0.18s ease;
+      position: static !important;
+      align-self: flex-end !important;
+      font-size: 9.5px !important;
+      color: var(--c-text-3) !important;
+      pointer-events: none !important;
+      opacity: 0.45 !important;
+      line-height: 1 !important;
+      letter-spacing: 0.01em !important;
+      transition: opacity 0.18s ease, color 0.18s ease !important;
+      font-weight: 400 !important;
+    }
+    /* Inline <kbd> chips inside the hint — keep them subtle so the
+       footer reads as a whisper, not a banner. Without these, host-page
+       <kbd> styles or the user agent default can render them at almost
+       a full chip-button size, which is what the user was seeing. */
+    .autodom-chat-input-hint kbd {
+      font: inherit !important;
+      font-size: 9.5px !important;
+      background: transparent !important;
+      border: none !important;
+      box-shadow: none !important;
+      padding: 0 1px !important;
+      margin: 0 !important;
+      color: inherit !important;
+      opacity: 1 !important;
     }
     .autodom-chat-input-shell:focus-within ~ .autodom-chat-input-hint {
-      opacity: 1;
-      color: var(--c-text-2);
+      opacity: 0.7 !important;
+      color: var(--c-text-2) !important;
     }
 
     /* ─── Image Attachment Composer ──────────────────────────── */
@@ -4305,38 +4212,6 @@
       </div>
     </div>
 
-    <!-- Settings Sheet (slides down from header) -->
-    <div class="autodom-chat-settings-sheet" id="__autodom_settings_sheet" role="dialog" aria-label="Chat settings" hidden>
-      <div class="acss-row">
-        <label class="acss-toggle" for="__autodom_verbose_toggle">
-          <span class="acss-toggle-info">
-            <span class="acss-toggle-title">Verbose automation logs</span>
-            <span class="acss-toggle-desc">Show each tool call &amp; result in the chat, like Claude CLI.</span>
-          </span>
-          <input type="checkbox" id="__autodom_verbose_toggle" />
-          <span class="acss-switch" aria-hidden="true"><span class="acss-switch-knob"></span></span>
-        </label>
-      </div>
-      <div class="acss-row">
-        <label class="acss-toggle" for="__autodom_persist_toggle">
-          <span class="acss-toggle-info">
-            <span class="acss-toggle-title">Keep chat across browser sessions</span>
-            <span class="acss-toggle-desc">Save chat to extension storage so it survives tab close &amp; browser restart. Off = chat lives only for this tab.</span>
-          </span>
-          <input type="checkbox" id="__autodom_persist_toggle" />
-          <span class="acss-switch" aria-hidden="true"><span class="acss-switch-knob"></span></span>
-        </label>
-      </div>
-      <div class="acss-foot">
-        <span class="acss-foot-hint">Stop button is always shown while automation is running.</span>
-        <button type="button" id="__autodom_open_settings_window"
-                class="acss-foot-btn"
-                title="Open extension settings (servers, providers, connection) here in the panel">
-          ⚙ Open extension settings…
-        </button>
-      </div>
-    </div>
-
     <!-- Context Bar -->
     <div class="autodom-chat-context" role="status" aria-label="Page context">
       <span class="autodom-chat-context-icon" aria-hidden="true">
@@ -5265,6 +5140,23 @@
         _chatSettings.widthByHost = { ...s.widthByHost };
       if (s.collapsedByHost && typeof s.collapsedByHost === "object")
         _chatSettings.collapsedByHost = { ...s.collapsedByHost };
+      // Mirror the persist-across-sessions flag too, since the popup's
+      // Chat tab is now the only place this is toggled. Apply the
+      // same side effects the legacy in-panel toggle did so flipping
+      // the switch from the popup is observably equivalent.
+      if (typeof s.persistAcrossSessions === "boolean") {
+        const wasOn = _chatSettings.persistAcrossSessions;
+        _chatSettings.persistAcrossSessions = s.persistAcrossSessions;
+        if (wasOn !== s.persistAcrossSessions) {
+          try {
+            if (s.persistAcrossSessions) {
+              _scheduleLongLivedPersist(_buildChatStateSnapshot(), true);
+            } else if (wasOn) {
+              _clearLongLivedPersist();
+            }
+          } catch (_) {}
+        }
+      }
       try { _applyVerboseAttr(); } catch (_) {}
       try { _applyPanelWidth(); } catch (_) {}
     });
@@ -5540,54 +5432,13 @@
     );
   } catch (_) {}
 
-  // ─── Settings Sheet (legacy — kept for storage sync wiring) ─
-  // The gear button now opens the inline extension-settings overlay
-  // directly. The legacy in-panel "settings sheet" is no longer
-  // surfaced; its DOM is left in place but stays hidden so the
-  // existing verbose/persist toggle wiring (which mirrors
-  // chrome.storage onChanged events to the chat) keeps working.
+  // ─── Settings entry point ──────────────────────────────────
+  // The header gear opens an inline overlay that hosts popup.html
+  // (extension settings, including the Chat tab where verbose /
+  // persist toggles live). The legacy in-panel "settings sheet" was
+  // removed; chrome.storage.onChanged keeps this panel in sync with
+  // toggle changes made in the popup.
   const settingsBtn = document.getElementById("__autodom_settings_btn");
-  const settingsSheet = document.getElementById("__autodom_settings_sheet");
-  const verboseToggle = document.getElementById("__autodom_verbose_toggle");
-  function _closeSettingsSheet() {
-    if (!settingsSheet) return;
-    settingsSheet.setAttribute("hidden", "");
-    if (settingsBtn) {
-      settingsBtn.setAttribute("aria-expanded", "false");
-      settingsBtn.classList.remove("active");
-    }
-  }
-  if (verboseToggle) {
-    verboseToggle.addEventListener("change", () => {
-      _chatSettings.verboseLogs = !!verboseToggle.checked;
-      _saveChatSettings();
-      _applyVerboseAttr();
-    });
-  }
-  const persistToggle = document.getElementById("__autodom_persist_toggle");
-  if (persistToggle) {
-    persistToggle.addEventListener("change", () => {
-      const wasOn = _chatSettings.persistAcrossSessions;
-      _chatSettings.persistAcrossSessions = !!persistToggle.checked;
-      _saveChatSettings();
-      if (_chatSettings.persistAcrossSessions) {
-        // Toggling ON: snapshot the current chat into long-lived storage
-        // immediately so the user gets the protection right away.
-        _scheduleLongLivedPersist(_buildChatStateSnapshot(), true);
-      } else if (wasOn) {
-        // Toggling OFF: don't keep stale data in chrome.storage.local.
-        _clearLongLivedPersist();
-      }
-    });
-  }
-  // Open extension settings inline — render popup.html inside the
-  // panel via an iframe overlay instead of spawning a separate
-  // browser window. Keeps the user's context (side-panel or in-page
-  // panel) and removes the disorienting "new window pops out" UX.
-  // The iframe loads lazily on first open and is reused thereafter.
-  const openSettingsWindowBtn = document.getElementById(
-    "__autodom_open_settings_window",
-  );
   const settingsOverlay = document.getElementById("__autodom_settings_overlay");
   const settingsOverlayFrame = document.getElementById(
     "__autodom_settings_overlay_frame",
@@ -5604,14 +5455,20 @@
       _settingsOverlayLastFocus = null;
     }
     // Lazy-load the iframe src so the popup UI doesn't initialize
-    // until the user actually asks for settings.
+    // until the user actually asks for settings. The ?embedded=1
+    // hint tells popup.js to relax its fixed-width body and hide
+    // the redundant "Open AI Chat" button.
     if (!settingsOverlayFrame.getAttribute("src")) {
       settingsOverlayFrame.setAttribute(
         "src",
-        chrome.runtime.getURL("popup/popup.html"),
+        chrome.runtime.getURL("popup/popup.html") + "?embedded=1",
       );
     }
     settingsOverlay.removeAttribute("hidden");
+    if (settingsBtn) {
+      settingsBtn.setAttribute("aria-expanded", "true");
+      settingsBtn.classList.add("active");
+    }
     if (settingsOverlayBack) {
       // Defer focus so it lands after the slide-in animation paints.
       setTimeout(() => {
@@ -5622,6 +5479,10 @@
   function _closeSettingsOverlay() {
     if (!settingsOverlay) return;
     settingsOverlay.setAttribute("hidden", "");
+    if (settingsBtn) {
+      settingsBtn.setAttribute("aria-expanded", "false");
+      settingsBtn.classList.remove("active");
+    }
     try {
       if (_settingsOverlayLastFocus && _settingsOverlayLastFocus.focus) {
         _settingsOverlayLastFocus.focus();
@@ -5629,32 +5490,21 @@
     } catch (_) {}
     _settingsOverlayLastFocus = null;
   }
-  if (openSettingsWindowBtn) {
-    openSettingsWindowBtn.addEventListener("click", () => {
-      try {
-        _openSettingsOverlay();
-        _closeSettingsSheet();
-      } catch (e) {
-        _err("[settings-overlay] open failed", e);
-      }
-    });
-  }
   if (settingsOverlayBack) {
     settingsOverlayBack.addEventListener("click", _closeSettingsOverlay);
   }
-  // The header gear icon now goes straight to the extension settings
-  // overlay (which hosts the full popup UI, including the Chat tab
-  // for verbose / persist toggles). The legacy in-panel sheet is no
-  // longer surfaced — one settings surface keeps the mental model
-  // simple and matches the popup-toolbar entry point.
   if (settingsBtn) {
     settingsBtn.addEventListener("click", (e) => {
       e.preventDefault();
       e.stopPropagation();
       try {
-        _openSettingsOverlay();
+        if (settingsOverlay && settingsOverlay.hasAttribute("hidden")) {
+          _openSettingsOverlay();
+        } else {
+          _closeSettingsOverlay();
+        }
       } catch (err) {
-        _err("[settings-overlay] gear-open failed", err);
+        _err("[settings-overlay] gear-toggle failed", err);
       }
     });
   }
