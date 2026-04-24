@@ -122,6 +122,34 @@
   const STORAGE_KEY_HISTORY = "__autodom_chat_history";
   const STORAGE_KEY_OPEN = "__autodom_chat_open";
   const STORAGE_KEY_THEME = "__autodom_chat_theme";
+  const STORAGE_KEY_SETTINGS = "__autodom_chat_settings"; // { verboseLogs: bool }
+
+  // User-adjustable runtime settings (persisted to chrome.storage.local so
+  // the choice survives tab reloads + applies across tabs).
+  const _chatSettings = { verboseLogs: true };
+  function _loadChatSettings() {
+    try {
+      chrome.storage?.local?.get?.([STORAGE_KEY_SETTINGS], (items) => {
+        const s = items && items[STORAGE_KEY_SETTINGS];
+        if (s && typeof s === "object") {
+          if (typeof s.verboseLogs === "boolean")
+            _chatSettings.verboseLogs = s.verboseLogs;
+        }
+        try { _applySettingsToUI(); } catch (_) {}
+      });
+    } catch (_) {}
+  }
+  function _saveChatSettings() {
+    try {
+      chrome.storage?.local?.set?.({
+        [STORAGE_KEY_SETTINGS]: { ..._chatSettings },
+      });
+    } catch (_) {}
+  }
+  function _applySettingsToUI() {
+    const toggle = document.getElementById("__autodom_verbose_toggle");
+    if (toggle) toggle.checked = !!_chatSettings.verboseLogs;
+  }
   const MAX_PERSISTED_MESSAGES = 50;
   const THEME_VALUES = new Set(["system", "dark", "light"]);
 
@@ -489,6 +517,98 @@
     .autodom-chat-beta-badge,
     .autodom-ai-badge { display: none !important; }
 
+    /* ─── Settings Sheet (slides down from header) ─── */
+    .autodom-chat-settings-sheet {
+      flex-shrink: 0 !important;
+      background: var(--c-raised) !important;
+      border-bottom: 1px solid var(--c-border) !important;
+      padding: 12px 14px !important;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 8px !important;
+      animation: __autodom_slide_in 0.18s var(--ease-out);
+    }
+    .autodom-chat-settings-sheet[hidden] { display: none !important; }
+    .autodom-chat-settings-sheet .acss-row {
+      display: flex !important;
+      align-items: center !important;
+    }
+    .autodom-chat-settings-sheet .acss-toggle {
+      display: flex !important;
+      align-items: center !important;
+      gap: 12px !important;
+      width: 100% !important;
+      cursor: pointer !important;
+      user-select: none !important;
+    }
+    .autodom-chat-settings-sheet .acss-toggle-info {
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 2px !important;
+      flex: 1 1 auto !important;
+      min-width: 0 !important;
+    }
+    .autodom-chat-settings-sheet .acss-toggle-title {
+      font-size: 12.5px !important;
+      font-weight: 600 !important;
+      color: var(--c-text) !important;
+      line-height: 1.3 !important;
+    }
+    .autodom-chat-settings-sheet .acss-toggle-desc {
+      font-size: 11px !important;
+      color: var(--c-text-3) !important;
+      line-height: 1.35 !important;
+    }
+    .autodom-chat-settings-sheet input[type="checkbox"] {
+      position: absolute !important;
+      opacity: 0 !important;
+      pointer-events: none !important;
+      width: 0 !important; height: 0 !important;
+    }
+    .autodom-chat-settings-sheet .acss-switch {
+      flex: 0 0 32px !important;
+      width: 32px !important;
+      height: 18px !important;
+      border-radius: 999px !important;
+      background: var(--c-border-s) !important;
+      position: relative !important;
+      transition: background-color 0.18s ease;
+    }
+    .autodom-chat-settings-sheet .acss-switch-knob {
+      position: absolute !important;
+      top: 2px !important;
+      left: 2px !important;
+      width: 14px !important;
+      height: 14px !important;
+      border-radius: 50% !important;
+      background: #fff !important;
+      transition: transform 0.18s ease;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.25);
+    }
+    .autodom-chat-settings-sheet .acss-toggle input:checked ~ .acss-switch {
+      background: var(--c-accent) !important;
+    }
+    .autodom-chat-settings-sheet .acss-toggle input:checked ~ .acss-switch .acss-switch-knob {
+      transform: translateX(14px);
+    }
+    .autodom-chat-settings-sheet .acss-toggle input:focus-visible ~ .acss-switch {
+      outline: 2px solid var(--c-accent);
+      outline-offset: 2px;
+    }
+    .autodom-chat-settings-sheet .acss-foot {
+      font-size: 10.5px !important;
+      color: var(--c-text-3) !important;
+      border-top: 1px dashed var(--c-border) !important;
+      padding-top: 6px !important;
+    }
+    .autodom-chat-settings-sheet .acss-foot-hint { line-height: 1.4 !important; }
+
+    /* Settings button active state */
+    .autodom-chat-header-btn.active {
+      background: color-mix(in oklch, var(--c-accent) 14%, transparent) !important;
+      color: var(--c-accent) !important;
+    }
+
     .autodom-chat-header-actions {
       display: flex;
       align-items: center;
@@ -798,6 +918,130 @@
       align-items: center;
       justify-content: center;
       line-height: 1;
+    }
+
+    /* ─── AI-unavailable alert ─────────────────────────────────
+       Prominent, actionable card shown when no AI provider can answer
+       the query (offline + direct provider disabled, API errors, etc.).
+       Lives inside the messages stream so it's contextual, but styled
+       as an alert so it clearly breaks the conversation flow. */
+    .autodom-chat-msg.alert {
+      align-self: stretch !important;
+      max-width: 100% !important;
+      width: 100% !important;
+      padding: 12px 14px !important;
+      border-radius: 12px !important;
+      background: color-mix(in oklch, var(--c-danger) 8%, var(--c-surface)) !important;
+      border: 1px solid color-mix(in oklch, var(--c-danger) 35%, var(--c-border)) !important;
+      color: var(--c-text) !important;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 8px !important;
+      position: relative;
+      animation: __autodom_slide_in 0.22s var(--ease-out);
+    }
+    .autodom-chat-msg.alert.warn {
+      background: color-mix(in oklch, var(--c-warn, oklch(80% 0.14 85)) 10%, var(--c-surface)) !important;
+      border-color: color-mix(in oklch, var(--c-warn, oklch(80% 0.14 85)) 40%, var(--c-border)) !important;
+    }
+    .autodom-chat-msg.alert .alert-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 22px;
+    }
+    .autodom-chat-msg.alert .alert-icon {
+      flex: 0 0 22px;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: color-mix(in oklch, var(--c-danger) 22%, transparent);
+      color: var(--c-danger);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 13px;
+      font-family: var(--font);
+      line-height: 1;
+    }
+    .autodom-chat-msg.alert.warn .alert-icon {
+      background: color-mix(in oklch, var(--c-warn, oklch(80% 0.14 85)) 22%, transparent);
+      color: var(--c-warn, oklch(80% 0.14 85));
+    }
+    .autodom-chat-msg.alert .alert-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--c-text);
+      line-height: 1.3;
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    .autodom-chat-msg.alert .alert-dismiss {
+      flex: 0 0 22px;
+      width: 22px;
+      height: 22px;
+      padding: 0;
+      border: none;
+      background: transparent;
+      color: var(--c-text-3);
+      cursor: pointer;
+      border-radius: 5px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font: inherit;
+      line-height: 1;
+      font-size: 14px;
+    }
+    .autodom-chat-msg.alert .alert-dismiss:hover {
+      background: var(--c-raised);
+      color: var(--c-text);
+    }
+    .autodom-chat-msg.alert .alert-body {
+      font-size: 12.5px;
+      color: var(--c-text-2);
+      line-height: 1.5;
+      white-space: pre-wrap;
+    }
+    .autodom-chat-msg.alert .alert-body strong { color: var(--c-text); }
+    .autodom-chat-msg.alert .alert-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 2px;
+    }
+    .autodom-chat-msg.alert .alert-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 5px 11px;
+      border-radius: 6px;
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+      line-height: 1.3;
+      transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    }
+    .autodom-chat-msg.alert .alert-btn.primary {
+      background: var(--c-accent);
+      border: 1px solid var(--c-accent);
+      color: #fff;
+    }
+    .autodom-chat-msg.alert .alert-btn.primary:hover {
+      background: var(--c-accent-2, var(--c-accent));
+      border-color: var(--c-accent-2, var(--c-accent));
+    }
+    .autodom-chat-msg.alert .alert-btn.ghost {
+      background: transparent;
+      border: 1px solid var(--c-border);
+      color: var(--c-text-2);
+    }
+    .autodom-chat-msg.alert .alert-btn.ghost:hover {
+      background: var(--c-raised);
+      border-color: var(--c-border-s);
+      color: var(--c-text);
     }
 
     /* Tool result legacy box (overridden later by collapsible details rules) */
@@ -1204,37 +1448,43 @@
     .autodom-chat-quick-actions {
       display: flex;
       align-items: center;
-      gap: 6px;
-      padding: 8px 14px;
-      background: var(--c-bg);
+      gap: 5px;
+      padding: 6px 12px 4px;
+      background: linear-gradient(
+        180deg,
+        transparent 0%,
+        color-mix(in oklch, var(--c-bg) 92%, transparent) 100%
+      );
       overflow-x: auto;
       flex-shrink: 0;
-      border-top: 1px solid var(--c-border);
+      border-top: 1px solid color-mix(in oklch, var(--c-border) 75%, transparent);
+      scrollbar-width: none;
     }
     .autodom-chat-quick-actions::-webkit-scrollbar {
       height: 0;
     }
     .autodom-chat-quick-btn {
       flex-shrink: 0;
-      padding: 5px 11px;
-      border-radius: 8px;
-      background: var(--c-surface);
-      border: 1px solid var(--c-border);
-      color: var(--c-text-2);
-      font-size: 11.5px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      background: color-mix(in oklch, var(--c-surface) 84%, transparent);
+      border: 1px solid color-mix(in oklch, var(--c-border) 85%, transparent);
+      color: var(--c-text-3);
+      font-size: 10px;
       font-weight: 500;
       cursor: pointer;
       transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
       font-family: inherit;
       white-space: nowrap;
-      line-height: 1.3;
+      line-height: 1;
+      letter-spacing: 0.01em;
       display: inline-flex;
       align-items: center;
-      min-height: 30px;
+      min-height: 24px;
     }
     .autodom-chat-quick-btn:hover {
-      background: var(--c-raised);
-      border-color: var(--c-border-s);
+      background: color-mix(in oklch, var(--c-surface-2) 90%, transparent);
+      border-color: color-mix(in oklch, var(--c-border-s) 85%, transparent);
       color: var(--c-text);
       transform: none;
     }
@@ -1393,50 +1643,128 @@
       color: var(--c-text-2);
     }
 
-    /* ─── Welcome Screen ────────────────────────────────────── */
+    /* ─── Welcome Screen ──────────────────────────────────────
+       No avatar icon here — the header already brands the panel.
+       This is a brief "how to use" cheatsheet so a new user knows
+       what they can type, which shortcuts exist, and how to escape
+       hatch to slash commands. */
     .autodom-chat-welcome {
       width: 100%;
       display: flex;
       flex-direction: column;
       align-items: stretch;
       justify-content: flex-start;
-      gap: 12px;
-      padding: 18px 2px 8px;
+      gap: 14px;
+      padding: 4px 2px 8px;
       text-align: left;
     }
-    .autodom-chat-welcome-icon {
-      width: 36px;
-      height: 36px;
-      border-radius: 10px;
-      background: var(--c-accent);
-      border: 1px solid var(--c-accent-ring);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      margin-bottom: 2px;
-      box-shadow: none;
-    }
-    .autodom-chat-welcome-icon::before { display: none; }
-    .autodom-chat-welcome-icon svg {
-      width: 18px;
-      height: 18px;
-      fill: #fff;
-      stroke: none;
-    }
+    /* Legacy welcome icon — hard-hidden so old cached DOM doesn't show it */
+    .autodom-chat-welcome-icon { display: none !important; }
     .autodom-chat-welcome h3 {
-      font-size: 20px;
+      font-size: 18px;
       font-weight: 600;
       color: var(--c-text);
-      letter-spacing: 0;
+      letter-spacing: -0.01em;
       margin: 0;
-      line-height: 1.2;
+      line-height: 1.25;
     }
-    .autodom-chat-welcome p {
-      font-size: 13px;
+    .autodom-chat-welcome p.welcome-sub {
+      font-size: 12.5px;
       color: var(--c-text-3);
-      line-height: 1.55;
+      line-height: 1.5;
       max-width: 360px;
       margin: 0;
+    }
+    .autodom-chat-welcome .welcome-section-label {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--c-text-3);
+      margin: 6px 0 -4px;
+    }
+    .autodom-chat-welcome .welcome-bullets {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .autodom-chat-welcome .welcome-bullets li {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      font-size: 12.5px;
+      color: var(--c-text-2);
+      line-height: 1.45;
+    }
+    .autodom-chat-welcome .welcome-bullets li::before {
+      content: "";
+      flex: 0 0 5px;
+      width: 5px; height: 5px;
+      margin-top: 7px;
+      border-radius: 50%;
+      background: var(--c-accent);
+      opacity: 0.8;
+    }
+    .autodom-chat-welcome .welcome-bullets li b {
+      color: var(--c-text);
+      font-weight: 600;
+    }
+    .autodom-chat-welcome .welcome-tips {
+      margin: 0;
+      padding: 10px 12px;
+      border: 1px solid var(--c-border);
+      border-radius: 10px;
+      background: var(--c-surface);
+    }
+    .autodom-chat-welcome .welcome-tips summary {
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--c-text-2);
+      cursor: pointer;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .autodom-chat-welcome .welcome-tips summary::-webkit-details-marker { display: none; }
+    .autodom-chat-welcome .welcome-tips summary::before {
+      content: "▸";
+      font-size: 10px;
+      color: var(--c-text-3);
+      transition: transform 0.15s ease;
+    }
+    .autodom-chat-welcome .welcome-tips[open] summary::before { transform: rotate(90deg); }
+    .autodom-chat-welcome .welcome-tips-body {
+      margin-top: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      font-size: 11.5px;
+      color: var(--c-text-3);
+      line-height: 1.5;
+    }
+    .autodom-chat-welcome .welcome-tips-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px 10px;
+      align-items: center;
+    }
+    .autodom-chat-welcome .welcome-tips-row .tip-label {
+      color: var(--c-text-2);
+      font-weight: 600;
+      min-width: 72px;
+    }
+    .autodom-chat-welcome .welcome-tips code {
+      font-family: var(--mono);
+      font-size: 10.5px;
+      color: var(--c-text-2);
+      background: var(--c-bg);
+      padding: 1px 6px;
+      border-radius: 4px;
+      border: 1px solid var(--c-border);
     }
     .autodom-chat-welcome .shortcut-hint {
       display: inline-flex;
@@ -1444,8 +1772,7 @@
       gap: 6px;
       font-size: 10.5px;
       color: var(--c-text-3);
-      padding: 6px 10px;
-      border-radius: 8px;
+      padding: 6px 0 0;
       font-weight: 500;
       margin-top: 0;
     }
@@ -1467,17 +1794,17 @@
     /* ─── Inline Overlay (Spotlight-style) ─────────────────────── */
     #${INLINE_OVERLAY_ID} {
       position: fixed;
-      top: 50%;
+      top: 18%;
       left: 50%;
-      transform: translate(-50%, -50%) scale(0.96);
-      width: 560px;
-      max-width: 90vw;
+      transform: translate(-50%, -8px) scale(0.98);
+      width: 520px;
+      max-width: calc(100vw - 32px);
       background: var(--c-bg);
-      border: 1px solid var(--c-border-s);
-      border-radius: 14px;
-      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(0, 0, 0, 0.1);
+      border: 1px solid var(--c-border);
+      border-radius: 12px;
+      box-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
       z-index: 2147483647;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-family: var(--font);
       opacity: 0;
       pointer-events: none;
       transition: opacity 0.2s ease, transform 0.2s var(--ease-out);
@@ -1486,7 +1813,7 @@
     #${INLINE_OVERLAY_ID}.visible {
       opacity: 1;
       pointer-events: auto;
-      transform: translate(-50%, -50%) scale(1);
+      transform: translate(-50%, 0) scale(1);
     }
     #${INLINE_OVERLAY_ID} * {
       box-sizing: border-box;
@@ -1497,14 +1824,14 @@
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 14px 16px 8px;
-      font-size: 12px;
+      padding: 10px 12px 0;
+      font-size: 11px;
       color: var(--c-text-3);
     }
     .autodom-inline-header .logo {
-      width: 22px;
-      height: 22px;
-      border-radius: 5px;
+      width: 18px;
+      height: 18px;
+      border-radius: 6px;
       background: var(--c-accent);
       display: flex;
       align-items: center;
@@ -1512,24 +1839,24 @@
       flex-shrink: 0;
     }
     .autodom-inline-header .logo svg {
-      width: 12px;
-      height: 12px;
+      width: 10px;
+      height: 10px;
       fill: none;
-      stroke: var(--c-bg);
+      stroke: #fff;
       stroke-width: 2.5;
     }
     .autodom-inline-header .title {
-      font-weight: 700;
-      color: var(--c-text);
+      font-weight: 600;
+      color: var(--c-text-2);
     }
     .autodom-inline-header .mcp-status {
       margin-left: auto;
       display: inline-flex;
       align-items: center;
       gap: 5px;
-      font-size: 10px;
-      color: var(--c-success);
-      font-weight: 600;
+      font-size: 10.5px;
+      color: var(--c-text-3);
+      font-weight: 500;
       line-height: 1;
       white-space: nowrap;
     }
@@ -1544,46 +1871,48 @@
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 16px 14px;
+      padding: 10px 12px 8px;
     }
     .autodom-inline-input {
       flex: 1;
-      height: 44px;
-      padding: 0 14px;
+      height: 42px;
+      padding: 0 12px;
       background: var(--c-surface);
-      border: 1px solid var(--c-border-s);
-      border-radius: var(--radius);
+      border: 1px solid var(--c-border);
+      border-radius: 10px;
       color: var(--c-text);
       font-family: inherit;
       font-size: 14px;
       outline: none;
-      transition: border-color 0.15s ease;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
     }
     .autodom-inline-input:focus {
-      border-color: var(--c-text-3);
+      border-color: var(--c-accent);
+      background: var(--c-surface-2);
+      box-shadow: 0 0 0 3px var(--c-accent-soft);
     }
     .autodom-inline-input::placeholder {
       color: var(--c-text-3);
     }
     .autodom-inline-send {
-      width: 44px;
-      height: 44px;
-      border-radius: var(--radius);
-      background: var(--c-accent-muted);
-      border: 1px solid var(--c-border-s);
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      background: var(--c-accent);
+      border: none;
       cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
-      transition: background-color 0.15s ease, border-color 0.15s ease;
+      transition: background-color 0.15s ease, transform 0.15s ease, opacity 0.15s ease;
       flex-shrink: 0;
     }
     .autodom-inline-send:hover {
-      background: var(--c-border-s);
-      border-color: var(--c-text-3);
+      background: var(--c-accent-2);
+      transform: scale(1.04);
     }
     .autodom-inline-send:active {
-      background: var(--c-raised);
+      transform: scale(0.96);
     }
     .autodom-inline-send:disabled {
       opacity: 0.25;
@@ -1602,15 +1931,15 @@
       width: 16px;
       height: 16px;
       fill: none;
-      stroke: var(--c-text);
-      stroke-width: 2;
+      stroke: #fff;
+      stroke-width: 2.2;
       stroke-linecap: round;
       stroke-linejoin: round;
     }
     .autodom-inline-response {
       display: none;
-      padding: 0 16px 14px;
-      max-height: 300px;
+      padding: 0 12px 10px;
+      max-height: 260px;
       overflow-y: auto;
     }
     .autodom-inline-response.visible {
@@ -1619,8 +1948,8 @@
     .autodom-inline-response-content {
       background: var(--c-surface);
       border: 1px solid var(--c-border);
-      border-radius: var(--radius);
-      padding: 14px;
+      border-radius: 10px;
+      padding: 12px;
       font-size: 13px;
       color: var(--c-text);
       line-height: 1.55;
@@ -1642,15 +1971,15 @@
       display: flex;
       align-items: center;
       gap: 6px;
-      padding: 0 16px 12px;
+      padding: 0 12px 10px;
       overflow-x: auto;
     }
     .autodom-inline-hints::-webkit-scrollbar { height: 0; }
     .autodom-inline-hint {
       flex-shrink: 0;
-      padding: 5px 10px;
-      border-radius: 6px;
-      background: var(--c-raised);
+      padding: 5px 9px;
+      border-radius: 999px;
+      background: transparent;
       border: 1px solid var(--c-border);
       color: var(--c-text-2);
       font-size: 10px;
@@ -1662,26 +1991,29 @@
       line-height: 1.3;
       display: inline-flex;
       align-items: center;
-      min-height: 28px;
+      min-height: 26px;
     }
     .autodom-inline-hint:hover {
-      background: var(--c-border-s);
+      background: var(--c-surface);
       border-color: var(--c-border-s);
       color: var(--c-text);
     }
     .autodom-inline-footer {
-      padding: 8px 16px 10px;
-      text-align: center;
-      font-size: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      padding: 0 12px 10px;
+      font-size: 10.5px;
       color: var(--c-text-3);
-      border-top: 1px solid var(--c-border);
-      background: var(--c-surface);
-      letter-spacing: 0.01em;
+      border-top: none;
+      background: transparent;
+      letter-spacing: 0;
     }
     .autodom-inline-footer kbd {
       font-family: var(--mono);
       font-size: 9px;
-      background: var(--c-raised);
+      background: var(--c-surface);
       padding: 2px 6px;
       border-radius: 3px;
       color: var(--c-text-2);
@@ -1693,7 +2025,7 @@
     .autodom-inline-backdrop {
       position: fixed;
       inset: 0;
-      background: rgba(0, 0, 0, 0.5);
+      background: rgba(0, 0, 0, 0.18);
       z-index: 2147483646;
       opacity: 0;
       pointer-events: none;
@@ -1914,6 +2246,7 @@
     }
     .autodom-chat-msg.assistant:hover .msg-copy-btn,
     .autodom-chat-msg.ai-response:hover .msg-copy-btn,
+    .autodom-chat-msg.user:hover .msg-copy-btn,
     .autodom-chat-msg .msg-copy-btn:focus-visible { opacity: 1; }
     .autodom-chat-msg .msg-copy-btn:hover {
       background: var(--c-raised);
@@ -1924,6 +2257,65 @@
     .autodom-chat-msg .msg-copy-btn svg {
       width: 12px; height: 12px;
       fill: none; stroke: currentColor; stroke-width: 2;
+      stroke-linecap: round; stroke-linejoin: round;
+    }
+    /* User bubble copy button — floats just outside the pill on its left
+       so it never overlaps the message text. */
+    .autodom-chat-msg.user { position: relative; }
+    .autodom-chat-msg.user .msg-copy-btn {
+      top: 50%;
+      right: auto;
+      left: -34px;
+      transform: translateY(-50%);
+      width: 24px; height: 24px;
+      border-radius: 6px;
+    }
+    .autodom-chat-msg.user .msg-copy-btn svg { width: 11px; height: 11px; }
+
+    /* Copy button inside a tool-result summary row (compact, inline) */
+    .autodom-chat-msg.tool-result .tr-copy-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 16px;
+      height: 16px;
+      margin-left: 3px;
+      padding: 0;
+      border-radius: 999px;
+      background: transparent;
+      border: none;
+      color: var(--c-text-3);
+      cursor: pointer;
+      opacity: 0.38;
+      transition: opacity 0.15s ease, background-color 0.15s ease,
+        color 0.15s ease, transform 0.15s ease;
+      flex-shrink: 0;
+    }
+    .autodom-chat-msg.tool-result summary:hover .tr-copy-btn,
+    .autodom-chat-msg.tool-result .tr-copy-btn:focus-visible {
+      opacity: 0.88;
+      color: var(--c-text);
+    }
+    .autodom-chat-msg.tool-result .tr-copy-btn:hover {
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--c-text);
+      opacity: 1;
+      transform: translateY(-1px);
+    }
+    .autodom-chat-msg.tool-result .tr-copy-btn:focus-visible {
+      outline: 1px solid rgba(255, 255, 255, 0.12);
+      outline-offset: 1px;
+    }
+    .autodom-chat-msg.tool-result .tr-copy-btn.copied {
+      color: var(--c-success);
+      opacity: 1;
+    }
+    .autodom-chat-msg.tool-result .tr-copy-btn svg {
+      width: 9px;
+      height: 9px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.85;
       stroke-linecap: round; stroke-linejoin: round;
     }
 
@@ -1970,9 +2362,10 @@
     .autodom-chat-msg.tool-result details[open] summary::before { transform: rotate(90deg); }
     .autodom-chat-msg.tool-result details[open] summary { border-bottom-color: var(--c-border); }
     .autodom-chat-msg.tool-result summary .tr-tool {
-      font-family: var(--mono);
+      font-family: inherit;
       color: var(--c-text);
       font-weight: 600;
+      letter-spacing: 0.01em;
     }
     .autodom-chat-msg.tool-result summary .tr-meta {
       margin-left: auto;
@@ -2030,6 +2423,70 @@
       outline-offset: 2px;
     }
 
+    /* ─── Floating Run Indicator ─────────────────────────────
+       Always-visible pill that appears while an agent run is active,
+       even if the chat panel is closed or the page was refreshed mid-
+       run. Gives the user a universal manual-stop handle. */
+    .autodom-run-indicator {
+      position: fixed !important;
+      bottom: 20px !important;
+      right: 20px !important;
+      z-index: 2147483645 !important;
+      display: none !important;
+      align-items: center !important;
+      gap: 10px !important;
+      padding: 8px 12px 8px 10px !important;
+      border-radius: 999px !important;
+      background: rgba(14, 14, 14, 0.96) !important;
+      color: #fff !important;
+      border: 1px solid rgba(255, 255, 255, 0.08) !important;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.25) !important;
+      font-family: var(--font) !important;
+      font-size: 12.5px !important;
+      line-height: 1.2 !important;
+      animation: __autodom_slide_in 0.22s var(--ease-out);
+      -webkit-font-smoothing: antialiased;
+    }
+    .autodom-run-indicator.visible { display: inline-flex !important; }
+    .autodom-run-indicator .ari-spinner {
+      flex: 0 0 14px;
+      width: 14px; height: 14px;
+      border-radius: 50%;
+      border: 2px solid rgba(255,255,255,0.18);
+      border-top-color: #fff;
+      animation: __autodom_spin 0.7s linear infinite;
+    }
+    .autodom-run-indicator .ari-text {
+      font-weight: 500;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+      max-width: 180px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .autodom-run-indicator .ari-stop {
+      appearance: none !important;
+      background: color-mix(in oklch, var(--c-danger) 40%, transparent) !important;
+      border: 1px solid color-mix(in oklch, var(--c-danger) 70%, transparent) !important;
+      color: #fff !important;
+      padding: 4px 10px !important;
+      border-radius: 999px !important;
+      font: inherit !important;
+      font-size: 11.5px !important;
+      font-weight: 600 !important;
+      cursor: pointer !important;
+      letter-spacing: 0.02em !important;
+      transition: background-color 0.15s ease, transform 0.1s ease !important;
+    }
+    .autodom-run-indicator .ari-stop:hover {
+      background: var(--c-danger) !important;
+    }
+    .autodom-run-indicator .ari-stop:active { transform: translateY(1px); }
+    .autodom-run-indicator[data-stopping="1"] .ari-stop {
+      opacity: 0.6; cursor: wait !important;
+    }
+    @keyframes __autodom_spin { to { transform: rotate(360deg); } }
+
     /* Responsive: narrow screens */
     @media (max-width: 480px) {
       #${PANEL_ID} {
@@ -2043,8 +2500,8 @@
         border-radius: 10px;
       }
       .autodom-chat-quick-btn {
-        min-height: 44px;
-        padding: 8px 12px;
+        min-height: 34px;
+        padding: 6px 10px;
       }
       .confirm-prompt-btn {
         min-height: 44px;
@@ -2222,12 +2679,32 @@
           <option value="dark">Dark</option>
           <option value="light">Light</option>
         </select>
+        <button class="autodom-chat-header-btn" id="__autodom_settings_btn" title="Chat settings" aria-label="Chat settings" aria-haspopup="true" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
         <button class="autodom-chat-header-btn" id="__autodom_clear_btn" title="Clear conversation" aria-label="Clear conversation">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
         </button>
         <button class="autodom-chat-close-btn" id="__autodom_close_btn" title="Close panel (Esc)" aria-label="Close chat panel">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg>
         </button>
+      </div>
+    </div>
+
+    <!-- Settings Sheet (slides down from header) -->
+    <div class="autodom-chat-settings-sheet" id="__autodom_settings_sheet" role="dialog" aria-label="Chat settings" hidden>
+      <div class="acss-row">
+        <label class="acss-toggle" for="__autodom_verbose_toggle">
+          <span class="acss-toggle-info">
+            <span class="acss-toggle-title">Verbose automation logs</span>
+            <span class="acss-toggle-desc">Show each tool call &amp; result in the chat, like Claude CLI.</span>
+          </span>
+          <input type="checkbox" id="__autodom_verbose_toggle" />
+          <span class="acss-switch" aria-hidden="true"><span class="acss-switch-knob"></span></span>
+        </label>
+      </div>
+      <div class="acss-foot">
+        <span class="acss-foot-hint">Stop button is always shown while automation is running.</span>
       </div>
     </div>
 
@@ -2242,31 +2719,59 @@
     <!-- Messages Area -->
     <div class="autodom-chat-messages" id="__autodom_messages" role="log" aria-label="Chat messages" aria-live="polite">
       <div class="autodom-chat-welcome">
-        <div class="autodom-chat-welcome-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24">
-            <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
-          </svg>
-        </div>
-        <h3>How can I help today?</h3>
-        <p>Ask about this page, inspect the DOM, or run safe browser actions.</p>
+        <h3>How can I help?</h3>
+        <p class="welcome-sub">Type naturally, tap a suggestion, or drop to <code style="font-family:var(--mono);font-size:11px;">/commands</code> — AutoDOM reads the page and runs safe browser actions.</p>
+
+        <div class="welcome-section-label">What you can do</div>
+        <ul class="welcome-bullets">
+          <li><span><b>Summarize &amp; explain</b> — ask about this page, its forms, buttons, or flows.</span></li>
+          <li><span><b>Automate actions</b> — "click the login button", "fill the search with …", navigate, scroll.</span></li>
+          <li><span><b>Inspect the DOM</b> — live tool calls stream as cards so you can see what ran.</span></li>
+          <li><span><b>Stay in control</b> — hit <b>Stop</b> anytime; dangerous actions ask first.</span></li>
+        </ul>
+
+        <div class="welcome-section-label">Try something</div>
         <div class="autodom-chat-welcome-suggestions" id="__autodom_welcome_suggestions" role="list" aria-label="Suggested prompts">
           <button class="autodom-chat-suggestion" type="button" data-prompt="__summarize__" role="listitem">Summarize page</button>
           <button class="autodom-chat-suggestion" type="button" data-prompt="What is this page about and what can I do here?" role="listitem">Explain page</button>
           <button class="autodom-chat-suggestion" type="button" data-prompt="List the most important interactive elements on this page." role="listitem">Key controls</button>
           <button class="autodom-chat-suggestion" type="button" data-prompt="Find any forms on this page and describe their fields." role="listitem">Inspect forms</button>
         </div>
-        <div class="shortcut-hint" aria-label="Keyboard shortcuts">
-          <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd> toggle &nbsp;·&nbsp; <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd> inline
-        </div>
+
+        <details class="welcome-tips">
+          <summary>Tips &amp; shortcuts</summary>
+          <div class="welcome-tips-body">
+            <div class="welcome-tips-row">
+              <span class="tip-label">Toggle panel</span>
+              <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd></span>
+            </div>
+            <div class="welcome-tips-row">
+              <span class="tip-label">Quick prompt</span>
+              <span><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd></span>
+            </div>
+            <div class="welcome-tips-row">
+              <span class="tip-label">Send</span>
+              <span><kbd>Enter</kbd> · newline <kbd>Shift</kbd>+<kbd>Enter</kbd></span>
+            </div>
+            <div class="welcome-tips-row">
+              <span class="tip-label">Commands</span>
+              <span><code>/dom</code> <code>/screenshot</code> <code>/click</code> <code>/type</code> <code>/nav</code> <code>/help</code></span>
+            </div>
+            <div class="welcome-tips-row">
+              <span class="tip-label">Settings</span>
+              <span>gear icon in the header — toggle verbose tool logs.</span>
+            </div>
+          </div>
+        </details>
       </div>
     </div>
 
     <!-- Quick Actions -->
     <div class="autodom-chat-quick-actions" id="__autodom_quick_actions" role="toolbar" aria-label="Quick actions">
       <button class="autodom-chat-quick-btn" data-action="dom_state">DOM</button>
-      <button class="autodom-chat-quick-btn" data-action="screenshot">Screenshot</button>
+      <button class="autodom-chat-quick-btn" data-action="screenshot">Screen</button>
       <button class="autodom-chat-quick-btn" data-action="page_info">Info</button>
-      <button class="autodom-chat-quick-btn" data-action="summarize">Summarize</button>
+      <button class="autodom-chat-quick-btn" data-action="summarize">Summary</button>
       <button class="autodom-chat-quick-btn" data-action="accessibility">A11y</button>
     </div>
 
@@ -2310,11 +2815,11 @@
       <div class="logo" aria-hidden="true">
         <svg viewBox="0 0 24 24"><path d="M8 10h8M8 14h5" stroke-linecap="round"/></svg>
       </div>
-      <span class="title">AutoDOM AI</span>
+      <span class="title">Quick prompt</span>
       <span class="autodom-chat-beta-badge" aria-label="Beta">BETA</span>
       <span class="mcp-status" id="__autodom_inline_status" role="status" aria-live="polite">
         <span class="dot" aria-hidden="true"></span>
-        Connected
+        MCP ready
       </span>
     </div>
     <div class="autodom-inline-input-row">
@@ -2322,26 +2827,28 @@
         type="text"
         class="autodom-inline-input"
         id="__autodom_inline_input"
-        placeholder="Ask AI to do something on this page..."
+        placeholder="Ask AutoDOM about this page..."
         autocomplete="off"
         aria-label="Quick AI prompt"
       />
       <button class="autodom-inline-send" id="__autodom_inline_send" title="Send" aria-label="Send prompt">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
       </button>
     </div>
     <div class="autodom-inline-hints" id="__autodom_inline_hints" role="toolbar" aria-label="Suggested prompts">
-      <button class="autodom-inline-hint" data-text="What's on this page?">What's on this page?</button>
+      <button class="autodom-inline-hint" data-text="What's on this page?">Explain</button>
       <button class="autodom-inline-hint" data-text="Take a screenshot">Screenshot</button>
-      <button class="autodom-inline-hint" data-text="Show interactive elements">DOM State</button>
+      <button class="autodom-inline-hint" data-text="Show interactive elements">DOM</button>
       <button class="autodom-inline-hint" data-text="Summarize this page">Summarize</button>
-      <button class="autodom-inline-hint" data-text="Check accessibility">A11y Check</button>
+      <button class="autodom-inline-hint" data-text="Check accessibility">A11y</button>
     </div>
     <div class="autodom-inline-response" id="__autodom_inline_response" aria-live="polite">
       <div class="autodom-inline-response-content" id="__autodom_inline_response_content"></div>
     </div>
     <div class="autodom-inline-footer">
-      <kbd>Esc</kbd> close &middot; <kbd>Enter</kbd> send &middot; <kbd>Ctrl+Shift+L</kbd> toggle
+      <span><kbd>Esc</kbd> close</span>
+      <span><kbd>Enter</kbd> send</span>
+      <span><kbd>Cmd/Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>L</kbd></span>
     </div>
   `;
   document.documentElement.appendChild(inlineOverlay);
@@ -2544,9 +3051,106 @@
     panel.classList.remove("open");
     persistChatState();
     _updateAutomationUi();
+    // If automation is still running when the user closes the panel,
+    // stop it — there's no UI left to surface progress and the user
+    // clearly wants to bail. SW-side tab listeners cover refresh/close,
+    // this covers the explicit "X button" path.
+    if (_activeRunId) {
+      try {
+        chrome.runtime.sendMessage(
+          { type: "STOP_AGENT_RUN", runId: _activeRunId, reason: "panel_closed" },
+          () => { try { void chrome.runtime.lastError; } catch (_) {} },
+        );
+      } catch (_) {}
+      _activeRunId = null;
+    }
   }
 
   closeBtn.addEventListener("click", closePanel);
+
+  // Fresh content-script load (hard refresh, SPA route change, first
+  // inject). Ask the SW whether any agent run is still active:
+  //   - if the run was bound to *this* tab, SW aborts it (stale)
+  //   - if another tab is still running, surface the floating pill so
+  //     the user has a manual Stop without needing to leave this tab.
+  try {
+    chrome.runtime.sendMessage(
+      { type: "PANEL_LOADED_RESET_RUN" },
+      (resp) => {
+        try { void chrome.runtime.lastError; } catch (_) {}
+        // After the reset, re-query; anything still active is a real
+        // in-flight run that we should surface a stop handle for.
+        try {
+          chrome.runtime.sendMessage({ type: "GET_ACTIVE_RUN" }, (s) => {
+            try { void chrome.runtime.lastError; } catch (_) {}
+            if (s && s.active) {
+              _activeRunId = s.runId || null;
+              _showRunIndicator(
+                s.toolRunning ? "Automation running" : "Automation finishing",
+              );
+            }
+          });
+        } catch (_) {}
+      },
+    );
+  } catch (_) {}
+
+  // Best-effort beforeunload beacon — message delivery before unload
+  // is not guaranteed in MV3 content scripts, but when it lands it's
+  // faster than waiting for webNavigation to fire.
+  window.addEventListener("beforeunload", () => {
+    if (!_activeRunId) return;
+    try {
+      chrome.runtime.sendMessage(
+        { type: "STOP_AGENT_RUN", runId: _activeRunId, reason: "panel_unloading" },
+        () => {},
+      );
+    } catch (_) {}
+  });
+
+  // ─── Settings Sheet ────────────────────────────────────────
+  const settingsBtn = document.getElementById("__autodom_settings_btn");
+  const settingsSheet = document.getElementById("__autodom_settings_sheet");
+  const verboseToggle = document.getElementById("__autodom_verbose_toggle");
+  function _closeSettingsSheet() {
+    if (!settingsSheet) return;
+    settingsSheet.setAttribute("hidden", "");
+    if (settingsBtn) {
+      settingsBtn.setAttribute("aria-expanded", "false");
+      settingsBtn.classList.remove("active");
+    }
+  }
+  function _openSettingsSheet() {
+    if (!settingsSheet) return;
+    _applySettingsToUI();
+    settingsSheet.removeAttribute("hidden");
+    if (settingsBtn) {
+      settingsBtn.setAttribute("aria-expanded", "true");
+      settingsBtn.classList.add("active");
+    }
+  }
+  if (settingsBtn && settingsSheet) {
+    settingsBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (settingsSheet.hasAttribute("hidden")) _openSettingsSheet();
+      else _closeSettingsSheet();
+    });
+    // Close when clicking elsewhere in the panel (not inside the sheet)
+    panel.addEventListener("click", (e) => {
+      if (settingsSheet.hasAttribute("hidden")) return;
+      if (settingsSheet.contains(e.target)) return;
+      if (settingsBtn.contains(e.target)) return;
+      _closeSettingsSheet();
+    });
+  }
+  if (verboseToggle) {
+    verboseToggle.addEventListener("change", () => {
+      _chatSettings.verboseLogs = !!verboseToggle.checked;
+      _saveChatSettings();
+    });
+  }
+  // Load persisted settings now that DOM refs exist
+  _loadChatSettings();
 
   // ─── Clear Conversation ────────────────────────────────────
   clearBtn.addEventListener("click", () => {
@@ -2555,13 +3159,15 @@
     persistChatState();
     messagesContainer.innerHTML = `
       <div class="autodom-chat-welcome">
-        <div class="autodom-chat-welcome-icon">
-          <svg viewBox="0 0 24 24">
-            <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
-          </svg>
+        <h3>How can I help?</h3>
+        <p class="welcome-sub">Conversation cleared. Ask anything about this page, tap a suggestion, or use a slash command.</p>
+        <div class="welcome-section-label">Try something</div>
+        <div class="autodom-chat-welcome-suggestions" role="list" aria-label="Suggested prompts">
+          <button class="autodom-chat-suggestion" type="button" data-prompt="__summarize__" role="listitem">Summarize page</button>
+          <button class="autodom-chat-suggestion" type="button" data-prompt="What is this page about and what can I do here?" role="listitem">Explain page</button>
+          <button class="autodom-chat-suggestion" type="button" data-prompt="List the most important interactive elements on this page." role="listitem">Key controls</button>
+          <button class="autodom-chat-suggestion" type="button" data-prompt="Find any forms on this page and describe their fields." role="listitem">Inspect forms</button>
         </div>
-        <h3>How can I help today?</h3>
-        <p>Conversation cleared. Ask me anything about this page.</p>
       </div>
     `;
   });
@@ -2805,6 +3411,182 @@
     if (welcome) welcome.remove();
   }
 
+  // Render a prominent, actionable "AI unavailable" alert inside the chat
+  // stream. One place to style + wire every unavailable state so the
+  // message, icon, and buttons stay consistent.
+  //
+  //   opts:
+  //     title    — one-line headline (required)
+  //     body     — longer explanation shown under the title (string; supports \n)
+  //     tone     — "error" (default) | "warn"
+  //     actions  — [{ label, kind?: "primary"|"ghost", onClick: () => void }]
+  //     dedupeKey— if set, remove any prior alert with the same key first
+  function addAiAlert(opts) {
+    try {
+      clearWelcome();
+      if (opts && opts.dedupeKey) {
+        messagesContainer
+          .querySelectorAll(
+            `.autodom-chat-msg.alert[data-alert-key="${CSS.escape(opts.dedupeKey)}"]`,
+          )
+          .forEach((n) => n.remove());
+      }
+      const msg = document.createElement("div");
+      msg.className =
+        "autodom-chat-msg alert" + (opts?.tone === "warn" ? " warn" : "");
+      msg.setAttribute("role", "alert");
+      if (opts?.dedupeKey) msg.dataset.alertKey = opts.dedupeKey;
+
+      const head = document.createElement("div");
+      head.className = "alert-head";
+      const icon = document.createElement("span");
+      icon.className = "alert-icon";
+      icon.setAttribute("aria-hidden", "true");
+      icon.textContent = opts?.tone === "warn" ? "!" : "!";
+      const title = document.createElement("span");
+      title.className = "alert-title";
+      title.textContent = opts?.title || "AI is unavailable";
+      const dismiss = document.createElement("button");
+      dismiss.type = "button";
+      dismiss.className = "alert-dismiss";
+      dismiss.setAttribute("aria-label", "Dismiss alert");
+      dismiss.title = "Dismiss";
+      dismiss.textContent = "×"; // ×
+      dismiss.addEventListener("click", () => msg.remove());
+      head.append(icon, title, dismiss);
+      msg.appendChild(head);
+
+      if (opts?.body) {
+        const body = document.createElement("div");
+        body.className = "alert-body";
+        body.textContent = String(opts.body);
+        msg.appendChild(body);
+      }
+
+      const actions = Array.isArray(opts?.actions) ? opts.actions : [];
+      if (actions.length > 0) {
+        const row = document.createElement("div");
+        row.className = "alert-actions";
+        actions.forEach((a) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "alert-btn " + (a.kind === "primary" ? "primary" : "ghost");
+          btn.textContent = a.label || "Action";
+          btn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            try {
+              a.onClick && a.onClick();
+            } catch (_) {}
+          });
+          row.appendChild(btn);
+        });
+        msg.appendChild(row);
+      }
+
+      messagesContainer.appendChild(msg);
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      // The alert isn't part of the persisted conversation — it's ambient
+      // UI. Don't push it into `messages` so reloads stay clean.
+      return msg;
+    } catch (err) {
+      _err("addAiAlert failed:", err && err.message);
+      return null;
+    }
+  }
+
+  // Open the extension popup via the service worker (content scripts can't
+  // call chrome.action directly). No-op if the SW doesn't handle the
+  // message — we just stop quietly.
+  function _openExtensionPopup() {
+    try {
+      chrome.runtime.sendMessage({ type: "OPEN_POPUP" }, () => {
+        // swallow lastError; popup open is best-effort
+        try { void chrome.runtime.lastError; } catch (_) {}
+      });
+    } catch (_) {}
+  }
+
+  // Build the standard "no AI available" alert used when the user tries to
+  // send but neither a direct provider nor the IDE bridge is ready.
+  function showAiUnavailableAlert(detail) {
+    return addAiAlert({
+      dedupeKey: "ai-unavailable",
+      tone: "error",
+      title: "AI is unavailable",
+      body:
+        (detail ? detail + "\n\n" : "") +
+        "No AI provider is connected. Connect one to send natural-language queries:\n" +
+        "• OpenAI / Anthropic / Ollama (direct) — add an API key in the popup\n" +
+        "• IDE Agent (MCP) — start the bridge from your IDE\n\n" +
+        "Slash commands like /dom, /screenshot, and /help keep working offline.",
+      actions: [
+        {
+          label: "Open settings",
+          kind: "primary",
+          onClick: _openExtensionPopup,
+        },
+        {
+          label: "Retry",
+          kind: "ghost",
+          onClick: () => {
+            try {
+              checkConnectionStatus();
+            } catch (_) {}
+          },
+        },
+      ],
+    });
+  }
+
+  // Minimal clipboard helper. Returns the button element so callers can
+  // append it wherever; the button handles its own copied-state animation.
+  // `opts.small` renders the compact variant used inside tool-result summaries.
+  function _makeCopyBtn(text, opts) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = opts && opts.small ? "tr-copy-btn" : "msg-copy-btn";
+    btn.title = "Copy";
+    btn.setAttribute("aria-label", "Copy to clipboard");
+    btn.innerHTML =
+      '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const value = typeof text === "function" ? text() : text;
+      const resolved = String(value == null ? "" : value);
+      const flash = () => {
+        btn.classList.add("copied");
+        btn.title = "Copied!";
+        btn.innerHTML =
+          '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>';
+        setTimeout(() => {
+          btn.classList.remove("copied");
+          btn.title = "Copy";
+          btn.innerHTML =
+            '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+        }, 1400);
+      };
+      try {
+        navigator.clipboard.writeText(resolved).then(flash).catch(() => {
+          // Fallback: textarea + execCommand — works on pages that block
+          // the Async Clipboard API on untrusted origins.
+          try {
+            const ta = document.createElement("textarea");
+            ta.value = resolved;
+            ta.style.position = "fixed";
+            ta.style.opacity = "0";
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand("copy");
+            document.body.removeChild(ta);
+            flash();
+          } catch (_) {}
+        });
+      } catch (_) {}
+    });
+    return btn;
+  }
+
   function addMessage(role, content, extra) {
     clearWelcome();
 
@@ -2832,6 +3614,8 @@
       const lines = String(content || "").split("\n").length;
       meta.textContent = lines > 1 ? `${lines} lines` : "result";
       summary.appendChild(meta);
+      // Copy icon in the summary — doesn't toggle the <details>
+      summary.appendChild(_makeCopyBtn(String(content || ""), { small: true }));
       details.appendChild(summary);
 
       const pre = document.createElement("pre");
@@ -2859,35 +3643,15 @@
       md.className = "md";
       renderMarkdownInto(md, String(content || ""));
       msg.appendChild(md);
-
-      // Hover copy button (copies the raw markdown source)
-      const copyBtn = document.createElement("button");
-      copyBtn.type = "button";
-      copyBtn.className = "msg-copy-btn";
-      copyBtn.title = "Copy message";
-      copyBtn.setAttribute("aria-label", "Copy message");
-      copyBtn.innerHTML =
-        '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
-      copyBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        try {
-          navigator.clipboard
-            .writeText(String(content || ""))
-            .then(() => {
-              copyBtn.classList.add("copied");
-              copyBtn.title = "Copied!";
-              setTimeout(() => {
-                copyBtn.classList.remove("copied");
-                copyBtn.title = "Copy message";
-              }, 1500);
-            })
-            .catch(() => {});
-        } catch (_) {}
-      });
-      msg.appendChild(copyBtn);
+      msg.appendChild(_makeCopyBtn(String(content || "")));
     } else {
       const textNode = document.createTextNode(content);
       msg.appendChild(textNode);
+      // User / system / error messages also get a copy button so the
+      // operator can grab their own prompt without re-typing it.
+      if (role === "user") {
+        msg.appendChild(_makeCopyBtn(String(content || "")));
+      }
     }
 
     // Show AI tool calls if present
@@ -3124,6 +3888,68 @@
   // "run-end" or when the final assistant reply arrives.
   let _activeRunId = null;
 
+  // ─── Floating "automation running" indicator ──────────────
+  // Independent of the chat panel: a pill pinned to the page corner
+  // whenever any agent run is active so the user can stop it even with
+  // the panel closed, scrolled away, or freshly re-injected after a
+  // page refresh. Attached to documentElement so host CSS can't nest it.
+  const RUN_INDICATOR_ID = "__autodom_run_indicator";
+  function _ensureRunIndicator() {
+    let el = document.getElementById(RUN_INDICATOR_ID);
+    if (el) return el;
+    el = document.createElement("div");
+    el.id = RUN_INDICATOR_ID;
+    el.className = "autodom-run-indicator";
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    el.setAttribute("aria-label", "Automation running");
+    const spin = document.createElement("span");
+    spin.className = "ari-spinner";
+    spin.setAttribute("aria-hidden", "true");
+    const text = document.createElement("span");
+    text.className = "ari-text";
+    text.textContent = "Automation running";
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.className = "ari-stop";
+    stop.textContent = "Stop";
+    stop.setAttribute("aria-label", "Stop automation");
+    stop.addEventListener("click", () => {
+      if (el.getAttribute("data-stopping") === "1") return;
+      el.setAttribute("data-stopping", "1");
+      stop.textContent = "Stopping…";
+      try {
+        chrome.runtime.sendMessage(
+          { type: "STOP_AGENT_RUN", runId: _activeRunId, reason: "stopped_by_user" },
+          () => { try { void chrome.runtime.lastError; } catch (_) {} },
+        );
+      } catch (_) {}
+      // Also flag any in-chat tool cards as cancelled for immediate feedback
+      try {
+        document.querySelectorAll(".ai-tool-card.running").forEach((c) => {
+          c.classList.remove("running");
+          c.classList.add("fail");
+        });
+      } catch (_) {}
+    });
+    el.append(spin, text, stop);
+    (document.documentElement || document.body || document).appendChild(el);
+    return el;
+  }
+  function _showRunIndicator(labelText) {
+    const el = _ensureRunIndicator();
+    el.removeAttribute("data-stopping");
+    const text = el.querySelector(".ari-text");
+    const stop = el.querySelector(".ari-stop");
+    if (text) text.textContent = labelText || "Automation running";
+    if (stop) stop.textContent = "Stop";
+    el.classList.add("visible");
+  }
+  function _hideRunIndicator() {
+    const el = document.getElementById(RUN_INDICATOR_ID);
+    if (el) el.classList.remove("visible");
+  }
+
   function showTyping() {
     clearWelcome();
     // Never stack two turn cards concurrently.
@@ -3247,10 +4073,12 @@
     if (evt.phase === "run-start") {
       _activeRunId = evt.runId || null;
       showTyping();
+      _showRunIndicator();
       return;
     }
     if (evt.phase === "run-end") {
       _activeRunId = null;
+      _hideRunIndicator();
       const stopBtn = document.getElementById("__autodom_stop_btn");
       if (stopBtn) stopBtn.remove();
       // If aborted, stamp any still-running cards as cancelled.
@@ -3262,6 +4090,22 @@
       }
       return;
     }
+    // Update the floating pill label with the current tool name so the
+    // user can see progress at a glance when the chat panel is closed.
+    if (evt.phase === "start" && evt.tool) {
+      try {
+        const el = document.getElementById(RUN_INDICATOR_ID);
+        if (el && el.classList.contains("visible")) {
+          const t = el.querySelector(".ari-text");
+          if (t) t.textContent = "Running: " + evt.tool;
+        }
+      } catch (_) {}
+    }
+    // Respect the user's "Verbose automation logs" preference — when off,
+    // start/end events don't render a tool card (the run header with the
+    // spinner + Stop button is still shown so the user has control and
+    // progress feedback, just without per-step details).
+    if (!_chatSettings.verboseLogs) return;
     const container = _ensureRunContainer();
     if (!container) return;
     const tool = evt.tool || "tool";
@@ -3346,7 +4190,7 @@
         if (!evt.ok && evt.error) {
           text = String(evt.error);
         } else if (evt.result !== undefined) {
-          text = formatToolResult(evt.result);
+          text = formatToolResult(evt.result, tool);
         } else {
           text = evt.ok ? "(no output)" : "(failed)";
         }
@@ -3379,9 +4223,250 @@
     }
   }
 
-  function formatToolResult(result) {
+  function _normalizeUiText(value) {
+    return String(value == null ? "" : value)
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function _truncateUiText(value, max = 88) {
+    const text = _normalizeUiText(value);
+    if (text.length <= max) return text;
+    return text.substring(0, max - 1).trimEnd() + "…";
+  }
+
+  function _getResultElements(result) {
+    if (Array.isArray(result?.elements)) return result.elements;
+    if (result?.elements && typeof result.elements === "object") {
+      return Object.keys(result.elements)
+        .sort((a, b) => Number(a) - Number(b))
+        .map((key) => result.elements[key]);
+    }
+    return [];
+  }
+
+  function getToolDisplayName(toolName) {
+    const known = {
+      get_dom_state: "DOM state",
+      get_page_info: "Page info",
+      take_screenshot: "Screenshot",
+      take_snapshot: "Snapshot",
+      execute_code: "Code result",
+    };
+    if (known[toolName]) return known[toolName];
+    return String(toolName || "tool")
+      .replace(/^get_/, "")
+      .replace(/^take_/, "")
+      .replace(/^wait_for_/, "")
+      .replace(/_/g, " ")
+      .replace(/\b\w/g, (ch) => ch.toUpperCase());
+  }
+
+  function _formatPageInfoResult(result) {
+    const lines = [];
+    if (result?.title) lines.push(result.title);
+    if (result?.url) lines.push(_truncateUiText(result.url, 140));
+
+    const stateBits = [];
+    if (result?.readyState) stateBits.push(`State: ${result.readyState}`);
+    if (result?.lang) stateBits.push(`Lang: ${result.lang}`);
+    if (stateBits.length) lines.push(stateBits.join(" · "));
+
+    const counts = [];
+    if (typeof result?.forms === "number") counts.push(`${result.forms} forms`);
+    if (typeof result?.links === "number") counts.push(`${result.links} links`);
+    if (typeof result?.images === "number")
+      counts.push(`${result.images} images`);
+    if (counts.length) lines.push(counts.join(" · "));
+
+    const metas = Object.entries(result?.metas || {})
+      .filter(([, value]) => !!value)
+      .slice(0, 2);
+    if (metas.length) {
+      lines.push("");
+      metas.forEach(([key, value]) => {
+        lines.push(`${key}: ${_truncateUiText(value, 84)}`);
+      });
+    }
+
+    return lines.join("\n");
+  }
+
+  function _formatDomStateResult(result) {
+    const elements = _getResultElements(result);
+    const total = Number(result?.elementCount) || elements.length;
+    if (!elements.length) return "No interactive elements found.";
+
+    const lines = [];
+    if (result?.scope?.label) {
+      const scopeLabel =
+        result.scope.strategy === "main-root"
+          ? "Focused on"
+          : result.scope.strategy === "document-filtered"
+            ? "Showing"
+            : "Scope";
+      lines.push(`${scopeLabel}: ${_truncateUiText(result.scope.label, 64)}`);
+      lines.push("");
+    }
+
+    lines.push(
+      `Found ${total} interactive element${total === 1 ? "" : "s"}.`,
+      "",
+    );
+
+    elements.slice(0, 12).forEach((el, i) => {
+      const index = typeof el?.index === "number" ? el.index : i;
+      const label =
+        el?.ariaLabel ||
+        el?.text ||
+        el?.placeholder ||
+        el?.value ||
+        el?.name ||
+        el?.id ||
+        "";
+      const parts = [`[${index}]`, `<${el?.tag || "element"}>`];
+      if (label) parts.push(`"${_truncateUiText(label, 56)}"`);
+      if (el?.type) parts.push(`(${el.type})`);
+      if (el?.href) parts.push(`→ ${_truncateUiText(el.href, 44)}`);
+      lines.push(parts.join(" "));
+    });
+
+    if (total > 12) {
+      lines.push("", `… ${total - 12} more items hidden.`);
+    }
+
+    return lines.join("\n");
+  }
+
+  function _formatA11yResult(result) {
+    const issueCount = Number(result?.issueCount) || 0;
+    const issues = Array.isArray(result?.issues) ? result.issues : [];
+    const lines = [];
+
+    lines.push(
+      issueCount > 0
+        ? `${issueCount} accessibility issue${issueCount === 1 ? "" : "s"} found.`
+        : "No major accessibility issues found.",
+    );
+
+    if (result?.lang) {
+      lines.push(`Lang: ${result.lang}`);
+    }
+
+    if (issues.length > 0) {
+      lines.push("");
+      issues.slice(0, 10).forEach((issue, i) => {
+        lines.push(`${i + 1}. ${_truncateUiText(issue, 120)}`);
+      });
+      if (issueCount > 10) {
+        lines.push("", `… ${issueCount - 10} more issues hidden.`);
+      }
+    }
+
+    return lines.join("\n");
+  }
+
+  function buildA11yAuditScript() {
+    return `
+      const IGNORED_ROOTS =
+        '#__autodom_chat_panel,#__autodom_inline_overlay,' +
+        '#__autodom_automation_overlay,#__autodom_automation_stop,' +
+        '#__bmcp_session_border,#__bmcp_session_border_badge';
+      const isIgnored = (node) => !!node.closest(IGNORED_ROOTS);
+      const isVisible = (el) => {
+        const style = window.getComputedStyle(el);
+        if (
+          style.display === 'none' ||
+          style.visibility === 'hidden' ||
+          style.opacity === '0'
+        ) return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 || rect.height > 0;
+      };
+      const issues = [];
+      document.querySelectorAll('img').forEach((img) => {
+        if (isIgnored(img) || !isVisible(img)) return;
+        if (!img.getAttribute('alt')) {
+          issues.push('Missing alt: ' + (img.src || '').substring(0, 80));
+        }
+      });
+      document
+        .querySelectorAll('input:not([type="hidden"]),textarea,select')
+        .forEach((inp) => {
+          if (isIgnored(inp) || !isVisible(inp)) return;
+          const id = inp.id;
+          const label = id ? document.querySelector('label[for="' + id + '"]') : null;
+          const ariaLabel = inp.getAttribute('aria-label');
+          if (!label && !ariaLabel && !inp.closest('label')) {
+            issues.push(
+              'Unlabeled: <' +
+                inp.tagName.toLowerCase() +
+                '> name=' +
+                (inp.name || '(none)'),
+            );
+          }
+        });
+      const contentRoot =
+        document.querySelector('main, [role="main"], article') || document.body;
+      if (contentRoot && !isIgnored(contentRoot)) {
+        const h1s = contentRoot.querySelectorAll('h1').length;
+        if (h1s === 0) issues.push('No h1 element');
+        if (h1s > 1) issues.push('Multiple h1: ' + h1s);
+      }
+      const lang = document.documentElement.getAttribute('lang');
+      if (!lang) issues.push('Missing lang attribute on <html>');
+      return {
+        issueCount: issues.length,
+        issues: issues.slice(0, 20),
+        lang: lang || null,
+      };
+    `;
+  }
+
+  function formatToolResult(result, toolName) {
     if (result == null) return "";
-    if (typeof result === "string") return result;
+    const MAX_TOOL_TEXT = 1800;
+
+    if (
+      toolName === "execute_code" &&
+      result?.result &&
+      typeof result.result === "object" &&
+      typeof result.result.issueCount === "number" &&
+      Array.isArray(result.result.issues)
+    ) {
+      return _formatA11yResult(result.result);
+    }
+
+    if (
+      typeof result === "object" &&
+      typeof result.issueCount === "number" &&
+      Array.isArray(result.issues)
+    ) {
+      return _formatA11yResult(result);
+    }
+
+    if (toolName === "get_page_info" && typeof result === "object") {
+      return _formatPageInfoResult(result);
+    }
+
+    if (toolName === "get_dom_state" && typeof result === "object") {
+      return _formatDomStateResult(result);
+    }
+
+    if (
+      typeof result === "object" &&
+      result.success === true &&
+      result.result !== undefined
+    ) {
+      return formatToolResult(result.result, toolName);
+    }
+
+    if (typeof result === "string") {
+      return result.length > MAX_TOOL_TEXT
+        ? result.substring(0, MAX_TOOL_TEXT) + "\n… (truncated)"
+        : result;
+    }
+
     // Unwrap common single-string wrappers ({text|content|output|html|data})
     // so newlines render as actual line breaks instead of escaped "\n"
     // characters inside a JSON literal.
@@ -3389,7 +4474,9 @@
       for (const key of ["text", "content", "output", "html", "data"]) {
         const v = result[key];
         if (typeof v === "string" && v.length > 0) {
-          return v.length > 4000 ? v.substring(0, 4000) + "\n… (truncated)" : v;
+          return v.length > MAX_TOOL_TEXT
+            ? v.substring(0, MAX_TOOL_TEXT) + "\n… (truncated)"
+            : v;
         }
       }
     }
@@ -3591,6 +4678,151 @@
   // Used as a fallback when AI routing is not available, or for
   // direct tool invocations.
 
+  function buildLocalAutomationScript(userCode) {
+    return `
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const queryXPath = (xpath, root = document) => {
+        const result = document.evaluate(xpath, root, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+        return result.singleNodeValue;
+      };
+      const resolveLocator = (locator) => {
+        if (!locator) return null;
+        if (typeof locator === "string") {
+          if (locator.startsWith("text=")) {
+            const needle = locator.slice(5).replace(/^["']|["']$/g, "").trim();
+            return [...document.querySelectorAll("button,a,input,textarea,select,[role],label,span,div")]
+              .find((el) => (el.innerText || el.textContent || el.value || "").trim().includes(needle));
+          }
+          if (locator.startsWith("xpath=")) return queryXPath(locator.slice(6));
+          if (locator.startsWith("//") || locator.startsWith("(//")) return queryXPath(locator);
+          return document.querySelector(locator);
+        }
+        if (locator.using === "xpath") return queryXPath(locator.value);
+        if (locator.using === "css") return document.querySelector(locator.value);
+        if (locator.using === "id") return document.getElementById(locator.value);
+        if (locator.using === "name") return document.querySelector('[name="' + CSS.escape(locator.value) + '"]');
+        return null;
+      };
+      const makeElementHandle = (el) => ({
+        element: el,
+        click: async () => { el.click(); await sleep(120); },
+        fill: async (value) => {
+          el.focus();
+          el.value = "";
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.value = String(value);
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          await sleep(80);
+        },
+        type: async (value) => {
+          el.focus();
+          el.value = (el.value || "") + String(value);
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          await sleep(80);
+        },
+        sendKeys: async (value) => {
+          el.focus();
+          el.value = (el.value || "") + String(value);
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          await sleep(80);
+        },
+        textContent: async () => el.textContent || "",
+        getText: async () => el.textContent || "",
+        getAttribute: async (name) => el.getAttribute(name),
+      });
+      const waitForElement = async (selectorOrLocator, timeout = 10000) => {
+        const started = Date.now();
+        while (Date.now() - started < timeout) {
+          const el = resolveLocator(selectorOrLocator);
+          if (el) return el;
+          await sleep(100);
+        }
+        throw new Error("Timed out waiting for " + JSON.stringify(selectorOrLocator));
+      };
+      const page = {
+        click: async (selector) => makeElementHandle(await waitForElement(selector)).click(),
+        fill: async (selector, value) => makeElementHandle(await waitForElement(selector)).fill(value),
+        type: async (selector, value) => makeElementHandle(await waitForElement(selector)).type(value),
+        press: async (selector, key) => {
+          const el = await waitForElement(selector);
+          el.focus();
+          el.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+          el.dispatchEvent(new KeyboardEvent("keyup", { key, bubbles: true }));
+          await sleep(80);
+        },
+        waitForTimeout: sleep,
+        waitForSelector: async (selector, opts = {}) => makeElementHandle(await waitForElement(selector, opts.timeout || 10000)),
+        textContent: async (selector) => (await waitForElement(selector)).textContent || "",
+        locator: (selector) => ({
+          click: async () => page.click(selector),
+          fill: async (value) => page.fill(selector, value),
+          type: async (value) => page.type(selector, value),
+          textContent: async () => page.textContent(selector),
+          count: async () => selector.startsWith("text=")
+            ? [...document.querySelectorAll("button,a,input,textarea,select,[role],label,span,div")]
+                .filter((el) => (el.innerText || el.textContent || el.value || "").trim().includes(selector.slice(5))).length
+            : document.querySelectorAll(selector).length,
+          nth: (index) => page.locator(selector + ":nth-of-type(" + (index + 1) + ")"),
+        }),
+        getByText: (text) => page.locator("text=" + text),
+        getByRole: (role, opts = {}) => {
+          const name = opts.name ? String(opts.name).replace(/"/g, '\\"') : "";
+          const selector = name
+            ? '[role="' + role + '"],button,a,input'
+            : '[role="' + role + '"]';
+          return {
+            click: async () => {
+              const candidates = [...document.querySelectorAll(selector)];
+              const el = name
+                ? candidates.find((node) => (node.innerText || node.textContent || node.value || "").trim().includes(name))
+                : candidates[0];
+              if (!el) throw new Error("No element for role=" + role + (name ? " name=" + name : ""));
+              await makeElementHandle(el).click();
+            },
+          };
+        },
+        evaluate: async (fnOrSource, arg) => {
+          if (typeof fnOrSource === "function") return fnOrSource(arg);
+          return Function("arg", "return (" + fnOrSource + ")(arg)")(arg);
+        },
+        goto: async (url) => { location.href = url; return { url }; },
+        url: () => location.href,
+        title: async () => document.title,
+      };
+      const By = {
+        css: (value) => ({ using: "css", value }),
+        xpath: (value) => ({ using: "xpath", value }),
+        id: (value) => ({ using: "id", value }),
+        name: (value) => ({ using: "name", value }),
+      };
+      const driver = {
+        findElement: async (locator) => makeElementHandle(await waitForElement(locator)),
+        findElements: async (locator) => {
+          if (locator.using === "css") return [...document.querySelectorAll(locator.value)].map(makeElementHandle);
+          if (locator.using === "xpath") {
+            const snapshot = document.evaluate(locator.value, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+            return Array.from({ length: snapshot.snapshotLength }, (_, i) => makeElementHandle(snapshot.snapshotItem(i)));
+          }
+          const el = resolveLocator(locator);
+          return el ? [makeElementHandle(el)] : [];
+        },
+        executeScript: async (fnOrSource, ...args) => {
+          if (typeof fnOrSource === "function") return fnOrSource(...args);
+          return Function("return (" + fnOrSource + ")")()(...args);
+        },
+        sleep,
+        get: async (url) => { location.href = url; return { url }; },
+        getTitle: async () => document.title,
+        getCurrentUrl: async () => location.href,
+      };
+      const browser = { page, driver };
+      ${userCode}
+    `;
+  }
+
   function parseCommand(text) {
     const lower = text.toLowerCase().trim();
 
@@ -3610,10 +4842,18 @@
         case "dom":
         case "domstate":
         case "state":
-          return { tool: "get_dom_state", params: {} };
+          return {
+            tool: "get_dom_state",
+            params: { maxElements: 80 },
+            displayName: "DOM state",
+          };
         case "info":
         case "pageinfo":
-          return { tool: "get_page_info", params: {} };
+          return {
+            tool: "get_page_info",
+            params: {},
+            displayName: "Page info",
+          };
         case "click":
           if (!isNaN(rest)) {
             return {
@@ -3645,6 +4885,16 @@
         case "js":
         case "eval":
           return { tool: "execute_code", params: { code: rest } };
+        case "run":
+        case "playwright":
+        case "selenium":
+          return {
+            tool: "execute_code",
+            params: {
+              code: buildLocalAutomationScript(rest),
+              timeout: 60000,
+            },
+          };
         case "extract":
           return {
             tool: "execute_code",
@@ -3748,11 +4998,14 @@
 
     const freshConnected = await checkConnectionStatus();
     if (!freshConnected) {
+      // Raise a proper alert so the user knows AI is unavailable, then
+      // still hand them a best-effort local summary so the click wasn't
+      // wasted.
+      showAiUnavailableAlert(
+        "Can't generate a smart summary without a connected AI provider. A quick local summary follows.",
+      );
       const summary = buildLocalSummary();
-      const note =
-        "_AI is offline — showing a quick local summary. " +
-        "Connect a provider in the popup for a smarter summary._\n\n";
-      addMessage("ai-response", note + summary);
+      addMessage("ai-response", summary);
       conversationHistory.push({
         role: "assistant",
         content: "[local summary of the page]",
@@ -3878,10 +5131,11 @@
         "  /snapshot \u2014 DOM tree snapshot\n" +
         "  /info \u2014 Page metadata\n" +
         "  /js <code> \u2014 Execute JavaScript\n" +
+        "  /run <code> \u2014 Run local Playwright/Selenium-style automation\n" +
         "  /extract \u2014 Extract page text\n\n" +
         "Shortcuts:\n" +
-        "  Ctrl+Shift+K \u2014 Toggle sidebar\n" +
-        "  Ctrl+Shift+L \u2014 Inline AI overlay";
+        "  Cmd/Ctrl+Shift+K \u2014 Toggle sidebar\n" +
+        "  Cmd/Ctrl+Shift+L \u2014 Quick prompt";
       addMessage("assistant", helpText);
       conversationHistory.push({ role: "assistant", content: helpText });
       return;
@@ -3912,15 +5166,7 @@
         await executeToolCommand(localCommand);
         return;
       }
-      addMessage(
-        "system",
-        "Not connected to any AI provider.\n\n" +
-          "To enable AI chat, go to the AutoDOM extension popup → Config tab and select a provider:\n" +
-          "• **Connect with GPT** — enter your OpenAI API key\n" +
-          "• **Connect with Claude** — enter your Anthropic API key\n" +
-          "• **Connect with Ollama** — free, runs locally (no key needed)\n\n" +
-          "You can still use slash commands like /dom, /screenshot, /click, or /help while offline.",
-      );
+      showAiUnavailableAlert();
       return;
     }
 
@@ -3969,20 +5215,38 @@
         if (localCommand) {
           await executeToolCommand(localCommand);
         } else {
-          // No local mapping either — provide helpful response
-          addMessage(
-            "assistant",
-            "I understood your request but the AI agent isn't available right now. " +
-              "Try using slash commands like /dom, /click, /screenshot, or /help for all options.\n\n" +
-              "The full AI experience requires the MCP server to be connected to an AI agent (Claude, GPT, etc.) through your IDE.",
+          // No local mapping either — raise a proper alert rather than a
+          // quiet chat line, so the user is nudged to fix the setup.
+          showAiUnavailableAlert(
+            aiResult.error
+              ? `Request couldn't be routed: ${aiResult.error}`
+              : "The AI agent didn't respond.",
           );
-          conversationHistory.push({
-            role: "assistant",
-            content: "AI agent not available. Suggested using slash commands.",
-          });
         }
       } else if (aiResult && aiResult.error) {
-        addMessage("error", `AI Error: ${aiResult.error}`);
+        // Real AI error (API 4xx/5xx, timeout, agent-side error, etc.).
+        // Use the alert surface so it's visible and actionable.
+        addAiAlert({
+          dedupeKey: "ai-error",
+          tone: "error",
+          title: "AI request failed",
+          body: String(aiResult.error),
+          actions: [
+            {
+              label: "Open settings",
+              kind: "ghost",
+              onClick: _openExtensionPopup,
+            },
+            {
+              label: "Retry",
+              kind: "primary",
+              onClick: () => {
+                chatInput.value = text;
+                sendMessage();
+              },
+            },
+          ],
+        });
       }
     } catch (err) {
       hideTyping();
@@ -4009,14 +5273,22 @@
       lower.includes("interactive elements") ||
       lower.includes("what can i click")
     ) {
-      return { tool: "get_dom_state", params: {} };
+      return {
+        tool: "get_dom_state",
+        params: { maxElements: 80 },
+        displayName: "DOM state",
+      };
     }
     if (
       lower.includes("page info") ||
       lower.includes("page details") ||
       lower.includes("what page")
     ) {
-      return { tool: "get_page_info", params: {} };
+      return {
+        tool: "get_page_info",
+        params: {},
+        displayName: "Page info",
+      };
     }
     if (
       lower.startsWith("go to ") ||
@@ -4043,30 +5315,18 @@
     if (lower.includes("accessibility") || lower.includes("a11y")) {
       return {
         tool: "execute_code",
+        displayName: "A11y check",
         params: {
-          code: `
-            const issues = [];
-            document.querySelectorAll('img').forEach(img => {
-              if (!img.getAttribute('alt')) issues.push('Missing alt: ' + (img.src||'').substring(0,80));
-            });
-            document.querySelectorAll('input:not([type="hidden"]),textarea,select').forEach(inp => {
-              const id = inp.id;
-              const label = id ? document.querySelector('label[for="'+id+'"]') : null;
-              const ariaLabel = inp.getAttribute('aria-label');
-              if (!label && !ariaLabel && !inp.closest('label'))
-                issues.push('Unlabeled: <' + inp.tagName.toLowerCase() + '> name=' + (inp.name||'(none)'));
-            });
-            const h1s = document.querySelectorAll('h1').length;
-            if (h1s === 0) issues.push('No h1 element');
-            if (h1s > 1) issues.push('Multiple h1: ' + h1s);
-            return { issueCount: issues.length, issues: issues.slice(0, 20) };
-          `,
+          code: buildA11yAuditScript(),
         },
       };
     }
     if (lower.startsWith("run ") || lower.startsWith("execute ")) {
       const code = text.replace(/^(run|execute)\s+/i, "").trim();
-      return { tool: "execute_code", params: { code } };
+      return {
+        tool: "execute_code",
+        params: { code: buildLocalAutomationScript(code), timeout: 60000 },
+      };
     }
 
     return null;
@@ -4163,8 +5423,13 @@
             if (confirmResult && confirmResult.error) {
               addMessage("error", `Error: ${confirmResult.error}`);
             } else if (confirmResult && confirmResult.result) {
-              const formatted = formatToolResult(confirmResult.result);
-              addMessage("tool-result", formatted, { toolName: command.tool });
+              const formatted = formatToolResult(
+                confirmResult.result,
+                command.tool,
+              );
+              addMessage("tool-result", formatted, {
+                toolName: command.displayName || getToolDisplayName(command.tool),
+              });
               conversationHistory.push({
                 role: "assistant",
                 content: `[Confirmed ${command.tool}]: ${formatted.substring(0, 500)}`,
@@ -4247,7 +5512,8 @@
 
         const toolTag = document.createElement("div");
         toolTag.className = "tool-name";
-        toolTag.textContent = "take_screenshot";
+        toolTag.textContent =
+          command.displayName || getToolDisplayName(command.tool);
         msg.appendChild(toolTag);
 
         const img = document.createElement("img");
@@ -4264,8 +5530,10 @@
           content: "[Screenshot captured]",
         });
       } else {
-        const formatted = formatToolResult(result);
-        addMessage("tool-result", formatted, { toolName: command.tool });
+        const formatted = formatToolResult(result, command.tool);
+        addMessage("tool-result", formatted, {
+          toolName: command.displayName || getToolDisplayName(command.tool),
+        });
         conversationHistory.push({
           role: "assistant",
           content: `[Tool ${command.tool} result]: ${formatted.substring(0, 500)}`,
@@ -4340,15 +5608,27 @@
     switch (action) {
       case "dom_state":
         displayText = "/dom";
-        command = { tool: "get_dom_state", params: {} };
+        command = {
+          tool: "get_dom_state",
+          params: { maxElements: 80 },
+          displayName: "DOM state",
+        };
         break;
       case "screenshot":
         displayText = "/screenshot";
-        command = { tool: "take_screenshot", params: {} };
+        command = {
+          tool: "take_screenshot",
+          params: {},
+          displayName: "Screenshot",
+        };
         break;
       case "page_info":
         displayText = "/info";
-        command = { tool: "get_page_info", params: {} };
+        command = {
+          tool: "get_page_info",
+          params: {},
+          displayName: "Page info",
+        };
         break;
       case "summarize":
         // Run the AI-aware page summarizer (with offline fallback).
@@ -4358,23 +5638,9 @@
         displayText = "/a11y check";
         command = {
           tool: "execute_code",
+          displayName: "A11y check",
           params: {
-            code: `
-              const issues = [];
-              document.querySelectorAll('img').forEach(img => {
-                if (!img.getAttribute('alt')) issues.push('Missing alt: ' + (img.src||'').substring(0,80));
-              });
-              document.querySelectorAll('input:not([type="hidden"]),textarea,select').forEach(inp => {
-                const id = inp.id;
-                const label = id ? document.querySelector('label[for="'+id+'"]') : null;
-                if (!label && !inp.getAttribute('aria-label') && !inp.closest('label'))
-                  issues.push('Unlabeled: <' + inp.tagName.toLowerCase() + '> name=' + (inp.name||'(none)'));
-              });
-              const h1s = document.querySelectorAll('h1').length;
-              if (h1s === 0) issues.push('No h1 element');
-              if (h1s > 1) issues.push('Multiple h1: ' + h1s);
-              return { issueCount: issues.length, issues: issues.slice(0, 20) };
-            `,
+            code: buildA11yAuditScript(),
           },
         };
         break;
@@ -4431,15 +5697,19 @@
             inlineResponseContent.innerHTML =
               '<span class="ai-sparkle">\u{1F4F8}</span> Screenshot captured! Open the sidebar to view it.';
           } else {
-            const formatted = formatToolResult(result);
+            const formatted = formatToolResult(result, command.tool);
             inlineResponseContent.textContent = formatted.substring(0, 1000);
           }
         } else {
+          // AI unreachable \u2014 surface a clear, compact alert in the inline
+          // overlay. The full sidebar also shows its own alert if opened.
+          const reason =
+            aiResult?.error ||
+            "No AI provider is connected. Open the popup to configure one.";
           inlineResponseContent.innerHTML =
-            '<span class="ai-sparkle">\u2728</span> ' +
-            (aiResult?.error
-              ? escapeHtml(aiResult.error)
-              : "Could not process. Try slash commands like /dom, /screenshot, /help");
+            '<span class="ai-sparkle" aria-hidden="true">\u26a0\ufe0f</span> ' +
+            '<strong>AI unavailable.</strong> ' +
+            escapeHtml(String(reason));
         }
       }
     } catch (err) {
@@ -4552,7 +5822,7 @@
       }
     }
 
-    // Toggle inline AI overlay (from keyboard command Ctrl+Shift+L)
+    // Toggle inline AI overlay (from keyboard command Cmd/Ctrl+Shift+L)
     if (message.type === "TOGGLE_INLINE_AI") {
       if (message.mcpActive) {
         setMcpActive(true);
@@ -4599,7 +5869,7 @@
 
   // ─── Keyboard Shortcuts ────────────────────────────────────
   // Ctrl/Cmd + Shift + K → Toggle sidebar chat panel
-  // Ctrl/Cmd + Shift + L → Toggle inline AI overlay (like Browser Atlas)
+  // Ctrl/Cmd + Shift + L → Toggle quick prompt overlay
   // Escape → Close active panel/overlay
   document.addEventListener("keydown", (e) => {
     // Ctrl/Cmd + Shift + K: Toggle sidebar

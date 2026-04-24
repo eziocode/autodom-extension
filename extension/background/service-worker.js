@@ -466,12 +466,20 @@ async function executeAgentTool(toolName, params) {
     }
   } catch (_) {}
 
+  // Mark the active run as "mid-tool" so the panel-tab navigation
+  // listeners don't abort when the *agent itself* navigates (e.g.
+  // the `navigate` / `click` tool triggers a page load). The listeners
+  // only abort when navigation happens while NO tool is running —
+  // that's the user-initiated case (refresh, URL change, close).
+  if (_activeAgentRun) _activeAgentRun.toolRunning = true;
   try {
     touchToolActivity();
     const raw = await handler(params || {});
     return { ok: !raw?.error, ...(raw || {}) };
   } catch (err) {
     return { ok: false, error: err?.message || String(err) };
+  } finally {
+    if (_activeAgentRun) _activeAgentRun.toolRunning = false;
   }
 }
 
@@ -1330,7 +1338,43 @@ chrome.tabs.onCreated.addListener((tab) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   recordAction("tab_closed", `Tab closed`, {}, tabId);
+  // If the active agent run belongs to this tab, abort it — the chat
+  // panel is gone so there's nothing to report back to.
+  try {
+    if (_activeAgentRun && _activeAgentRun.panelTabId === tabId) {
+      _stopActiveAgentRun("tab_closed");
+    }
+  } catch (_) {}
 });
+
+// Abort any in-flight agent run whose panel tab is navigating away —
+// after a hard refresh or URL change the chat panel is destroyed and
+// a fresh one will be injected with no knowledge of the old run, so
+// the automation must not keep firing tools at the new page. Listen on
+// both tabs.onUpdated (URL changes in-tab) and webNavigation (full
+// navigations including main-frame reloads).
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  try {
+    if (!_activeAgentRun || _activeAgentRun.panelTabId !== tabId) return;
+    // Skip while an agent tool is mid-flight — that's the agent
+    // navigating on purpose (navigate / click-that-navigates).
+    if (_activeAgentRun.toolRunning) return;
+    if (changeInfo.url || changeInfo.status === "loading") {
+      _stopActiveAgentRun("panel_tab_navigated");
+    }
+  } catch (_) {}
+});
+if (chrome.webNavigation && chrome.webNavigation.onBeforeNavigate) {
+  chrome.webNavigation.onBeforeNavigate.addListener((details) => {
+    try {
+      if (details.frameId !== 0) return; // main frame only
+      if (!_activeAgentRun || _activeAgentRun.panelTabId !== details.tabId)
+        return;
+      if (_activeAgentRun.toolRunning) return; // agent-driven, not user
+      _stopActiveAgentRun("panel_tab_navigated");
+    } catch (_) {}
+  });
+}
 
 // ─── WebSocket Management ────────────────────────────────────
 
@@ -1722,6 +1766,56 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ ok: stopped });
     return false;
   }
+
+  // Fresh content-script load (post-refresh or first inject). If an
+  // agent run is still bound to this tab from before the reload, abort
+  // it — the old panel is gone so there's no UI left for it.
+  if (message.type === "PANEL_LOADED_RESET_RUN") {
+    const tid = sender?.tab?.id ?? null;
+    let wasActive = false;
+    try {
+      if (_activeAgentRun && (tid == null || _activeAgentRun.panelTabId === tid)) {
+        wasActive = true;
+        _stopActiveAgentRun("panel_reloaded");
+      }
+    } catch (_) {}
+    sendResponse({ ok: true, wasActive });
+    return false;
+  }
+
+  // Query the current agent-run state. Used by the chat panel on load
+  // so it can show the floating "automation running" overlay if a run
+  // is genuinely still in flight.
+  if (message.type === "GET_ACTIVE_RUN") {
+    if (_activeAgentRun) {
+      sendResponse({
+        active: true,
+        runId: _activeAgentRun.runId,
+        panelTabId: _activeAgentRun.panelTabId,
+        toolRunning: !!_activeAgentRun.toolRunning,
+      });
+    } else {
+      sendResponse({ active: false });
+    }
+    return false;
+  }
+
+  // Best-effort "open the extension popup" request from chat-panel alerts.
+  // chrome.action.openPopup is MV3-only and some Chrome versions require a
+  // recent user gesture — we try, swallow errors, and return ok so the
+  // caller doesn't surface yet another alert if it fails.
+  if (message.type === "OPEN_POPUP") {
+    try {
+      if (chrome.action && typeof chrome.action.openPopup === "function") {
+        chrome.action.openPopup(() => {
+          try { void chrome.runtime.lastError; } catch (_) {}
+        });
+      }
+    } catch (_) {}
+    sendResponse({ ok: true });
+    return false;
+  }
+
 
   if (message.type === "START_MCP") {
     const port = message.port || getCurrentPort();
@@ -2156,6 +2250,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // the bridge so it can suppress any in-flight tool calls / further
   // AI_CHAT_RESPONSE messages for those ids.
   if (message.type === "ABORT_AI_CHAT") {
+    _stopActiveAgentRun("stopped_by_user");
     const cancelledIds = [];
     for (const [id, pending] of pendingAiRequests.entries()) {
       cancelledIds.push(id);
@@ -2481,9 +2576,14 @@ let aiCallIdCounter = 0;
 // function). We use an *idle* timer that is reset every time the bridge
 // reports activity (a TOOL_CALL from the agent), so the user only sees a
 // timeout when the bridge has actually gone silent.
-const AI_REQUEST_IDLE_TIMEOUT_MS = 180000; // 3 minutes of no activity
+// Disabled by default: the chat bar Stop action is the source of truth for
+// cancelling automation. Some local CLI providers can run long tasks without
+// streaming TOOL_CALL activity, and timing out the UI while automation keeps
+// running is worse than waiting for an explicit stop.
+const AI_REQUEST_IDLE_TIMEOUT_MS = 0;
 
 function armAiRequestTimeout(id) {
+  if (!AI_REQUEST_IDLE_TIMEOUT_MS || AI_REQUEST_IDLE_TIMEOUT_MS <= 0) return;
   const pending = pendingAiRequests.get(id);
   if (!pending) return;
   if (pending.timeoutHandle) clearTimeout(pending.timeoutHandle);
@@ -4643,7 +4743,7 @@ async function toolExecuteCode(params) {
 async function toolGetDomState(params) {
   const tab = await getActiveTab();
   const includeHidden = params?.includeHidden || false;
-  const maxElements = params?.maxElements || 200;
+  const maxElements = params?.maxElements || 80;
 
   const result = await executeInTab(
     tab.id,
@@ -4665,43 +4765,108 @@ async function toolGetDomState(params) {
         '[role="slider"]',
         '[role="textbox"]',
         "[onclick]",
-        "[tabindex]",
+        '[tabindex]:not([tabindex="-1"])',
         "[contenteditable]",
         "details > summary",
       ];
+      const INTERACTIVE_QUERY = INTERACTIVE_SELECTORS.join(",");
+      const INTERACTIVE_ROLES = new Set([
+        "button",
+        "link",
+        "tab",
+        "menuitem",
+        "checkbox",
+        "radio",
+        "switch",
+        "combobox",
+        "slider",
+        "textbox",
+      ]);
+      const EXTENSION_UI_SELECTOR = [
+        "#__autodom_chat_panel",
+        "#__autodom_inline_overlay",
+        "#__autodom_automation_overlay",
+        "#__autodom_automation_stop",
+        "#__bmcp_session_border",
+        "#__bmcp_session_border_badge",
+      ].join(",");
+      const APP_CHROME_SELECTOR =
+        "nav,aside,header,footer,[role='navigation']";
+      const ROOT_CANDIDATE_SELECTORS = [
+        "main",
+        '[role="main"]',
+        "article",
+        "#main",
+        "#content",
+        "#main-content",
+        ".main",
+        ".main-content",
+        ".content",
+        ".content-area",
+        ".page-content",
+        ".workspace",
+        '[data-testid*="main"]',
+        '[data-testid*="content"]',
+        '[data-role="main"]',
+      ];
 
-      const seen = new Set();
-      const elements = [];
-      const allEls = document.querySelectorAll(INTERACTIVE_SELECTORS.join(","));
-
-      for (const el of allEls) {
-        if (seen.has(el)) continue;
-        seen.add(el);
-
-        // Skip hidden elements unless requested
-        if (!includeHidden) {
-          const style = window.getComputedStyle(el);
-          if (
-            style.display === "none" ||
-            style.visibility === "hidden" ||
-            style.opacity === "0"
-          )
-            continue;
-          const rect = el.getBoundingClientRect();
-          if (rect.width === 0 && rect.height === 0) continue;
+      function isVisible(el) {
+        if (includeHidden) return true;
+        const style = window.getComputedStyle(el);
+        if (
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          style.opacity === "0"
+        ) {
+          return false;
         }
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 || rect.height > 0;
+      }
 
-        // Skip elements inside <script>, <style>, <noscript>
-        if (el.closest("script, style, noscript")) continue;
+      function isExtensionUi(el) {
+        return !!(EXTENSION_UI_SELECTOR && el.closest(EXTENSION_UI_SELECTOR));
+      }
 
+      function isNoisyContainer(el) {
         const tag = el.tagName.toLowerCase();
-        const entry = { tag };
+        const role = (el.getAttribute("role") || "").toLowerCase();
+        if (INTERACTIVE_ROLES.has(role)) return false;
+        if (
+          el.matches("a[href], button, input, textarea, select, summary") ||
+          el.isContentEditable ||
+          el.hasAttribute("onclick")
+        ) {
+          return false;
+        }
+        if (!["div", "section", "main", "article", "nav", "aside"].includes(tag)) {
+          return false;
+        }
+        return el.querySelectorAll(INTERACTIVE_QUERY).length >= 4;
+      }
 
-        // Text content (compact)
-        const text = (el.textContent || "").trim().substring(0, 80);
-        if (text) entry.text = text;
+      function describeRoot(root, strategy) {
+        if (!root || root === document.body || root === document.documentElement) {
+          return { strategy, label: "document body" };
+        }
+        const tag = root.tagName ? root.tagName.toLowerCase() : "section";
+        const label =
+          root.getAttribute("aria-label") ||
+          (root.id ? `#${root.id}` : "") ||
+          (typeof root.className === "string" && root.className.trim()
+            ? "." + root.className.trim().split(/\s+/).slice(0, 2).join(".")
+            : "") ||
+          tag;
+        return { strategy, label: `${tag} ${label}`.trim() };
+      }
 
-        // Key attributes — only include if present
+      function serializeElement(el, index) {
+        const tag = el.tagName.toLowerCase();
+        const entry = { index, tag };
+
+        const text = (el.textContent || "").trim().replace(/\s+/g, " ");
+        if (text) entry.text = text.substring(0, 80);
+
         const type = el.getAttribute("type");
         if (type) entry.type = type;
 
@@ -4709,7 +4874,7 @@ async function toolGetDomState(params) {
         if (name) entry.name = name;
 
         const placeholder = el.getAttribute("placeholder");
-        if (placeholder) entry.placeholder = placeholder;
+        if (placeholder) entry.placeholder = placeholder.substring(0, 80);
 
         const href = el.getAttribute("href");
         if (href) entry.href = href.substring(0, 120);
@@ -4718,7 +4883,7 @@ async function toolGetDomState(params) {
         if (role) entry.role = role;
 
         const ariaLabel = el.getAttribute("aria-label");
-        if (ariaLabel) entry.ariaLabel = ariaLabel;
+        if (ariaLabel) entry.ariaLabel = ariaLabel.substring(0, 80);
 
         const value = el.value;
         if (value && tag !== "a") entry.value = String(value).substring(0, 80);
@@ -4726,22 +4891,100 @@ async function toolGetDomState(params) {
         const id = el.id;
         if (id) entry.id = id;
 
-        // Unique CSS selector for fallback
         if (id) {
           entry.selector = `#${CSS.escape(id)}`;
         } else if (name) {
           entry.selector = `${tag}[name="${CSS.escape(name)}"]`;
         }
 
-        elements.push(entry);
-        if (elements.length >= maxElements) break;
+        return entry;
+      }
+
+      function collectElements(root, excludeChrome) {
+        const seen = new Set();
+        const elements = [];
+        const allEls = root.querySelectorAll(INTERACTIVE_QUERY);
+
+        for (const el of allEls) {
+          if (seen.has(el)) continue;
+          seen.add(el);
+          if (el.closest("script, style, noscript")) continue;
+          if (isExtensionUi(el)) continue;
+          if (excludeChrome && el.closest(APP_CHROME_SELECTOR)) continue;
+          if (!isVisible(el)) continue;
+          if (isNoisyContainer(el)) continue;
+
+          elements.push(serializeElement(el, elements.length));
+          if (elements.length >= maxElements) break;
+        }
+
+        return elements;
+      }
+
+      function pickPreferredRoot() {
+        const seenRoots = new Set();
+        let best = null;
+        let bestScore = 0;
+
+        const consider = (root) => {
+          if (!root || seenRoots.has(root) || isExtensionUi(root) || !isVisible(root)) {
+            return;
+          }
+          seenRoots.add(root);
+          const rect = root.getBoundingClientRect();
+          const score = Math.max(0, rect.width) * Math.max(0, rect.height);
+          if (score > bestScore) {
+            best = root;
+            bestScore = score;
+          }
+        };
+
+        ROOT_CANDIDATE_SELECTORS.forEach((selector) => {
+          document.querySelectorAll(selector).forEach(consider);
+        });
+
+        const probe = document.elementFromPoint(
+          Math.min(window.innerWidth - 40, Math.floor(window.innerWidth * 0.66)),
+          Math.min(window.innerHeight - 40, Math.max(80, Math.floor(window.innerHeight * 0.28))),
+        );
+        if (probe) {
+          consider(probe.closest(ROOT_CANDIDATE_SELECTORS.join(",")));
+        }
+
+        return best;
+      }
+
+      let scope = { strategy: "document-filtered", label: "document body" };
+      let elements = [];
+
+      const preferredRoot = pickPreferredRoot();
+      if (preferredRoot) {
+        elements = collectElements(preferredRoot, true);
+        scope = describeRoot(preferredRoot, "main-root");
+      }
+
+      if (elements.length < Math.min(maxElements, 8)) {
+        const fallback = collectElements(document, true);
+        if (fallback.length > elements.length) {
+          elements = fallback;
+          scope = { strategy: "document-filtered", label: "document body" };
+        }
+      }
+
+      if (elements.length < Math.min(maxElements, 4)) {
+        const fullPage = collectElements(document, false);
+        if (fullPage.length > elements.length) {
+          elements = fullPage;
+          scope = { strategy: "full-document", label: "document body" };
+        }
       }
 
       return {
         title: document.title,
         url: location.href,
+        scope,
         elementCount: elements.length,
-        elements: Object.fromEntries(elements.entries()),
+        elements,
       };
     },
     [includeHidden, maxElements],
@@ -4782,7 +5025,7 @@ async function toolClickByIndex(params) {
         '[role="slider"]',
         '[role="textbox"]',
         "[onclick]",
-        "[tabindex]",
+        '[tabindex]:not([tabindex="-1"])',
         "[contenteditable]",
         "details > summary",
       ];
@@ -4862,7 +5105,7 @@ async function toolTypeByIndex(params) {
         '[role="slider"]',
         '[role="textbox"]',
         "[onclick]",
-        "[tabindex]",
+        '[tabindex]:not([tabindex="-1"])',
         "[contenteditable]",
         "details > summary",
       ];
@@ -5319,7 +5562,7 @@ async function toolIframeInteract(params) {
             '[role="tab"]',
             '[role="menuitem"]',
             "[onclick]",
-            "[tabindex]",
+            '[tabindex]:not([tabindex="-1"])',
             "[contenteditable]",
           ];
           const seen = new Set();
@@ -5599,7 +5842,7 @@ async function toolShadowInteract(params) {
           '[role="button"]',
           '[role="link"]',
           "[onclick]",
-          "[tabindex]",
+          '[tabindex]:not([tabindex="-1"])',
           "[contenteditable]",
         ];
         const seen = new Set();

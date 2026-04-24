@@ -617,7 +617,33 @@ DOM.actionBtn.addEventListener("click", () => {
 
 // ─── AI Chat Button ──────────────────────────────────────────
 // Opens the AI chat panel on the active tab. Only works when MCP is connected.
+//
+// "NEW" badge logic — bump this key when shipping a wave of features you
+// want current users to rediscover. We persist the *seen* version so the
+// badge re-appears whenever AI_CHAT_NEW_VERSION bumps, even for long-time
+// users.
+const AI_CHAT_NEW_VERSION = "1.3.0";
+(function _initAiChatNewBadge() {
+  const badge = document.getElementById("aiChatNewBadge");
+  if (!badge) return;
+  try {
+    chrome.storage.local.get(["aiChatNewSeenVersion"], (items) => {
+      const seen = items && items.aiChatNewSeenVersion;
+      if (seen === AI_CHAT_NEW_VERSION) {
+        badge.setAttribute("hidden", "");
+      }
+    });
+  } catch (_) {}
+})();
 DOM.aiChatBtn.addEventListener("click", async () => {
+  // Dismiss the "NEW" badge — user has acknowledged the new features.
+  const _badge = document.getElementById("aiChatNewBadge");
+  if (_badge && !_badge.hasAttribute("hidden")) {
+    _badge.setAttribute("hidden", "");
+    try {
+      chrome.storage.local.set({ aiChatNewSeenVersion: AI_CHAT_NEW_VERSION });
+    } catch (_) {}
+  }
   // Always send the toggle request — the service worker and content script
   // will handle connection state. Slash commands work even without MCP bridge.
   // This avoids blocking on stale popup-local isConnected state.

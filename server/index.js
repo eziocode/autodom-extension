@@ -842,6 +842,7 @@ let isPrimaryServer = true;
 // (callExtensionTool, direct provider calls) to short-circuit further
 // work, and the AI_CHAT_RESPONSE emit path skips sending late results.
 const abortedAiRequests = new Set();
+const activeCliProviderProcesses = new Map();
 class AiAbortError extends Error {
   constructor(id) {
     super(`AI request ${id} aborted by user`);
@@ -851,6 +852,33 @@ class AiAbortError extends Error {
 }
 function _isAborted(id) {
   return id != null && abortedAiRequests.has(id);
+}
+function _killCliProviderProcess(id, reason) {
+  const proc = activeCliProviderProcesses.get(id);
+  if (!proc) return false;
+  activeCliProviderProcesses.delete(id);
+  try {
+    process.stderr.write(
+      `[AutoDOM] Killing CLI provider process for id=${id}: ${reason || "aborted"}\n`,
+    );
+  } catch (_) {}
+  try {
+    if (process.platform !== "win32" && proc.pid) {
+      process.kill(-proc.pid, "SIGTERM");
+    } else {
+      proc.kill("SIGTERM");
+    }
+  } catch (_) {}
+  setTimeout(() => {
+    try {
+      if (process.platform !== "win32" && proc.pid) {
+        process.kill(-proc.pid, "SIGKILL");
+      } else if (!proc.killed) {
+        proc.kill("SIGKILL");
+      }
+    } catch (_) {}
+  }, 1500).unref?.();
+  return true;
 }
 function _safeSendAiResponse(socket, payload) {
   if (_isAborted(payload?.id)) {
@@ -1259,6 +1287,7 @@ function _processWsMessage(socket, message) {
   if (message.type === "AI_CHAT_ABORT") {
     if (typeof message.id !== "undefined" && message.id !== null) {
       abortedAiRequests.add(message.id);
+      _killCliProviderProcess(message.id, "AI_CHAT_ABORT");
       // Auto-evict after 5 minutes so the set doesn't grow forever.
       setTimeout(() => abortedAiRequests.delete(message.id), 300000).unref?.();
       process.stderr.write(
@@ -1449,6 +1478,7 @@ function _processWsMessage(socket, message) {
             context,
             conversationHistory,
             providerConfig: mergedProviderConfig,
+            requestId: id,
           });
 
           process.stderr.write(
@@ -2352,6 +2382,7 @@ async function routeDirectProviderChat({
   context,
   conversationHistory,
   providerConfig: incomingConfig,
+  requestId,
 }) {
   const providerConfig = mergeProviderConfig(incomingConfig || { provider });
 
@@ -2388,6 +2419,7 @@ async function routeDirectProviderChat({
       context,
       conversationHistory,
       providerConfig,
+      requestId,
     });
   }
 
@@ -2410,17 +2442,20 @@ async function callCliProvider({
   context,
   conversationHistory,
   providerConfig,
+  requestId,
 }) {
+  if (_isAborted(requestId)) throw new AiAbortError(requestId);
   const binary = (providerConfig.cliBinary || "claude").trim();
   const kind = (providerConfig.cliKind || "claude").trim().toLowerCase();
   const extraArgs = (providerConfig.cliExtraArgs || "")
     .trim()
     .split(/\s+/)
     .filter(Boolean);
-  const timeoutMs = Math.max(
-    5000,
-    Math.min(600000, Number(providerConfig.cliTimeoutMs) || 90000),
-  );
+  const configuredTimeout = Number(providerConfig.cliTimeoutMs);
+  const timeoutMs =
+    Number.isFinite(configuredTimeout) && configuredTimeout > 0
+      ? Math.max(5000, Math.min(3600000, configuredTimeout))
+      : 0;
 
   if (!binary) {
     throw new Error(
@@ -2464,7 +2499,7 @@ async function callCliProvider({
   }
 
   process.stderr.write(
-    `[AutoDOM] CLI provider: spawning '${binary}' kind=${kind} args=${JSON.stringify(args)} timeout=${timeoutMs}ms\n`,
+    `[AutoDOM] CLI provider: spawning '${binary}' kind=${kind} args=${JSON.stringify(args)} timeout=${timeoutMs ? timeoutMs + "ms" : "disabled"}\n`,
   );
 
   return await new Promise((resolve, reject) => {
@@ -2474,7 +2509,18 @@ async function callCliProvider({
         stdio: ["pipe", "pipe", "pipe"],
         // Inherit env so the CLI finds its own auth token files
         env: process.env,
+        // Put local AI CLIs in their own process group so Stop can kill
+        // child workers they spawn for MCP/tool execution too.
+        detached: process.platform !== "win32",
       });
+      if (requestId != null) {
+        activeCliProviderProcesses.set(requestId, proc);
+      }
+      if (_isAborted(requestId)) {
+        _killCliProviderProcess(requestId, "aborted before prompt write");
+        reject(new AiAbortError(requestId));
+        return;
+      }
     } catch (spawnErr) {
       reject(
         new Error(
@@ -2492,28 +2538,35 @@ async function callCliProvider({
       if (settled) return;
       settled = true;
       try {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
       } catch (_) {}
+      if (requestId != null) activeCliProviderProcesses.delete(requestId);
       fn(value);
     };
 
-    const timer = setTimeout(() => {
-      try {
-        proc.kill("SIGTERM");
-      } catch (_) {}
-      setTimeout(() => {
-        try {
-          proc.kill("SIGKILL");
-        } catch (_) {}
-      }, 1500).unref();
-      finish(
-        reject,
-        new Error(
-          `CLI provider: '${binary}' timed out after ${Math.round(timeoutMs / 1000)}s`,
-        ),
-      );
-    }, timeoutMs);
-    timer.unref?.();
+    const timer = timeoutMs
+      ? setTimeout(() => {
+        if (requestId != null) {
+          _killCliProviderProcess(requestId, "CLI provider timeout");
+        } else {
+          try {
+            proc.kill("SIGTERM");
+          } catch (_) {}
+          setTimeout(() => {
+            try {
+              proc.kill("SIGKILL");
+            } catch (_) {}
+          }, 1500).unref();
+        }
+        finish(
+          reject,
+          new Error(
+            `CLI provider: '${binary}' timed out after ${Math.round(timeoutMs / 1000)}s`,
+          ),
+        );
+      }, timeoutMs)
+      : null;
+    timer?.unref?.();
 
     proc.stdout.on("data", (d) => stdoutChunks.push(d));
     proc.stderr.on("data", (d) => stderrChunks.push(d));
@@ -2530,6 +2583,10 @@ async function callCliProvider({
     });
 
     proc.on("close", (code) => {
+      if (_isAborted(requestId)) {
+        finish(reject, new AiAbortError(requestId));
+        return;
+      }
       const stdout = Buffer.concat(stdoutChunks).toString("utf8").trim();
       const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
       if (code !== 0 && !stdout) {
