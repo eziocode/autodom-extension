@@ -947,6 +947,57 @@ function _isRepeatLoop(history, toolName, args) {
   return count >= 2; // 3rd identical call in a row → loop
 }
 
+// ─── Multimodal user-message builder ─────────────────────────────────
+// Translates the chat panel's attachment objects ({ name, mime, dataUrl })
+// into provider-native message shapes. Returns the additional fields
+// to spread onto a `{ role: "user", ... }` entry. Falls back to the
+// plain text payload when no attachments are present (cheapest path).
+function _buildUserMessageForProvider(text, attachments, providerType) {
+  const list = Array.isArray(attachments) ? attachments.filter((a) => a && a.dataUrl) : [];
+  if (list.length === 0) return { content: String(text || "") };
+
+  if (providerType === "anthropic") {
+    // Anthropic vision wants base64-decoded blocks: { type:"image", source:{ type:"base64", media_type, data } }
+    const blocks = [];
+    list.forEach((a) => {
+      const m = String(a.dataUrl).match(/^data:([^;,]+);base64,(.+)$/);
+      if (!m) return;
+      blocks.push({
+        type: "image",
+        source: { type: "base64", media_type: m[1], data: m[2] },
+      });
+    });
+    if (text) blocks.push({ type: "text", text: String(text) });
+    return blocks.length > 0 ? { content: blocks } : { content: String(text || "") };
+  }
+
+  if (providerType === "openai") {
+    // OpenAI chat completions vision: content array with text + image_url parts.
+    const parts = [];
+    if (text) parts.push({ type: "text", text: String(text) });
+    list.forEach((a) => {
+      parts.push({ type: "image_url", image_url: { url: a.dataUrl } });
+    });
+    return { content: parts };
+  }
+
+  if (providerType === "ollama") {
+    // Ollama (llava/llama3.2-vision) takes raw base64 strings under `images`.
+    const images = [];
+    list.forEach((a) => {
+      const m = String(a.dataUrl).match(/^data:[^;,]+;base64,(.+)$/);
+      if (m) images.push(m[1]);
+    });
+    return images.length > 0
+      ? { content: String(text || ""), images }
+      : { content: String(text || "") };
+  }
+
+  // Unknown provider — fall back to text only so we never crash the loop
+  // with an unsupported content shape.
+  return { content: String(text || "") };
+}
+
 async function runAgentLoop({
   providerType,
   text,
@@ -954,6 +1005,7 @@ async function runAgentLoop({
   conversationHistory,
   initialTabId,
   modelOverride,
+  attachments,
 }) {
   const ProvidersApi = globalThis.AutoDOMProviders;
   const AgentApi = globalThis.AutoDOMAgent;
@@ -1041,7 +1093,10 @@ async function runAgentLoop({
           content: String(m.content),
         });
       });
-      messages.push({ role: "user", content: text });
+      messages.push({
+        role: "user",
+        ..._buildUserMessageForProvider(text, attachments, providerType),
+      });
 
       for (let turn = 0; turn < AGENT_MAX_TURNS; turn++) {
         if (isAborted()) return finish(abortedReply());
@@ -1174,7 +1229,10 @@ async function runAgentLoop({
           content: String(m.content),
         });
       });
-      messages.push({ role: "user", content: text });
+      messages.push({
+        role: "user",
+        ..._buildUserMessageForProvider(text, attachments, "anthropic"),
+      });
 
       // Build the system prompt here (with agent instructions + identity)
       // and pass it down — callAnthropic would otherwise rebuild a base
@@ -2882,10 +2940,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "CHAT_AI_MESSAGE") {
-    const { text, context, conversationHistory, provider } = message;
+    const { text, context, conversationHistory, provider, attachments } = message;
     _debugLog(
       "[AutoDOM SW] CHAT_AI_MESSAGE received, text:",
       (text || "").substring(0, 80),
+      Array.isArray(attachments) && attachments.length > 0
+        ? `(+${attachments.length} image)`
+        : "",
     );
     touchToolActivity(); // Reset inactivity timer
 
@@ -2976,6 +3037,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             conversationHistory: conversationHistory || [],
             initialTabId: sender?.tab?.id,
             modelOverride: effectiveModel,
+            attachments: Array.isArray(attachments) ? attachments : [],
           });
           _debugLog(
             "[AutoDOM SW] Agent loop finished, length:",
@@ -3005,6 +3067,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     // ─── IDE / MCP Path (requires bridge server) ─────────────
+    // Image attachments aren't supported over the bridge protocol — the
+    // CLI providers (Claude/Copilot/Codex) don't accept inline image
+    // payloads from us. Refuse explicitly instead of silently dropping
+    // the images so the user understands the model didn't actually see
+    // them.
+    if (Array.isArray(attachments) && attachments.length > 0) {
+      sendResponse({
+        type: "AI_CHAT_RESPONSE",
+        error:
+          "Image attachments require a Direct AI provider (OpenAI / Anthropic / Ollama vision model). " +
+          "The IDE / MCP bridge currently routes text only — please pick a vision-capable Direct provider in the extension settings.",
+      });
+      return false;
+    }
+
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       _debugWarn(
         "[AutoDOM SW] CHAT_AI_MESSAGE: bridge unavailable for IDE mode",
@@ -5112,9 +5189,23 @@ chrome.commands.onCommand.addListener(async (command) => {
   try {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     const tab = tabs[0];
-    if (!tab || !tab.url || !isInjectableTab(tab)) return;
+    if (!tab) return;
 
     if (command === "toggle-chat-panel") {
+      // Open Chrome's native side panel — this is the primary chat
+      // surface (Claude-extension style). Falls back to the in-page
+      // injected panel only when sidePanel API is unavailable (older
+      // Chrome, Firefox via manifest.firefox.json, restricted pages
+      // where the side panel can't be opened).
+      try {
+        if (chrome.sidePanel && typeof chrome.sidePanel.open === "function") {
+          await chrome.sidePanel.open({ windowId: tab.windowId });
+          return;
+        }
+      } catch (e) {
+        _debugWarn?.("[AutoDOM] sidePanel.open failed, falling back:", e);
+      }
+      if (!tab.url || !isInjectableTab(tab)) return;
       await ensureChatPanelInjected(tab.id);
       chrome.tabs
         .sendMessage(tab.id, {
@@ -5122,9 +5213,11 @@ chrome.commands.onCommand.addListener(async (command) => {
           mcpActive: isConnected,
         })
         .catch(() => {});
+      return;
     }
 
     if (command === "toggle-inline-ai") {
+      if (!tab.url || !isInjectableTab(tab)) return;
       await ensureChatPanelInjected(tab.id);
       chrome.tabs
         .sendMessage(tab.id, {
@@ -5137,6 +5230,21 @@ chrome.commands.onCommand.addListener(async (command) => {
     _debugError("[AutoDOM] Command handler error:", err);
   }
 });
+
+// Side panel: route the toolbar action click straight to the side
+// panel (no popup). This must be configured at top level so it's
+// idempotent across SW restarts; setPanelBehavior is harmless to
+// re-call. Wrapped in try/catch because the API is Chrome-only and
+// the same SW source is shared with the Firefox manifest variant.
+try {
+  if (chrome.sidePanel && typeof chrome.sidePanel.setPanelBehavior === "function") {
+    chrome.sidePanel
+      .setPanelBehavior({ openPanelOnActionClick: true })
+      .catch((e) => _debugWarn?.("[AutoDOM] setPanelBehavior failed:", e));
+  }
+} catch (e) {
+  _debugWarn?.("[AutoDOM] sidePanel API unavailable:", e);
+}
 
 // ─── Auto-connect on service worker startup ──────────────────
 // The extension auto-connects on startup only when the user explicitly

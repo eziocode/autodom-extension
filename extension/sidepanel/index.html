@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AutoDOM Chat</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <!--
+      Side-panel host page. The chat-panel.js content script is reused
+      verbatim — it detects window.__AUTODOM_SIDE_PANEL_MODE__ and
+      renders into document.body without trying to push the host page
+      (there is no host page in this context — we live inside Chrome's
+      native side panel).
+    -->
+    <script src="bootstrap.js"></script>
+    <script src="../common/webext-api.js"></script>
+    <script src="../content/chat-panel.js"></script>
+  </body>
+</html>

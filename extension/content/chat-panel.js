@@ -34,6 +34,12 @@
   if (window.__autodomChatPanelLoaded) return;
   window.__autodomChatPanelLoaded = true;
 
+  // True when chat-panel.js is loaded by sidepanel/index.html — the
+  // panel renders into the side-panel page's <body> directly, never
+  // pushes a host page (there isn't one), and the resize/close UI
+  // hands off to Chrome's native side panel chrome.
+  const SIDE_PANEL_MODE = !!window.__AUTODOM_SIDE_PANEL_MODE__;
+
   const PANEL_ID = "__autodom_chat_panel";
   const STYLE_ID = "__autodom_chat_style";
   const INLINE_OVERLAY_ID = "__autodom_inline_overlay";
@@ -122,6 +128,9 @@
   let pendingRequests = new Map();
   let requestIdCounter = 0;
   let isProcessing = false;
+  // Image attachments queued for the next outgoing user turn. Populated by
+  // the paperclip button, paste, or drag-and-drop. Cleared on send.
+  let pendingAttachments = [];
   // Set to true while the user has cancelled an in-flight AI request
   // but a late response has not yet arrived. The response handlers
   // check this and silently drop late results so the UI doesn't show
@@ -253,6 +262,14 @@
   const PERSIST_KEY_MESSAGES = "__autodom_chat_messages_persist";
   const PERSIST_KEY_HISTORY = "__autodom_chat_history_persist";
   const STORAGE_KEY_MODEL_OVERRIDES = "__autodom_chat_model_overrides"; // { [providerSource]: modelId }
+
+  // ─── Image Attachment Limits ──────────────────────────────
+  // Vision models choke (or get rate-limited / billed heavily) on large
+  // payloads. Keep raw size modest; downscale on encode if needed.
+  const ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;        // hard reject above 5 MB raw
+  const ATTACHMENT_MAX_COUNT = 6;                       // per outgoing message
+  const ATTACHMENT_DOWNSCALE_MAX_DIM = 1568;            // matches Anthropic vision recommendation
+  const ATTACHMENT_DOWNSCALE_TRIGGER_BYTES = 700 * 1024; // re-encode anything bigger than ~700 KB
 
   // Static fallback catalog, keyed by provider "source" or "ide:<cliKind>".
   // Used for providers that don't expose a live /models endpoint (Anthropic,
@@ -783,9 +800,31 @@
     _pendingLongLivedSnapshot = null;
     if (!_chatSettings.persistAcrossSessions || !snapshot) return;
     try {
+      // Strip embedded image data URLs from the long-lived mirror —
+      // chrome.storage.local has a 5 MB per-item cap and even one
+      // mid-resolution screenshot can exceed it. The thumbnails still
+      // live in sessionStorage for the active tab; long-lived restore
+      // keeps text turns intact and shows a small "[image]" placeholder.
+      const sanitize = (arr) =>
+        Array.isArray(arr)
+          ? arr.map((m) => {
+              if (!m || !Array.isArray(m.attachments) || m.attachments.length === 0) {
+                return m;
+              }
+              const stripped = m.attachments.map((a) => ({
+                id: a && a.id,
+                name: a && a.name,
+                mime: a && a.mime,
+                size: a && a.size,
+                // dataUrl intentionally omitted (quota); presence of the
+                // record alone tells restore to render a placeholder pill.
+              }));
+              return { ...m, attachments: stripped };
+            })
+          : arr;
       chrome.storage?.local?.set?.({
-        [PERSIST_KEY_MESSAGES]: snapshot.messages,
-        [PERSIST_KEY_HISTORY]: snapshot.history,
+        [PERSIST_KEY_MESSAGES]: sanitize(snapshot.messages),
+        [PERSIST_KEY_HISTORY]: sanitize(snapshot.history),
       });
     } catch (_) {}
   }
@@ -893,8 +932,16 @@
             const nextSibling = messagesContainer.nextSibling;
             if (parent) parent.removeChild(messagesContainer);
             snapshot.forEach((msg) => {
-              const extra = msg.toolName ? { toolName: msg.toolName } : undefined;
-              addMessage(msg.role, msg.content, extra);
+              const extra = {};
+              if (msg.toolName) extra.toolName = msg.toolName;
+              if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
+                extra.attachments = msg.attachments;
+              }
+              addMessage(
+                msg.role,
+                msg.content,
+                Object.keys(extra).length > 0 ? extra : undefined,
+              );
             });
             if (parent) parent.insertBefore(messagesContainer, nextSibling);
             messagesContainer.scrollTop = messagesContainer.scrollHeight;
@@ -1483,8 +1530,90 @@
       color: var(--c-text-3) !important;
       border-top: 1px dashed var(--c-border) !important;
       padding-top: 6px !important;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 6px !important;
     }
     .autodom-chat-settings-sheet .acss-foot-hint { line-height: 1.4 !important; }
+    .autodom-chat-settings-sheet .acss-foot-btn {
+      align-self: flex-start !important;
+      font: inherit !important;
+      font-size: 11.5px !important;
+      color: var(--c-text-1) !important;
+      background: color-mix(in oklch, var(--c-accent) 10%, transparent) !important;
+      border: 1px solid var(--c-border) !important;
+      border-radius: 6px !important;
+      padding: 4px 10px !important;
+      cursor: pointer !important;
+      transition: background-color 0.15s ease, border-color 0.15s ease !important;
+    }
+    .autodom-chat-settings-sheet .acss-foot-btn:hover {
+      background: color-mix(in oklch, var(--c-accent) 18%, transparent) !important;
+      border-color: var(--c-accent) !important;
+    }
+    .autodom-chat-settings-sheet .acss-foot-btn:focus-visible {
+      outline: 2px solid var(--c-accent) !important;
+      outline-offset: 2px !important;
+    }
+
+    /* ─── Inline Settings Overlay (hosts popup.html in an iframe) ─── */
+    .autodom-chat-settings-overlay {
+      position: absolute !important;
+      inset: 0 !important;
+      z-index: 30 !important;
+      display: flex !important;
+      flex-direction: column !important;
+      background: var(--c-bg) !important;
+      animation: __autodom_slide_in 0.18s var(--ease-out);
+    }
+    .autodom-chat-settings-overlay[hidden] { display: none !important; }
+    .autodom-chat-settings-overlay-header {
+      flex: 0 0 auto !important;
+      display: flex !important;
+      align-items: center !important;
+      gap: 10px !important;
+      padding: 8px 10px !important;
+      background: var(--c-raised) !important;
+      border-bottom: 1px solid var(--c-border) !important;
+    }
+    .autodom-chat-settings-overlay-back {
+      display: inline-flex !important;
+      align-items: center !important;
+      gap: 4px !important;
+      font: inherit !important;
+      font-size: 12px !important;
+      color: var(--c-text-1) !important;
+      background: transparent !important;
+      border: 1px solid var(--c-border) !important;
+      border-radius: 6px !important;
+      padding: 4px 8px 4px 6px !important;
+      cursor: pointer !important;
+      transition: background-color 0.15s ease, border-color 0.15s ease !important;
+    }
+    .autodom-chat-settings-overlay-back svg {
+      width: 14px !important;
+      height: 14px !important;
+    }
+    .autodom-chat-settings-overlay-back:hover {
+      background: color-mix(in oklch, var(--c-accent) 12%, transparent) !important;
+      border-color: var(--c-accent) !important;
+    }
+    .autodom-chat-settings-overlay-back:focus-visible {
+      outline: 2px solid var(--c-accent) !important;
+      outline-offset: 2px !important;
+    }
+    .autodom-chat-settings-overlay-title {
+      font-size: 12.5px !important;
+      font-weight: 600 !important;
+      color: var(--c-text) !important;
+    }
+    .autodom-chat-settings-overlay-frame {
+      flex: 1 1 auto !important;
+      width: 100% !important;
+      border: 0 !important;
+      background: var(--c-bg) !important;
+      color-scheme: light dark;
+    }
 
     /* Settings button active state */
     .autodom-chat-header-btn.active {
@@ -2688,6 +2817,109 @@
     .autodom-chat-input-shell:focus-within ~ .autodom-chat-input-hint {
       opacity: 1;
       color: var(--c-text-2);
+    }
+
+    /* ─── Image Attachment Composer ──────────────────────────── */
+    .autodom-chat-attach-btn {
+      width: 32px !important;
+      height: 32px !important;
+      min-width: 32px !important;
+      border-radius: 50% !important;
+      background: transparent !important;
+      border: none !important;
+      cursor: pointer !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      color: var(--c-text-3) !important;
+      transition: background-color 0.15s ease, color 0.15s ease;
+      flex-shrink: 0 !important;
+      align-self: flex-end !important;
+      padding: 0 !important;
+      margin-right: 2px;
+    }
+    .autodom-chat-attach-btn:hover {
+      background: var(--c-surface-2) !important;
+      color: var(--c-accent) !important;
+    }
+    .autodom-chat-attach-btn:focus-visible {
+      outline: 2px solid var(--c-accent) !important;
+      outline-offset: 2px !important;
+    }
+    .autodom-chat-attach-btn svg {
+      width: 18px !important;
+      height: 18px !important;
+      fill: none !important;
+      stroke: currentColor !important;
+      stroke-width: 2 !important;
+      stroke-linecap: round !important;
+      stroke-linejoin: round !important;
+    }
+    .autodom-chat-attachments {
+      display: flex !important;
+      gap: 8px !important;
+      flex-wrap: wrap !important;
+      padding: 0 2px !important;
+    }
+    .autodom-chat-attachments[hidden] { display: none !important; }
+    .autodom-chat-attachment-chip {
+      position: relative;
+      width: 56px;
+      height: 56px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--c-border);
+      background: var(--c-surface-2);
+      box-shadow: 0 1px 2px rgba(0,0,0,0.08);
+    }
+    .autodom-chat-attachment-chip img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .autodom-chat-attachment-chip .autodom-attach-remove {
+      position: absolute;
+      top: 2px;
+      right: 2px;
+      width: 18px;
+      height: 18px;
+      border: none;
+      border-radius: 50%;
+      background: rgba(0,0,0,0.65);
+      color: #fff;
+      cursor: pointer;
+      font-size: 13px;
+      line-height: 1;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .autodom-chat-attachment-chip .autodom-attach-remove:hover {
+      background: rgba(220, 38, 38, 0.9);
+    }
+    .autodom-chat-input-shell.is-drag-over {
+      outline: 2px dashed var(--c-accent) !important;
+      outline-offset: -3px !important;
+      background: var(--c-accent-soft) !important;
+    }
+    .autodom-chat-input-shell.is-drag-over .autodom-chat-input::placeholder {
+      color: var(--c-accent) !important;
+    }
+    .autodom-msg-attachments {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .autodom-msg-attachments img {
+      max-width: 220px;
+      max-height: 220px;
+      border-radius: 8px;
+      border: 1px solid var(--c-border);
+      cursor: zoom-in;
+      display: block;
     }
 
     /* ─── Model Picker (composer footer) ───────────────────── */
@@ -4097,6 +4329,11 @@
       </div>
       <div class="acss-foot">
         <span class="acss-foot-hint">Stop button is always shown while automation is running.</span>
+        <button type="button" id="__autodom_open_settings_window"
+                class="acss-foot-btn"
+                title="Open extension settings (servers, providers, connection) here in the panel">
+          ⚙ Open extension settings…
+        </button>
       </div>
     </div>
 
@@ -4142,7 +4379,26 @@
 
     <!-- Input Area -->
     <div class="autodom-chat-input-area">
+      <div class="autodom-chat-attachments" id="__autodom_attachments" hidden role="list" aria-label="Attached images"></div>
       <div class="autodom-chat-input-shell">
+        <button
+          class="autodom-chat-attach-btn"
+          id="__autodom_attach_btn"
+          type="button"
+          title="Attach image (or paste / drop)"
+          aria-label="Attach image"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+        </button>
+        <input
+          type="file"
+          id="__autodom_attach_input"
+          accept="image/*"
+          multiple
+          hidden
+          aria-hidden="true"
+          tabindex="-1"
+        />
         <textarea
           class="autodom-chat-input"
           id="__autodom_chat_input"
@@ -4181,8 +4437,88 @@
     <div class="autodom-chat-footer" role="contentinfo">
       AutoDOM
     </div>
+
+    <!--
+      Inline Settings Overlay — replaces the legacy "open popup in a
+      separate window" affordance. We host the existing popup.html in
+      an iframe so the user stays inside the side panel (or in-page
+      panel) and so we don't have to reimplement the connection /
+      provider / server UI here.
+    -->
+    <div class="autodom-chat-settings-overlay" id="__autodom_settings_overlay" role="dialog" aria-label="AutoDOM extension settings" aria-modal="true" hidden>
+      <div class="autodom-chat-settings-overlay-header">
+        <button type="button" class="autodom-chat-settings-overlay-back" id="__autodom_settings_overlay_back" title="Back to chat" aria-label="Back to chat">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span>Back to chat</span>
+        </button>
+        <span class="autodom-chat-settings-overlay-title">Extension settings</span>
+      </div>
+      <iframe class="autodom-chat-settings-overlay-frame" id="__autodom_settings_overlay_frame" title="AutoDOM extension settings"></iframe>
+    </div>
   `;
   document.documentElement.appendChild(panel);
+
+  // Side-panel mode tweaks: the panel needs to fill the side-panel
+  // page's viewport (no host page to push, no need for `position:
+  // fixed` semantics, no native close/resize affordance — the browser
+  // owns those). One scoped style block flips the panel to
+  // `inset: 0` and hides the in-panel resize handle / close button so
+  // the side-panel chrome is the single source of truth.
+  if (SIDE_PANEL_MODE) {
+    const sideStyle = document.createElement("style");
+    sideStyle.id = "__autodom_sidepanel_overrides";
+    sideStyle.textContent = `
+      html, body {
+        height: 100% !important;
+        width: 100% !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+      }
+      /* Page-push rules become no-ops in the side panel: there is no
+         host page to push, and the panel must always fill its window. */
+      html.__autodom_panel_open,
+      html.__autodom_panel_resizing,
+      html.__autodom_panel_resizing.__autodom_panel_open {
+        margin-right: 0 !important;
+        overflow-x: visible !important;
+        cursor: auto !important;
+      }
+      #${PANEL_ID} {
+        position: absolute !important;
+        inset: 0 !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        height: 100% !important;
+        max-height: 100% !important;
+        border-left: none !important;
+        box-shadow: none !important;
+        border-radius: 0 !important;
+        transform: none !important;
+        transition: none !important;
+      }
+      /* Hide the in-panel resize handle and the close button — the
+         browser's native side-panel chrome already provides both. */
+      #${PANEL_ID} .autodom-chat-resize-handle,
+      #${PANEL_ID} #__autodom_close_btn,
+      #${PANEL_ID} #__autodom_collapse_btn {
+        display: none !important;
+      }
+    `;
+    // Append AFTER the panel's main <style> (which lives on
+    // document.documentElement) so our `!important` overrides win
+    // the cascade tie on source order. Appending to <head> lost
+    // because <head> precedes the late-appended panel style.
+    document.documentElement.appendChild(sideStyle);
+    // Make sure the panel is in <body> (cleaner for side panel page DOM
+    // and matches Chrome's side panel expectations), and force-open it
+    // so the user immediately sees the chat — there is no toggle in
+    // side-panel mode (the browser handles open/close).
+    if (panel.parentNode !== document.body) {
+      document.body.appendChild(panel);
+    }
+    document.documentElement.classList.add("__autodom_panel_open");
+  }
 
   // ─── Inline Overlay (Browser Atlas-style) ──────────────────
   const inlineBackdrop = document.createElement("div");
@@ -4303,7 +4639,9 @@
         sendBtn.setAttribute("aria-label", "Stop AI request");
       } else {
         sendBtn.classList.remove("is-stop");
-        sendBtn.disabled = !chatInput || chatInput.value.trim().length === 0;
+        const hasText = !!chatInput && chatInput.value.trim().length > 0;
+        const hasAttach = pendingAttachments.length > 0;
+        sendBtn.disabled = !(hasText || hasAttach);
         sendBtn.title = "Send (Enter) · Shift+Enter for newline";
         sendBtn.setAttribute("aria-label", "Send message");
       }
@@ -4393,6 +4731,157 @@
     if (!btn) return;
     btn.classList.add("just-pressed");
     setTimeout(() => btn.classList.remove("just-pressed"), 280);
+  }
+
+  // ─── Image Attachment Helpers ──────────────────────────────
+  // Manages the `pendingAttachments` queue (image files pasted, dropped,
+  // or picked via the paperclip button). Attachments are rendered as
+  // thumbnail chips above the composer and shipped with the next user
+  // turn so vision-capable models (Claude / GPT-4o / llava-style Ollama)
+  // can use them as context.
+  function _genAttachmentId() {
+    return "att_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  }
+
+  function _readFileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result || ""));
+      fr.onerror = () => reject(fr.error || new Error("read failed"));
+      fr.readAsDataURL(file);
+    });
+  }
+
+  // Re-encode large images to JPEG and clamp the long edge so we don't
+  // ship a 4032×3024 phone photo to the model. Returns a data URL.
+  // Falls back to the original data URL on any failure.
+  async function _maybeDownscaleImage(dataUrl, originalSize) {
+    try {
+      if (!dataUrl || originalSize < ATTACHMENT_DOWNSCALE_TRIGGER_BYTES) return dataUrl;
+      const img = await new Promise((resolve, reject) => {
+        const i = new Image();
+        i.onload = () => resolve(i);
+        i.onerror = () => reject(new Error("image decode failed"));
+        i.src = dataUrl;
+      });
+      const max = ATTACHMENT_DOWNSCALE_MAX_DIM;
+      const longest = Math.max(img.naturalWidth || 0, img.naturalHeight || 0);
+      if (!longest) return dataUrl;
+      const scale = longest > max ? max / longest : 1;
+      // Always re-encode at moderate JPEG quality even if dimensions fit,
+      // because PNGs of UI screenshots routinely weigh 1–3 MB and
+      // round-trip to JPEG cuts that by 5-10× with no perceptible loss
+      // for vision-model OCR.
+      const w = Math.max(1, Math.round((img.naturalWidth || longest) * scale));
+      const h = Math.max(1, Math.round((img.naturalHeight || longest) * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return dataUrl;
+      ctx.drawImage(img, 0, 0, w, h);
+      const out = canvas.toDataURL("image/jpeg", 0.85);
+      return out && out.length < dataUrl.length ? out : dataUrl;
+    } catch (_) {
+      return dataUrl;
+    }
+  }
+
+  async function _addAttachmentFile(file) {
+    if (!file || !file.type || !file.type.startsWith("image/")) {
+      _showChatToast("Only image files are supported");
+      return;
+    }
+    if (file.size > ATTACHMENT_MAX_BYTES) {
+      _showChatToast(
+        `Image too large (${Math.round(file.size / 1024 / 1024)}MB · max ${ATTACHMENT_MAX_BYTES / 1024 / 1024}MB)`,
+      );
+      return;
+    }
+    if (pendingAttachments.length >= ATTACHMENT_MAX_COUNT) {
+      _showChatToast(`Max ${ATTACHMENT_MAX_COUNT} images per message`);
+      return;
+    }
+    try {
+      const rawUrl = await _readFileAsDataUrl(file);
+      const dataUrl = await _maybeDownscaleImage(rawUrl, file.size);
+      pendingAttachments.push({
+        id: _genAttachmentId(),
+        name: file.name || "image",
+        mime: dataUrl.startsWith("data:") ? dataUrl.slice(5, dataUrl.indexOf(";")) : (file.type || "image/png"),
+        size: file.size,
+        dataUrl,
+      });
+      _renderAttachmentChips();
+      _refreshSendBtnEnabled();
+    } catch (err) {
+      _err && _err("attachment read failed:", err && err.message);
+      _showChatToast("Could not read image");
+    }
+  }
+
+  function _removeAttachment(id) {
+    const before = pendingAttachments.length;
+    pendingAttachments = pendingAttachments.filter((a) => a.id !== id);
+    if (pendingAttachments.length !== before) {
+      _renderAttachmentChips();
+      _refreshSendBtnEnabled();
+    }
+  }
+
+  function _clearPendingAttachments() {
+    if (pendingAttachments.length === 0) return;
+    pendingAttachments = [];
+    _renderAttachmentChips();
+    _refreshSendBtnEnabled();
+  }
+
+  function _renderAttachmentChips() {
+    const strip = document.getElementById("__autodom_attachments");
+    if (!strip) return;
+    strip.innerHTML = "";
+    if (pendingAttachments.length === 0) {
+      strip.hidden = true;
+      strip.setAttribute("aria-hidden", "true");
+      return;
+    }
+    strip.hidden = false;
+    strip.setAttribute("aria-hidden", "false");
+    pendingAttachments.forEach((a) => {
+      const chip = document.createElement("div");
+      chip.className = "autodom-chat-attachment-chip";
+      chip.setAttribute("role", "listitem");
+      chip.title = `${a.name} (${Math.round((a.size || 0) / 1024)} KB)`;
+      const img = document.createElement("img");
+      img.src = a.dataUrl;
+      img.alt = a.name || "attachment";
+      img.loading = "lazy";
+      chip.appendChild(img);
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "autodom-attach-remove";
+      rm.textContent = "\u00D7";
+      rm.setAttribute("aria-label", `Remove ${a.name}`);
+      rm.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        _removeAttachment(a.id);
+      });
+      chip.appendChild(rm);
+      strip.appendChild(chip);
+    });
+  }
+
+  // Send btn is enabled when there's text OR at least one queued image.
+  // Centralised so the input/attachment paths stay in sync with _setBusy.
+  function _refreshSendBtnEnabled() {
+    if (typeof isProcessing !== "undefined" && isProcessing) return;
+    const sb = document.getElementById("__autodom_send_btn");
+    const ci = document.getElementById("__autodom_chat_input");
+    if (!sb) return;
+    const hasText = ci && ci.value.trim().length > 0;
+    const hasAttach = pendingAttachments.length > 0;
+    sb.disabled = !(hasText || hasAttach);
   }
 
   function _updateAutomationUi() {
@@ -4998,6 +5487,80 @@
       }
     });
   }
+  // Open extension settings inline — render popup.html inside the
+  // panel via an iframe overlay instead of spawning a separate
+  // browser window. Keeps the user's context (side-panel or in-page
+  // panel) and removes the disorienting "new window pops out" UX.
+  // The iframe loads lazily on first open and is reused thereafter.
+  const openSettingsWindowBtn = document.getElementById(
+    "__autodom_open_settings_window",
+  );
+  const settingsOverlay = document.getElementById("__autodom_settings_overlay");
+  const settingsOverlayFrame = document.getElementById(
+    "__autodom_settings_overlay_frame",
+  );
+  const settingsOverlayBack = document.getElementById(
+    "__autodom_settings_overlay_back",
+  );
+  let _settingsOverlayLastFocus = null;
+  function _openSettingsOverlay() {
+    if (!settingsOverlay || !settingsOverlayFrame) return;
+    try {
+      _settingsOverlayLastFocus = document.activeElement;
+    } catch (_) {
+      _settingsOverlayLastFocus = null;
+    }
+    // Lazy-load the iframe src so the popup UI doesn't initialize
+    // until the user actually asks for settings.
+    if (!settingsOverlayFrame.getAttribute("src")) {
+      settingsOverlayFrame.setAttribute(
+        "src",
+        chrome.runtime.getURL("popup/popup.html"),
+      );
+    }
+    settingsOverlay.removeAttribute("hidden");
+    if (settingsOverlayBack) {
+      // Defer focus so it lands after the slide-in animation paints.
+      setTimeout(() => {
+        try { settingsOverlayBack.focus(); } catch (_) {}
+      }, 0);
+    }
+  }
+  function _closeSettingsOverlay() {
+    if (!settingsOverlay) return;
+    settingsOverlay.setAttribute("hidden", "");
+    try {
+      if (_settingsOverlayLastFocus && _settingsOverlayLastFocus.focus) {
+        _settingsOverlayLastFocus.focus();
+      }
+    } catch (_) {}
+    _settingsOverlayLastFocus = null;
+  }
+  if (openSettingsWindowBtn) {
+    openSettingsWindowBtn.addEventListener("click", () => {
+      try {
+        _openSettingsOverlay();
+        _closeSettingsSheet();
+      } catch (e) {
+        _err("[settings-overlay] open failed", e);
+      }
+    });
+  }
+  if (settingsOverlayBack) {
+    settingsOverlayBack.addEventListener("click", _closeSettingsOverlay);
+  }
+  // Esc closes the overlay (only when it's open and focus is inside it
+  // or on the back button) — avoids hijacking Esc for the rest of the
+  // chat surface.
+  if (settingsOverlay) {
+    settingsOverlay.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        _closeSettingsOverlay();
+      }
+    });
+  }
   // Load persisted settings now that DOM refs exist
   _loadChatSettings();
 
@@ -5280,6 +5843,19 @@
   // Poll connection status every 5 seconds (faster than before to reduce stale state)
   _statusPollInterval = setInterval(checkConnectionStatus, 5000);
   checkConnectionStatus();
+
+  // Side-panel mode: auto-open the panel and force-show MCP-active
+  // affordances. The browser already opened our window — there's no
+  // user gesture left to wait for, and hiding the UI behind a
+  // "connect MCP first" gate would just show a blank panel.
+  if (SIDE_PANEL_MODE) {
+    try {
+      setMcpActive(true);
+      openPanel();
+    } catch (e) {
+      _err?.("[side-panel] auto-open failed", e);
+    }
+  }
 
   // ─── Message Rendering ─────────────────────────────────────
   function clearWelcome() {
@@ -5685,6 +6261,39 @@
       }
     }
 
+    // ─── Attached images (user bubble) ───────────────────────
+    // Rendered for user turns only. Stored on the message so reloads,
+    // long-lived restore, and inline→panel handoff all show the same
+    // visual context the AI received.
+    if (extra && Array.isArray(extra.attachments) && extra.attachments.length > 0) {
+      const grid = document.createElement("div");
+      grid.className = "autodom-msg-attachments";
+      extra.attachments.forEach((a) => {
+        if (!a) return;
+        if (a.dataUrl) {
+          const img = document.createElement("img");
+          img.src = a.dataUrl;
+          img.alt = a.name || "attached image";
+          img.loading = "lazy";
+          img.addEventListener("click", () => {
+            try { window.open(a.dataUrl, "_blank", "noopener"); } catch (_) {}
+          });
+          grid.appendChild(img);
+          return;
+        }
+        // Long-lived restore strips dataUrls (storage quota); show a
+        // lightweight placeholder so the message history isn't silently
+        // shorter than it was.
+        const ph = document.createElement("div");
+        ph.className = "autodom-msg-attachment-placeholder";
+        ph.style.cssText =
+          "padding:6px 10px;border:1px dashed var(--c-border);border-radius:6px;font-size:11px;color:var(--c-text-3);";
+        ph.textContent = `\uD83D\uDDBC\uFE0F ${a.name || "image"} (not stored)`;
+        grid.appendChild(ph);
+      });
+      if (grid.childElementCount > 0) msg.appendChild(grid);
+    }
+
     // Show AI tool calls if present
     if (visibleToolCalls.length > 0) {
       const toolCallsDiv = document.createElement("div");
@@ -5708,7 +6317,15 @@
     messagesContainer.appendChild(msg);
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
 
-    messages.push({ role, content, toolName: extra && extra.toolName });
+    messages.push({
+      role,
+      content,
+      toolName: extra && extra.toolName,
+      attachments:
+        extra && Array.isArray(extra.attachments) && extra.attachments.length > 0
+          ? extra.attachments
+          : undefined,
+    });
     persistChatState();
     return msg;
   }
@@ -6602,8 +7219,10 @@
   // ─── AI Chat via MCP ───────────────────────────────────────
   // Routes messages to the MCP AI agent for context-aware responses.
   // Falls back to local tool dispatch if AI routing is unavailable.
-  function sendAiMessage(text) {
-    _log("sendAiMessage:", text.substring(0, 80));
+  function sendAiMessage(text, options) {
+    const attachments =
+      options && Array.isArray(options.attachments) ? options.attachments : [];
+    _log("sendAiMessage:", text.substring(0, 80), attachments.length ? `(+${attachments.length} image)` : "");
     return new Promise((resolve) => {
       if (_contextInvalidated) {
         resolve({
@@ -6631,6 +7250,14 @@
             context: context,
             conversationHistory: conversationHistory.slice(-20), // Last 20 messages
             model: _currentModelId() || undefined,
+            attachments: attachments.length > 0
+              ? attachments.map((a) => ({
+                  name: a.name,
+                  mime: a.mime,
+                  size: a.size,
+                  dataUrl: a.dataUrl,
+                }))
+              : undefined,
           },
           (response) => {
             let lastError = null;
@@ -7239,12 +7866,21 @@
       return;
     }
 
-    addMessage("user", text);
+    addMessage("user", text, pendingAttachments.length > 0 ? { attachments: pendingAttachments.slice() } : undefined);
+    // Snapshot + clear NOW so re-entrant Enter / fast double-clicks can't
+    // re-attach the same images to the next prompt. We also pass the
+    // snapshot down to sendAiMessage rather than re-reading the global.
+    const _attachmentsForTurn = pendingAttachments.slice();
+    _clearPendingAttachments();
     chatInput.value = "";
     autoResizeInput();
 
     // Add to conversation history for AI context
-    _pushHistory({ role: "user", content: text });
+    _pushHistory({
+      role: "user",
+      content: text,
+      attachments: _attachmentsForTurn.length > 0 ? _attachmentsForTurn : undefined,
+    });
 
     // Check for slash commands first (direct tool invocation)
     // Slash commands use local tool handlers and do NOT require MCP bridge
@@ -7314,7 +7950,7 @@
     showTyping();
 
     try {
-      const aiResult = await sendAiMessage(text);
+      const aiResult = await sendAiMessage(text, { attachments: _attachmentsForTurn });
 
       // If the user pressed Stop while we were waiting for the bridge,
       // _userAborted will be set and the response (whether success or
@@ -7705,8 +8341,90 @@
   chatInput.addEventListener("input", autoResizeInput);
   chatInput.addEventListener("input", () => {
     if (isProcessing) return; // don't fight the stop button while busy
-    if (sendBtn) sendBtn.disabled = chatInput.value.trim().length === 0;
+    _refreshSendBtnEnabled();
   });
+
+  // ─── Image attachments: paperclip · paste · drag-and-drop ──
+  (function bindAttachmentInputs() {
+    const attachBtn = document.getElementById("__autodom_attach_btn");
+    const attachInput = document.getElementById("__autodom_attach_input");
+    const inputShell = panel.querySelector(".autodom-chat-input-shell");
+    if (attachBtn && attachInput && !attachBtn.dataset.bound) {
+      attachBtn.dataset.bound = "1";
+      attachBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        attachInput.click();
+      });
+      attachInput.addEventListener("change", async () => {
+        const files = Array.from(attachInput.files || []);
+        for (const f of files) await _addAttachmentFile(f);
+        // Reset so re-picking the same file fires `change` again.
+        attachInput.value = "";
+      });
+    }
+    if (chatInput && !chatInput.dataset.pasteBound) {
+      chatInput.dataset.pasteBound = "1";
+      chatInput.addEventListener("paste", async (ev) => {
+        const items = (ev.clipboardData && ev.clipboardData.items) || [];
+        const imageFiles = [];
+        for (const it of items) {
+          if (it && it.kind === "file") {
+            const f = it.getAsFile();
+            if (f && f.type && f.type.startsWith("image/")) imageFiles.push(f);
+          }
+        }
+        if (imageFiles.length === 0) return;
+        // Suppress the default paste so a screenshot's textual fallback
+        // ("\uFFFC" or filename) doesn't litter the textarea.
+        ev.preventDefault();
+        for (const f of imageFiles) await _addAttachmentFile(f);
+      });
+    }
+    if (inputShell && !inputShell.dataset.dropBound) {
+      inputShell.dataset.dropBound = "1";
+      const hasFileType = (e) => {
+        try {
+          const t = e.dataTransfer && e.dataTransfer.types;
+          if (!t) return false;
+          // Older Edge exposes a DOMStringList; iterate defensively.
+          for (let i = 0; i < t.length; i++) {
+            if (String(t[i]).toLowerCase() === "files") return true;
+          }
+        } catch (_) {}
+        return false;
+      };
+      inputShell.addEventListener("dragenter", (ev) => {
+        if (!hasFileType(ev)) return;
+        ev.preventDefault();
+        inputShell.classList.add("is-drag-over");
+      });
+      inputShell.addEventListener("dragover", (ev) => {
+        if (!hasFileType(ev)) return;
+        ev.preventDefault();
+        try { ev.dataTransfer.dropEffect = "copy"; } catch (_) {}
+        inputShell.classList.add("is-drag-over");
+      });
+      inputShell.addEventListener("dragleave", (ev) => {
+        // Only clear when the pointer truly leaves the shell — dragging
+        // over a child element fires dragleave on the parent too.
+        if (ev.relatedTarget && inputShell.contains(ev.relatedTarget)) return;
+        inputShell.classList.remove("is-drag-over");
+      });
+      inputShell.addEventListener("drop", async (ev) => {
+        const dt = ev.dataTransfer;
+        const files = dt && dt.files ? Array.from(dt.files) : [];
+        const imageFiles = files.filter((f) => f && f.type && f.type.startsWith("image/"));
+        if (imageFiles.length === 0) {
+          inputShell.classList.remove("is-drag-over");
+          return;
+        }
+        ev.preventDefault();
+        ev.stopPropagation();
+        inputShell.classList.remove("is-drag-over");
+        for (const f of imageFiles) await _addAttachmentFile(f);
+      });
+    }
+  })();
 
   chatInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -8166,8 +8884,12 @@
     const nextSibling = messagesContainer.nextSibling;
     if (parent) parent.removeChild(messagesContainer);
     snapshot.forEach((msg) => {
-      const extra = msg.toolName ? { toolName: msg.toolName } : undefined;
-      addMessage(msg.role, msg.content, extra);
+      const extra = {};
+      if (msg.toolName) extra.toolName = msg.toolName;
+      if (Array.isArray(msg.attachments) && msg.attachments.length > 0) {
+        extra.attachments = msg.attachments;
+      }
+      addMessage(msg.role, msg.content, Object.keys(extra).length > 0 ? extra : undefined);
     });
     if (parent) parent.insertBefore(messagesContainer, nextSibling);
     // Scroll to bottom
