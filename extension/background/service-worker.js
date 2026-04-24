@@ -414,11 +414,13 @@ function _startAgentRunHandle(panelTabId) {
     aborted: false,
     panelTabId,
   };
+  _broadcastAgentRunState();
   return _activeAgentRun;
 }
 function _endAgentRunHandle(runId) {
   if (_activeAgentRun && _activeAgentRun.runId === runId) {
     _activeAgentRun = null;
+    _broadcastAgentRunState();
   }
 }
 function _stopActiveAgentRun(reason) {
@@ -429,6 +431,29 @@ function _stopActiveAgentRun(reason) {
     run.aborter.abort(reason || "stopped_by_user");
   } catch (_) {}
   return true;
+}
+
+// Notify the currently-focused tab in every window that the run state
+// changed, so its chat panel can re-mount or tear down the overlay.
+// We target the active tab per window (cheap, predictable) instead of
+// every tab; the user's overlay only needs to be visible where they
+// are looking. Other tabs catch up via tabs.onActivated when they're
+// switched to.
+function _broadcastAgentRunState() {
+  try {
+    chrome.tabs.query({ active: true }, (tabs) => {
+      try { void chrome.runtime.lastError; } catch (_) {}
+      if (!tabs) return;
+      for (const t of tabs) {
+        if (!t || t.id == null) continue;
+        try {
+          chrome.tabs
+            .sendMessage(t.id, { type: "AGENT_RUN_STATE_CHANGED" })
+            .catch(() => {});
+        } catch (_) {}
+      }
+    });
+  } catch (_) {}
 }
 
 // Pinned-tab execution context for the in-flight loop. Calls to active-tab
@@ -1324,6 +1349,18 @@ chrome.tabs.onActivated.addListener(async (activeInfo) => {
       activeInfo.tabId,
       tab.url,
     );
+    // If an agent run is active, make sure the chat panel content
+    // script is mounted on the tab the user just switched to so the
+    // automation overlay + floating Stop appear there too. The panel's
+    // own init queries GET_ACTIVE_RUN and restores busy state.
+    if (_activeAgentRun && isInjectableTab(tab)) {
+      try {
+        await ensureChatPanelInjected(activeInfo.tabId);
+        chrome.tabs
+          .sendMessage(activeInfo.tabId, { type: "AGENT_RUN_STATE_CHANGED" })
+          .catch(() => {});
+      } catch (_) {}
+    }
   } catch {}
 });
 
@@ -1338,43 +1375,28 @@ chrome.tabs.onCreated.addListener((tab) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   recordAction("tab_closed", `Tab closed`, {}, tabId);
-  // If the active agent run belongs to this tab, abort it — the chat
-  // panel is gone so there's nothing to report back to.
+  // Don't kill the agent run when its panel tab is closed — the user
+  // may want automation to keep running on whichever tab they switch
+  // to next. Just unpin so getActiveTab() can fall back to whatever
+  // tab is currently active.
   try {
     if (_activeAgentRun && _activeAgentRun.panelTabId === tabId) {
-      _stopActiveAgentRun("tab_closed");
+      _activeAgentRun.panelTabId = null;
+    }
+    if (_agentRunContext && _agentRunContext.tabId === tabId) {
+      _agentRunContext = _agentRunContext.windowId != null
+        ? { windowId: _agentRunContext.windowId }
+        : null;
     }
   } catch (_) {}
 });
 
-// Abort any in-flight agent run whose panel tab is navigating away —
-// after a hard refresh or URL change the chat panel is destroyed and
-// a fresh one will be injected with no knowledge of the old run, so
-// the automation must not keep firing tools at the new page. Listen on
-// both tabs.onUpdated (URL changes in-tab) and webNavigation (full
-// navigations including main-frame reloads).
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  try {
-    if (!_activeAgentRun || _activeAgentRun.panelTabId !== tabId) return;
-    // Skip while an agent tool is mid-flight — that's the agent
-    // navigating on purpose (navigate / click-that-navigates).
-    if (_activeAgentRun.toolRunning) return;
-    if (changeInfo.url || changeInfo.status === "loading") {
-      _stopActiveAgentRun("panel_tab_navigated");
-    }
-  } catch (_) {}
-});
-if (chrome.webNavigation && chrome.webNavigation.onBeforeNavigate) {
-  chrome.webNavigation.onBeforeNavigate.addListener((details) => {
-    try {
-      if (details.frameId !== 0) return; // main frame only
-      if (!_activeAgentRun || _activeAgentRun.panelTabId !== details.tabId)
-        return;
-      if (_activeAgentRun.toolRunning) return; // agent-driven, not user
-      _stopActiveAgentRun("panel_tab_navigated");
-    } catch (_) {}
-  });
-}
+// Previously we aborted the agent run on user-initiated navigation
+// (refresh / URL change) of the panel tab. The user explicitly asked
+// for the OPPOSITE behavior: keep the run alive across refresh / new
+// tab / tab close so that long-running automation can't be killed by
+// accident. The chat panel's overlay re-appears on the new page via
+// PANEL_LOADED_RESET_RUN -> GET_ACTIVE_RUN -> _setBusy(true).
 
 // ─── WebSocket Management ────────────────────────────────────
 
@@ -1767,27 +1789,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
-  // Fresh content-script load (post-refresh or first inject). If an
-  // agent run is still bound to this tab from before the reload, keep
-  // it alive *only* when a tool is currently mid-flight (the agent
-  // itself triggered the navigation). In that case rebind panelTabId
-  // to the new sender so future tool events still reach the panel and
-  // surface the overlay. Otherwise (user-initiated refresh while idle
-  // between turns) abort, since the panel state is gone.
+  // Fresh content-script load (post-refresh, new tab, or first inject).
+  // We NEVER abort an active run here — the user wants the overlay to
+  // persist across refresh / new tab / tab close. Just rebind
+  // panelTabId so future tool stream events reach the freshly mounted
+  // panel, then let the panel call GET_ACTIVE_RUN to restore its UI.
   if (message.type === "PANEL_LOADED_RESET_RUN") {
     const tid = sender?.tab?.id ?? null;
     let wasActive = false;
     let kept = false;
     try {
-      if (_activeAgentRun && (tid == null || _activeAgentRun.panelTabId === tid)) {
+      if (_activeAgentRun) {
         wasActive = true;
-        if (_activeAgentRun.toolRunning) {
-          // Agent-driven navigation — rebind to the reloaded panel.
-          if (tid != null) _activeAgentRun.panelTabId = tid;
-          kept = true;
-        } else {
-          _stopActiveAgentRun("panel_reloaded");
-        }
+        kept = true;
+        if (tid != null) _activeAgentRun.panelTabId = tid;
       }
     } catch (_) {}
     sendResponse({ ok: true, wasActive, kept });

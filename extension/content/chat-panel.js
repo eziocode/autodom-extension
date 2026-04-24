@@ -5983,6 +5983,28 @@
       } catch (_) {}
       return;
     }
+    // ─── Agent run state changed (e.g. user switched to this tab
+    // mid-run, or the SW just rebound panelTabId after a refresh).
+    // Re-query the SW so the overlay + busy state matches reality
+    // even on a tab where this panel never started a run.
+    if (message.type === "AGENT_RUN_STATE_CHANGED") {
+      try {
+        chrome.runtime.sendMessage({ type: "GET_ACTIVE_RUN" }, (s) => {
+          try { void chrome.runtime.lastError; } catch (_) {}
+          if (s && s.active) {
+            _activeRunId = s.runId || null;
+            if (!isProcessing) _setBusy(true);
+            _showRunIndicator(
+              s.toolRunning ? "Automation running" : "Automation finishing",
+            );
+          } else if (isProcessing) {
+            _setBusy(false);
+            _hideRunIndicator();
+          }
+        });
+      } catch (_) {}
+      return;
+    }
     _log(
       "onMessage received:",
       message.type,
