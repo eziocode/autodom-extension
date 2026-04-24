@@ -12,3 +12,4 @@ dist/
 
 # Developer-private notes
 AGENTS.md
+.claude/settings.json

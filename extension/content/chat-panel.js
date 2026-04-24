@@ -884,41 +884,47 @@
       stroke-width: 2;
     }
 
-    /* ─── Context Bar (subtle URL strip below header) ────────── */
-    .autodom-chat-context {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 14px 8px;
-      background: var(--c-bg);
-      border-bottom: 1px solid var(--c-border);
-      font-size: 11px;
-      color: var(--c-text-3);
-      flex-shrink: 0;
-      overflow: hidden;
-      min-height: 0;
+    /* ─── Context Bar (page context chip) ────────────────────── */
+    #${PANEL_ID} .autodom-chat-context {
+      display: flex !important;
+      align-items: center !important;
+      gap: 8px !important;
+      margin: 0 16px 4px !important;
+      padding: 8px 10px !important;
+      background: color-mix(in oklch, var(--c-surface) 88%, transparent) !important;
+      border: 1px solid color-mix(in oklch, var(--c-border) 88%, transparent) !important;
+      border-radius: 12px !important;
+      font-size: 11.5px !important;
+      color: var(--c-text-3) !important;
+      flex-shrink: 0 !important;
+      overflow: hidden !important;
+      min-height: 34px !important;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
     }
-    .autodom-chat-context-icon {
-      flex-shrink: 0;
-      opacity: 0.55;
-      display: flex;
-      align-items: center;
+    #${PANEL_ID} .autodom-chat-context-icon {
+      flex-shrink: 0 !important;
+      opacity: 0.65 !important;
+      display: flex !important;
+      align-items: center !important;
     }
-    .autodom-chat-context-icon svg {
-      width: 11px;
-      height: 11px;
-      fill: none;
-      stroke: currentColor;
-      stroke-width: 2;
-      display: block;
+    #${PANEL_ID} .autodom-chat-context-icon svg {
+      width: 11px !important;
+      height: 11px !important;
+      fill: none !important;
+      stroke: currentColor !important;
+      stroke-width: 2 !important;
+      display: block !important;
     }
-    .autodom-chat-context-text {
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      flex: 1;
-      font-weight: 400;
-      line-height: 1.3;
+    #${PANEL_ID} .autodom-chat-context-text {
+      white-space: nowrap !important;
+      overflow: hidden !important;
+      text-overflow: ellipsis !important;
+      flex: 1 1 auto !important;
+      font-weight: 500 !important;
+      line-height: 1.35 !important;
+      color: var(--c-text-2) !important;
+      letter-spacing: 0.01em !important;
+      min-width: 0 !important;
     }
     /* ─── Messages ────────────────────────────────────────────── */
     .autodom-chat-messages {
@@ -2041,146 +2047,163 @@
     }
 
     /* ─── Welcome Screen ──────────────────────────────────────
-       No avatar icon here — the header already brands the panel.
-       This is a brief "how to use" cheatsheet so a new user knows
-       what they can type, which shortcuts exist, and how to escape
-       hatch to slash commands. */
-    .autodom-chat-welcome {
-      width: 100%;
-      display: flex;
-      flex-direction: column;
-      align-items: stretch;
-      justify-content: flex-start;
-      gap: 14px;
-      padding: 4px 2px 8px;
-      text-align: left;
+       Give the empty state a proper hero card so the panel feels like
+       a designed landing view instead of loose text floating in a dark
+       column. Scoped to the panel ID so these rules beat the defensive
+       reset above. */
+    #${PANEL_ID} .autodom-chat-welcome {
+      width: 100% !important;
+      max-width: none !important;
+      align-self: stretch !important;
+      position: relative !important;
+      overflow: hidden !important;
+      display: flex !important;
+      flex-direction: column !important;
+      align-items: stretch !important;
+      justify-content: flex-start !important;
+      gap: 16px !important;
+      padding: 20px 18px 18px !important;
+      border-radius: 18px !important;
+      border: 1px solid color-mix(in oklch, var(--c-border) 92%, transparent) !important;
+      background:
+        linear-gradient(180deg,
+          color-mix(in oklch, var(--c-surface) 92%, transparent) 0%,
+          color-mix(in oklch, var(--c-bg) 94%, transparent) 100%) !important;
+      box-shadow:
+        0 12px 30px rgba(0, 0, 0, 0.18),
+        inset 0 1px 0 rgba(255, 255, 255, 0.04) !important;
+      text-align: left !important;
+      isolation: isolate !important;
     }
-    /* Legacy welcome icon — hard-hidden so old cached DOM doesn't show it */
-    .autodom-chat-welcome-icon { display: none !important; }
-    .autodom-chat-welcome h3 {
-      font-size: 18px;
-      font-weight: 600;
-      color: var(--c-text);
-      letter-spacing: -0.01em;
-      margin: 0;
-      line-height: 1.25;
+    #${PANEL_ID} .autodom-chat-welcome::before {
+      content: "" !important;
+      position: absolute !important;
+      top: -42px !important;
+      left: -18px !important;
+      width: 180px !important;
+      height: 180px !important;
+      border-radius: 50% !important;
+      background: radial-gradient(circle, var(--c-accent-soft) 0%, transparent 72%) !important;
+      pointer-events: none !important;
+      opacity: 0.95 !important;
     }
-    .autodom-chat-welcome p.welcome-sub {
-      font-size: 12.5px;
-      color: var(--c-text-3);
-      line-height: 1.5;
-      max-width: 360px;
-      margin: 0;
+    #${PANEL_ID} .autodom-chat-welcome > * {
+      position: relative !important;
+      z-index: 1 !important;
     }
-    .autodom-chat-welcome .welcome-section-label {
-      font-size: 10px;
-      font-weight: 600;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--c-text-3);
-      margin: 6px 0 -4px;
+    #${PANEL_ID} .autodom-chat-welcome h3 {
+      font-size: 28px !important;
+      font-weight: 700 !important;
+      color: var(--c-text) !important;
+      letter-spacing: -0.03em !important;
+      margin: 0 !important;
+      line-height: 1.08 !important;
     }
-    .autodom-chat-welcome .welcome-bullets {
-      margin: 0;
-      padding: 0;
-      list-style: none;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
+    #${PANEL_ID} .autodom-chat-welcome p.welcome-sub {
+      font-size: 14px !important;
+      color: var(--c-text-2) !important;
+      line-height: 1.6 !important;
+      max-width: none !important;
+      margin: 0 !important;
     }
-    .autodom-chat-welcome .welcome-bullets li {
-      display: flex;
-      gap: 8px;
-      align-items: flex-start;
-      font-size: 12.5px;
-      color: var(--c-text-2);
-      line-height: 1.45;
+    #${PANEL_ID} .autodom-chat-welcome p.welcome-sub code,
+    #${PANEL_ID} .autodom-chat-welcome .welcome-tips code {
+      font-family: var(--mono) !important;
+      font-size: 10.5px !important;
+      color: var(--c-text) !important;
+      background: color-mix(in oklch, var(--c-bg) 92%, transparent) !important;
+      padding: 2px 7px !important;
+      border-radius: 6px !important;
+      border: 1px solid color-mix(in oklch, var(--c-border) 88%, transparent) !important;
     }
-    .autodom-chat-welcome .welcome-bullets li::before {
-      content: "";
-      flex: 0 0 5px;
-      width: 5px; height: 5px;
-      margin-top: 7px;
-      border-radius: 50%;
-      background: var(--c-accent);
-      opacity: 0.8;
+    #${PANEL_ID} .autodom-chat-welcome .welcome-section-label {
+      font-size: 10.5px !important;
+      font-weight: 700 !important;
+      letter-spacing: 0.1em !important;
+      text-transform: uppercase !important;
+      color: var(--c-text-3) !important;
+      margin: 2px 0 -4px !important;
     }
-    .autodom-chat-welcome .welcome-bullets li b {
-      color: var(--c-text);
-      font-weight: 600;
+    #${PANEL_ID} .autodom-chat-welcome .welcome-bullets {
+      margin: 0 !important;
+      padding: 0 !important;
+      list-style: none !important;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 10px !important;
     }
-    .autodom-chat-welcome .welcome-tips {
-      margin: 0;
-      padding: 10px 12px;
-      border: 1px solid var(--c-border);
-      border-radius: 10px;
-      background: var(--c-surface);
+    #${PANEL_ID} .autodom-chat-welcome .welcome-bullets li {
+      display: flex !important;
+      gap: 10px !important;
+      align-items: flex-start !important;
+      padding: 12px 14px !important;
+      border-radius: 14px !important;
+      border: 1px solid color-mix(in oklch, var(--c-border) 86%, transparent) !important;
+      background: color-mix(in oklch, var(--c-bg) 70%, transparent) !important;
+      font-size: 13px !important;
+      color: var(--c-text-2) !important;
+      line-height: 1.55 !important;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02) !important;
     }
-    .autodom-chat-welcome .welcome-tips summary {
-      font-size: 11.5px;
-      font-weight: 600;
-      color: var(--c-text-2);
-      cursor: pointer;
-      list-style: none;
-      display: flex;
-      align-items: center;
-      gap: 6px;
+    #${PANEL_ID} .autodom-chat-welcome .welcome-bullets li::before {
+      content: "" !important;
+      flex: 0 0 7px !important;
+      width: 7px !important;
+      height: 7px !important;
+      margin-top: 7px !important;
+      border-radius: 50% !important;
+      background: var(--c-accent) !important;
+      box-shadow: 0 0 0 4px var(--c-accent-soft) !important;
+      opacity: 1 !important;
     }
-    .autodom-chat-welcome .welcome-tips summary::-webkit-details-marker { display: none; }
-    .autodom-chat-welcome .welcome-tips summary::before {
-      content: "▸";
-      font-size: 10px;
-      color: var(--c-text-3);
-      transition: transform 0.15s ease;
+    #${PANEL_ID} .autodom-chat-welcome .welcome-bullets li b {
+      color: var(--c-text) !important;
+      font-weight: 700 !important;
     }
-    .autodom-chat-welcome .welcome-tips[open] summary::before { transform: rotate(90deg); }
-    .autodom-chat-welcome .welcome-tips-body {
-      margin-top: 8px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      font-size: 11.5px;
-      color: var(--c-text-3);
-      line-height: 1.5;
+    #${PANEL_ID} .autodom-chat-welcome .welcome-tips {
+      margin: 0 !important;
+      padding: 12px 14px !important;
+      border: 1px solid color-mix(in oklch, var(--c-border) 88%, transparent) !important;
+      border-radius: 14px !important;
+      background: color-mix(in oklch, var(--c-surface) 88%, transparent) !important;
     }
-    .autodom-chat-welcome .welcome-tips-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px 10px;
-      align-items: center;
+    #${PANEL_ID} .autodom-chat-welcome .welcome-tips summary {
+      font-size: 12px !important;
+      font-weight: 600 !important;
+      color: var(--c-text-2) !important;
+      cursor: pointer !important;
+      list-style: none !important;
+      display: flex !important;
+      align-items: center !important;
+      gap: 8px !important;
     }
-    .autodom-chat-welcome .welcome-tips-row .tip-label {
-      color: var(--c-text-2);
-      font-weight: 600;
-      min-width: 72px;
+    #${PANEL_ID} .autodom-chat-welcome .welcome-tips summary::-webkit-details-marker { display: none !important; }
+    #${PANEL_ID} .autodom-chat-welcome .welcome-tips summary::before {
+      content: "▸" !important;
+      font-size: 10px !important;
+      color: var(--c-text-3) !important;
+      transition: transform 0.15s ease !important;
     }
-    .autodom-chat-welcome .welcome-tips code {
-      font-family: var(--mono);
-      font-size: 10.5px;
-      color: var(--c-text-2);
-      background: var(--c-bg);
-      padding: 1px 6px;
-      border-radius: 4px;
-      border: 1px solid var(--c-border);
+    #${PANEL_ID} .autodom-chat-welcome .welcome-tips[open] summary::before { transform: rotate(90deg) !important; }
+    #${PANEL_ID} .autodom-chat-welcome .welcome-tips-body {
+      margin-top: 10px !important;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 9px !important;
+      font-size: 11.5px !important;
+      color: var(--c-text-3) !important;
+      line-height: 1.55 !important;
     }
-    .autodom-chat-welcome .shortcut-hint {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 10.5px;
-      color: var(--c-text-3);
-      padding: 6px 0 0;
-      font-weight: 500;
-      margin-top: 0;
+    #${PANEL_ID} .autodom-chat-welcome .welcome-tips-row {
+      display: flex !important;
+      flex-wrap: wrap !important;
+      gap: 6px 12px !important;
+      align-items: center !important;
     }
-    .autodom-chat-welcome .shortcut-hint kbd {
-      font-family: var(--mono);
-      font-size: 9.5px;
-      background: var(--c-surface);
-      padding: 2px 6px;
-      border-radius: 4px;
-      color: var(--c-text-2);
-      border: 1px solid var(--c-border);
+    #${PANEL_ID} .autodom-chat-welcome .welcome-tips-row .tip-label {
+      color: var(--c-text-2) !important;
+      font-weight: 600 !important;
+      min-width: 78px !important;
     }
 
     /* Footer hidden — replaced by composer hint */
@@ -2839,41 +2862,66 @@
     }
 
     /* Welcome suggestion cards (2x2 grid) */
-    .autodom-chat-welcome-suggestions {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 8px;
-      margin-top: 0;
-      width: 100%;
-      max-width: 360px;
+    #${PANEL_ID} .autodom-chat-welcome-suggestions {
+      display: grid !important;
+      grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+      gap: 10px !important;
+      margin-top: 0 !important;
+      width: 100% !important;
+      max-width: none !important;
     }
-    .autodom-chat-suggestion {
-      background: var(--c-surface);
-      border: 1px solid var(--c-border);
-      color: var(--c-text);
-      padding: 10px 11px;
-      border-radius: 8px;
-      font-size: 12.5px;
-      font-weight: 500;
-      cursor: pointer;
-      font-family: inherit;
-      text-align: left;
-      line-height: 1.35;
-      min-height: 44px;
-      display: flex;
-      align-items: center;
-      transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+    #${PANEL_ID} .autodom-chat-suggestion {
+      position: relative !important;
+      background: color-mix(in oklch, var(--c-bg) 74%, transparent) !important;
+      border: 1px solid color-mix(in oklch, var(--c-border) 90%, transparent) !important;
+      color: var(--c-text) !important;
+      padding: 12px 14px !important;
+      border-radius: 14px !important;
+      font-size: 13px !important;
+      font-weight: 600 !important;
+      cursor: pointer !important;
+      font-family: inherit !important;
+      text-align: left !important;
+      line-height: 1.4 !important;
+      min-height: 58px !important;
+      display: flex !important;
+      align-items: flex-start !important;
+      justify-content: space-between !important;
+      gap: 10px !important;
+      transition:
+        background-color 0.16s ease,
+        color 0.16s ease,
+        border-color 0.16s ease,
+        transform 0.16s ease,
+        box-shadow 0.16s ease !important;
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.03),
+        0 6px 16px rgba(0, 0, 0, 0.12) !important;
     }
-    .autodom-chat-suggestion:hover {
-      background: var(--c-surface-2);
-      border-color: var(--c-accent);
-      color: var(--c-text);
-      transform: none;
-      box-shadow: none;
+    #${PANEL_ID} .autodom-chat-suggestion::after {
+      content: "↗" !important;
+      color: var(--c-text-3) !important;
+      font-size: 13px !important;
+      line-height: 1 !important;
+      transition: transform 0.16s ease, color 0.16s ease !important;
+      flex-shrink: 0 !important;
     }
-    .autodom-chat-suggestion:focus-visible {
-      outline: 2px solid var(--c-accent);
-      outline-offset: 2px;
+    #${PANEL_ID} .autodom-chat-suggestion:hover {
+      background: color-mix(in oklch, var(--c-surface-2) 94%, transparent) !important;
+      border-color: color-mix(in oklch, var(--c-accent) 70%, var(--c-border)) !important;
+      color: var(--c-text) !important;
+      transform: translateY(-1px) !important;
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.04),
+        0 12px 24px rgba(0, 0, 0, 0.16) !important;
+    }
+    #${PANEL_ID} .autodom-chat-suggestion:hover::after {
+      color: var(--c-accent) !important;
+      transform: translate(1px, -1px) !important;
+    }
+    #${PANEL_ID} .autodom-chat-suggestion:focus-visible {
+      outline: 2px solid var(--c-accent) !important;
+      outline-offset: 2px !important;
     }
 
     /* ─── Floating Run Indicator ─────────────────────────────
@@ -3252,7 +3300,7 @@
     <div class="autodom-chat-messages" id="__autodom_messages" role="log" aria-label="Chat messages" aria-live="polite">
       ${getWelcomeMarkup({
         subtitle:
-          'Type naturally, tap a suggestion, or drop to <code style="font-family:var(--mono);font-size:11px;">/commands</code> — AutoDOM reads the page and runs safe browser actions.',
+          'Ask naturally, tap a suggestion, or use <code>/commands</code>. AutoDOM understands the current page and can run safe browser actions for you.',
         includeCapabilities: true,
         includeTips: true,
         suggestionsId: "__autodom_welcome_suggestions",
@@ -3840,7 +3888,9 @@
     persistChatState();
     messagesContainer.innerHTML = getWelcomeMarkup({
       subtitle:
-        "Conversation cleared. Ask anything about this page, tap a suggestion, or use a slash command.",
+        "Conversation cleared. Start with a quick task below or ask anything about this page.",
+      includeCapabilities: true,
+      includeTips: true,
     });
   });
 
