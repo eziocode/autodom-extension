@@ -17,10 +17,25 @@
  * this file.
  */
 (function () {
-  function buildSystemPrompt(context) {
+  function buildSystemPrompt(context, providerInfo) {
     let p =
       "You are AutoDOM, a helpful browser AI assistant. " +
       "You help users understand and interact with the current web page.\n\n";
+    // Identity disclosure — without this the underlying LLM happily
+    // hallucinates an arbitrary model name (e.g. "Claude Opus 4.7") when
+    // the user asks "what model are you?". Wire the actual configured
+    // model + provider in so the response is truthful.
+    if (providerInfo && (providerInfo.model || providerInfo.provider)) {
+      const m = String(providerInfo.model || "unknown").trim();
+      const prov = String(providerInfo.provider || "unknown").trim();
+      p +=
+        `── Identity ──\n` +
+        `You are running on provider "${prov}" using model "${m}". ` +
+        `When the user asks which model, AI, or LLM you are, answer truthfully ` +
+        `with this exact provider and model. Do NOT claim to be any other model ` +
+        `(e.g. do not say "Claude Opus", "GPT-4", etc. unless that matches the ` +
+        `model id above).\n\n`;
+    }
     if (context) {
       if (context.title) p += `Page title: ${context.title}\n`;
       if (context.url) p += `Page URL: ${context.url}\n`;
@@ -42,8 +57,8 @@
     return p;
   }
 
-  function buildMessages(text, context, conversationHistory) {
-    const msgs = [{ role: "system", content: buildSystemPrompt(context) }];
+  function buildMessages(text, context, conversationHistory, providerInfo) {
+    const msgs = [{ role: "system", content: buildSystemPrompt(context, providerInfo) }];
     if (Array.isArray(conversationHistory) && conversationHistory.length > 0) {
       conversationHistory.slice(-12).forEach((m) => {
         if (m && m.role && m.content) {
@@ -71,6 +86,7 @@
     tools, // OpenAI tool schema array (optional)
     messagesOverride, // when provided, used verbatim (for multi-turn agent loops)
     signal, // optional AbortSignal so the caller can cancel an in-flight run
+    providerInfo, // { model, provider } — used by buildSystemPrompt for identity
   }) {
     if (!apiKey) throw new Error("No OpenAI API key configured");
     const cleanBase = (baseUrl || "https://api.openai.com/v1").replace(
@@ -79,7 +95,8 @@
     );
     const m = model || "gpt-4.1-mini";
     const messages =
-      messagesOverride || buildMessages(text, context, conversationHistory);
+      messagesOverride ||
+      buildMessages(text, context, conversationHistory, providerInfo || { model: m, provider: "openai" });
     debug && debug("[AutoDOM SW] Calling OpenAI:", cleanBase + "/chat/completions", "model:", m, "tools:", tools ? tools.length : 0);
     const body = { model: m, messages, max_tokens: 4096 };
     if (Array.isArray(tools) && tools.length > 0) {
@@ -130,6 +147,8 @@
     tools, // Anthropic tool schema array (optional)
     messagesOverride, // pre-built `messages` array (for multi-turn loops)
     signal,
+    providerInfo, // { model, provider } — used by buildSystemPrompt for identity
+    systemPromptOverride, // when provided, used verbatim instead of buildSystemPrompt
   }) {
     if (!apiKey) throw new Error("No Anthropic API key configured");
     const m = model || "claude-3-5-sonnet-latest";
@@ -137,7 +156,9 @@
       /\/+$/,
       "",
     );
-    const systemPrompt = buildSystemPrompt(context);
+    const systemPrompt =
+      systemPromptOverride ||
+      buildSystemPrompt(context, providerInfo || { model: m, provider: "anthropic" });
     let msgs;
     if (messagesOverride) {
       msgs = messagesOverride;
@@ -212,11 +233,13 @@
     messagesOverride,
     requireTools, // when true, throw if model didn't return tool_calls
     signal,
+    providerInfo, // { model, provider } — used by buildSystemPrompt for identity
   }) {
     const cleanBase = (baseUrl || "http://localhost:11434").replace(/\/+$/, "");
     const m = model || "llama3.2";
     const messages =
-      messagesOverride || buildMessages(text, context, conversationHistory);
+      messagesOverride ||
+      buildMessages(text, context, conversationHistory, providerInfo || { model: m, provider: "ollama" });
     debug && debug("[AutoDOM SW] Calling Ollama:", cleanBase + "/api/chat", "model:", m, "tools:", tools ? tools.length : 0);
     const body = { model: m, messages, stream: false };
     if (Array.isArray(tools) && tools.length > 0) {

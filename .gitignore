@@ -13,3 +13,4 @@ dist/
 # Developer-private notes
 AGENTS.md
 .claude/settings.json
+.github/agents/code-design-reviewer.agent.md

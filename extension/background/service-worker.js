@@ -832,8 +832,8 @@ function _toolsForProvider(providerType) {
   return null;
 }
 
-function _agentSystemPrompt(context) {
-  const base = AutoDOMProviders.buildSystemPrompt(context);
+function _agentSystemPrompt(context, providerInfo) {
+  const base = AutoDOMProviders.buildSystemPrompt(context, providerInfo);
   return (
     base +
     "\n\n" +
@@ -959,17 +959,29 @@ async function runAgentLoop({
     try {
     // ── OpenAI / Ollama style: messages = [{role, content/tool_calls/...}] ──
     if (providerType === "openai" || providerType === "ollama") {
-      const sys = _agentSystemPrompt(context);
+      const providerInfo = { model: _model, provider: providerType };
+      const sys = _agentSystemPrompt(context, providerInfo);
       const messages = [{ role: "system", content: sys }];
-      if (Array.isArray(conversationHistory)) {
-        conversationHistory.slice(-12).forEach((m) => {
-          if (!m?.role || !m?.content) return;
-          messages.push({
-            role: m.role === "assistant" ? "assistant" : "user",
-            content: String(m.content),
-          });
+      // Carry recent conversation context so the model remembers previous
+      // turns. The client-side panel pushes the just-typed user message to
+      // conversationHistory BEFORE sending, so the trailing entry is
+      // typically the same as `text` — dedupe to avoid the model seeing
+      // its current prompt twice (which historically caused the agent to
+      // ignore prior turns and ask "what were we talking about?").
+      const histSlice = Array.isArray(conversationHistory)
+        ? conversationHistory.slice(-12)
+        : [];
+      const last = histSlice[histSlice.length - 1];
+      const lastIsCurrentUser =
+        last && last.role === "user" && String(last.content) === String(text);
+      const trimmed = lastIsCurrentUser ? histSlice.slice(0, -1) : histSlice;
+      trimmed.forEach((m) => {
+        if (!m?.role || !m?.content) return;
+        messages.push({
+          role: m.role === "assistant" ? "assistant" : "user",
+          content: String(m.content),
         });
-      }
+      });
       messages.push({ role: "user", content: text });
 
       for (let turn = 0; turn < AGENT_MAX_TURNS; turn++) {
@@ -1085,20 +1097,32 @@ async function runAgentLoop({
 
     // ── Anthropic style: messages = [{role:'user'|'assistant', content: blocks[]}] ──
     if (providerType === "anthropic") {
+      const providerInfo = { model: _model, provider: "anthropic" };
       const messages = [];
-      if (Array.isArray(conversationHistory)) {
-        conversationHistory.slice(-12).forEach((m) => {
-          if (!m?.role || !m?.content) return;
-          messages.push({
-            role: m.role === "assistant" ? "assistant" : "user",
-            content: String(m.content),
-          });
+      // See OpenAI/Ollama branch above for why we dedupe the trailing
+      // user message — same client-side push-then-send pattern applies.
+      const histSlice = Array.isArray(conversationHistory)
+        ? conversationHistory.slice(-12)
+        : [];
+      const last = histSlice[histSlice.length - 1];
+      const lastIsCurrentUser =
+        last && last.role === "user" && String(last.content) === String(text);
+      const trimmed = lastIsCurrentUser ? histSlice.slice(0, -1) : histSlice;
+      trimmed.forEach((m) => {
+        if (!m?.role || !m?.content) return;
+        messages.push({
+          role: m.role === "assistant" ? "assistant" : "user",
+          content: String(m.content),
         });
-      }
+      });
       messages.push({ role: "user", content: text });
 
-      // Override system prompt to add agent instructions
+      // Build the system prompt here (with agent instructions + identity)
+      // and pass it down — callAnthropic would otherwise rebuild a base
+      // prompt from `context` and miss both the agent appendix and the
+      // model identity disclosure.
       const agentContext = { ...context, _agentMode: true };
+      const agentSystemPrompt = _agentSystemPrompt(agentContext, providerInfo);
 
       for (let turn = 0; turn < AGENT_MAX_TURNS; turn++) {
         if (isAborted()) return finish(abortedReply());
@@ -1115,8 +1139,10 @@ async function runAgentLoop({
             apiKey,
             baseUrl: aiProviderSettings.baseUrl,
             model: _model,
-            context: agentContext, // buildSystemPrompt is called inside; we patch via agent prompt below
+            context: agentContext,
             messagesOverride: messages,
+            systemPromptOverride: agentSystemPrompt,
+            providerInfo,
             tools,
             debug: _debugLog,
             signal,

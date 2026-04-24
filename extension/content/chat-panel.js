@@ -106,6 +106,19 @@
   let isConnected = false;
   let messages = [];
   let conversationHistory = [];
+
+  // ─── Conversation History Helper ──────────────────────────
+  // Single entry-point for appending to conversationHistory so that every
+  // turn (user or assistant) is also persisted to storage. Without this,
+  // assistant responses pushed AFTER addMessage()'s persistChatState() call
+  // were never written to sessionStorage — meaning a content-script reload
+  // (SPA navigation, extension reload) restored a history with no assistant
+  // turns, and the model lost all prior context.
+  function _pushHistory(entry) {
+    if (!entry || !entry.role) return;
+    conversationHistory[conversationHistory.length] = entry;
+    try { persistChatState(); } catch (_) {}
+  }
   let pendingRequests = new Map();
   let requestIdCounter = 0;
   let isProcessing = false;
@@ -116,6 +129,44 @@
   let _userAborted = false;
   let inlineMode = false; // inline overlay mode (like browser atlas)
   let _statusPollInterval = null;
+
+  // AutoDOM brand mark used as the AI chat avatar. Kept inline (data URI)
+  // so it costs zero network requests and is shared across every message
+  // via a single CSS background — the browser caches the decoded image.
+  // Single-quoted attributes so the markup can be safely URI-encoded.
+  const AUTODOM_AVATAR_SVG =
+    "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128' role='img' aria-label='AutoDOM'>" +
+      "<defs>" +
+        "<linearGradient id='ad-bg' x1='14' y1='10' x2='116' y2='120' gradientUnits='userSpaceOnUse'>" +
+          "<stop offset='0' stop-color='#2a2f27'/><stop offset='1' stop-color='#121510'/>" +
+        "</linearGradient>" +
+        "<linearGradient id='ad-focus' x1='58' y1='46' x2='90' y2='82' gradientUnits='userSpaceOnUse'>" +
+          "<stop offset='0' stop-color='#f5d8aa'/><stop offset='1' stop-color='#d67f2c'/>" +
+        "</linearGradient>" +
+        "<linearGradient id='ad-pointer' x1='74' y1='78' x2='101' y2='105' gradientUnits='userSpaceOnUse'>" +
+          "<stop offset='0' stop-color='#fff6e4'/><stop offset='1' stop-color='#f2c887'/>" +
+        "</linearGradient>" +
+      "</defs>" +
+      "<rect x='8' y='8' width='112' height='112' rx='28' fill='url(#ad-bg)'/>" +
+      "<rect x='12' y='12' width='104' height='104' rx='24' fill='none' stroke='#3a4036' stroke-width='2'/>" +
+      "<rect x='24' y='24' width='80' height='80' rx='18' fill='#181b16'/>" +
+      "<rect x='24' y='24' width='80' height='80' rx='18' fill='none' stroke='#eef1e4' stroke-opacity='.16' stroke-width='2'/>" +
+      "<path d='M24 40h80' stroke='#eef1e4' stroke-opacity='.15' stroke-width='2'/>" +
+      "<circle cx='34' cy='32' r='3' fill='#f5d8aa' fill-opacity='.95'/>" +
+      "<circle cx='44' cy='32' r='3' fill='#eef1e4' fill-opacity='.34'/>" +
+      "<circle cx='54' cy='32' r='3' fill='#eef1e4' fill-opacity='.22'/>" +
+      "<path d='M42 56v16m0 0v0M42 64h12m0 0h14' fill='none' stroke='#eef1e4' stroke-opacity='.72' stroke-width='6' stroke-linecap='round' stroke-linejoin='round'/>" +
+      "<path d='M42 72h12' fill='none' stroke='#eef1e4' stroke-opacity='.72' stroke-width='6' stroke-linecap='round'/>" +
+      "<rect x='34' y='48' width='16' height='16' rx='5' fill='#f6f0df'/>" +
+      "<rect x='34' y='64' width='16' height='16' rx='5' fill='#f6f0df'/>" +
+      "<rect x='60' y='54' width='24' height='24' rx='8' fill='url(#ad-focus)'/>" +
+      "<rect x='60' y='54' width='24' height='24' rx='8' fill='none' stroke='#fff4de' stroke-opacity='.38' stroke-width='2'/>" +
+      "<circle cx='72' cy='66' r='4' fill='#1a1c15'/>" +
+      "<path d='M75 81 92 97l2-12 10-2-17-17-3 15-9 0Z' fill='url(#ad-pointer)'/>" +
+      "<path d='M75 81 92 97l2-12 10-2-17-17-3 15-9 0Z' fill='none' stroke='#1c1f18' stroke-opacity='.48' stroke-width='2.25' stroke-linejoin='round'/>" +
+    "</svg>";
+  const AUTODOM_AVATAR_URL =
+    "url(\"data:image/svg+xml;utf8," + encodeURIComponent(AUTODOM_AVATAR_SVG) + "\")";
 
   const WELCOME_SUGGESTIONS_HTML = `
     <button class="autodom-chat-suggestion" type="button" data-prompt="__summarize__" role="listitem">Summarize page</button>
@@ -1217,12 +1268,10 @@
       height: 28px !important;
       border-radius: 8px;
       box-shadow: 0 0 0 1px rgba(255,255,255,0.05) inset;
-      background-image:
-        radial-gradient(120% 120% at 0% 0%, var(--c-accent-2) 0%, var(--c-accent) 60%, oklch(48% 0.18 25) 100%),
-        url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><polygon points='12 2 14 9 22 12 14 15 12 22 10 15 2 12 10 9' fill='white'/></svg>");
-      background-size: cover, 16px 16px;
-      background-position: center, center;
-      background-repeat: no-repeat, no-repeat;
+      background-image: ${AUTODOM_AVATAR_URL};
+      background-size: cover;
+      background-position: center;
+      background-repeat: no-repeat;
       flex-shrink: 0;
     }
 
@@ -1486,16 +1535,15 @@
       display: inline-flex !important;
       align-items: center !important;
       justify-content: center !important;
-      background: radial-gradient(120% 120% at 0% 0%, var(--c-accent-2) 0%, var(--c-accent) 60%, oklch(48% 0.18 25) 100%) !important;
+      background-image: ${AUTODOM_AVATAR_URL} !important;
+      background-size: cover !important;
+      background-position: center !important;
+      background-repeat: no-repeat !important;
       box-shadow: 0 0 0 1px rgba(255,255,255,0.05) inset !important;
       color: #fff !important;
     }
     .autodom-chat-turn .turn-avatar svg {
-      width: 14px !important;
-      height: 14px !important;
-      display: block !important;
-      fill: currentColor !important;
-      stroke: none !important;
+      display: none !important;
     }
     .autodom-chat-turn .turn-label {
       flex: 0 1 auto !important;
@@ -4510,7 +4558,7 @@
     btn.title = "Copy";
     btn.setAttribute("aria-label", "Copy to clipboard");
     btn.innerHTML =
-      '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+      '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="3"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>';
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
       e.preventDefault();
@@ -4525,7 +4573,7 @@
           btn.classList.remove("copied");
           btn.title = "Copy";
           btn.innerHTML =
-            '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+            '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="3"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>';
         }, 1400);
       };
       try {
@@ -5055,24 +5103,8 @@
     const avatar = document.createElement("span");
     avatar.className = "turn-avatar";
     avatar.setAttribute("aria-hidden", "true");
-    // Single compact star glyph — avoid host-page SVG styling quirks by
-    // inlining with explicit attributes; CSS also clamps width/height.
-    const avatarSvg = document.createElementNS(
-      "http://www.w3.org/2000/svg",
-      "svg",
-    );
-    avatarSvg.setAttribute("viewBox", "0 0 24 24");
-    avatarSvg.setAttribute("aria-hidden", "true");
-    const polygon = document.createElementNS(
-      "http://www.w3.org/2000/svg",
-      "polygon",
-    );
-    polygon.setAttribute(
-      "points",
-      "12 2 14 9 22 12 14 15 12 22 10 15 2 12 10 9",
-    );
-    avatarSvg.appendChild(polygon);
-    avatar.appendChild(avatarSvg);
+    // Avatar artwork is supplied by the CSS background (AutoDOM brand mark).
+    // Keeping the node empty avoids any host-page SVG style bleed-through.
 
     const label = document.createElement("span");
     label.className = "turn-label";
@@ -6179,7 +6211,7 @@
 
     const displayLabel = "Summarize this page";
     addMessage("user", displayLabel);
-    conversationHistory.push({ role: "user", content: displayLabel });
+    _pushHistory({ role: "user", content: displayLabel });
 
     const freshConnected = await checkConnectionStatus();
     if (!freshConnected) {
@@ -6191,7 +6223,7 @@
       );
       const summary = buildLocalSummary();
       addMessage("ai-response", summary);
-      conversationHistory.push({
+      _pushHistory({
         role: "assistant",
         content: "[local summary of the page]",
       });
@@ -6238,7 +6270,7 @@
           toolCalls: aiResult.toolCalls || [],
         });
         // Persist only a short label, NOT the giant prompt.
-        conversationHistory.push({
+        _pushHistory({
           role: "assistant",
           content: responseText,
         });
@@ -6250,7 +6282,7 @@
             ? `_AI error: ${aiResult.error}. Showing a local summary instead._\n\n`
             : "_AI unavailable — showing a local summary instead._\n\n";
         addMessage("ai-response", why + summary);
-        conversationHistory.push({
+        _pushHistory({
           role: "assistant",
           content: "[local summary of the page]",
         });
@@ -6309,7 +6341,7 @@
     autoResizeInput();
 
     // Add to conversation history for AI context
-    conversationHistory.push({ role: "user", content: text });
+    _pushHistory({ role: "user", content: text });
 
     // Check for slash commands first (direct tool invocation)
     // Slash commands use local tool handlers and do NOT require MCP bridge
@@ -6339,7 +6371,7 @@
         "  Cmd/Ctrl+Shift+K \u2014 Toggle sidebar\n" +
         "  Cmd/Ctrl+Shift+L \u2014 Quick prompt";
       addMessage("assistant", helpText);
-      conversationHistory.push({ role: "assistant", content: helpText });
+      _pushHistory({ role: "assistant", content: helpText });
       return;
     }
 
@@ -6414,7 +6446,7 @@
           toolCalls,
           model: aiResult.model,
         });
-        conversationHistory.push({ role: "assistant", content: responseText });
+        _pushHistory({ role: "assistant", content: responseText });
       } else if (aiResult && aiResult.fallback) {
         _log("AI fallback, trying local NLP...");
         // AI routing not available — try local NLP-to-tool mapping
@@ -6637,7 +6669,7 @@
               addMessage("tool-result", formatted, {
                 toolName: command.displayName || getToolDisplayName(command.tool),
               });
-              conversationHistory.push({
+              _pushHistory({
                 role: "assistant",
                 content: `[Confirmed ${command.tool}]: ${formatted.substring(0, 500)}`,
               });
@@ -6666,7 +6698,7 @@
           );
           btnRow.remove();
           addMessage("system", `Action "${command.tool}" cancelled.`);
-          conversationHistory.push({
+          _pushHistory({
             role: "assistant",
             content: `[Cancelled ${command.tool}]`,
           });
@@ -6680,7 +6712,7 @@
           role: "assistant",
           content: `[Confirmation required for ${command.tool}]`,
         });
-        conversationHistory.push({
+        _pushHistory({
           role: "assistant",
           content: `Confirmation required: ${result.reason || command.tool}`,
         });
@@ -6698,7 +6730,7 @@
             `${result.callsInWindow || "?"}/${result.budget || "?"} calls used. ` +
             `Resets in ${resetSecs}s.`,
         );
-        conversationHistory.push({
+        _pushHistory({
           role: "assistant",
           content: `Rate limited on ${result.domain}: ${result.error}`,
         });
@@ -6707,7 +6739,7 @@
 
       if (result && result.error) {
         addMessage("error", `Error: ${result.error}`);
-        conversationHistory.push({
+        _pushHistory({
           role: "assistant",
           content: `Error: ${result.error}`,
         });
@@ -6732,7 +6764,7 @@
         messagesContainer.appendChild(msg);
         messagesContainer.scrollTop = messagesContainer.scrollHeight;
         messages.push({ role: "assistant", content: "[screenshot]" });
-        conversationHistory.push({
+        _pushHistory({
           role: "assistant",
           content: "[Screenshot captured]",
         });
@@ -6741,7 +6773,7 @@
         addMessage("tool-result", formatted, {
           toolName: command.displayName || getToolDisplayName(command.tool),
         });
-        conversationHistory.push({
+        _pushHistory({
           role: "assistant",
           content: `[Tool ${command.tool} result]: ${formatted.substring(0, 500)}`,
         });
@@ -6887,7 +6919,7 @@
     }
 
     addMessage("user", displayText);
-    conversationHistory.push({ role: "user", content: displayText });
+    _pushHistory({ role: "user", content: displayText });
 
     // Quick actions use local tool handlers (chrome.scripting APIs) —
     // they do NOT require the MCP bridge server to be connected.
@@ -6906,7 +6938,7 @@
     inlineResponseContent.innerHTML =
       '<span class="ai-sparkle">\u2728</span> AI thinking...';
 
-    conversationHistory.push({ role: "user", content: text });
+    _pushHistory({ role: "user", content: text });
 
     try {
       // Try AI routing first
@@ -6923,7 +6955,7 @@
         md.className = "md";
         renderMarkdownInto(md, responseText);
         inlineResponseContent.appendChild(md);
-        conversationHistory.push({ role: "assistant", content: responseText });
+        _pushHistory({ role: "assistant", content: responseText });
       } else {
         // Fallback: try local command parsing
         const command = parseCommand(text) || parseNaturalLanguage(text);
