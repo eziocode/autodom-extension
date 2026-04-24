@@ -6587,7 +6587,31 @@
 
     const label = document.createElement("span");
     label.className = "turn-label";
-    label.textContent = "Running automation";
+    // Creative idle-phase loading text — Claude/Cursor/JetBrains-AI
+    // style. Picked once per turn so the phrase doesn't flicker. The
+    // label is swapped to "Running automation" the moment a real tool
+    // call is observed (see _renderToolEvent / _ensureRunContainer),
+    // so plain Q&A turns no longer lie about doing automation.
+    const _idlePhrases = [
+      "Thinking…",
+      "Pondering…",
+      "Brewing…",
+      "Cooking up an answer…",
+      "Crunching tokens…",
+      "Untangling thoughts…",
+      "Consulting the ducks…",
+      "Sharpening pencils…",
+      "Reading between the divs…",
+      "Asking the page nicely…",
+      "Scheming politely…",
+      "Doing the math…",
+      "Rubber-ducking…",
+      "Warming up the GPUs…",
+      "Sniffing the DOM…",
+    ];
+    label.textContent =
+      _idlePhrases[Math.floor(Math.random() * _idlePhrases.length)];
+    label.dataset.phase = "idle";
 
     const dots = document.createElement("span");
     dots.className = "turn-dots";
@@ -6655,6 +6679,21 @@
     return document.getElementById("__autodom_agent_activity");
   }
 
+  // Promote the typing card's idle "Thinking…" phrase to the literal
+  // "Running automation" the moment a real tool call begins, so plain
+  // chat turns never carry that misleading label. Idempotent — once
+  // promoted the dataset.phase guards re-runs.
+  function _promoteTypingToAutomation() {
+    try {
+      const typing = document.getElementById("__autodom_typing");
+      if (!typing) return;
+      const label = typing.querySelector(".turn-label");
+      if (!label || label.dataset.phase === "automation") return;
+      label.textContent = "Running automation";
+      label.dataset.phase = "automation";
+    } catch (_) {}
+  }
+
   function _shortArgs(args) {
     try {
       const s = typeof args === "string" ? args : JSON.stringify(args || {});
@@ -6669,6 +6708,7 @@
     if (evt.phase === "run-start") {
       _activeRunId = evt.runId || null;
       showTyping();
+      _promoteTypingToAutomation();
       _showRunIndicator();
       return;
     }
@@ -6706,6 +6746,7 @@
     if (!container) return;
     const tool = evt.tool || "tool";
     if (evt.phase === "start") {
+      _promoteTypingToAutomation();
       const card = document.createElement("div");
       card.className = "ai-tool-card running";
       card.dataset.tool = tool;

@@ -661,12 +661,11 @@ function _compactHistoryForOutbound(history, opts) {
     const atts = Array.isArray(m.attachments) ? m.attachments : null;
 
     // Strip attachment binaries; keep a short text marker so the model
-    // still knows an image was part of that turn.
+    // still knows an image was part of that turn. We omit per-image
+    // names — uploads frequently have throwaway names (IC0.png,
+    // screenshot.png, image (3).png) that would just mislead the model.
     if (stripAttachmentBinaries && atts && atts.length > 0) {
-      const markers = atts
-        .map((a) => `image:${a?.name || "untitled"}`)
-        .join(", ");
-      const note = `[attached ${atts.length} image(s) — ${markers}; bytes not forwarded to this AI bridge]`;
+      const note = `[image attached × ${atts.length}; pixel data not forwarded to this AI bridge]`;
       content = content ? `${content}\n${note}` : note;
     }
 
@@ -3155,19 +3154,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Image attachments: the CLI/MCP bridge can't pipe image bytes to
     // the underlying CLI (Claude Code / Copilot / Codex). We used to
     // hard-fail the whole turn here — that broke the conversation flow.
-    // Instead, gracefully degrade: drop the binaries, prepend a clear
-    // note to the outbound text so the model knows an image existed
+    // Instead, gracefully degrade: drop the binaries, prepend a SHORT
+    // hint to the outbound text so the model knows an image existed
     // (and is told NOT to claim it saw it), and continue. The user's
-    // chat bubble in the UI still shows the original image.
+    // chat bubble in the UI still shows the original image. We
+    // deliberately omit filenames here — many uploads come in with
+    // throwaway names (IC0.png, image.png, screenshot.png) that the
+    // model would otherwise echo back to the user.
     let outboundText = text || "";
     if (Array.isArray(attachments) && attachments.length > 0) {
-      const summary = attachments
-        .map((a) => `${a?.name || "untitled"} (${a?.mime || "image"})`)
-        .join(", ");
       const note =
-        `[The user attached ${attachments.length} image(s) — ${summary}. ` +
-        `This AI bridge cannot receive image bytes, so you did NOT see the actual pixels. ` +
-        `Do not pretend to have viewed the image. Ask the user to describe it, or suggest switching to a vision-capable Direct provider (OpenAI / Anthropic / Ollama vision) in the extension settings.]`;
+        `[Note: the user attached ${attachments.length} image(s), but this AI bridge is text-only and did NOT receive the pixel data. Do not describe or pretend to have seen the image. If you need the visuals, ask the user to describe them in one sentence.]`;
       outboundText = outboundText
         ? `${note}\n\n${outboundText}`
         : note;
