@@ -540,7 +540,94 @@ const _secretAreaName =
   initScriptRunner();
   initSecurityTab();
   initChatSettingsTab();
+  initChatAppearanceTab();
 });
+
+// ─── Chat panel appearance (theme + accent colour) ───
+// Shared with chat-panel.js via two storage keys:
+//   __autodom_chat_theme  : "system" | "dark" | "light"
+//   __autodom_chat_accent : CSS colour string, or null/unset = theme default
+// chat-panel.js listens to storage.onChanged for both keys, so writes
+// here are reflected live in the side panel without a reload.
+function initChatAppearanceTab() {
+  const THEME_KEY = "__autodom_chat_theme";
+  const ACCENT_KEY = "__autodom_chat_accent";
+  const themeSelect = document.getElementById("chatThemeSelect");
+  const swatchesEl = document.getElementById("chatAccentSwatches");
+  const customInput = document.getElementById("chatAccentCustom");
+  const resetBtn = document.getElementById("chatAccentReset");
+  if (!themeSelect || !swatchesEl || !customInput || !resetBtn) return;
+
+  const swatches = Array.from(swatchesEl.querySelectorAll(".accent-swatch"));
+
+  function reflectAccentSelection(value) {
+    const v = value || "";
+    let matched = false;
+    swatches.forEach((sw) => {
+      const isMatch = (sw.dataset.accent || "") === v;
+      sw.setAttribute("aria-checked", isMatch ? "true" : "false");
+      if (isMatch) matched = true;
+    });
+    // If user picked a custom hex that is not one of the presets,
+    // reflect it on the colour input + clear the swatches so the UI
+    // stays consistent.
+    if (!matched && v) {
+      try {
+        customInput.value = v;
+      } catch (_) {}
+    }
+  }
+
+  // Initial load.
+  chrome.storage?.local?.get?.([THEME_KEY, ACCENT_KEY], (items) => {
+    const theme = (items && items[THEME_KEY]) || "system";
+    const accent = (items && items[ACCENT_KEY]) || "";
+    if (["system", "dark", "light"].includes(theme))
+      themeSelect.value = theme;
+    reflectAccentSelection(accent);
+  });
+
+  themeSelect.addEventListener("change", () => {
+    chrome.storage?.local?.set?.({ [THEME_KEY]: themeSelect.value });
+  });
+
+  swatches.forEach((sw) => {
+    sw.addEventListener("click", () => {
+      const value = sw.dataset.accent || "";
+      reflectAccentSelection(value);
+      if (value) {
+        chrome.storage?.local?.set?.({ [ACCENT_KEY]: value });
+      } else {
+        chrome.storage?.local?.remove?.(ACCENT_KEY);
+      }
+    });
+  });
+
+  customInput.addEventListener("input", () => {
+    const value = customInput.value;
+    if (!value) return;
+    reflectAccentSelection(value);
+    chrome.storage?.local?.set?.({ [ACCENT_KEY]: value });
+  });
+
+  resetBtn.addEventListener("click", () => {
+    reflectAccentSelection("");
+    chrome.storage?.local?.remove?.(ACCENT_KEY);
+  });
+
+  if (chrome.storage?.onChanged?.addListener) {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local") return;
+      if (changes[THEME_KEY]) {
+        const v = changes[THEME_KEY].newValue || "system";
+        if (["system", "dark", "light"].includes(v)) themeSelect.value = v;
+      }
+      if (changes[ACCENT_KEY]) {
+        reflectAccentSelection(changes[ACCENT_KEY].newValue || "");
+      }
+    });
+  }
+}
 
 // ─── Chat panel settings (mirrors __autodom_chat_settings used by chat-panel.js) ───
 // chat-panel.js owns the storage shape; we only touch the two boolean

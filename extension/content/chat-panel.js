@@ -254,6 +254,10 @@
   const STORAGE_KEY_HISTORY = "__autodom_chat_history";
   const STORAGE_KEY_OPEN = "__autodom_chat_open";
   const STORAGE_KEY_THEME = "__autodom_chat_theme";
+  // Accent colour the user picked from popup → Chat tab. Any CSS
+  // colour string (`#rrggbb`, `oklch(...)`, etc.) is accepted; null
+  // / unset means "use the theme's built-in accent".
+  const STORAGE_KEY_ACCENT = "__autodom_chat_accent";
   const STORAGE_KEY_SETTINGS = "__autodom_chat_settings"; // { verboseLogs: bool, panelWidth: number, persistAcrossSessions: bool, widthByHost: {host:number}, collapsedByHost: {host:bool} }
   // chrome.storage.local mirrors of the chat (survives tab close + browser
   // restart). Only written when the "Keep chat across browser sessions"
@@ -1517,31 +1521,6 @@
       gap: 6px;
       flex-shrink: 0;
       flex-wrap: nowrap;
-    }
-    .autodom-chat-theme-select {
-      appearance: none !important;
-      width: 84px !important;
-      height: 30px !important;
-      min-width: 84px !important;
-      padding: 0 22px 0 9px !important;
-      border-radius: 8px !important;
-      border: 1px solid var(--c-border) !important;
-      background:
-        linear-gradient(45deg, transparent 50%, var(--c-text-3) 50%) right 9px center / 5px 5px no-repeat,
-        linear-gradient(135deg, var(--c-text-3) 50%, transparent 50%) right 5px center / 5px 5px no-repeat,
-        var(--c-surface) !important;
-      color: var(--c-text-2) !important;
-      font: 500 11.5px/1 var(--font) !important;
-      cursor: pointer !important;
-      outline: none !important;
-    }
-    .autodom-chat-theme-select:hover {
-      border-color: var(--c-border-s) !important;
-      color: var(--c-text) !important;
-    }
-    .autodom-chat-theme-select:focus-visible {
-      box-shadow: 0 0 0 3px var(--c-accent-soft) !important;
-      border-color: var(--c-accent) !important;
     }
     .autodom-chat-header-btn {
       background: none;
@@ -4192,11 +4171,6 @@
         <span class="autodom-chat-beta-badge" aria-label="Beta" hidden>BETA</span>
       </div>
       <div class="autodom-chat-header-actions">
-        <select class="autodom-chat-theme-select" id="__autodom_theme_select" aria-label="Theme">
-          <option value="system">System</option>
-          <option value="dark">Dark</option>
-          <option value="light">Light</option>
-        </select>
         <button class="autodom-chat-header-btn" id="__autodom_collapse_btn" title="Collapse panel (Ctrl/⌘+Alt+\\)" aria-label="Collapse chat panel" aria-controls="${PANEL_ID}">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
@@ -4565,7 +4539,6 @@
   const sendBtn = document.getElementById("__autodom_send_btn");
   const closeBtn = document.getElementById("__autodom_close_btn");
   const clearBtn = document.getElementById("__autodom_clear_btn");
-  const themeSelect = document.getElementById("__autodom_theme_select");
   const statusBadge = document.getElementById("__autodom_status_badge");
   const contextText = document.getElementById("__autodom_context_text");
   const quickActions = document.getElementById("__autodom_quick_actions");
@@ -4585,26 +4558,62 @@
     inlineOverlay.classList.remove("theme-system", "theme-dark", "theme-light");
     panel.classList.add(`theme-${nextTheme}`);
     inlineOverlay.classList.add(`theme-${nextTheme}`);
-    if (themeSelect) themeSelect.value = nextTheme;
+  }
+
+  // Apply (or clear) a user-picked accent colour. Sets --c-accent on
+  // the panel + inline overlay; the secondary tone (--c-accent-2)
+  // and the soft / ring variants are derived via color-mix so a
+  // single colour choice produces a consistent dual-tone palette
+  // (the brand-matching hover/gradient highlight comes "for free").
+  function applyChatAccent(color) {
+    const els = [panel, inlineOverlay];
+    if (!color) {
+      // Reset to theme defaults — let the cascaded variables show through.
+      els.forEach((el) => {
+        if (!el || !el.style) return;
+        el.style.removeProperty("--c-accent");
+        el.style.removeProperty("--c-accent-2");
+        el.style.removeProperty("--c-accent-soft");
+        el.style.removeProperty("--c-accent-ring");
+      });
+      return;
+    }
+    const c = String(color);
+    // The lighter "second tone" reads white over the user's accent,
+    // matching the gradient look of the default oklch pair.
+    const tone2 = `color-mix(in oklch, ${c} 78%, white)`;
+    const soft = `color-mix(in srgb, ${c} 14%, transparent)`;
+    const ring = `color-mix(in srgb, ${c} 26%, transparent)`;
+    els.forEach((el) => {
+      if (!el || !el.style) return;
+      el.style.setProperty("--c-accent", c);
+      el.style.setProperty("--c-accent-2", tone2);
+      el.style.setProperty("--c-accent-soft", soft);
+      el.style.setProperty("--c-accent-ring", ring);
+    });
   }
 
   applyChatTheme("system");
   try {
-    chrome.storage.local.get([STORAGE_KEY_THEME], (stored) => {
+    chrome.storage.local.get([STORAGE_KEY_THEME, STORAGE_KEY_ACCENT], (stored) => {
       if (chrome.runtime.lastError) return;
       applyChatTheme(stored?.[STORAGE_KEY_THEME] || "system");
+      applyChatAccent(stored?.[STORAGE_KEY_ACCENT] || null);
     });
   } catch (_) {}
 
-  if (themeSelect) {
-    themeSelect.addEventListener("change", () => {
-      const nextTheme = THEME_VALUES.has(themeSelect.value)
-        ? themeSelect.value
-        : "system";
-      applyChatTheme(nextTheme);
-      try {
-        chrome.storage.local.set({ [STORAGE_KEY_THEME]: nextTheme });
-      } catch (_) {}
+  // Theme + accent are now picked from popup → Chat tab. Mirror
+  // changes here so the panel updates live without a reload.
+  if (chrome?.storage?.onChanged && !window.__autodom_panel_theme_bound) {
+    window.__autodom_panel_theme_bound = true;
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local") return;
+      if (changes[STORAGE_KEY_THEME]) {
+        applyChatTheme(changes[STORAGE_KEY_THEME].newValue || "system");
+      }
+      if (changes[STORAGE_KEY_ACCENT]) {
+        applyChatAccent(changes[STORAGE_KEY_ACCENT].newValue || null);
+      }
     });
   }
 

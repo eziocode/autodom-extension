@@ -518,6 +518,42 @@ return { title: document.title, url: location.href };"
                 <div class="tab-content" id="tab-chat">
                     <section class="panel">
                         <div class="panel-header">
+                            <span class="section-label">Appearance</span>
+                        </div>
+                        <div class="field-stack">
+                            <label class="field-label" for="chatThemeSelect">Theme</label>
+                            <select id="chatThemeSelect" class="config-input">
+                                <option value="system">System (follow OS)</option>
+                                <option value="dark">Dark</option>
+                                <option value="light">Light</option>
+                            </select>
+
+                            <label class="field-label">Accent colour</label>
+                            <div class="accent-swatches" id="chatAccentSwatches" role="radiogroup" aria-label="Accent colour preset">
+                                <button type="button" class="accent-swatch" role="radio" aria-checked="true" data-accent="" title="Default (theme accent)">
+                                    <span class="accent-swatch-default" aria-hidden="true"></span>
+                                </button>
+                                <button type="button" class="accent-swatch" role="radio" aria-checked="false" data-accent="#ef4444" title="Red" style="--swatch:#ef4444"></button>
+                                <button type="button" class="accent-swatch" role="radio" aria-checked="false" data-accent="#f97316" title="Orange" style="--swatch:#f97316"></button>
+                                <button type="button" class="accent-swatch" role="radio" aria-checked="false" data-accent="#f59e0b" title="Amber" style="--swatch:#f59e0b"></button>
+                                <button type="button" class="accent-swatch" role="radio" aria-checked="false" data-accent="#22c55e" title="Green" style="--swatch:#22c55e"></button>
+                                <button type="button" class="accent-swatch" role="radio" aria-checked="false" data-accent="#06b6d4" title="Cyan" style="--swatch:#06b6d4"></button>
+                                <button type="button" class="accent-swatch" role="radio" aria-checked="false" data-accent="#3b82f6" title="Blue" style="--swatch:#3b82f6"></button>
+                                <button type="button" class="accent-swatch" role="radio" aria-checked="false" data-accent="#8b5cf6" title="Violet" style="--swatch:#8b5cf6"></button>
+                                <button type="button" class="accent-swatch" role="radio" aria-checked="false" data-accent="#ec4899" title="Pink" style="--swatch:#ec4899"></button>
+                            </div>
+                            <div class="field-row accent-custom-row">
+                                <label class="field-label accent-custom-label" for="chatAccentCustom">Custom</label>
+                                <input type="color" id="chatAccentCustom" class="accent-custom-input" value="#ef4444" aria-label="Custom accent colour" />
+                                <button type="button" class="text-btn" id="chatAccentReset">Reset</button>
+                            </div>
+                            <p class="field-hint">
+                                Picks the chat panel accent (buttons, focus ring, gradient highlight). The brighter dual-tone shade is auto-derived.
+                            </p>
+                        </div>
+                    </section>
+                    <section class="panel">
+                        <div class="panel-header">
                             <span class="section-label">Chat panel behavior</span>
                         </div>
                         <div class="field-stack">

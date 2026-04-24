@@ -966,8 +966,62 @@ function _toolsForProvider(providerType) {
   return null;
 }
 
-function _agentSystemPrompt(context, providerInfo) {
-  const base = AutoDOMProviders.buildSystemPrompt(context, providerInfo);
+// ─── Page-context dedup cache (jcodemunch session_context idea) ─────
+// In a multi-turn chat on one page, the page context (~1000 tokens of
+// visible text) is usually the same across turns — but we currently
+// re-paste it into the system prompt every single call. Borrowing
+// jcodemunch's "files_accessed" trick: cache a per-tab fingerprint of
+// the page context; if unchanged on the next turn, drop the heavy text
+// fields and inject a 1-line "[unchanged]" marker instead. The model
+// already saw the text in an earlier turn's system prompt and can call
+// get_dom_state if it needs fresh detail.
+//
+// This pays off massively in long sessions: a 10-turn chat on the same
+// page saves ~9× the page-text cost (~9k tokens at 1k/turn).
+const _pageCtxCache = new Map(); // tabId -> { fingerprint, ts }
+const _PAGE_CTX_TTL_MS = 5 * 60 * 1000;
+
+function _ctxFingerprint(ctx) {
+  if (!ctx) return "";
+  const t = String(ctx.visibleTextPreview || "");
+  const o = String(ctx.visibleOverlayText || "");
+  // url+title catches navigation; text length+head catches in-place
+  // mutation; overlay catches modal opens. Cheap to compute, stable
+  // enough that scroll/blur events don't bust the cache.
+  return [
+    ctx.url || "",
+    ctx.title || "",
+    t.length,
+    t.slice(0, 96),
+    o.length,
+  ].join("|");
+}
+
+function _slimContextForRepeat(ctx) {
+  if (!ctx) return ctx;
+  return {
+    url: ctx.url,
+    title: ctx.title,
+    interactiveElements: ctx.interactiveElements,
+    _pageUnchanged: true,
+  };
+}
+
+function _agentSystemPrompt(context, providerInfo, cacheKey) {
+  let effectiveCtx = context;
+  if (cacheKey != null && context) {
+    const fp = _ctxFingerprint(context);
+    const prev = _pageCtxCache.get(cacheKey);
+    if (
+      prev &&
+      prev.fingerprint === fp &&
+      Date.now() - prev.ts < _PAGE_CTX_TTL_MS
+    ) {
+      effectiveCtx = _slimContextForRepeat(context);
+    }
+    _pageCtxCache.set(cacheKey, { fingerprint: fp, ts: Date.now() });
+  }
+  const base = AutoDOMProviders.buildSystemPrompt(effectiveCtx, providerInfo);
   // Compressed prompt — every line costs tokens on every turn. The
   // older verbose version had ~700 tokens of agent-mode + reply-hygiene
   // prose with examples. This bullet-form keeps every behavioural rule
@@ -1143,7 +1197,7 @@ async function runAgentLoop({
     // ── OpenAI / Ollama style: messages = [{role, content/tool_calls/...}] ──
     if (providerType === "openai" || providerType === "ollama") {
       const providerInfo = { model: _model, provider: providerType };
-      const sys = _agentSystemPrompt(context, providerInfo);
+      const sys = _agentSystemPrompt(context, providerInfo, panelTabId);
       const messages = [{ role: "system", content: sys }];
       // Compact + dedupe the prior turns. _compactHistoryForOutbound
       // bounds payload size and (for very long sessions) prepends a
@@ -1307,7 +1361,7 @@ async function runAgentLoop({
       // prompt from `context` and miss both the agent appendix and the
       // model identity disclosure.
       const agentContext = { ...context, _agentMode: true };
-      const agentSystemPrompt = _agentSystemPrompt(agentContext, providerInfo);
+      const agentSystemPrompt = _agentSystemPrompt(agentContext, providerInfo, panelTabId);
 
       for (let turn = 0; turn < AGENT_MAX_TURNS; turn++) {
         if (isAborted()) return finish(abortedReply());
@@ -1873,6 +1927,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   recordAction("tab_closed", `Tab closed`, {}, tabId);
   _chatPanelReadyTabs.delete(tabId);
   _chatPanelInjectingTabs.delete(tabId);
+  _pageCtxCache.delete(tabId);
   // Don't kill the agent run when its panel tab is closed — the user
   // may want automation to keep running on whichever tab they switch
   // to next. Just unpin so getActiveTab() can fall back to whatever
