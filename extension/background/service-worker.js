@@ -1768,18 +1768,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   // Fresh content-script load (post-refresh or first inject). If an
-  // agent run is still bound to this tab from before the reload, abort
-  // it — the old panel is gone so there's no UI left for it.
+  // agent run is still bound to this tab from before the reload, keep
+  // it alive *only* when a tool is currently mid-flight (the agent
+  // itself triggered the navigation). In that case rebind panelTabId
+  // to the new sender so future tool events still reach the panel and
+  // surface the overlay. Otherwise (user-initiated refresh while idle
+  // between turns) abort, since the panel state is gone.
   if (message.type === "PANEL_LOADED_RESET_RUN") {
     const tid = sender?.tab?.id ?? null;
     let wasActive = false;
+    let kept = false;
     try {
       if (_activeAgentRun && (tid == null || _activeAgentRun.panelTabId === tid)) {
         wasActive = true;
-        _stopActiveAgentRun("panel_reloaded");
+        if (_activeAgentRun.toolRunning) {
+          // Agent-driven navigation — rebind to the reloaded panel.
+          if (tid != null) _activeAgentRun.panelTabId = tid;
+          kept = true;
+        } else {
+          _stopActiveAgentRun("panel_reloaded");
+        }
       }
     } catch (_) {}
-    sendResponse({ ok: true, wasActive });
+    sendResponse({ ok: true, wasActive, kept });
     return false;
   }
 

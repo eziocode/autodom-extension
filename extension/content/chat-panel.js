@@ -671,6 +671,12 @@
       outline: 2px solid var(--c-accent);
       outline-offset: 2px;
     }
+    .autodom-chat-header-btn:disabled,
+    .autodom-chat-header-btn[aria-disabled="true"] {
+      opacity: 0.32;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
 
     /* Hidden helper kept for AI Badge */
     .autodom-ai-badge {
@@ -1556,6 +1562,56 @@
       align-self: stretch !important;
       margin: 4px 4px !important;
       background: color-mix(in oklch, var(--c-border) 70%, transparent) !important;
+    }
+    .autodom-chat-force-stop {
+      color: oklch(70% 0.13 25) !important;
+    }
+    .autodom-chat-force-stop:hover {
+      color: oklch(82% 0.18 25) !important;
+      background: color-mix(in oklch, oklch(60% 0.18 25) 14%, transparent) !important;
+      border-color: color-mix(in oklch, oklch(60% 0.18 25) 50%, transparent) !important;
+    }
+    .autodom-chat-force-stop.is-armed {
+      color: oklch(85% 0.2 25) !important;
+      background: color-mix(in oklch, oklch(60% 0.2 25) 22%, transparent) !important;
+      border-color: color-mix(in oklch, oklch(60% 0.2 25) 70%, transparent) !important;
+      animation: autodom-force-stop-pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes autodom-force-stop-pulse {
+      0%, 100% { box-shadow: 0 0 0 0 color-mix(in oklch, oklch(60% 0.2 25) 35%, transparent); }
+      50%      { box-shadow: 0 0 0 4px color-mix(in oklch, oklch(60% 0.2 25) 0%, transparent); }
+    }
+    .autodom-chat-force-stop svg rect {
+      fill: currentColor !important;
+      stroke: none !important;
+    }
+    .autodom-chat-toast {
+      position: absolute !important;
+      left: 50% !important;
+      bottom: 100% !important;
+      transform: translate(-50%, -6px) !important;
+      margin-bottom: 8px !important;
+      padding: 6px 12px !important;
+      max-width: 80% !important;
+      background: oklch(20% 0.01 70 / 95%) !important;
+      color: #fff !important;
+      font-size: 11px !important;
+      font-weight: 500 !important;
+      letter-spacing: 0.01em !important;
+      border-radius: 999px !important;
+      box-shadow: 0 4px 14px oklch(0% 0 0 / 35%) !important;
+      pointer-events: none !important;
+      opacity: 0 !important;
+      transition: opacity 0.18s ease, transform 0.18s ease !important;
+      z-index: 5 !important;
+      white-space: nowrap !important;
+    }
+    .autodom-chat-toast.is-visible {
+      opacity: 1 !important;
+      transform: translate(-50%, -10px) !important;
+    }
+    .autodom-chat-input-area {
+      position: relative !important;
     }
 
     /* ─── Input Area — modern pill composer ──────────────────── */
@@ -2831,12 +2887,18 @@
           <circle cx="12" cy="13" r="3.5"/>
         </svg>
       </button>
+      <button class="autodom-chat-icon-btn autodom-chat-force-stop" type="button" data-action="force_stop" title="Force stop automation" aria-label="Force stop automation">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="6" y="6" width="12" height="12" rx="2"/>
+        </svg>
+      </button>
       <span class="autodom-chat-quick-divider" aria-hidden="true"></span>
       <button class="autodom-chat-quick-btn" type="button" data-prompt="Summarize this page in 4 short bullets."><span class="prompt-spark" aria-hidden="true">✨</span>Summarize</button>
       <button class="autodom-chat-quick-btn" type="button" data-prompt="What can I do on this page? List the main actions."><span class="prompt-spark" aria-hidden="true">✨</span>What can I do?</button>
       <button class="autodom-chat-quick-btn" type="button" data-prompt="List the most important interactive elements on this page."><span class="prompt-spark" aria-hidden="true">✨</span>Key controls</button>
       <button class="autodom-chat-quick-btn" type="button" data-prompt="Check this page for accessibility issues and summarize the top problems."><span class="prompt-spark" aria-hidden="true">✨</span>A11y audit</button>
     </div>
+    <div class="autodom-chat-toast" id="__autodom_chat_toast" role="status" aria-live="polite" aria-hidden="true"></div>
 
     <!-- Input Area -->
     <div class="autodom-chat-input-area">
@@ -2986,6 +3048,23 @@
         sendBtn.disabled = !chatInput || chatInput.value.trim().length === 0;
         sendBtn.title = "Send (Enter) · Shift+Enter for newline";
         sendBtn.setAttribute("aria-label", "Send message");
+      }
+    }
+    // Lock the "Clear conversation" header button while a request is
+    // in flight — clearing mid-run would orphan the assistant message
+    // that the streaming tool chips are being appended to, and the
+    // user would lose the context of what's running.
+    if (clearBtn) {
+      if (busy) {
+        clearBtn.disabled = true;
+        clearBtn.setAttribute("aria-disabled", "true");
+        clearBtn.dataset.prevTitle = clearBtn.title || "Clear conversation";
+        clearBtn.title = "Stop the current run before clearing";
+      } else {
+        clearBtn.disabled = false;
+        clearBtn.removeAttribute("aria-disabled");
+        clearBtn.title = clearBtn.dataset.prevTitle || "Clear conversation";
+        delete clearBtn.dataset.prevTitle;
       }
     }
     _updateAutomationUi();
@@ -3148,6 +3227,13 @@
             try { void chrome.runtime.lastError; } catch (_) {}
             if (s && s.active) {
               _activeRunId = s.runId || null;
+              // Restore full busy state so the page-wide automation
+              // overlay re-mounts (warning the user that automation is
+              // still acting on this page after the reload). _setBusy
+              // also calls _updateAutomationUi() which mounts overlay +
+              // floating Stop.
+              _setBusy(true);
+              showTyping();
               _showRunIndicator(
                 s.toolRunning ? "Automation running" : "Automation finishing",
               );
@@ -3217,6 +3303,11 @@
 
   // ─── Clear Conversation ────────────────────────────────────
   clearBtn.addEventListener("click", () => {
+    // Hard guard: never wipe history while a request is in flight.
+    // _setBusy() also disables the button, but we double-check here in
+    // case the disabled state is bypassed (e.g. keyboard activation
+    // racing the busy flip).
+    if (isProcessing) return;
     messages = [];
     conversationHistory = [];
     persistChatState();
