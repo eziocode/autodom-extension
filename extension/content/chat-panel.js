@@ -5651,6 +5651,16 @@
       context.visibleTextPreview = "";
     }
 
+    // Page outline — jcodemunch's "signatures over bodies" idea applied
+    // to the DOM. A structured H1/H2/H3 + landmark + form summary is
+    // ~100-200 tokens but conveys what the page IS far more reliably
+    // than 1200 chars of raw visible text (which often starts with a
+    // cookie banner). The model sees both; on long pages the outline
+    // is what it actually uses for navigation reasoning.
+    try {
+      context.outline = buildPageOutline();
+    } catch (_) {}
+
     // Note: meta tags previously collected here weren't read by any
     // server-side prompt builder — pure wire waste, removed. Re-add only
     // if a future feature reads context.meta on the SW side.
@@ -7680,6 +7690,72 @@
       .map((item) => item.text);
 
     return normalizeReadableText(overlays.join("\n\n")).substring(0, limit);
+  }
+
+  // Compact structured outline of the page — h1/h2/h3, landmarks, and
+  // form labels. Designed to be ~100-200 tokens regardless of page
+  // size so it's cheap to send every turn. Skips AutoDOM's own UI.
+  function buildPageOutline() {
+    const trim = (s, n) => {
+      const t = (s || "").replace(/\s+/g, " ").trim();
+      return t.length > n ? t.slice(0, n) + "…" : t;
+    };
+    const headings = [];
+    try {
+      const nodes = document.querySelectorAll("h1, h2, h3");
+      for (const el of nodes) {
+        if (isAutodomElement(el)) continue;
+        const text = trim(el.innerText || el.textContent || "", 80);
+        if (!text) continue;
+        headings.push(`${el.tagName.toLowerCase()}: ${text}`);
+        if (headings.length >= 12) break;
+      }
+    } catch (_) {}
+
+    const forms = [];
+    try {
+      const fs = document.querySelectorAll("form");
+      for (const f of fs) {
+        if (isAutodomElement(f)) continue;
+        const name =
+          f.getAttribute("name") ||
+          f.getAttribute("id") ||
+          f.getAttribute("aria-label") ||
+          (f.querySelector("legend, h1, h2, h3, button[type=submit]")?.innerText || "form");
+        const inputs = f.querySelectorAll("input, textarea, select").length;
+        forms.push(`${trim(name, 40)} (${inputs} fields)`);
+        if (forms.length >= 5) break;
+      }
+    } catch (_) {}
+
+    const landmarks = [];
+    try {
+      const ls = document.querySelectorAll(
+        'nav, main, aside, header, footer, [role="navigation"], [role="main"], [role="complementary"]',
+      );
+      const seen = new Set();
+      for (const el of ls) {
+        if (isAutodomElement(el)) continue;
+        const role =
+          el.getAttribute("role") ||
+          el.tagName.toLowerCase();
+        const label =
+          el.getAttribute("aria-label") ||
+          el.getAttribute("aria-labelledby") ||
+          "";
+        const key = role + ":" + label;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        landmarks.push(label ? `${role}[${trim(label, 30)}]` : role);
+        if (landmarks.length >= 6) break;
+      }
+    } catch (_) {}
+
+    const parts = [];
+    if (headings.length) parts.push("headings: " + headings.join(" | "));
+    if (forms.length) parts.push("forms: " + forms.join(" | "));
+    if (landmarks.length) parts.push("landmarks: " + landmarks.join(", "));
+    return parts.length ? parts.join("\n") : "";
   }
 
   function extractMainPageText() {
