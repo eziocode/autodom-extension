@@ -1446,59 +1446,116 @@
 
     /* ─── Quick Actions Strip (above composer) ─────────────── */
     .autodom-chat-quick-actions {
-      display: flex;
-      align-items: center;
-      gap: 5px;
-      padding: 6px 12px 4px;
+      display: flex !important;
+      align-items: center !important;
+      gap: 5px !important;
+      padding: 6px 12px 4px !important;
       background: linear-gradient(
         180deg,
         transparent 0%,
         color-mix(in oklch, var(--c-bg) 92%, transparent) 100%
-      );
-      overflow-x: auto;
-      flex-shrink: 0;
-      border-top: 1px solid color-mix(in oklch, var(--c-border) 75%, transparent);
-      scrollbar-width: none;
+      ) !important;
+      overflow-x: auto !important;
+      flex-shrink: 0 !important;
+      border-top: 1px solid color-mix(in oklch, var(--c-border) 75%, transparent) !important;
+      scrollbar-width: none !important;
     }
     .autodom-chat-quick-actions::-webkit-scrollbar {
-      height: 0;
+      height: 0 !important;
     }
     .autodom-chat-quick-btn {
-      flex-shrink: 0;
-      padding: 4px 9px;
-      border-radius: 999px;
-      background: color-mix(in oklch, var(--c-surface) 84%, transparent);
-      border: 1px solid color-mix(in oklch, var(--c-border) 85%, transparent);
-      color: var(--c-text-3);
-      font-size: 10px;
-      font-weight: 500;
-      cursor: pointer;
-      transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
-      font-family: inherit;
-      white-space: nowrap;
-      line-height: 1;
-      letter-spacing: 0.01em;
-      display: inline-flex;
-      align-items: center;
-      min-height: 24px;
+      flex-shrink: 0 !important;
+      padding: 4px 9px 4px 8px !important;
+      border-radius: 999px !important;
+      background: color-mix(in oklch, var(--c-surface) 84%, transparent) !important;
+      border: 1px solid color-mix(in oklch, var(--c-border) 85%, transparent) !important;
+      color: var(--c-text-3) !important;
+      font-size: 10px !important;
+      font-weight: 500 !important;
+      cursor: pointer !important;
+      transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease !important;
+      font-family: inherit !important;
+      white-space: nowrap !important;
+      line-height: 1 !important;
+      letter-spacing: 0.01em !important;
+      display: inline-flex !important;
+      align-items: center !important;
+      gap: 4px !important;
+      min-height: 24px !important;
+      box-shadow: none !important;
+      text-transform: none !important;
     }
     .autodom-chat-quick-btn:hover {
-      background: color-mix(in oklch, var(--c-surface-2) 90%, transparent);
-      border-color: color-mix(in oklch, var(--c-border-s) 85%, transparent);
-      color: var(--c-text);
-      transform: none;
+      background: color-mix(in oklch, var(--c-surface-2) 90%, transparent) !important;
+      border-color: color-mix(in oklch, var(--c-border-s) 85%, transparent) !important;
+      color: var(--c-text) !important;
+      transform: none !important;
     }
     .autodom-chat-quick-btn:focus-visible {
-      outline: 2px solid var(--c-accent);
-      outline-offset: 2px;
+      outline: 2px solid var(--c-accent) !important;
+      outline-offset: 2px !important;
     }
     .autodom-chat-quick-btn:active {
-      transform: none;
-      opacity: 0.85;
+      transform: none !important;
+      opacity: 0.85 !important;
     }
     .autodom-chat-quick-btn:disabled {
-      opacity: 0.3;
-      cursor: not-allowed;
+      opacity: 0.3 !important;
+      cursor: not-allowed !important;
+    }
+    .autodom-chat-quick-btn .prompt-spark {
+      font-size: 9px !important;
+      line-height: 1 !important;
+      opacity: 0.7 !important;
+      filter: saturate(1.2) !important;
+    }
+    .autodom-chat-quick-btn:hover .prompt-spark {
+      opacity: 1 !important;
+    }
+    .autodom-chat-icon-btn {
+      flex-shrink: 0 !important;
+      width: 26px !important;
+      height: 24px !important;
+      padding: 0 !important;
+      border-radius: 8px !important;
+      background: transparent !important;
+      border: 1px solid transparent !important;
+      color: var(--c-text-3) !important;
+      cursor: pointer !important;
+      display: inline-flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease !important;
+      box-shadow: none !important;
+    }
+    .autodom-chat-icon-btn:hover {
+      background: color-mix(in oklch, var(--c-surface-2) 90%, transparent) !important;
+      border-color: color-mix(in oklch, var(--c-border) 75%, transparent) !important;
+      color: var(--c-text) !important;
+    }
+    .autodom-chat-icon-btn:focus-visible {
+      outline: 2px solid var(--c-accent) !important;
+      outline-offset: 2px !important;
+    }
+    .autodom-chat-icon-btn:disabled {
+      opacity: 0.3 !important;
+      cursor: not-allowed !important;
+    }
+    .autodom-chat-icon-btn svg {
+      width: 14px !important;
+      height: 14px !important;
+      stroke: currentColor !important;
+      fill: none !important;
+      stroke-width: 1.6 !important;
+      stroke-linecap: round !important;
+      stroke-linejoin: round !important;
+    }
+    .autodom-chat-quick-divider {
+      flex-shrink: 0 !important;
+      width: 1px !important;
+      align-self: stretch !important;
+      margin: 4px 4px !important;
+      background: color-mix(in oklch, var(--c-border) 70%, transparent) !important;
     }
 
     /* ─── Input Area — modern pill composer ──────────────────── */
@@ -2768,11 +2825,17 @@
 
     <!-- Quick Actions -->
     <div class="autodom-chat-quick-actions" id="__autodom_quick_actions" role="toolbar" aria-label="Quick actions">
-      <button class="autodom-chat-quick-btn" data-action="dom_state">DOM</button>
-      <button class="autodom-chat-quick-btn" data-action="screenshot">Screen</button>
-      <button class="autodom-chat-quick-btn" data-action="page_info">Info</button>
-      <button class="autodom-chat-quick-btn" data-action="summarize">Summary</button>
-      <button class="autodom-chat-quick-btn" data-action="accessibility">A11y</button>
+      <button class="autodom-chat-icon-btn" type="button" data-action="screenshot" title="Capture screenshot" aria-label="Capture screenshot">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Z"/>
+          <circle cx="12" cy="13" r="3.5"/>
+        </svg>
+      </button>
+      <span class="autodom-chat-quick-divider" aria-hidden="true"></span>
+      <button class="autodom-chat-quick-btn" type="button" data-prompt="Summarize this page in 4 short bullets."><span class="prompt-spark" aria-hidden="true">✨</span>Summarize</button>
+      <button class="autodom-chat-quick-btn" type="button" data-prompt="What can I do on this page? List the main actions."><span class="prompt-spark" aria-hidden="true">✨</span>What can I do?</button>
+      <button class="autodom-chat-quick-btn" type="button" data-prompt="List the most important interactive elements on this page."><span class="prompt-spark" aria-hidden="true">✨</span>Key controls</button>
+      <button class="autodom-chat-quick-btn" type="button" data-prompt="Check this page for accessibility issues and summarize the top problems."><span class="prompt-spark" aria-hidden="true">✨</span>A11y audit</button>
     </div>
 
     <!-- Input Area -->

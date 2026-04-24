@@ -260,7 +260,7 @@ Then restart your IDE to get a fresh connection.
 
 - **Full documentation:** [README.md](README.md)
 - **Detailed install guide:** [INSTALL.md](INSTALL.md)
-- **GitHub:** [github.com/eziocode/IntelliJ-Plugins](https://github.com/eziocode/IntelliJ-Plugins/tree/main/autodom-extension)
+- **GitHub:** [github.com/eziocode/autodom-extension](https://github.com/eziocode/autodom-extension)
 
 ---
 

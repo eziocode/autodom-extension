@@ -200,7 +200,7 @@ Edit `~/.gemini/settings.json`:
 2. Click the AutoDOM icon in the browser toolbar
 3. The popup should show **Connected** (green status)
 4. If it shows Disconnected, click **Connect**
-5. In your IDE, autodom should appear as an available MCP server with 54 tools
+5. In your IDE, autodom should appear as an available MCP server with 66 tools
 
 ---
 
