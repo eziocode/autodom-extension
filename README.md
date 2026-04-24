@@ -52,10 +52,12 @@ scripts, or use MCP tools from an IDE to run local Playwright scripts. See
 ```bash
 git clone https://github.com/eziocode/autodom-extension.git
 cd autodom-extension
-./setup.sh
+./setup.sh                                          # macOS / Linux / WSL / Git Bash
+# OR (Windows PowerShell):
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
 ```
 
-`setup.sh` will:
+`setup.sh` / `setup.ps1` will:
 
 - ✅ Verify Node.js v18+
 - ✅ `npm install` inside `server/`
@@ -66,7 +68,8 @@ cd autodom-extension
 To register a second browser target on a different port:
 
 ```bash
-./setup.sh --name autodom-firefox --port 9877
+./setup.sh --name autodom-firefox --port 9877      # macOS / Linux
+.\setup.ps1 -Name autodom-firefox -Port 9877       # Windows
 ```
 
 Then:

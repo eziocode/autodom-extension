@@ -363,7 +363,17 @@ echo -e "${BLUE}[6/6]${NC} Configuring IDEs..."
 CONFIGURED_COUNT=0
 
 configure_jetbrains() {
-    local app_support="$HOME/Library/Application Support/JetBrains"
+    # JetBrains stores per-IDE settings under different roots depending
+    # on the OS — pick the right one (or fall back to env override).
+    local app_support
+    if [ -n "${JETBRAINS_CONFIG_DIR:-}" ]; then
+        app_support="$JETBRAINS_CONFIG_DIR"
+    elif [ "$(uname)" = "Darwin" ]; then
+        app_support="$HOME/Library/Application Support/JetBrains"
+    else
+        # Linux: per-IDE config lives directly under ~/.config/JetBrains/<IDE><ver>/options
+        app_support="$HOME/.config/JetBrains"
+    fi
     if [ ! -d "$app_support" ]; then
         return
     fi

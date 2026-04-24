@@ -15,26 +15,23 @@
 |---|---|
 | **IntelliJ IDEA / WebStorm / PyCharm / GoLand / Rider** | Settings → Tools → MCP Servers |
 | **VS Code / Cursor** | `.vscode/mcp.json` in workspace root |
-| **Claude Desktop** | `~/Library/Application Support/Claude/claude_desktop_config.json` |
-| **Gemini CLI** | `~/.gemini/settings.json` |
+| **Claude Desktop** | macOS: `~/Library/Application Support/Claude/...` &nbsp;•&nbsp; Win: `%APPDATA%\Claude\...` &nbsp;•&nbsp; Linux: `~/.config/Claude/...` |
+| **Gemini CLI** | `~/.gemini/settings.json` (Win: `%USERPROFILE%\.gemini\settings.json`) |
 
 ### Port Requirement
 
 AutoDOM uses **TCP port 9876** on localhost for the WebSocket bridge between the server and extension. Verify it is free before setup:
 
-```bash
-lsof -ti:9876    # should print nothing
-```
-
-If something is using it, kill it:
-
-```bash
-lsof -ti:9876 | xargs kill -9
-```
+| OS | Check | Free it |
+|---|---|---|
+| **macOS / Linux** | `lsof -ti:9876` (should print nothing) | `lsof -ti:9876 \| xargs kill -9` |
+| **Windows (PowerShell)** | `Get-NetTCPConnection -LocalPort 9876 -State Listen -ErrorAction SilentlyContinue` | `Get-NetTCPConnection -LocalPort 9876 -State Listen \| ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }` |
 
 ---
 
 ## Quick Setup (Recommended)
+
+### macOS / Linux
 
 ```bash
 cd autodom-extension
@@ -44,25 +41,37 @@ cd autodom-extension
 ./setup.sh --name autodom-firefox --port 9877
 ```
 
-This will:
+### Windows (PowerShell)
+
+```powershell
+cd autodom-extension
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+
+# Add a second browser target on another port
+.\setup.ps1 -Name autodom-firefox -Port 9877
+```
+
+> **Windows alternative:** if you have **Git Bash** or **WSL**, you can run the same `./setup.sh` script — it works identically there.
+
+Both scripts will:
 
 - ✅ Check Node.js v18+ is installed
 - ✅ Install server dependencies (`npm install`)
-- ✅ Auto-configure all detected IDEs (JetBrains, VS Code, Claude Desktop, Gemini CLI)
-- ✅ Enable autodom for both **GitHub Copilot** and **JetBrains AI Assistant**
+- ✅ Auto-configure all detected IDEs (JetBrains, VS Code, Cursor, Claude Desktop, Gemini CLI)
+- ✅ On macOS/Linux: enable AutoDOM for both **GitHub Copilot** and **JetBrains AI Assistant**
 - ✅ Print instructions for loading the browser extension
 
-For multiple browsers at the same time, run `setup.sh` once per browser with a unique MCP server name and port.
+For multiple browsers at the same time, run the setup script once per browser with a unique MCP server name and port.
 
 After the script finishes:
 
 1. Load the extension into your browser:
    - **Chromium** (Chrome / Edge / Brave / Arc / Ulaa): open `chrome://extensions` → enable **Developer mode** → **Load unpacked** → select the `extension/` folder
-   - **Firefox**: run `./scripts/build-firefox.sh`, then open `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** → select `dist/firefox/manifest.json` (see [Firefox install](#firefox-install) for permanent install)
+   - **Firefox**: run `./scripts/build-firefox.sh` (macOS/Linux) and use `dist/firefox/` or the prebuilt `dist/autodom-firefox-<version>.xpi` (see [Firefox install](#firefox-install)). On Windows, use the prebuilt `.xpi` from a release.
 2. Pin AutoDOM to the toolbar
 3. **Restart your IDE** so it picks up the new MCP config
 4. Open the AutoDOM popup in the browser → confirm it says **Connected**
-5. Your AI agent now has access to 54 browser automation tools
+5. Your AI agent now has access to 70 browser-automation tools
 
 ---
 
@@ -141,11 +150,13 @@ The MCP server config is the same JSON everywhere — only the file location dif
 1. Open Settings → Tools → AI Assistant → MCP Servers
 2. Make sure **autodom** is checked / enabled
 
-If autodom does not appear in the AI Assistant list, the server definition from Copilot's config needs to be registered. The `setup.sh` script handles this by writing both `McpToolsStoreService.xml` and `llm.mcpServers.xml`. To do it manually, create or edit:
+If autodom does not appear in the AI Assistant list, the server definition from Copilot's config needs to be registered. The `setup.sh` / `setup.ps1` script handles this by writing both `McpToolsStoreService.xml` and `llm.mcpServers.xml`. To do it manually, create or edit the per-IDE `options/llm.mcpServers.xml`:
 
-```
-~/Library/Application Support/JetBrains/<IDE><version>/options/llm.mcpServers.xml
-```
+| OS | JetBrains options dir |
+|---|---|
+| **macOS** | `~/Library/Application Support/JetBrains/<IDE><version>/options/` |
+| **Windows** | `%APPDATA%\JetBrains\<IDE><version>\options\` |
+| **Linux** | `~/.config/JetBrains/<IDE><version>/options/` |
 
 Add an entry with `name="autodom"` and `enabled="true"` inside the `<commands>` block.
 
@@ -166,7 +177,13 @@ Create `.vscode/mcp.json` in your workspace root:
 
 #### Claude Desktop
 
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+Edit the Claude Desktop config (path varies by OS):
+
+| OS | Config Path |
+|---|---|
+| **macOS** | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| **Windows** | `%APPDATA%\Claude\claude_desktop_config.json` |
+| **Linux** | `~/.config/Claude/claude_desktop_config.json` |
 
 ```json
 {
@@ -181,7 +198,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
 
 #### Gemini CLI
 
-Edit `~/.gemini/settings.json`:
+Edit `~/.gemini/settings.json` (Windows: `%USERPROFILE%\.gemini\settings.json`):
 
 ```json
 {
@@ -194,13 +211,15 @@ Edit `~/.gemini/settings.json`:
 }
 ```
 
+> **Windows path note:** Use forward slashes or escaped backslashes inside JSON, e.g. `"C:/dev/autodom-extension/server/index.js"` or `"C:\\dev\\autodom-extension\\server\\index.js"`.
+
 ### Step 4 — Connect
 
 1. **Restart your IDE** after changing MCP config
 2. Click the AutoDOM icon in the browser toolbar
 3. The popup should show **Connected** (green status)
 4. If it shows Disconnected, click **Connect**
-5. In your IDE, autodom should appear as an available MCP server with 66 tools
+5. In your IDE, autodom should appear as an available MCP server with 70 tools
 
 ---
 
@@ -251,6 +270,8 @@ By default AutoDOM uses port **9876**. To use a different port:
 
 The MCP bridge server process died or failed to start.
 
+**macOS / Linux:**
+
 | Step | Command / Action |
 |---|---|
 | Kill zombie processes | `pkill -9 -f "autodom.*index.js"` |
@@ -259,6 +280,16 @@ The MCP bridge server process died or failed to start.
 | Verify server starts | `cd server && echo '{}' \| node index.js 2>&1 \| head -10` |
 | Check path is absolute | The `args` value in your MCP config must start with `/` |
 | Restart MCP in IDE | Settings → Tools → MCP Servers → click restart/refresh on autodom |
+
+**Windows (PowerShell):**
+
+| Step | Command / Action |
+|---|---|
+| Kill zombie node processes | `Get-Process node -ErrorAction SilentlyContinue \| Where-Object { $_.Path -like '*autodom*' } \| Stop-Process -Force` |
+| Free port 9876 | `Get-NetTCPConnection -LocalPort 9876 -State Listen \| ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }` |
+| Remove stale lock file | `Remove-Item "$env:TEMP\autodom-bridge-9876.json" -ErrorAction SilentlyContinue` |
+| Verify server starts | `cd server; '{}' \| node index.js 2>&1 \| Select-Object -First 10` |
+| Check path is absolute | The `args` value in your MCP config must be a full path (use forward slashes or escaped backslashes inside JSON) |
 
 ### "Chrome extension is not connected"
 
@@ -270,16 +301,24 @@ The bridge is running but the extension hasn't connected via WebSocket.
 | Click Connect | If status shows Disconnected |
 | Reload extension | `chrome://extensions` → find AutoDOM → click refresh icon → then Connect |
 | Check port | Make sure the port in the popup matches the server's port (default 9876) |
-| Verify bridge is listening | `lsof -ti:9876` should print a PID |
+| Verify bridge is listening | macOS/Linux: `lsof -ti:9876` &nbsp;•&nbsp; Windows: `Get-NetTCPConnection -LocalPort 9876 -State Listen` |
 
 ### Extension shows "Connected" but IDE says tools are unavailable
 
 The extension connected to a zombie bridge process that the IDE no longer controls.
 
 ```bash
-# Kill everything and let the IDE start fresh:
+# macOS / Linux — kill everything and let the IDE start fresh:
 pkill -9 -f "autodom.*index.js"
 rm -f /tmp/autodom-bridge-9876.json
+```
+
+```powershell
+# Windows (PowerShell) equivalent:
+Get-Process node -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -like '*autodom*' } |
+    Stop-Process -Force
+Remove-Item "$env:TEMP\autodom-bridge-9876.json" -ErrorAction SilentlyContinue
 ```
 
 Then restart the MCP server from your IDE settings.
@@ -378,7 +417,18 @@ pkill -f "autodom.*index.js"
 3. Delete the `autodom-extension/` folder
 4. Clean up any leftover processes:
 
+**macOS / Linux:**
+
 ```bash
 pkill -f "autodom.*index.js"
 rm -f /tmp/autodom-bridge-*.json
+```
+
+**Windows (PowerShell):**
+
+```powershell
+Get-Process node -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -like '*autodom*' } |
+    Stop-Process -Force
+Remove-Item "$env:TEMP\autodom-bridge-*.json" -ErrorAction SilentlyContinue
 ```
