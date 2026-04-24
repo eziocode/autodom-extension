@@ -1294,6 +1294,58 @@ function renderCliPrompt() {
   }
 }
 
+function _normalizedProviderBaseUrl(url) {
+  return String(url || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\/+$/, "");
+}
+
+function _isBareOllamaBaseUrl(url) {
+  return /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):11434$/.test(
+    _normalizedProviderBaseUrl(url),
+  );
+}
+
+function _modelLooksCompatibleWithProvider(model, source, baseUrl) {
+  const id = String(model || "").trim();
+  if (!id) return false;
+  const d = id.toLowerCase();
+  const s = (source || "").toLowerCase();
+  const base = _normalizedProviderBaseUrl(baseUrl);
+
+  if (s === "anthropic") return d.startsWith("claude");
+  if (s === "openai") {
+    if (!base || /api\.openai\.com/.test(base) || _isBareOllamaBaseUrl(base)) {
+      return /^(gpt|o\d|text-|chatgpt)/.test(d);
+    }
+    if (/deepseek/.test(base)) return d.startsWith("deepseek");
+    if (/bigmodel|zhipu/.test(base)) return d.startsWith("glm");
+    if (/moonshot|kimi/.test(base)) return /^(moonshot|kimi)/.test(d);
+    if (/qianfan|baidubce/.test(base)) return /^(ernie|qianfan)/.test(d);
+    if (/dashscope|aliyuncs/.test(base)) return /^(qwen|qwq)/.test(d);
+    return true;
+  }
+  if (s === "ollama") {
+    return !d.startsWith("claude") && !/^(gpt-(?:3|4|5)|o\d|chatgpt|text-)/.test(d);
+  }
+  return true;
+}
+
+function _defaultModelForProvider(source, baseUrl) {
+  const s = (source || "").toLowerCase();
+  const base = _normalizedProviderBaseUrl(baseUrl);
+  if (s === "anthropic") return "claude-3-7-sonnet-latest";
+  if (s === "ollama") return "llama3.2";
+  if (s !== "openai") return "";
+  if (/deepseek/.test(base)) return "deepseek-chat";
+  if (/bigmodel|zhipu/.test(base)) return "glm-4-plus";
+  if (/moonshot|kimi/.test(base)) return "moonshot-v1-8k";
+  if (/qianfan|baidubce/.test(base)) return "ernie-4.0-8k";
+  if (/dashscope|aliyuncs/.test(base)) return "qwen-turbo";
+  return "gpt-4.1";
+}
+
 function updateProviderUI(statusOverride) {
   if (!DOM.providerStatus) return;
 
@@ -1341,15 +1393,21 @@ function updateProviderUI(statusOverride) {
 
   if (DOM.providerModel) {
     DOM.providerModel.disabled = source === "ide";
-    if (!DOM.providerModel.value && source === "openai") {
-      DOM.providerModel.value = "gpt-4.1";
+    const baseUrl = DOM.providerBaseUrl?.value || providerSettings.baseUrl || "";
+    const currentModel = (DOM.providerModel.value || providerSettings.model || "").trim();
+    const fallbackModel = _defaultModelForProvider(source, baseUrl);
+    const nextModel =
+      source === "ide"
+        ? currentModel
+        : !currentModel
+          ? fallbackModel
+          : _modelLooksCompatibleWithProvider(currentModel, source, baseUrl)
+            ? currentModel
+            : fallbackModel;
+    if (DOM.providerModel.value !== nextModel) {
+      DOM.providerModel.value = nextModel;
     }
-    if (!DOM.providerModel.value && source === "anthropic") {
-      DOM.providerModel.value = "claude-3-7-sonnet-latest";
-    }
-    if (!DOM.providerModel.value && source === "ollama") {
-      DOM.providerModel.value = "llama3.2";
-    }
+    providerSettings.model = nextModel;
   }
 
   if (DOM.providerBaseUrl) {

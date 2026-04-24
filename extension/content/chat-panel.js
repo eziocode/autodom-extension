@@ -228,6 +228,7 @@
     providerSource: "ide",  // snapshotted from popup's aiProviderSource
     cliKind: "",            // snapshotted from popup's aiProviderCliKind (only when source==="ide")
     defaultModel: "",       // snapshotted from popup's aiProviderModel
+    baseUrl: "",            // snapshotted from popup's aiProviderBaseUrl
     enabled: false,         // snapshotted from popup's aiProviderEnabled
     overrides: {},          // per-provider user overrides, keyed by catalog key
   };
@@ -244,7 +245,14 @@
     return s || "ide";
   }
 
-  function _catalogKey() {
+  function _normalizedModelBaseUrl(url) {
+    return String(url || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\/+$/, "");
+  }
+
+  function _catalogBaseKey() {
     const src = _modelPickerState.providerSource;
     if (src === "ide") {
       const cli = (_modelPickerState.cliKind || "").toLowerCase();
@@ -253,25 +261,46 @@
     return src;
   }
 
+  function _catalogKey() {
+    const key = _catalogBaseKey();
+    if ((key === "openai" || key === "ollama") && _modelPickerState.baseUrl) {
+      return `${key}@@${_normalizedModelBaseUrl(_modelPickerState.baseUrl)}`;
+    }
+    return key;
+  }
+
   function _currentModelId() {
     const key = _catalogKey();
-    return _modelPickerState.overrides[key] || _modelPickerState.defaultModel || "";
+    const baseKey = _catalogBaseKey();
+    const override =
+      _modelPickerState.overrides[key] ||
+      (key !== baseKey ? _modelPickerState.overrides[baseKey] : "");
+    if (override) return override;
+    const def = _modelPickerState.defaultModel || "";
+    return _defaultBelongsToCurrent(def, baseKey) ? def : "";
   }
 
   function _modelsForCurrentProvider() {
     const key = _catalogKey();
+    const baseKey = _catalogBaseKey();
     const live = _liveModels[key];
-    const base = live && live.length ? live : (MODEL_CATALOG[key] || []);
+    const base = live && live.length ? live : (MODEL_CATALOG[baseKey] || []);
     const list = [...base];
     // Surface the configured default ONLY if it actually belongs to the
     // current provider's list — prevents stale defaults (e.g. "llama3.2"
     // from a prior Ollama selection) from leaking into unrelated providers
     // like Copilot.
     const def = _modelPickerState.defaultModel;
-    if (def && !list.find((m) => m.id === def) && _defaultBelongsToCurrent(def, key)) {
+    if (def && !list.find((m) => m.id === def) && _defaultBelongsToCurrent(def, baseKey)) {
       list.unshift({ id: def, label: def, description: "Configured default" });
     }
     return list;
+  }
+
+  function _isBareOllamaBaseUrl(url) {
+    return /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):11434$/.test(
+      _normalizedModelBaseUrl(url),
+    );
   }
 
   // Heuristic: a bare ollama-style default like "llama3.2" should not show
@@ -281,9 +310,22 @@
   function _defaultBelongsToCurrent(def, key) {
     if (!def) return false;
     const d = def.toLowerCase();
-    if (key === "openai") return /^(gpt|o\d|text-|chatgpt)/.test(d);
+    if (key === "openai") {
+      const base = _normalizedModelBaseUrl(_modelPickerState.baseUrl);
+      if (!base || /api\.openai\.com/.test(base) || _isBareOllamaBaseUrl(base)) {
+        return /^(gpt|o\d|text-|chatgpt)/.test(d);
+      }
+      if (/deepseek/.test(base)) return d.startsWith("deepseek");
+      if (/bigmodel|zhipu/.test(base)) return d.startsWith("glm");
+      if (/moonshot|kimi/.test(base)) return /^(moonshot|kimi)/.test(d);
+      if (/qianfan|baidubce/.test(base)) return /^(ernie|qianfan)/.test(d);
+      if (/dashscope|aliyuncs/.test(base)) return /^(qwen|qwq)/.test(d);
+      return true;
+    }
     if (key === "anthropic" || key === "ide:claude") return d.startsWith("claude");
-    if (key === "ollama") return /^(llama|qwen|mistral|phi|gemma|deepseek)/.test(d);
+    if (key === "ollama") {
+      return !d.startsWith("claude") && !/^(gpt-(?:3|4|5)|o\d|chatgpt|text-)/.test(d);
+    }
     if (key === "ide:copilot") return /^(gpt|claude)/.test(d);
     if (key === "ide:codex") return /^(gpt|o\d)/.test(d);
     return true; // unknown key → don't filter
@@ -319,6 +361,7 @@
           "aiProviderSource",
           "aiProviderCliKind",
           "aiProviderModel",
+          "aiProviderBaseUrl",
           "aiProviderEnabled",
           STORAGE_KEY_MODEL_OVERRIDES,
         ],
@@ -328,6 +371,7 @@
           );
           _modelPickerState.cliKind = (items?.aiProviderCliKind || "").toLowerCase();
           _modelPickerState.defaultModel = items?.aiProviderModel || "";
+          _modelPickerState.baseUrl = items?.aiProviderBaseUrl || "";
           _modelPickerState.enabled = items?.aiProviderEnabled === true;
           _modelPickerState.overrides = items?.[STORAGE_KEY_MODEL_OVERRIDES] || {};
           try { _refreshModelPickerUI(); } catch (_) {}
@@ -350,6 +394,10 @@
         }
         if (changes.aiProviderModel) {
           _modelPickerState.defaultModel = changes.aiProviderModel.newValue || "";
+        }
+        if (changes.aiProviderBaseUrl) {
+          _modelPickerState.baseUrl = changes.aiProviderBaseUrl.newValue || "";
+          providerChanged = true;
         }
         if (changes.aiProviderEnabled) {
           _modelPickerState.enabled = changes.aiProviderEnabled.newValue === true;

@@ -404,6 +404,53 @@ let aiProviderSettings = {
   preset: "custom",
 };
 
+function _normalizedProviderBaseUrl(url) {
+  return String(url || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\/+$/, "");
+}
+
+function _isBareOllamaBaseUrl(url) {
+  return /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):11434$/.test(
+    _normalizedProviderBaseUrl(url),
+  );
+}
+
+function _modelLooksCompatibleWithSettings(model, settings) {
+  const id = String(model || "").trim();
+  if (!id) return false;
+  const source = (settings?.source || "").toLowerCase();
+  const base = _normalizedProviderBaseUrl(settings?.baseUrl);
+  const d = id.toLowerCase();
+
+  if (source === "anthropic" || source === "claude") {
+    return d.startsWith("claude");
+  }
+  if (source === "openai" || source === "gpt" || source === "chatgpt") {
+    if (!base || /api\.openai\.com/.test(base) || _isBareOllamaBaseUrl(base)) {
+      return /^(gpt|o\d|text-|chatgpt)/.test(d);
+    }
+    if (/deepseek/.test(base)) return d.startsWith("deepseek");
+    if (/bigmodel|zhipu/.test(base)) return d.startsWith("glm");
+    if (/moonshot|kimi/.test(base)) return /^(moonshot|kimi)/.test(d);
+    if (/qianfan|baidubce/.test(base)) return /^(ernie|qianfan)/.test(d);
+    if (/dashscope|aliyuncs/.test(base)) return /^(qwen|qwq)/.test(d);
+    return true;
+  }
+  if (source === "ollama") {
+    return !d.startsWith("claude") && !/^(gpt-(?:3|4|5)|o\d|chatgpt|text-)/.test(d);
+  }
+  return true;
+}
+
+function _effectiveConfiguredProviderModel(settings, override = null) {
+  const chosen = String(override || "").trim();
+  if (chosen) return chosen;
+  const configured = String(settings?.model || "").trim();
+  return _modelLooksCompatibleWithSettings(configured, settings) ? configured : "";
+}
+
 function _readCurrentProviderSettings() {
   return new Promise((resolve) => {
     const fallback = async () => {
@@ -828,8 +875,10 @@ async function runAgentLoop({
   const apiKey = (aiProviderSettings.apiKey || "").trim();
   // Per-run model override from the chat panel's model picker. Falls back
   // to the globally configured default in chrome.storage.
-  const _model = (modelOverride && String(modelOverride).trim()) ||
-    aiProviderSettings.model;
+  const _model = _effectiveConfiguredProviderModel(
+    aiProviderSettings,
+    modelOverride,
+  );
   const tools = _toolsForProvider(providerType);
   if (!tools) {
     throw new Error(`Agent loop not supported for provider: ${providerType}`);
@@ -2385,6 +2434,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "GET_STATUS") {
+    const effectiveModel = _effectiveConfiguredProviderModel(aiProviderSettings);
     sendResponse({
       connected: isConnected,
       running: shouldRunMcp,
@@ -2393,7 +2443,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       provider: {
         source: aiProviderSettings.source,
         apiKey: aiProviderSettings.apiKey,
-        model: aiProviderSettings.model,
+        model: effectiveModel,
         baseUrl: aiProviderSettings.baseUrl,
       },
     });
@@ -2424,6 +2474,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       enabled: incomingProvider.enabled === true,
       preset: incomingProvider.preset || "custom",
     };
+    const effectiveModel = _effectiveConfiguredProviderModel(aiProviderSettings);
     _debugLog(
       "[AutoDOM SW] aiProviderSettings updated:",
       JSON.stringify({
@@ -2464,7 +2515,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       provider: {
         source: aiProviderSettings.source,
         apiKey: aiProviderSettings.apiKey,
-        model: aiProviderSettings.model,
+        model: effectiveModel,
         baseUrl: aiProviderSettings.baseUrl,
       },
       statusText:
@@ -2473,7 +2524,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             ? "Using IDE Agent over MCP"
             : "IDE Agent selected — connect MCP to enable full AI"
           : aiProviderSettings.apiKey
-            ? `${aiProviderSettings.source === "openai" ? "GPT" : aiProviderSettings.source === "anthropic" ? "Claude" : "Provider"} ready${aiProviderSettings.model ? ` · ${aiProviderSettings.model}` : ""}`
+            ? `${aiProviderSettings.source === "openai" ? "GPT" : aiProviderSettings.source === "anthropic" ? "Claude" : "Provider"} ready${effectiveModel ? ` · ${effectiveModel}` : ""}`
             : `${aiProviderSettings.source === "openai" ? "GPT" : aiProviderSettings.source === "anthropic" ? "Claude" : "Provider"} selected — add API key to enable direct AI`,
     });
 
@@ -2482,7 +2533,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       provider: {
         source: aiProviderSettings.source,
         apiKey: aiProviderSettings.apiKey,
-        model: aiProviderSettings.model,
+        model: effectiveModel,
         baseUrl: aiProviderSettings.baseUrl,
       },
       statusText:
@@ -2491,7 +2542,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             ? "Using IDE Agent over MCP"
             : "IDE Agent selected — connect MCP to enable full AI"
           : aiProviderSettings.apiKey
-            ? `${aiProviderSettings.source === "openai" ? "GPT" : aiProviderSettings.source === "anthropic" ? "Claude" : "Provider"} ready${aiProviderSettings.model ? ` · ${aiProviderSettings.model}` : ""}`
+            ? `${aiProviderSettings.source === "openai" ? "GPT" : aiProviderSettings.source === "anthropic" ? "Claude" : "Provider"} ready${effectiveModel ? ` · ${effectiveModel}` : ""}`
             : `${aiProviderSettings.source === "openai" ? "GPT" : aiProviderSettings.source === "anthropic" ? "Claude" : "Provider"} selected — add API key to enable direct AI`,
     });
 
@@ -2775,6 +2826,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       (async () => {
         try {
+          const effectiveModel = _effectiveConfiguredProviderModel(
+            aiProviderSettings,
+            message.model || null,
+          );
           const normalizedProvider =
             providerType === "gpt" || providerType === "chatgpt"
               ? "openai"
@@ -2787,7 +2842,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             context: context || {},
             conversationHistory: conversationHistory || [],
             initialTabId: sender?.tab?.id,
-            modelOverride: message.model || null,
+            modelOverride: effectiveModel || null,
           });
           _debugLog(
             "[AutoDOM SW] Agent loop finished, length:",
@@ -2799,7 +2854,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             type: "AI_CHAT_RESPONSE",
             response: result.response,
             toolCalls: result.toolCalls || [],
-            model: message.model || aiProviderSettings.model || null,
+            model: effectiveModel || null,
             error: null,
           });
         } catch (err) {
