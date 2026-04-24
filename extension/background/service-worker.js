@@ -2713,14 +2713,20 @@ async function handleToolCall(tool, params, id) {
 // ─── Helper: Get active tab ──────────────────────────────────
 
 async function getActiveTab() {
+  const pinnedWindowId = _agentRunContext?.windowId;
   if (_agentRunContext?.tabId != null) {
     try {
       return await chrome.tabs.get(_agentRunContext.tabId);
     } catch (_) {
-      _agentRunContext = null;
+      _agentRunContext =
+        pinnedWindowId != null ? { windowId: pinnedWindowId } : null;
     }
   }
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const [tab] = await chrome.tabs.query(
+    pinnedWindowId != null
+      ? { active: true, windowId: pinnedWindowId }
+      : { active: true, currentWindow: true },
+  );
   if (!tab) throw new Error("No active tab found");
   return tab;
 }
