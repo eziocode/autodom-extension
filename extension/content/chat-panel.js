@@ -1127,16 +1127,32 @@
     #${PANEL_ID}.is-collapsed .autodom-chat-rail {
       display: flex !important;
     }
+    /* Rail logo: reuse the AutoDOM brand mark from the header so the
+       collapsed state is recognisably AutoDOM (not a generic gradient
+       block). Same radial gradient + accent colors + inset star glyph. */
     .autodom-chat-rail-logo {
-      width: 24px !important;
-      height: 24px !important;
-      border-radius: 6px !important;
-      background: linear-gradient(135deg, #6aa4ff, #c46aff) !important;
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3) !important;
+      width: 28px !important;
+      height: 28px !important;
+      border-radius: 8px !important;
+      background:
+        radial-gradient(120% 120% at 0% 0%, var(--c-accent-2) 0%, var(--c-accent) 55%, oklch(48% 0.18 25) 100%) !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      flex-shrink: 0 !important;
+      box-shadow:
+        0 0 0 1px rgba(255, 255, 255, 0.06) inset,
+        0 4px 14px var(--c-accent-soft) !important;
+    }
+    .autodom-chat-rail-logo svg {
+      width: 14px !important;
+      height: 14px !important;
+      fill: #fff !important;
+      stroke: none !important;
     }
     .autodom-chat-rail-icon {
-      width: 18px !important;
-      height: 18px !important;
+      width: 16px !important;
+      height: 16px !important;
       color: var(--c-text-muted, #a0a0a8) !important;
       transition: color 0.15s ease !important;
     }
@@ -3989,7 +4005,9 @@
          tabindex="0"></div>
     <!-- Collapsed-state rail (only visible when panel.is-collapsed). -->
     <div class="autodom-chat-rail" id="__autodom_rail" role="button" tabindex="0" aria-label="Expand chat panel" title="Expand panel (Ctrl/⌘+Alt+\\)">
-      <div class="autodom-chat-rail-logo" aria-hidden="true"></div>
+      <div class="autodom-chat-rail-logo" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><polygon points="12 2 14 9 22 12 14 15 12 22 10 15 2 12 10 9" fill="white" stroke="none"/></svg>
+      </div>
       <svg class="autodom-chat-rail-icon" viewBox="0 0 24 24" aria-hidden="true">
         <path d="M15 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
@@ -7758,6 +7776,10 @@
   });
 
   // ─── Inline Overlay Send ───────────────────────────────────
+  // Mirrors every turn into the main chat panel's `messages` array via
+  // addMessage so that, when the user later opens the full sidebar,
+  // they see the conversation continue from where the quick-prompt
+  // overlay left off (same conversationHistory the AI already saw).
   async function sendInlineMessage() {
     const text = inlineInput.value.trim();
     if (!text || isProcessing) return;
@@ -7769,6 +7791,11 @@
     inlineResponseContent.innerHTML =
       '<span class="ai-sparkle">\u2728</span> AI thinking...';
 
+    // Mirror into the panel BEFORE sending so the panel can show the
+    // user's question even if the AI call fails or is cancelled. The
+    // panel may not currently be in the DOM-visible state, but addMessage
+    // populates `messages` and the messagesContainer regardless.
+    try { addMessage("user", text); } catch (_) {}
     _pushHistory({ role: "user", content: text });
 
     try {
@@ -7786,6 +7813,7 @@
         md.className = "md";
         renderMarkdownInto(md, responseText);
         inlineResponseContent.appendChild(md);
+        try { addMessage("assistant", responseText); } catch (_) {}
         _pushHistory({ role: "assistant", content: responseText });
       } else {
         // Fallback: try local command parsing
@@ -7793,16 +7821,26 @@
         if (command && command.tool) {
           const result = await callTool(command.tool, command.params);
           if (result && result.error) {
-            inlineResponseContent.textContent = `Error: ${result.error}`;
+            const msg = `Error: ${result.error}`;
+            inlineResponseContent.textContent = msg;
+            try { addMessage("assistant", msg); } catch (_) {}
+            _pushHistory({ role: "assistant", content: msg });
           } else if (result && result.screenshot) {
+            const note =
+              "Screenshot captured! Open the sidebar to view it.";
             inlineResponseContent.innerHTML =
-              '<span class="ai-sparkle">\u{1F4F8}</span> Screenshot captured! Open the sidebar to view it.';
+              '<span class="ai-sparkle">\u{1F4F8}</span> ' + escapeHtml(note);
+            try { addMessage("assistant", "\u{1F4F8} " + note); } catch (_) {}
+            _pushHistory({ role: "assistant", content: note });
           } else {
             const formatted = formatToolResult(result, command.tool);
-            inlineResponseContent.textContent = formatted.substring(0, 1000);
+            const truncated = formatted.substring(0, 1000);
+            inlineResponseContent.textContent = truncated;
+            try { addMessage("assistant", truncated); } catch (_) {}
+            _pushHistory({ role: "assistant", content: truncated });
           }
         } else {
-          // AI unreachable \u2014 surface a clear, compact alert in the inline
+          // AI unreachable — surface a clear, compact alert in the inline
           // overlay. The full sidebar also shows its own alert if opened.
           const reason =
             aiResult?.error ||
@@ -7811,10 +7849,14 @@
             '<span class="ai-sparkle" aria-hidden="true">\u26a0\ufe0f</span> ' +
             '<strong>AI unavailable.</strong> ' +
             escapeHtml(String(reason));
+          const note = `AI unavailable. ${reason}`;
+          try { addMessage("system", note); } catch (_) {}
         }
       }
     } catch (err) {
-      inlineResponseContent.textContent = `Error: ${err.message}`;
+      const msg = `Error: ${err.message}`;
+      inlineResponseContent.textContent = msg;
+      try { addMessage("system", msg); } catch (_) {}
     } finally {
       isProcessing = false;
       inlineSendBtn.disabled = false;
