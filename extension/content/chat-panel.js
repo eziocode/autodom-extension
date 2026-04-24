@@ -228,6 +228,7 @@
     providerSource: "ide",  // snapshotted from popup's aiProviderSource
     cliKind: "",            // snapshotted from popup's aiProviderCliKind (only when source==="ide")
     defaultModel: "",       // snapshotted from popup's aiProviderModel
+    enabled: false,         // snapshotted from popup's aiProviderEnabled
     overrides: {},          // per-provider user overrides, keyed by catalog key
   };
 
@@ -318,6 +319,7 @@
           "aiProviderSource",
           "aiProviderCliKind",
           "aiProviderModel",
+          "aiProviderEnabled",
           STORAGE_KEY_MODEL_OVERRIDES,
         ],
         (items) => {
@@ -326,6 +328,7 @@
           );
           _modelPickerState.cliKind = (items?.aiProviderCliKind || "").toLowerCase();
           _modelPickerState.defaultModel = items?.aiProviderModel || "";
+          _modelPickerState.enabled = items?.aiProviderEnabled === true;
           _modelPickerState.overrides = items?.[STORAGE_KEY_MODEL_OVERRIDES] || {};
           try { _refreshModelPickerUI(); } catch (_) {}
           _requestProviderModels();
@@ -347,6 +350,9 @@
         }
         if (changes.aiProviderModel) {
           _modelPickerState.defaultModel = changes.aiProviderModel.newValue || "";
+        }
+        if (changes.aiProviderEnabled) {
+          _modelPickerState.enabled = changes.aiProviderEnabled.newValue === true;
         }
         if (changes[STORAGE_KEY_MODEL_OVERRIDES]) {
           _modelPickerState.overrides =
@@ -2055,85 +2061,115 @@
     }
 
     /* ─── Model Picker (composer footer) ───────────────────── */
-    .autodom-model-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 4px 4px 0 4px;
+    #${PANEL_ID} .autodom-model-row {
+      position: relative !important;
+      display: flex !important;
+      align-items: center !important;
+      gap: 8px !important;
+      padding: 4px 4px 0 4px !important;
+      width: max-content !important;
+      max-width: 100% !important;
+      overflow: visible !important;
+      z-index: 6 !important;
     }
-    .autodom-model-picker {
-      position: relative;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 3px 10px;
-      border: 1px solid var(--c-border);
-      border-radius: 999px;
-      background: var(--c-surface);
-      color: var(--c-text-2);
-      font-size: 11px;
-      line-height: 1.3;
-      cursor: pointer;
-      user-select: none;
-      transition: border-color 0.15s ease, background-color 0.15s ease;
+    #${PANEL_ID} .autodom-model-picker {
+      position: relative !important;
+      display: inline-flex !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+      gap: 8px !important;
+      min-height: 30px !important;
+      max-width: min(240px, calc(100vw - 72px)) !important;
+      padding: 5px 11px !important;
+      border: 1px solid var(--c-border) !important;
+      border-radius: 999px !important;
+      background: var(--c-surface) !important;
+      color: var(--c-text-2) !important;
+      font-size: 11.5px !important;
+      font-weight: 600 !important;
+      line-height: 1.3 !important;
+      cursor: pointer !important;
+      user-select: none !important;
+      white-space: nowrap !important;
+      transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease !important;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03) !important;
+      overflow: hidden !important;
+      pointer-events: auto !important;
     }
-    .autodom-model-picker:hover,
-    .autodom-model-picker:focus-visible {
-      border-color: var(--c-accent);
-      background: var(--c-surface-2);
-      color: var(--c-text-1);
-      outline: none;
+    #${PANEL_ID} #__autodom_model_picker_label {
+      display: inline-block !important;
+      overflow: hidden !important;
+      text-overflow: ellipsis !important;
+      white-space: nowrap !important;
+      min-width: 0 !important;
+      max-width: 180px !important;
     }
-    .autodom-model-picker[hidden] { display: none !important; }
-    .autodom-model-picker::after {
-      content: "";
-      width: 6px;
-      height: 6px;
-      border-right: 1.5px solid currentColor;
-      border-bottom: 1.5px solid currentColor;
-      transform: rotate(45deg);
-      margin-left: 2px;
-      opacity: 0.7;
+    #${PANEL_ID} .autodom-model-picker:hover,
+    #${PANEL_ID} .autodom-model-picker:focus-visible {
+      border-color: var(--c-accent) !important;
+      background: var(--c-surface-2) !important;
+      color: var(--c-text-1) !important;
+      outline: none !important;
+      box-shadow: 0 0 0 3px var(--c-accent-soft) !important;
     }
-    .autodom-model-menu {
-      position: absolute;
-      bottom: calc(100% + 6px);
-      left: 0;
-      min-width: 220px;
-      background: var(--c-surface-2, #1c1c1e);
-      border: 1px solid var(--c-border);
-      border-radius: 10px;
-      padding: 4px;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
-      z-index: 10;
+    #${PANEL_ID} .autodom-model-picker[hidden] { display: none !important; }
+    #${PANEL_ID} .autodom-model-picker::after {
+      content: "" !important;
+      width: 6px !important;
+      height: 6px !important;
+      border-right: 1.5px solid currentColor !important;
+      border-bottom: 1.5px solid currentColor !important;
+      transform: rotate(45deg) translateY(-1px) !important;
+      margin-left: 2px !important;
+      opacity: 0.78 !important;
+      flex-shrink: 0 !important;
     }
-    .autodom-model-menu[hidden] { display: none !important; }
-    .autodom-model-item {
-      display: block;
-      width: 100%;
-      text-align: left;
-      padding: 6px 10px;
-      border: 0;
-      background: transparent;
-      color: var(--c-text-1);
-      border-radius: 6px;
-      font-size: 12px;
-      cursor: pointer;
+    #${PANEL_ID} .autodom-model-menu {
+      position: absolute !important;
+      bottom: calc(100% + 8px) !important;
+      left: 0 !important;
+      min-width: max(220px, 100%) !important;
+      max-width: min(280px, calc(100vw - 48px)) !important;
+      max-height: 240px !important;
+      overflow-y: auto !important;
+      background: var(--c-surface-2, #1c1c1e) !important;
+      border: 1px solid var(--c-border) !important;
+      border-radius: 12px !important;
+      padding: 4px !important;
+      box-shadow: 0 14px 32px rgba(0, 0, 0, 0.36) !important;
+      z-index: 30 !important;
+      pointer-events: auto !important;
     }
-    .autodom-model-item:hover,
-    .autodom-model-item:focus-visible {
-      background: rgba(255, 255, 255, 0.06);
-      outline: none;
+    #${PANEL_ID} .autodom-model-menu[hidden] { display: none !important; }
+    #${PANEL_ID} .autodom-model-item {
+      display: block !important;
+      width: 100% !important;
+      text-align: left !important;
+      padding: 8px 10px !important;
+      border: 0 !important;
+      background: transparent !important;
+      color: var(--c-text-1) !important;
+      border-radius: 8px !important;
+      font-size: 12px !important;
+      line-height: 1.35 !important;
+      cursor: pointer !important;
+      pointer-events: auto !important;
     }
-    .autodom-model-item .mi-desc {
-      display: block;
-      font-size: 10px;
-      color: var(--c-text-3);
-      margin-top: 1px;
+    #${PANEL_ID} .autodom-model-item:hover,
+    #${PANEL_ID} .autodom-model-item:focus-visible {
+      background: rgba(255, 255, 255, 0.06) !important;
+      outline: none !important;
     }
-    .autodom-model-item.is-active {
-      background: var(--c-accent-soft, rgba(37, 99, 235, 0.15));
-      color: var(--c-text-1);
+    #${PANEL_ID} .autodom-model-item .mi-desc {
+      display: block !important;
+      font-size: 10px !important;
+      color: var(--c-text-3) !important;
+      margin-top: 2px !important;
+      white-space: normal !important;
+    }
+    #${PANEL_ID} .autodom-model-item.is-active {
+      background: var(--c-accent-soft, rgba(37, 99, 235, 0.15)) !important;
+      color: var(--c-text-1) !important;
     }
     .autodom-model-badge {
       display: inline-block;
@@ -3866,15 +3902,20 @@
   _refreshModelPickerUI = function () {
     if (!_modelPickerBtn || !_modelPickerLabel) return;
     const src = _modelPickerState.providerSource;
-    // For the IDE path, the IDE dictates the model — hide the picker to
-    // avoid misleading the user.
-    if (src === "ide" || !src) {
+    // Only show the picker when a direct provider is actually active. In IDE
+    // mode (or when a direct provider is configured but disabled), the picker
+    // would be misleading because it has no effect on the current run.
+    if (src === "ide" || !src || !_modelPickerState.enabled) {
       _modelPickerBtn.hidden = true;
+      _modelPickerClose();
       return;
     }
     _modelPickerBtn.hidden = false;
-    const id = _currentModelId();
+    let id = _currentModelId();
     const models = _modelsForCurrentProvider();
+    if (models.length && id && !models.find((m) => m.id === id)) {
+      id = _validateSelectedModel();
+    }
     const match = models.find((m) => m.id === id);
     _modelPickerLabel.textContent = match ? match.label : id || "Model";
     if (!_modelPickerMenu?.hidden) _renderModelMenu();

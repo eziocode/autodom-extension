@@ -404,6 +404,55 @@ let aiProviderSettings = {
   preset: "custom",
 };
 
+function _readCurrentProviderSettings() {
+  return new Promise((resolve) => {
+    const fallback = async () => {
+      const apiKey = await _readApiKey();
+      resolve({
+        ...aiProviderSettings,
+        apiKey: apiKey || aiProviderSettings.apiKey || "",
+      });
+    };
+
+    try {
+      chrome.storage.local.get(
+        [
+          "aiProviderSource",
+          "aiProviderModel",
+          "aiProviderBaseUrl",
+          "aiProviderCliBinary",
+          "aiProviderCliKind",
+          "aiProviderCliExtraArgs",
+          "aiProviderEnabled",
+          "aiProviderPreset",
+        ],
+        async (result) => {
+          const apiKey = await _readApiKey();
+          resolve({
+            source: result?.aiProviderSource || aiProviderSettings.source || "ide",
+            apiKey: apiKey || aiProviderSettings.apiKey || "",
+            model: result?.aiProviderModel || aiProviderSettings.model || "",
+            baseUrl: result?.aiProviderBaseUrl || aiProviderSettings.baseUrl || "",
+            cliBinary:
+              result?.aiProviderCliBinary || aiProviderSettings.cliBinary || "",
+            cliKind: result?.aiProviderCliKind || aiProviderSettings.cliKind || "",
+            cliExtraArgs:
+              result?.aiProviderCliExtraArgs ||
+              aiProviderSettings.cliExtraArgs ||
+              "",
+            enabled:
+              result?.aiProviderEnabled === true ||
+              aiProviderSettings.enabled === true,
+            preset: result?.aiProviderPreset || aiProviderSettings.preset || "custom",
+          });
+        },
+      );
+    } catch (_) {
+      fallback();
+    }
+  });
+}
+
 function _formatLogText(args) {
   return args
     .map((arg) => {
@@ -737,7 +786,9 @@ function _agentSystemPrompt(context) {
     "You have a Playwright-style toolset to read AND act on the user's browser tab. " +
     "Plan briefly, then call tools to get fresh page state (get_dom_state / get_page_info), " +
     "and act (click_by_index, type_text, navigate, etc.). Prefer click_by_index/type_by_index " +
-    "after a get_dom_state for reliability. When a task spans tabs, use list_tabs/switch_tab/open_new_tab. " +
+    "after a get_dom_state for reliability. Never expose raw internal element shorthand like IC7 or IC8 in your final reply; " +
+    "if you must mention an indexed element, say element #7 and describe it in plain language. " +
+    "When a task spans tabs, use list_tabs/switch_tab/open_new_tab. " +
     "When content opens in a browser popup/window, use wait_for_popup/list_popups and switch_to_popup before reading or acting there. " +
     "Tool results may be truncated. When you have a final answer or finished the user's task, " +
     "STOP calling tools and return your final markdown reply (Anthropic/OpenAI: stop after " +
@@ -2006,7 +2057,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // provider. Live fetch for openai-compatible + ollama; static catalog for
   // anthropic and CLI-backed IDE providers (no public list endpoint).
   if (message.type === "LIST_PROVIDER_MODELS") {
-    _fetchProviderModels(aiProviderSettings)
+    _readCurrentProviderSettings()
+      .then((settings) => _fetchProviderModels(settings))
       .then((models) => sendResponse({ ok: true, models }))
       .catch((err) =>
         sendResponse({ ok: false, error: err?.message || String(err), models: [] }),

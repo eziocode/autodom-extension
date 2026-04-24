@@ -1717,7 +1717,7 @@ function _processWsMessage(socket, message) {
               }
               samplingPrompt += `\nUser request: "${text}"\n\n`;
               samplingPrompt += `You have access to AutoDOM MCP tools (get_dom_state, click_by_index, type_by_index, execute_code, navigate, screenshot, scroll, etc.).\n`;
-              samplingPrompt += `Please fulfill the user's request using the available tools. Respond with a clear, helpful answer describing what you found or did.`;
+              samplingPrompt += `Please fulfill the user's request using the available tools. Respond with a clear, helpful answer describing what you found or did. Never expose raw internal element shorthand like IC7 or IC8 in the final answer; if you need to mention an indexed element, say element #7 and describe it in plain English.`;
 
               const samplingResult = await activeMcpSession.requestSampling(
                 {
@@ -2214,7 +2214,8 @@ function buildProviderSystemPrompt(context) {
   prompt +=
     "You may reference the current page title, URL, and interactive element counts.\n";
   prompt +=
-    "Respond clearly and actionably. If you need more precise browser control, instruct the user to use AutoDOM tools such as /dom, /click, /type, /nav, or IDE agent mode.\n\n";
+    "Respond clearly and actionably. If you need more precise browser control, instruct the user to use AutoDOM tools such as /dom, /click, /type, /nav, or IDE agent mode. " +
+    "Never use raw internal shorthand like IC7 or IC8 in the user-facing answer; if you need to mention an indexed element, say element #7 and describe it in plain English.\n\n";
   prompt += `Page title: ${context?.title || "Unknown"}\n`;
   prompt += `Page URL: ${context?.url || "Unknown"}\n`;
   if (context?.visibleOverlayText) {
@@ -2823,6 +2824,7 @@ server.addTool({
     "textareas, clickable elements) with their index, tag, text, type, name, placeholder, " +
     "href, and value. Use the index with click_by_index or type_by_index for precise " +
     "interaction. This is 50-200x smaller than a full DOM snapshot. " +
+    "If you mention an index in a user-facing answer, call it element #7 (or similar), not IC7. " +
     "Always call this before interacting with page elements to discover what's available.",
   parameters: z.object({
     includeHidden: z
