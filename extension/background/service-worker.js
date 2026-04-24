@@ -2966,6 +2966,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         cliBinary: aiProviderSettings.cliBinary || "",
         cliKind: aiProviderSettings.cliKind || "",
         cliExtraArgs: aiProviderSettings.cliExtraArgs || "",
+        // Forward the model picker selection so CLI/IDE providers honour
+        // the dropdown instead of silently using their built-in default.
+        cliModel:
+          (message.model || "").trim() ||
+          (aiProviderSettings.model || "").trim() ||
+          "",
       },
     };
 

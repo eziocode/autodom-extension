@@ -2193,6 +2193,8 @@ function mergeProviderConfig(incoming = {}) {
       incoming.cliExtraArgs != null
         ? incoming.cliExtraArgs
         : directProviderConfig.cliExtraArgs || "",
+    cliModel:
+      (incoming.cliModel || directProviderConfig.cliModel || "").trim(),
     cliTimeoutMs:
       Number(incoming.cliTimeoutMs) ||
       directProviderConfig.cliTimeoutMs ||
@@ -2537,6 +2539,11 @@ async function callCliProvider({
     .trim()
     .split(/\s+/)
     .filter(Boolean);
+  // Picker-selected model (if any). Honoured per kind below by injecting
+  // a `--model <id>` flag — without this, the dropdown was silently
+  // ignored and every CLI ran on its built-in default model.
+  const pickedModel = (providerConfig.cliModel || "").trim();
+  const modelArgs = pickedModel ? ["--model", pickedModel] : [];
   const configuredTimeout = Number(providerConfig.cliTimeoutMs);
   const timeoutMs =
     Number.isFinite(configuredTimeout) && configuredTimeout > 0
@@ -2565,23 +2572,25 @@ async function callCliProvider({
   let writePromptToStdin = true;
   if (kind === "claude") {
     // `claude -p` reads prompt from stdin in non-interactive (print) mode.
-    args = ["-p", ...extraArgs];
+    args = ["-p", ...modelArgs, ...extraArgs];
   } else if (kind === "codex") {
     // `codex exec -` reads prompt from stdin and prints assistant reply.
     // `--skip-git-repo-check` (must come AFTER `exec`) lets codex run
     // when the server's cwd is not a trusted git repo. Harmless inside
     // a repo too.
-    args = ["exec", "--skip-git-repo-check", "-", ...extraArgs];
+    args = ["exec", "--skip-git-repo-check", ...modelArgs, "-", ...extraArgs];
   } else if (kind === "copilot") {
     // GitHub Copilot CLI takes the prompt via `-p` as an argv string and
     // exits after one response in non-interactive mode. `--allow-all-tools`
     // skips the interactive tool-approval loop which would otherwise hang
     // the spawn forever. Users can still override via extraArgs.
-    args = ["--allow-all-tools", "-p", composedPrompt, ...extraArgs];
+    args = ["--allow-all-tools", ...modelArgs, "-p", composedPrompt, ...extraArgs];
     writePromptToStdin = false;
   } else {
-    // Custom: caller fully controls argv (extraArgs only)
-    args = [...extraArgs];
+    // Custom: caller fully controls argv (extraArgs only). We still pass
+    // --model so picker-selected models propagate to user-supplied CLIs
+    // that accept the standard flag.
+    args = [...modelArgs, ...extraArgs];
   }
 
   process.stderr.write(
