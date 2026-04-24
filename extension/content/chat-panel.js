@@ -288,6 +288,8 @@
   // Takes precedence over MODEL_CATALOG when non-empty.
   const _liveModels = {};
   const _modelFetchState = {}; // key → "idle" | "loading" | "error"
+  let _modelPickerStateLoaded = false;
+  let _pendingActualModelId = "";
 
   function _normalizeProviderSource(src) {
     const s = (src || "").toLowerCase();
@@ -425,7 +427,14 @@
           _modelPickerState.baseUrl = items?.aiProviderBaseUrl || "";
           _modelPickerState.enabled = items?.aiProviderEnabled === true;
           _modelPickerState.overrides = items?.[STORAGE_KEY_MODEL_OVERRIDES] || {};
-          try { _refreshModelPickerUI(); } catch (_) {}
+          _modelPickerStateLoaded = true;
+          const pendingActualModelId = _pendingActualModelId;
+          _pendingActualModelId = "";
+          if (pendingActualModelId) {
+            try { _reconcileActualModel(pendingActualModelId); } catch (_) {}
+          } else {
+            try { _refreshModelPickerUI(); } catch (_) {}
+          }
           _requestProviderModels();
         },
       );
@@ -485,6 +494,10 @@
     if (!actualId || typeof actualId !== "string") return;
     const id = actualId.trim();
     if (!id) return;
+    if (!_modelPickerStateLoaded) {
+      _pendingActualModelId = id;
+      return;
+    }
     const current = _currentModelId();
     if (current === id) return;
     const key = _catalogKey();
@@ -743,9 +756,13 @@
     /* ─── Chat Panel (Sidebar) ────────────────────────────────── */
     /* Page push: when the panel is open, shift the host page's <html>
        over by the panel width so the panel never obscures content.
-       Closing the panel removes the class and the page reflows back. */
+       Closing the panel removes the class and the page reflows back.
+       overflow-x clip prevents host pages with width: 100vw elements
+       from spawning a horizontal scrollbar after the margin shrinks
+       the visible width — affects Windows Chrome/Edge most visibly. */
     html.__autodom_panel_open {
       margin-right: var(--autodom-panel-w, 440px) !important;
+      overflow-x: hidden !important;
       transition: margin-right 0.32s var(--ease-out, cubic-bezier(0.22, 1, 0.36, 1));
     }
     #${PANEL_ID} {
@@ -774,38 +791,54 @@
       pointer-events: auto;
       -webkit-font-smoothing: antialiased;
       -moz-osx-font-smoothing: grayscale;
+      /* Defensive containment: keeps the panel's own paint isolated from
+         host-page reflows during the drag, smoother on Windows + Linux. */
+      contain: layout paint style;
     }
     #${PANEL_ID}.open {
       transform: translateX(0) !important;
     }
-    /* Resize handle on the left edge — invisible 6px hit target, with
-       a thin 1px line on hover/active for affordance. While dragging,
-       transitions are disabled so the panel tracks the cursor 1:1. */
+    /* Resize handle on the left edge.
+       - 8px hit target straddles the panel's left border so the cursor
+         catches it consistently across Mac (Retina), Windows (DPI scaling
+         150%/175%), and Linux/Wayland (fractional scaling).
+       - The visible 2px line sits flush over the existing 1px border and
+         lights up on hover / focus / active.
+       - touch-action: none is required so iPadOS / Windows touchscreens /
+         Chromebooks don't hijack the gesture for page scroll. */
     #${PANEL_ID} .autodom-chat-resize-handle {
       position: absolute !important;
       top: 0 !important;
-      left: 0 !important;
-      width: 6px !important;
+      left: -4px !important;
+      width: 8px !important;
       height: 100% !important;
       cursor: ew-resize !important;
       z-index: 2 !important;
       background: transparent !important;
-      transition: background-color 0.15s ease !important;
+      touch-action: none !important;
+      -webkit-user-select: none !important;
+      user-select: none !important;
+      outline: none !important;
     }
     #${PANEL_ID} .autodom-chat-resize-handle::after {
       content: "" !important;
       position: absolute !important;
       top: 0 !important;
-      left: 2px !important;
-      width: 1px !important;
+      left: 3px !important;
+      width: 2px !important;
       height: 100% !important;
       background: transparent !important;
       transition: background-color 0.15s ease !important;
+      pointer-events: none !important;
     }
     #${PANEL_ID} .autodom-chat-resize-handle:hover::after,
+    #${PANEL_ID} .autodom-chat-resize-handle:focus-visible::after,
     #${PANEL_ID}.is-resizing .autodom-chat-resize-handle::after {
       background: var(--c-accent, #6aa4ff) !important;
     }
+    /* Disable transitions while dragging so the panel + page reflow track
+       the cursor 1:1 (otherwise the 0.32s margin-right ease lags behind
+       and you get a rubber-band feel, especially on Windows trackpads). */
     #${PANEL_ID}.is-resizing,
     html.__autodom_panel_resizing,
     html.__autodom_panel_resizing.__autodom_panel_open {
@@ -3602,8 +3635,16 @@
   panel.setAttribute("role", "complementary");
   panel.setAttribute("aria-label", "AutoDOM AI Chat");
   panel.innerHTML = `
-    <!-- Resize handle (left edge — drag to widen/narrow). Skipped in inline overlay. -->
-    <div class="autodom-chat-resize-handle" id="__autodom_resize_handle" role="separator" aria-orientation="vertical" aria-label="Resize chat panel" tabindex="-1"></div>
+    <!-- Resize handle (left edge — drag, double-click resets, arrows nudge). -->
+    <div class="autodom-chat-resize-handle"
+         id="__autodom_resize_handle"
+         role="separator"
+         aria-orientation="vertical"
+         aria-label="Resize chat panel (drag, double-click to reset, arrow keys to nudge)"
+         aria-valuemin="320"
+         aria-valuemax="800"
+         aria-valuenow="440"
+         tabindex="0"></div>
     <!-- Header -->
     <div class="autodom-chat-header" role="banner">
       <div class="autodom-chat-header-left">
@@ -4080,45 +4121,87 @@
 
   // ─── Resize handle ─────────────────────────────────────────
   // Drag the left edge of the panel to set its width. The width is
-  // committed to chrome.storage on mouseup so it persists across tabs
+  // committed to chrome.storage on release so it persists across tabs
   // and reloads. While dragging, transitions are disabled so the panel
   // tracks the cursor 1:1 and the page reflow stays in lock-step.
+  //
+  // Implementation notes (cross-platform):
+  // - Pointer Events API gives one code path for mouse, touch, and pen
+  //   on macOS, Windows, Linux/Wayland, ChromeOS, and Android.
+  // - setPointerCapture keeps the drag alive even if the cursor leaves
+  //   the panel, crosses an iframe, or briefly enters the host page —
+  //   essential on Windows where iframe boundaries otherwise eat events.
+  // - touch-action: none on the handle (set in CSS) blocks the browser
+  //   from claiming the gesture for page scroll on touchscreens.
+  // - Keyboard: Left/Right adjust by 16px, Shift+arrow by 64px, Home/End
+  //   jump to min/max. ARIA value attrs keep AT in sync.
   (function _wireResizeHandle() {
     const handle = panel.querySelector("#__autodom_resize_handle");
     if (!handle) return;
+    const STEP = 16;
+    const STEP_LARGE = 64;
+
+    function _syncAria() {
+      const w = _clampPanelWidth(_chatSettings.panelWidth);
+      handle.setAttribute("aria-valuemin", String(PANEL_WIDTH_MIN));
+      handle.setAttribute(
+        "aria-valuemax",
+        String(Math.min(PANEL_WIDTH_MAX, Math.floor(window.innerWidth * 0.8))),
+      );
+      handle.setAttribute("aria-valuenow", String(w));
+      handle.setAttribute("aria-valuetext", w + " pixels");
+    }
+    _syncAria();
+
+    function _commitWidth(next, persist) {
+      const w = _clampPanelWidth(next);
+      _chatSettings.panelWidth = w;
+      document.documentElement.style.setProperty(
+        "--autodom-panel-w",
+        w + "px",
+      );
+      _syncAria();
+      if (persist) _saveChatSettings();
+    }
+
     let dragging = false;
     let startX = 0;
     let startW = 0;
+    let activePointerId = null;
+
     const onMove = (e) => {
-      if (!dragging) return;
-      // Width grows as the cursor moves left (panel is anchored to the right).
+      if (!dragging || e.pointerId !== activePointerId) return;
+      // Width grows as the cursor moves left (panel anchored to the right).
       const delta = startX - e.clientX;
-      const next = _clampPanelWidth(startW + delta);
-      _chatSettings.panelWidth = next;
-      document.documentElement.style.setProperty(
-        "--autodom-panel-w",
-        next + "px",
-      );
+      _commitWidth(startW + delta, false);
       e.preventDefault();
     };
-    const onUp = () => {
+    const onEnd = (e) => {
       if (!dragging) return;
+      if (e && e.pointerId !== activePointerId && activePointerId !== null) return;
       dragging = false;
       panel.classList.remove("is-resizing");
       document.documentElement.classList.remove("__autodom_panel_resizing");
-      document.removeEventListener("mousemove", onMove, true);
-      document.removeEventListener("mouseup", onUp, true);
+      try { handle.releasePointerCapture(activePointerId); } catch (_) {}
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", onEnd);
+      handle.removeEventListener("pointercancel", onEnd);
+      activePointerId = null;
       _saveChatSettings();
     };
-    handle.addEventListener("mousedown", (e) => {
-      if (e.button !== 0) return;
+    handle.addEventListener("pointerdown", (e) => {
+      // Primary button only (mouse left / touch contact / pen tip).
+      if (e.pointerType === "mouse" && e.button !== 0) return;
       dragging = true;
+      activePointerId = e.pointerId;
       startX = e.clientX;
       startW = _clampPanelWidth(_chatSettings.panelWidth);
       panel.classList.add("is-resizing");
       document.documentElement.classList.add("__autodom_panel_resizing");
-      document.addEventListener("mousemove", onMove, true);
-      document.addEventListener("mouseup", onUp, true);
+      try { handle.setPointerCapture(e.pointerId); } catch (_) {}
+      handle.addEventListener("pointermove", onMove);
+      handle.addEventListener("pointerup", onEnd);
+      handle.addEventListener("pointercancel", onEnd);
       e.preventDefault();
       e.stopPropagation();
     });
@@ -4126,14 +4209,34 @@
     handle.addEventListener("dblclick", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      _chatSettings.panelWidth = 440;
-      _applyPanelWidth();
-      _saveChatSettings();
+      _commitWidth(440, true);
+    });
+    // Keyboard accessibility: focus the handle then nudge with arrows.
+    handle.setAttribute("tabindex", "0");
+    handle.addEventListener("keydown", (e) => {
+      const w = _clampPanelWidth(_chatSettings.panelWidth);
+      const step = e.shiftKey ? STEP_LARGE : STEP;
+      let next = null;
+      // Left arrow widens the panel (since panel is anchored right);
+      // Right arrow narrows. Mirrors how the visual drag works.
+      if (e.key === "ArrowLeft") next = w + step;
+      else if (e.key === "ArrowRight") next = w - step;
+      else if (e.key === "Home") next = PANEL_WIDTH_MIN;
+      else if (e.key === "End")
+        next = Math.min(PANEL_WIDTH_MAX, Math.floor(window.innerWidth * 0.8));
+      else if (e.key === "Enter" || e.key === " ") {
+        // Activate-style reset, matches double-click affordance.
+        next = 440;
+      } else return;
+      e.preventDefault();
+      e.stopPropagation();
+      _commitWidth(next, true);
     });
   })();
 
   // If the viewport shrinks below the current panel width (e.g. user
-  // narrows the window), re-clamp so the panel never exceeds 80vw.
+  // narrows the window or rotates a tablet), re-clamp so the panel
+  // never exceeds 80vw and the host page stays usable.
   window.addEventListener("resize", () => {
     const before = _chatSettings.panelWidth;
     const after = _clampPanelWidth(before);
