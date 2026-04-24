@@ -3673,7 +3673,8 @@ async function toolScreenshot(params) {
   async function setHiddenState(hidden) {
     try {
       await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
+        target: { tabId: tab.id, allFrames: false },
+        world: "MAIN",
         args: [HIDE_IDS, HIDE_MARK, PUSH_CLASS, PUSH_MARK, hidden],
         func: (ids, mark, pushClass, pushMark, on) => {
           for (const id of ids) {
@@ -3681,11 +3682,33 @@ async function toolScreenshot(params) {
             if (!el) continue;
             if (on) {
               if (!el.hasAttribute(mark)) {
-                el.setAttribute(mark, el.style.visibility || "");
+                // Snapshot BOTH display + visibility so we can restore
+                // exactly what was there (most callers don't set either,
+                // so the snapshot is empty strings — restoring removes
+                // the inline overrides cleanly).
+                el.setAttribute(
+                  mark,
+                  JSON.stringify({
+                    d: el.style.getPropertyValue("display"),
+                    dp: el.style.getPropertyPriority("display"),
+                    v: el.style.getPropertyValue("visibility"),
+                    vp: el.style.getPropertyPriority("visibility"),
+                  }),
+                );
               }
-              el.style.visibility = "hidden";
+              // display:none with !important beats every stylesheet rule
+              // including the panel's own `display: flex !important`.
+              // Removes the element from layout entirely, so it cannot
+              // appear in the captured PNG.
+              el.style.setProperty("display", "none", "important");
+              el.style.setProperty("visibility", "hidden", "important");
             } else if (el.hasAttribute(mark)) {
-              el.style.visibility = el.getAttribute(mark);
+              let prev = { d: "", dp: "", v: "", vp: "" };
+              try { prev = JSON.parse(el.getAttribute(mark)) || prev; } catch (_) {}
+              el.style.removeProperty("display");
+              el.style.removeProperty("visibility");
+              if (prev.d) el.style.setProperty("display", prev.d, prev.dp);
+              if (prev.v) el.style.setProperty("visibility", prev.v, prev.vp);
               el.removeAttribute(mark);
             }
           }
@@ -3701,9 +3724,29 @@ async function toolScreenshot(params) {
                 html.setAttribute(pushMark, "1");
                 html.classList.remove(pushClass);
               }
-            } else if (html.hasAttribute(pushMark)) {
-              html.classList.add(pushClass);
-              html.removeAttribute(pushMark);
+              // Also clear the panel-width CSS variable so any host-page
+              // CSS that depends on it reflows for the capture.
+              const root = document.documentElement;
+              if (root && root.style.getPropertyValue("--autodom-panel-w")) {
+                root.setAttribute(
+                  "data-autodom-prev-pw",
+                  root.style.getPropertyValue("--autodom-panel-w"),
+                );
+                root.style.removeProperty("--autodom-panel-w");
+              }
+            } else {
+              if (html.hasAttribute(pushMark)) {
+                html.classList.add(pushClass);
+                html.removeAttribute(pushMark);
+              }
+              const root = document.documentElement;
+              if (root && root.hasAttribute("data-autodom-prev-pw")) {
+                root.style.setProperty(
+                  "--autodom-panel-w",
+                  root.getAttribute("data-autodom-prev-pw"),
+                );
+                root.removeAttribute("data-autodom-prev-pw");
+              }
             }
           }
         },
@@ -3717,9 +3760,10 @@ async function toolScreenshot(params) {
   try {
     await setHiddenState(true);
     hidden = true;
-    // Two animation frames so the reflow + visibility change paint
-    // before capture. 60ms covers most layout settles on slow pages.
-    await new Promise((r) => setTimeout(r, 60));
+    // Two animation frames + a margin so the reflow + display-none
+    // change paint before capture. captureVisibleTab snapshots the
+    // current paint, so we MUST wait long enough for the compositor.
+    await new Promise((r) => setTimeout(r, 120));
 
     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
       format: params?.format || "png",

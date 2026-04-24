@@ -794,11 +794,14 @@
 
   function persistChatState(immediate = false, flushLongLived = false) {
     if (_contextInvalidated) return;
-    _pendingChatStateSnapshot = _buildChatStateSnapshot();
     if (immediate) {
+      _pendingChatStateSnapshot = _buildChatStateSnapshot();
       _flushChatStatePersist(flushLongLived);
       return;
     }
+    // During the debounce window, let the timer build the latest snapshot
+    // once instead of re-slicing both arrays on every addMessage/_pushHistory.
+    _pendingChatStateSnapshot = null;
     if (_chatStatePersistTimer) return;
     _chatStatePersistTimer = setTimeout(() => {
       _flushChatStatePersist();
