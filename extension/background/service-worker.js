@@ -17,6 +17,9 @@ try {
   if (typeof importScripts === "function" && !globalThis.AutoDOMAgent) {
     importScripts("agent-tools.js");
   }
+  if (typeof importScripts === "function" && !globalThis.AutoDOMActionGate) {
+    importScripts("action-gate.js");
+  }
 } catch (_) {
   // Already loaded (Firefox path) — ignore.
 }
@@ -490,16 +493,19 @@ function _withAgentTabContext(ctx, fn) {
 }
 
 // Single execution path for tool calls coming from the agent. Keeps rate
-// limiting; bypasses the sensitive-action confirmation gate per user
-// request ("auto-run all tools").
+// limiting and routes every call through the Ask-Before-Act ActionGate
+// middleware (action-gate.js). Denied actions short-circuit here with a
+// structured { ok:false, denied:true, reason } so the agent can replan.
 async function executeAgentTool(toolName, params) {
   const handler = TOOL_HANDLERS.get(toolName);
   if (!handler) {
     return { ok: false, error: `Unknown tool: ${toolName}` };
   }
   // Rate limit (re-uses bridge logic)
+  let _gateTab;
   try {
     const tab = await getActiveTab();
+    _gateTab = tab;
     const domain = getDomainFromTab(tab);
     const rateCheck = checkRateLimit(domain);
     if (!rateCheck.allowed) {
@@ -509,6 +515,34 @@ async function executeAgentTool(toolName, params) {
       };
     }
   } catch (_) {}
+
+  // ── ActionGate: Ask Before Act ──────────────────────────────
+  const Gate = globalThis.AutoDOMActionGate;
+  if (Gate) {
+    try {
+      const origin = Gate.normalizeOrigin(_gateTab?.url || "");
+      const decision = await Gate.requestDecision({
+        tabId: _gateTab?.id,
+        origin,
+        toolName,
+        params,
+      });
+      if (!decision?.allowed) {
+        return {
+          ok: false,
+          denied: true,
+          error: decision?.reason || `Action '${toolName}' denied by user`,
+        };
+      }
+    } catch (err) {
+      // Fail closed: if the gate itself crashes, refuse the action.
+      return {
+        ok: false,
+        denied: true,
+        error: `ActionGate error: ${err?.message || String(err)}`,
+      };
+    }
+  }
 
   // Mark the active run as "mid-tool" so the UI can distinguish a run
   // that's actively executing a browser tool from one that's merely
@@ -1949,6 +1983,59 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async
   }
 
+  // ── ActionGate messages ─────────────────────────────────────
+  if (message.type === "ACTION_GATE_DECISION") {
+    const delivered = globalThis.AutoDOMActionGate?.deliverDecision(
+      message.requestId,
+      message.decision || { allowed: false, reason: "No decision" },
+    );
+    sendResponse({ ok: !!delivered });
+    return false;
+  }
+  if (message.type === "ACTION_GATE_GET_STATE") {
+    (async () => {
+      const Gate = globalThis.AutoDOMActionGate;
+      if (!Gate) return sendResponse({ ok: false, error: "ActionGate unavailable" });
+      sendResponse({
+        ok: true,
+        settings: await Gate.getSettings(),
+        permissions: await Gate.getPermissions(),
+        audit: await Gate.getAuditLog(),
+      });
+    })();
+    return true;
+  }
+  if (message.type === "ACTION_GATE_UPDATE_SETTINGS") {
+    (async () => {
+      const settings = await globalThis.AutoDOMActionGate?.setSettings(
+        message.patch || {},
+      );
+      sendResponse({ ok: true, settings });
+    })();
+    return true;
+  }
+  if (message.type === "ACTION_GATE_REVOKE_ORIGIN") {
+    (async () => {
+      await globalThis.AutoDOMActionGate?.revokePermission(message.origin);
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
+  if (message.type === "ACTION_GATE_CLEAR_PERMISSIONS") {
+    (async () => {
+      await globalThis.AutoDOMActionGate?.clearAllPermissions();
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
+  if (message.type === "ACTION_GATE_CLEAR_AUDIT") {
+    (async () => {
+      await globalThis.AutoDOMActionGate?.clearAuditLog();
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
+
   if (message.type === "RUN_AUTOMATION_SCRIPT") {
     const params = message.params || {};
     if ((params.backend || "browser-extension") === "browser-extension") {
@@ -2014,19 +2101,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "VALIDATE_AUTOMATION_SCRIPT") {
     const params = message.params || {};
     if ((params.backend || "browser-extension") === "browser-extension") {
-      try {
-        new Function(
-          "params",
-          "log",
-          `"use strict"; return (async () => {\n${params.source || ""}\n})()`,
-        );
-        sendResponse({ ok: true, backend: "browser-extension" });
-      } catch (err) {
+      // MV3 service-worker CSP blocks `new Function` / eval, so parse-by-compile
+      // isn't available here. Match the server's approach for Playwright/Node
+      // (see server/automation/backends.js: validateAutomationScript) and defer
+      // real syntax checking to run time, where the script is compiled in the
+      // page's main world via executeInTab.
+      const src = String(params.source || "").trim();
+      if (!src) {
         sendResponse({
           ok: false,
           backend: "browser-extension",
-          error: `JavaScript syntax error: ${err.message}`,
+          error: "Script source is empty",
         });
+      } else {
+        sendResponse({ ok: true, backend: "browser-extension" });
       }
       return false;
     }

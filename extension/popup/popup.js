@@ -15,7 +15,6 @@ const DOM = {
   statusCard: $("#statusCard"),
   statusLabel: $("#statusLabel"),
   statusDetail: $("#statusDetail"),
-  tabTitle: $("#tabTitle"),
   tabUrl: $("#tabUrl"),
   logContainer: $("#logContainer"),
   logFilter: $("#logFilter"),
@@ -79,6 +78,7 @@ let providerSettings = {
   enabled: false,
   preset: "custom",
 };
+const TAB_ACTIVATED_EVENT = "autodom:tab-activated";
 
 // Provider presets — each maps a vendor to the underlying API protocol
 // AutoDOM already speaks (openai-compatible / anthropic / ollama) plus
@@ -526,18 +526,14 @@ const _secretAreaName =
   }
 
   initScriptRunner();
+  initSecurityTab();
 });
 
 // ─── Tab Switching ───────────────────────────────────────────
 function initTabs() {
-  const tabs = $$(".tab");
-  const tabContents = $$(".tab-content");
-  tabs.forEach((tab) => {
+  $$(".tab").forEach((tab) => {
     tab.addEventListener("click", () => {
-      tabs.forEach((t) => t.classList.remove("active"));
-      tabContents.forEach((tc) => tc.classList.remove("active"));
-      tab.classList.add("active");
-      $(`#tab-${tab.dataset.tab}`).classList.add("active");
+      activateTab(tab.dataset.tab);
     });
   });
 
@@ -582,13 +578,36 @@ function initTabs() {
   });
 }
 
+function activateTab(tabName) {
+  if (!tabName) return false;
+
+  let activated = false;
+  $$(".tab").forEach((tab) => {
+    const isActive = tab.dataset.tab === tabName;
+    tab.classList.toggle("active", isActive);
+    activated = activated || isActive;
+  });
+  $$(".tab-content").forEach((content) => {
+    content.classList.toggle("active", content.id === `tab-${tabName}`);
+  });
+
+  if (activated) {
+    document.dispatchEvent(
+      new CustomEvent(TAB_ACTIVATED_EVENT, {
+        detail: { tab: tabName },
+      }),
+    );
+  }
+
+  return activated;
+}
+
 // ─── Config Generation ───────────────────────────────────────
 function generateConfigs(port, detectedPath) {
   const isDetected = !!detectedPath;
   const serverPath = detectedPath || "autodom-extension/server/index.js";
 
   const portArgs = port !== 9876 ? `, "--port", "${port}"` : "";
-  const tomlPortArgs = port !== 9876 ? `, "--port", "${port}"` : "";
 
   $("#configPort").textContent = port;
 
@@ -618,12 +637,7 @@ args = ${tomlArgs}`;
 
 // ─── Event Listeners ─────────────────────────────────────────
 DOM.actionBtn.addEventListener("click", () => {
-  // Switch to Config tab
-  $$(".tab").forEach((t) => t.classList.remove("active"));
-  $$(".tab-content").forEach((tc) => tc.classList.remove("active"));
-
-  $('[data-tab="config"]').classList.add("active");
-  $("#tab-config").classList.add("active");
+  activateTab("config");
 });
 
 // ─── AI Chat Button ──────────────────────────────────────────
@@ -1600,11 +1614,128 @@ function initToolLogsTab() {
   if (sourceFilter) sourceFilter.addEventListener("change", renderToolLogs);
 
   // Auto-load when tab becomes active
-  $$(".tab").forEach((tab) => {
-    tab.addEventListener("click", () => {
-      if (tab.dataset.tab === "logs") fetchToolLogs();
-    });
+  document.addEventListener(TAB_ACTIVATED_EVENT, (event) => {
+    if (event.detail?.tab === "logs") fetchToolLogs();
   });
 }
 
 initToolLogsTab();
+
+// ─── Security tab (Ask Before Act) ───────────────────────────
+function initSecurityTab() {
+  const enabled = $("#gateEnabledToggle");
+  const silent = $("#gateSilentReadsToggle");
+  const permTable = $("#permTable");
+  const auditContainer = $("#auditContainer");
+  const refreshPerms = $("#refreshPermsBtn");
+  const clearPerms = $("#clearPermsBtn");
+  const refreshAudit = $("#refreshAuditBtn");
+  const clearAudit = $("#clearAuditBtn");
+  if (!enabled || !silent || !permTable || !auditContainer) return;
+
+  async function loadState() {
+    const resp = await sendRuntimeMessage({ type: "ACTION_GATE_GET_STATE" });
+    if (!resp?.ok) {
+      permTable.innerHTML = `<div class="log-entry log-error">Failed to load: ${resp?.error || "unknown"}</div>`;
+      return;
+    }
+    enabled.checked = !!resp.settings?.enabled;
+    silent.checked = !!resp.settings?.silentReads;
+    renderPermissions(resp.permissions || {});
+    renderAudit(resp.audit || []);
+  }
+
+  function renderPermissions(perms) {
+    const origins = Object.keys(perms);
+    if (!origins.length) {
+      permTable.innerHTML =
+        '<div class="log-entry log-info">No per-site permissions saved yet.</div>';
+      return;
+    }
+    permTable.innerHTML = "";
+    origins.sort().forEach((origin) => {
+      const row = document.createElement("div");
+      row.className = "perm-row";
+      const left = document.createElement("div");
+      const o = document.createElement("div");
+      o.className = "perm-origin";
+      o.textContent = origin;
+      const cats = document.createElement("div");
+      cats.className = "perm-cats";
+      const pairs = Object.entries(perms[origin]?.categories || {})
+        .map(([k, v]) => `${k}:${v}`)
+        .join("  ");
+      cats.textContent = pairs || "no rules";
+      left.appendChild(o);
+      left.appendChild(cats);
+      const btn = document.createElement("button");
+      btn.className = "perm-revoke";
+      btn.textContent = "Revoke";
+      btn.addEventListener("click", async () => {
+        await sendRuntimeMessage({ type: "ACTION_GATE_REVOKE_ORIGIN", origin });
+        loadState();
+      });
+      row.appendChild(left);
+      row.appendChild(btn);
+      permTable.appendChild(row);
+    });
+  }
+
+  function renderAudit(entries) {
+    if (!entries.length) {
+      auditContainer.innerHTML =
+        '<div class="log-entry log-info">No audited actions yet.</div>';
+      return;
+    }
+    auditContainer.innerHTML = "";
+    // Newest first
+    entries
+      .slice()
+      .reverse()
+      .forEach((e) => {
+        const row = document.createElement("div");
+        row.className = "audit-row";
+        const ts = new Date(e.t || Date.now()).toLocaleTimeString();
+        const cls = e.decision?.startsWith("allow")
+          ? "audit-decision-allow"
+          : "audit-decision-deny";
+        row.innerHTML =
+          `<span>${ts}</span>` +
+          `<span class="${cls}">${escapeHtml(e.decision || "?")}</span>` +
+          `<span>${escapeHtml(e.category || "?")}</span>` +
+          `<span>${escapeHtml(e.toolName || "?")}</span>` +
+          `<span style="flex:1;color:var(--text-muted)">${escapeHtml(e.origin || "")}</span>`;
+        auditContainer.appendChild(row);
+      });
+  }
+
+  enabled.addEventListener("change", () =>
+    sendRuntimeMessage({
+      type: "ACTION_GATE_UPDATE_SETTINGS",
+      patch: { enabled: enabled.checked },
+    }),
+  );
+  silent.addEventListener("change", () =>
+    sendRuntimeMessage({
+      type: "ACTION_GATE_UPDATE_SETTINGS",
+      patch: { silentReads: silent.checked },
+    }),
+  );
+  refreshPerms?.addEventListener("click", loadState);
+  refreshAudit?.addEventListener("click", loadState);
+  clearPerms?.addEventListener("click", async () => {
+    await sendRuntimeMessage({ type: "ACTION_GATE_CLEAR_PERMISSIONS" });
+    loadState();
+  });
+  clearAudit?.addEventListener("click", async () => {
+    await sendRuntimeMessage({ type: "ACTION_GATE_CLEAR_AUDIT" });
+    loadState();
+  });
+
+  // Refresh whenever the user actually opens the tab.
+  document.addEventListener(TAB_ACTIVATED_EVENT, (event) => {
+    if (event.detail?.tab === "security") loadState();
+  });
+
+  loadState();
+}

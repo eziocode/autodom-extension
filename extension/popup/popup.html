@@ -29,6 +29,7 @@
 	            <nav class="tab-bar">
 	                <button class="tab active" data-tab="status">Status</button>
 	                <button class="tab" data-tab="scripts">Scripts</button>
+	                <button class="tab" data-tab="security">Security</button>
 	                <button class="tab" data-tab="config">Config</button>
 	                <button class="tab" data-tab="logs">Logs</button>
 	            </nav>
@@ -383,7 +384,58 @@ return { title: document.title, url: location.href };"
 	                    </section>
 	                </div>
 	
-	                <div class="tab-content" id="tab-config">
+	                <div class="tab-content" id="tab-security">
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Ask Before Act</span>
+                        </div>
+                        <div class="field-stack">
+                            <label class="toggle-row">
+                                <input type="checkbox" id="gateEnabledToggle" />
+                                <span>Prompt before mutating actions</span>
+                            </label>
+                            <label class="toggle-row">
+                                <input type="checkbox" id="gateSilentReadsToggle" />
+                                <span>Skip prompts for read-only actions</span>
+                            </label>
+                            <p class="field-hint">
+                                Destructive actions (navigate, scripts, cookies, storage) always prompt.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Site Permissions</span>
+                            <div class="log-toolbar">
+                                <button class="text-btn" id="refreshPermsBtn">Refresh</button>
+                                <button class="text-btn" id="clearPermsBtn">Clear all</button>
+                            </div>
+                        </div>
+                        <div class="perm-table" id="permTable">
+                            <div class="log-entry log-info">
+                                No per-site permissions saved yet.
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Audit Log</span>
+                            <div class="log-toolbar">
+                                <button class="text-btn" id="refreshAuditBtn">Refresh</button>
+                                <button class="text-btn" id="clearAuditBtn">Clear</button>
+                            </div>
+                        </div>
+                        <div class="log-container" id="auditContainer">
+                            <div class="log-entry log-info">
+                                No audited actions yet.
+                            </div>
+                        </div>
+                    </section>
+                </div>
+
+                <div class="tab-content" id="tab-config">
                     <section class="panel">
                         <div class="panel-header">
                             <span class="section-label">Setup Config</span>

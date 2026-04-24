@@ -336,15 +336,28 @@
     }
     /* ─── Defensive reset (page CSS isolation) ─────────────────
        The panel is injected into the host page, so site stylesheets
-       (e.g. Zoho CRM) can bleed in and override our sizes. Lock the
-       most layout-critical properties with !important. */
-    #${PANEL_ID},
+       (e.g. Zoho CRM, GitHub, docs sites) can bleed in and override
+       our sizes / typography / surfaces. Reset descendants to a clean
+       baseline; explicit class rules below re-apply our intended
+       values (and win on specificity). Container itself keeps its
+       background/border/box-shadow defined above. */
     #${PANEL_ID} * {
       box-sizing: border-box !important;
       font-family: var(--font) !important;
+      font-weight: 400;
+      font-style: normal;
+      font-size: inherit;
+      line-height: inherit;
       letter-spacing: normal;
       text-transform: none;
       text-shadow: none;
+      text-decoration: none;
+      vertical-align: baseline;
+      float: none;
+      color: inherit;
+      background: transparent;
+      border: 0;
+      box-shadow: none;
     }
     #${PANEL_ID} svg {
       display: inline-block !important;
@@ -407,8 +420,9 @@
       display: flex;
       align-items: center;
       justify-content: center;
-      width: 30px;
-      height: 30px;
+      width: 30px !important;
+      height: 30px !important;
+      padding: 0 !important;
       background: transparent;
       border: none;
       color: var(--c-text-3);
@@ -416,7 +430,7 @@
       border-radius: 8px;
       transition: color 0.15s ease, background-color 0.15s ease;
       font-family: inherit;
-      flex-shrink: 0;
+      flex-shrink: 0 !important;
     }
     .autodom-chat-close-btn:hover {
       background: var(--c-surface);
@@ -427,10 +441,10 @@
       outline-offset: 2px;
     }
     .autodom-chat-close-btn svg {
-      width: 14px;
-      height: 14px;
-      fill: none;
-      stroke: currentColor;
+      width: 14px !important;
+      height: 14px !important;
+      fill: none !important;
+      stroke: currentColor !important;
       stroke-width: 2.5;
       stroke-linecap: round;
       stroke-linejoin: round;
@@ -2818,6 +2832,85 @@
         animation: none !important;
       }
     }
+    .autodom-gate-card {
+      border: 1px solid var(--c-border, #3a3a3a);
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: var(--c-surface-2, #1c1c1e);
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+      outline: none;
+    }
+    .autodom-gate-card:focus-visible {
+      box-shadow: 0 0 0 2px var(--c-accent, #6aa4ff);
+    }
+    .autodom-gate-card[data-gate-category="destructive"] {
+      border-color: #d14343;
+    }
+    .autodom-gate-title {
+      font-weight: 600;
+      font-size: 12px;
+      color: var(--c-text-1, #eaeaea);
+      margin-bottom: 4px;
+    }
+    .autodom-gate-card[data-gate-category="destructive"] .autodom-gate-title {
+      color: #ff7878;
+    }
+    .autodom-gate-tool {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+      color: var(--c-text-2, #b8b8b8);
+      margin-bottom: 6px;
+      word-break: break-all;
+    }
+    .autodom-gate-preview {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+      color: var(--c-text-2, #b8b8b8);
+      background: rgba(255, 255, 255, 0.03);
+      border-radius: 6px;
+      padding: 6px 8px;
+      max-height: 140px;
+      overflow: auto;
+      white-space: pre-wrap;
+      margin: 0 0 8px 0;
+    }
+    .autodom-gate-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .autodom-gate-btn {
+      font: inherit;
+      font-size: 12px;
+      padding: 5px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--c-border, #3a3a3a);
+      background: transparent;
+      color: var(--c-text-1, #eaeaea);
+      cursor: pointer;
+    }
+    .autodom-gate-btn:hover:not(:disabled) {
+      background: rgba(255, 255, 255, 0.06);
+    }
+    .autodom-gate-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .autodom-gate-btn.allow {
+      background: var(--c-accent, #2563eb);
+      border-color: transparent;
+      color: #fff;
+    }
+    .autodom-gate-btn.deny {
+      color: #ff7878;
+      border-color: #5a2a2a;
+    }
+    .autodom-gate-status {
+      margin-top: 6px;
+      font-size: 11px;
+      color: var(--c-text-2, #b8b8b8);
+      font-style: italic;
+    }
   `;
   document.documentElement.appendChild(style);
 
@@ -3804,6 +3897,117 @@
       } catch (_) {}
     });
     return btn;
+  }
+
+  // ─── Ask Before Act: inline confirmation card ───────────────
+  function renderActionGateCard(req) {
+    clearWelcome();
+    const card = document.createElement("div");
+    card.className = "autodom-chat-msg system autodom-gate-card";
+    card.dataset.gateRequestId = req.requestId;
+    card.dataset.gateCategory = req.category || "mutating";
+
+    const title = document.createElement("div");
+    title.className = "autodom-gate-title";
+    const riskLabel =
+      req.category === "destructive"
+        ? "Destructive action"
+        : req.category === "safe-read"
+          ? "Read action"
+          : "Page mutation";
+    title.textContent = `${riskLabel} — confirm to proceed`;
+
+    const tool = document.createElement("div");
+    tool.className = "autodom-gate-tool";
+    tool.textContent = `${req.toolName} · ${req.origin || "unknown origin"}`;
+
+    const preview = document.createElement("pre");
+    preview.className = "autodom-gate-preview";
+    preview.textContent = req.params || "{}";
+
+    const btnRow = document.createElement("div");
+    btnRow.className = "autodom-gate-actions";
+
+    const allowBtn = document.createElement("button");
+    allowBtn.className = "autodom-gate-btn allow";
+    allowBtn.textContent = "Allow once";
+
+    const allowSiteBtn = document.createElement("button");
+    allowSiteBtn.className = "autodom-gate-btn allow-site";
+    allowSiteBtn.textContent = `Allow on ${shortOrigin(req.origin)}`;
+    // Destructive actions cannot be persisted without Full Trust (v2).
+    if (req.category === "destructive") {
+      allowSiteBtn.disabled = true;
+      allowSiteBtn.title = "Destructive actions always require per-call approval";
+    }
+
+    const denyBtn = document.createElement("button");
+    denyBtn.className = "autodom-gate-btn deny";
+    denyBtn.textContent = "Deny";
+
+    const finish = (decision) => {
+      allowBtn.disabled = true;
+      allowSiteBtn.disabled = true;
+      denyBtn.disabled = true;
+      const status = document.createElement("div");
+      status.className = "autodom-gate-status";
+      status.textContent = decision.allowed
+        ? decision.persist === "origin"
+          ? "Allowed on this site"
+          : "Allowed once"
+        : "Denied";
+      card.appendChild(status);
+      try {
+        chrome.runtime.sendMessage({
+          type: "ACTION_GATE_DECISION",
+          requestId: req.requestId,
+          decision,
+        });
+      } catch (_) {}
+    };
+
+    allowBtn.addEventListener("click", () => finish({ allowed: true }));
+    allowSiteBtn.addEventListener("click", () =>
+      finish({ allowed: true, persist: "origin" }),
+    );
+    denyBtn.addEventListener("click", () =>
+      finish({ allowed: false, reason: "User denied" }),
+    );
+
+    btnRow.appendChild(allowBtn);
+    btnRow.appendChild(allowSiteBtn);
+    btnRow.appendChild(denyBtn);
+
+    card.appendChild(title);
+    card.appendChild(tool);
+    card.appendChild(preview);
+    card.appendChild(btnRow);
+
+    // Keyboard: Enter = allow once, Esc = deny.
+    card.tabIndex = 0;
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        allowBtn.click();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        denyBtn.click();
+      }
+    });
+
+    messagesContainer.appendChild(card);
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    // Focus so keyboard shortcuts work without a click.
+    try { card.focus(); } catch (_) {}
+  }
+
+  function shortOrigin(origin) {
+    if (!origin) return "site";
+    try {
+      return new URL(origin).host || origin;
+    } catch (_) {
+      return origin;
+    }
   }
 
   function addMessage(role, content, extra) {
@@ -6112,6 +6316,20 @@
       try {
         appendAgentToolChip(message.event);
       } catch (_) {}
+      return;
+    }
+    if (message.type === "ACTION_GATE_REQUEST" && message.requestId) {
+      try {
+        renderActionGateCard(message);
+      } catch (err) {
+        try {
+          chrome.runtime.sendMessage({
+            type: "ACTION_GATE_DECISION",
+            requestId: message.requestId,
+            decision: { allowed: false, reason: err?.message || String(err) },
+          });
+        } catch (_) {}
+      }
       return;
     }
     // ─── Agent run state changed (e.g. user switched to this tab

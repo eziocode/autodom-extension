@@ -713,6 +713,81 @@ select.config-input {
     background: var(--danger-bg);
 }
 
+/* ── Security tab ─────────────────────────────────────────── */
+.toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-primary);
+    padding: 4px 0;
+    cursor: pointer;
+}
+
+.toggle-row input[type="checkbox"] {
+    accent-color: var(--accent, #2563eb);
+}
+
+.perm-table {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+.perm-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-raised);
+    font-size: 11px;
+}
+
+.perm-row .perm-origin {
+    font-family: var(--mono);
+    color: var(--text-primary);
+    flex: 1;
+    word-break: break-all;
+}
+
+.perm-row .perm-cats {
+    color: var(--text-muted);
+    font-size: 10px;
+}
+
+.perm-row .perm-revoke {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--danger, #d14343);
+    cursor: pointer;
+}
+
+.audit-row {
+    display: flex;
+    gap: 6px;
+    align-items: flex-start;
+    font-size: 11px;
+    font-family: var(--mono);
+    padding: 4px 6px;
+    border-bottom: 1px solid var(--border);
+}
+
+.audit-row .audit-decision-allow {
+    color: var(--success, #16a34a);
+}
+
+.audit-row .audit-decision-deny {
+    color: var(--danger, #d14343);
+}
+
 /* Hide
 
 /* CLI binary prompt — appears under "Local CLI" provider inputs */

@@ -79,7 +79,6 @@ Then:
 4. Open the AutoDOM popup → confirm it says **Connected**.
 5. Your AI agent now has 70 browser-automation tools.
 
-For a step-by-step walkthrough, see **[GETTING-STARTED.md](GETTING-STARTED.md)**.
 For per-IDE setup, manual install, ports, and uninstall, see **[INSTALL.md](INSTALL.md)**.
 
 ---
@@ -190,7 +189,6 @@ autodom-extension/
 ├── dist/                   # prebuilt artifacts (Chrome zip, Firefox xpi)
 ├── setup.sh                # one-shot installer
 ├── INSTALL.md              # detailed install + per-IDE setup
-├── GETTING-STARTED.md      # gentle walkthrough
 └── SECURITY.md             # auth model, secret storage, permissions
 ```
 
