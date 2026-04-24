@@ -1740,6 +1740,17 @@
       min-height: 28px;
       box-shadow: none !important;
     }
+    /* Reserve a small top-right float so the absolutely-positioned
+       hover copy button never overlaps the first line of an assistant
+       reply. Invisible block; only affects text wrapping. */
+    .autodom-chat-msg.assistant > .md::before,
+    .autodom-chat-msg.ai-response > .md::before {
+      content: "";
+      float: right;
+      width: 28px;
+      height: 22px;
+      shape-outside: inset(0);
+    }
     .autodom-chat-msg .md,
     .autodom-chat-msg .md * {
       position: static !important;

@@ -549,7 +549,15 @@ return { title: document.title, url: location.href };"
                             <div class="field-row accent-custom-row">
                                 <label class="field-label accent-custom-label" for="chatAccentCustom">Custom</label>
                                 <input type="color" id="chatAccentCustom" class="accent-custom-input" value="#ef4444" aria-label="Custom accent colour" />
+                                <span class="accent-preview" id="chatAccentPreview" aria-hidden="true">
+                                    <span class="accent-preview-tone accent-preview-tone-1"></span>
+                                    <span class="accent-preview-tone accent-preview-tone-2"></span>
+                                </span>
                                 <button type="button" class="text-btn" id="chatAccentReset">Reset</button>
+                            </div>
+                            <div class="field-row accent-apply-row">
+                                <button type="button" class="primary-btn accent-apply-btn" id="chatAccentApply">Apply to chat panel</button>
+                                <span class="accent-apply-status" id="chatAccentStatus" role="status" aria-live="polite"></span>
                             </div>
                             <p class="field-hint">
                                 Picks the chat panel accent (buttons, focus ring, gradient highlight). The brighter dual-tone shade is auto-derived.

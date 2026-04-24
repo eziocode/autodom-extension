@@ -556,25 +556,75 @@ function initChatAppearanceTab() {
   const swatchesEl = document.getElementById("chatAccentSwatches");
   const customInput = document.getElementById("chatAccentCustom");
   const resetBtn = document.getElementById("chatAccentReset");
-  if (!themeSelect || !swatchesEl || !customInput || !resetBtn) return;
+  const applyBtn = document.getElementById("chatAccentApply");
+  const statusEl = document.getElementById("chatAccentStatus");
+  const previewEl = document.getElementById("chatAccentPreview");
+  if (!themeSelect || !swatchesEl || !customInput || !resetBtn || !applyBtn)
+    return;
 
   const swatches = Array.from(swatchesEl.querySelectorAll(".accent-swatch"));
 
-  function reflectAccentSelection(value) {
+  // The currently *staged* accent (what the user picked but hasn't
+  // applied yet). Empty string = "use theme default".
+  let pendingAccent = "";
+  // The accent currently persisted in storage. We use this to drive
+  // the Apply button's enabled state so the user can see whether their
+  // selection differs from what's already live in the chat panel.
+  let appliedAccent = "";
+  let statusTimer = null;
+
+  function updatePreview(value) {
+    if (!previewEl) return;
+    if (!value) {
+      previewEl.classList.add("is-default");
+      previewEl.style.removeProperty("--preview-1");
+      previewEl.style.removeProperty("--preview-2");
+      return;
+    }
+    previewEl.classList.remove("is-default");
+    previewEl.style.setProperty("--preview-1", value);
+    previewEl.style.setProperty(
+      "--preview-2",
+      `color-mix(in oklch, ${value} 78%, white)`,
+    );
+  }
+
+  function refreshApplyState() {
+    const dirty = pendingAccent !== appliedAccent;
+    applyBtn.disabled = !dirty;
+    applyBtn.classList.toggle("is-dirty", dirty);
+  }
+
+  function flashStatus(msg) {
+    if (!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.classList.add("is-visible");
+    if (statusTimer) clearTimeout(statusTimer);
+    statusTimer = setTimeout(() => {
+      statusEl.classList.remove("is-visible");
+    }, 1800);
+  }
+
+  function reflectAccentSelection(value, { stageOnly = false } = {}) {
     const v = value || "";
+    pendingAccent = v;
     let matched = false;
     swatches.forEach((sw) => {
       const isMatch = (sw.dataset.accent || "") === v;
       sw.setAttribute("aria-checked", isMatch ? "true" : "false");
       if (isMatch) matched = true;
     });
-    // If user picked a custom hex that is not one of the presets,
-    // reflect it on the colour input + clear the swatches so the UI
-    // stays consistent.
     if (!matched && v) {
       try {
         customInput.value = v;
       } catch (_) {}
+    }
+    updatePreview(v);
+    refreshApplyState();
+    if (!stageOnly) {
+      // Sync from storage — treat as already-applied.
+      appliedAccent = v;
+      refreshApplyState();
     }
   }
 
@@ -593,26 +643,38 @@ function initChatAppearanceTab() {
 
   swatches.forEach((sw) => {
     sw.addEventListener("click", () => {
-      const value = sw.dataset.accent || "";
-      reflectAccentSelection(value);
-      if (value) {
-        chrome.storage?.local?.set?.({ [ACCENT_KEY]: value });
-      } else {
-        chrome.storage?.local?.remove?.(ACCENT_KEY);
-      }
+      reflectAccentSelection(sw.dataset.accent || "", { stageOnly: true });
     });
   });
 
   customInput.addEventListener("input", () => {
-    const value = customInput.value;
-    if (!value) return;
-    reflectAccentSelection(value);
-    chrome.storage?.local?.set?.({ [ACCENT_KEY]: value });
+    reflectAccentSelection(customInput.value || "", { stageOnly: true });
+  });
+
+  applyBtn.addEventListener("click", () => {
+    const value = pendingAccent;
+    if (value) {
+      chrome.storage?.local?.set?.({ [ACCENT_KEY]: value }, () => {
+        appliedAccent = value;
+        refreshApplyState();
+        flashStatus("✓ Applied to chat panel");
+      });
+    } else {
+      chrome.storage?.local?.remove?.(ACCENT_KEY, () => {
+        appliedAccent = "";
+        refreshApplyState();
+        flashStatus("✓ Reset to theme default");
+      });
+    }
   });
 
   resetBtn.addEventListener("click", () => {
-    reflectAccentSelection("");
-    chrome.storage?.local?.remove?.(ACCENT_KEY);
+    reflectAccentSelection("", { stageOnly: true });
+    chrome.storage?.local?.remove?.(ACCENT_KEY, () => {
+      appliedAccent = "";
+      refreshApplyState();
+      flashStatus("✓ Reset to theme default");
+    });
   });
 
   if (chrome.storage?.onChanged?.addListener) {
