@@ -869,7 +869,7 @@ DOM.actionBtn.addEventListener("click", () => {
 // want current users to rediscover. We persist the *seen* version so the
 // badge re-appears whenever AI_CHAT_NEW_VERSION bumps, even for long-time
 // users.
-const AI_CHAT_NEW_VERSION = "1.3.0";
+const AI_CHAT_NEW_VERSION = "2.0.0";
 (function _initAiChatNewBadge() {
   const badge = document.getElementById("aiChatNewBadge");
   if (!badge) return;
