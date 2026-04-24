@@ -1826,7 +1826,7 @@
       border-radius: 8px !important;
       background: transparent !important;
       border: 1px solid transparent !important;
-      color: var(--c-text-3) !important;
+      color: var(--c-text-2) !important;
       cursor: pointer !important;
       display: inline-flex !important;
       align-items: center !important;
@@ -1834,9 +1834,13 @@
       transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease !important;
       box-shadow: none !important;
     }
+    /* Hover backdrop uses a text-color mix so the contrast works in both
+       dark (dim-on-dark) and light (subtle-dark-on-light) themes. The
+       previous rule mixed against --c-surface-2 which in light mode is
+       nearly white, leaving no visible hover state. */
     .autodom-chat-icon-btn:hover {
-      background: color-mix(in oklch, var(--c-surface-2) 90%, transparent) !important;
-      border-color: color-mix(in oklch, var(--c-border) 75%, transparent) !important;
+      background: color-mix(in oklch, var(--c-text) 10%, transparent) !important;
+      border-color: color-mix(in oklch, var(--c-text) 14%, transparent) !important;
       color: var(--c-text) !important;
     }
     .autodom-chat-icon-btn:focus-visible {
@@ -2835,38 +2839,51 @@
       margin: 10px 0;
     }
 
-    /* Hover copy button on assistant bubbles */
+    /* Hover copy button on assistant bubbles — minimal ghost-style.
+       Borderless on idle, subtle surface tint on hover/focus. Shrinks the
+       old 26px chip down to a 20px icon so it no longer dominates the
+       bubble corner. */
     .autodom-chat-msg .msg-copy-btn {
       position: absolute;
-      top: 0;
-      right: 0;
-      background: var(--c-surface);
-      border: 1px solid var(--c-border);
+      top: 4px;
+      right: 4px;
+      background: transparent;
+      border: 0;
       color: var(--c-text-3);
       cursor: pointer;
-      width: 26px;
-      height: 26px;
-      border-radius: 7px;
-      display: flex;
+      width: 20px;
+      height: 20px;
+      border-radius: 6px;
+      display: inline-flex;
       align-items: center;
       justify-content: center;
+      padding: 0;
       opacity: 0;
-      transition: opacity 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+      transition: opacity 0.15s ease, background-color 0.15s ease,
+        color 0.15s ease, transform 0.15s ease;
       font-family: inherit;
     }
     .autodom-chat-msg.assistant:hover .msg-copy-btn,
     .autodom-chat-msg.ai-response:hover .msg-copy-btn,
     .autodom-chat-msg.user:hover .msg-copy-btn,
-    .autodom-chat-msg .msg-copy-btn:focus-visible { opacity: 1; }
+    .autodom-chat-msg .msg-copy-btn:focus-visible { opacity: 0.72; }
     .autodom-chat-msg .msg-copy-btn:hover {
-      background: var(--c-raised);
-      border-color: var(--c-border-s);
-      color: var(--c-text);
+      background: color-mix(in oklch, var(--c-text-1) 10%, transparent);
+      color: var(--c-text-1);
+      opacity: 1;
+      transform: scale(1.06);
     }
-    .autodom-chat-msg .msg-copy-btn.copied { color: var(--c-success); }
+    .autodom-chat-msg .msg-copy-btn:focus-visible {
+      outline: 1px solid color-mix(in oklch, var(--c-accent) 60%, transparent);
+      outline-offset: 1px;
+    }
+    .autodom-chat-msg .msg-copy-btn.copied {
+      color: var(--c-success);
+      opacity: 1;
+    }
     .autodom-chat-msg .msg-copy-btn svg {
-      width: 12px; height: 12px;
-      fill: none; stroke: currentColor; stroke-width: 2;
+      width: 11px; height: 11px;
+      fill: none; stroke: currentColor; stroke-width: 1.9;
       stroke-linecap: round; stroke-linejoin: round;
     }
     /* User bubble copy button — floats just outside the pill on its left
@@ -2875,12 +2892,15 @@
     .autodom-chat-msg.user .msg-copy-btn {
       top: 50%;
       right: auto;
-      left: -34px;
+      left: -28px;
       transform: translateY(-50%);
-      width: 24px; height: 24px;
+      width: 20px; height: 20px;
       border-radius: 6px;
     }
-    .autodom-chat-msg.user .msg-copy-btn svg { width: 11px; height: 11px; }
+    .autodom-chat-msg.user .msg-copy-btn:hover {
+      transform: translateY(-50%) scale(1.06);
+    }
+    .autodom-chat-msg.user .msg-copy-btn svg { width: 10px; height: 10px; }
 
     /* Copy button inside a tool-result summary row (compact, inline) */
     .autodom-chat-msg.tool-result .tr-copy-btn {
@@ -3902,10 +3922,13 @@
   _refreshModelPickerUI = function () {
     if (!_modelPickerBtn || !_modelPickerLabel) return;
     const src = _modelPickerState.providerSource;
-    // Only show the picker when a direct provider is actually active. In IDE
-    // mode (or when a direct provider is configured but disabled), the picker
-    // would be misleading because it has no effect on the current run.
-    if (src === "ide" || !src || !_modelPickerState.enabled) {
+    const cli = (_modelPickerState.cliKind || "").toLowerCase();
+    // Hide only when there is genuinely nothing to pick — i.e. IDE mode with
+    // no recognised CLI backend. Copilot/Claude/Codex CLIs all have their
+    // own curated model lists, so the picker belongs there too.
+    const hasModels = src && src !== "ide"
+      || (src === "ide" && (cli === "copilot" || cli === "claude" || cli === "codex"));
+    if (!hasModels) {
       _modelPickerBtn.hidden = true;
       _modelPickerClose();
       return;
