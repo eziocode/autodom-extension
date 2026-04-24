@@ -216,8 +216,13 @@
 
   async function requestDecision({ tabId, origin, toolName, params, category }) {
     const cat = category || classify(toolName);
-    const settings = await getSettings();
-    const perm = await getPermissionFor(origin);
+    // Parallelize independent storage reads: previously these awaited
+    // sequentially, doubling the per-tool storage round-trip cost on every
+    // turn of the agent loop.
+    const [settings, perm] = await Promise.all([
+      getSettings(),
+      getPermissionFor(origin),
+    ]);
     const policy = resolveDecision(perm, cat, settings);
 
     if (policy === "allow") {

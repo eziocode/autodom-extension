@@ -715,6 +715,19 @@ async function saveProviderSettings(opts) {
     providerSettings.source === "anthropic" ||
     providerSettings.source === "ollama";
 
+  // Refuse to enable a network provider with an empty model — otherwise the
+  // service-worker / server silently falls back to a hardcoded default and
+  // the user thinks they're talking to the model they picked.
+  if (providerSettings.enabled && isNetworkSource && !providerSettings.model) {
+    providerSettings.enabled = false;
+    if (DOM.providerEnabledToggle) DOM.providerEnabledToggle.checked = false;
+    activationDeniedReason = "model is required";
+    addLog(
+      `Provider activation denied: pick a model for ${formatProviderLabel(providerSettings.source)}`,
+      "error",
+    );
+  }
+
   if (!skipTest && providerSettings.enabled && isNetworkSource) {
     updateProviderUI("Testing connection before activating…");
     const test = await runConnectionTest(providerSettings);

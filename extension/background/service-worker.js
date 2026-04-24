@@ -855,9 +855,30 @@ function _agentSystemPrompt(context) {
   );
 }
 
-// Detect if the same tool+args has been called repeatedly without progress
+// Detect if the same tool+args has been called repeatedly without progress.
+// Caches the last serialized key so we don't pay a JSON.stringify hit on
+// every tool call in the hot agent loop — args can be large (DOM extracts,
+// long text) and re-serializing each turn was a measurable overhead.
 function _isRepeatLoop(history, toolName, args) {
-  const key = toolName + "::" + JSON.stringify(args || {});
+  let argsKey;
+  if (args && typeof args === "object") {
+    if (args.__autodomKey) {
+      argsKey = args.__autodomKey;
+    } else {
+      argsKey = JSON.stringify(args);
+      try {
+        Object.defineProperty(args, "__autodomKey", {
+          value: argsKey,
+          enumerable: false,
+        });
+      } catch (_) {
+        // Frozen / sealed — ignore, will re-stringify next time.
+      }
+    }
+  } else {
+    argsKey = JSON.stringify(args || {});
+  }
+  const key = toolName + "::" + argsKey;
   let count = 0;
   for (let i = history.length - 1; i >= 0; i--) {
     if (history[i] === key) count++;
@@ -2844,13 +2865,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               : providerType === "claude"
                 ? "anthropic"
                 : providerType;
+          // Surface model/provider mismatch loudly instead of letting the
+          // provider client silently fall back to a hardcoded default
+          // (which was the root cause of "I picked Claude but it ran on
+          // gpt-4.1-mini" reports).
+          if (!effectiveModel) {
+            const configured = String(aiProviderSettings.model || "").trim();
+            const reason = configured
+              ? `Configured model "${configured}" is not compatible with provider "${normalizedProvider}". Please pick a matching model in the popup.`
+              : `No model configured for provider "${normalizedProvider}". Please pick a model in the popup.`;
+            throw new Error(reason);
+          }
           const result = await runAgentLoop({
             providerType: normalizedProvider,
             text,
             context: context || {},
             conversationHistory: conversationHistory || [],
             initialTabId: sender?.tab?.id,
-            modelOverride: effectiveModel || null,
+            modelOverride: effectiveModel,
           });
           _debugLog(
             "[AutoDOM SW] Agent loop finished, length:",

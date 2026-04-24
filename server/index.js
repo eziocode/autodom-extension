@@ -2245,6 +2245,28 @@ function conversationToProviderText(conversationHistory) {
     .join("\n\n");
 }
 
+// Default 60s upstream timeout for direct provider calls. Without a timeout
+// a hung provider (e.g. Ollama frozen, OpenAI gateway issue) would pin a
+// request indefinitely with no way for the popup user to cancel.
+const PROVIDER_FETCH_TIMEOUT_MS = Number(
+  process.env.AUTODOM_PROVIDER_TIMEOUT_MS || 60000,
+);
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = PROVIDER_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new Error(`Upstream timed out after ${timeoutMs}ms: ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function callOpenAIProvider({
   text,
   context,
@@ -2274,7 +2296,7 @@ async function callOpenAIProvider({
 
   messages.push({ role: "user", content: text });
 
-  const response = await fetch(`${baseUrl}/chat/completions`, {
+  const response = await fetchWithTimeout(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -2328,7 +2350,16 @@ async function callAnthropicProvider({
     content: text,
   });
 
-  const response = await fetch(ANTHROPIC_API_URL, {
+  const anthropicModel =
+    providerConfig.anthropicModel || "claude-3-5-sonnet-latest";
+  if (!providerConfig.anthropicModel) {
+    console.warn(
+      "[AutoDOM] anthropicModel not configured; falling back to",
+      anthropicModel,
+    );
+  }
+
+  const response = await fetchWithTimeout(ANTHROPIC_API_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -2336,7 +2367,7 @@ async function callAnthropicProvider({
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: providerConfig.anthropicModel,
+      model: anthropicModel,
       max_tokens: 2048,
       system: buildProviderSystemPrompt(context),
       messages,
@@ -2400,7 +2431,7 @@ async function callOllamaProvider({
 
   messages.push({ role: "user", content: text });
 
-  const response = await fetch(`${baseUrl}/api/chat`, {
+  const response = await fetchWithTimeout(`${baseUrl}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({

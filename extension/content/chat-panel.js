@@ -7193,10 +7193,17 @@
     const snapshot = messages.slice();
     messages.length = 0;
     messagesContainer.innerHTML = "";
+    // Detach the container while we rebuild N messages so the browser
+    // only reflows once on re-attach instead of once per message. This
+    // matters on long restored transcripts (50+ messages).
+    const parent = messagesContainer.parentNode;
+    const nextSibling = messagesContainer.nextSibling;
+    if (parent) parent.removeChild(messagesContainer);
     snapshot.forEach((msg) => {
       const extra = msg.toolName ? { toolName: msg.toolName } : undefined;
       addMessage(msg.role, msg.content, extra);
     });
+    if (parent) parent.insertBefore(messagesContainer, nextSibling);
     // Scroll to bottom
     messagesContainer.scrollTop = messagesContainer.scrollHeight;
   }
