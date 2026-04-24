@@ -18,42 +18,33 @@
  */
 (function () {
   function buildSystemPrompt(context, providerInfo) {
-    let p =
-      "You are AutoDOM, a helpful browser AI assistant. " +
-      "You help users understand and interact with the current web page.\n\n";
-    // Identity disclosure — without this the underlying LLM happily
-    // hallucinates an arbitrary model name (e.g. "Claude Opus 4.7") when
-    // the user asks "what model are you?". Wire the actual configured
-    // model + provider in so the response is truthful.
+    let p = "You are AutoDOM, an in-page browser assistant.\n";
     if (providerInfo && (providerInfo.model || providerInfo.provider)) {
       const m = String(providerInfo.model || "unknown").trim();
       const prov = String(providerInfo.provider || "unknown").trim();
-      p +=
-        `── Identity ──\n` +
-        `You are running on provider "${prov}" using model "${m}". ` +
-        `When the user asks which model, AI, or LLM you are, answer truthfully ` +
-        `with this exact provider and model. Do NOT claim to be any other model ` +
-        `(e.g. do not say "Claude Opus", "GPT-4", etc. unless that matches the ` +
-        `model id above).\n\n`;
+      // Identity disclosure — needed so 'what model are you?' doesn't
+      // hallucinate. One-liner; verbose framing was wasted tokens.
+      p += `Identity: provider=${prov}, model=${m}. When asked, answer truthfully with this exact pair; don't invent another model.\n`;
     }
     if (context) {
-      if (context.title) p += `Page title: ${context.title}\n`;
-      if (context.url) p += `Page URL: ${context.url}\n`;
+      if (context.title) p += `Page: ${context.title}\n`;
+      if (context.url) p += `URL: ${context.url}\n`;
+      // Page-context truncation — heaviest per-turn cost. Halved from
+      // 1500/2500 → 600/1200 chars (saves ~700 tokens/turn). The model
+      // can always re-read more via get_dom_state when it needs detail.
       if (context.visibleOverlayText) {
-        p += `Visible popup/dialog text:\n${String(context.visibleOverlayText).substring(0, 1500)}\n`;
+        p += `Popup text:\n${String(context.visibleOverlayText).substring(0, 600)}\n`;
       }
       if (context.visibleTextPreview) {
-        p += `Visible page text preview:\n${String(context.visibleTextPreview).substring(0, 2500)}\n`;
+        p += `Page text:\n${String(context.visibleTextPreview).substring(0, 1200)}\n`;
       }
       if (context.interactiveElements) {
         const ie = context.interactiveElements;
-        p += `Interactive elements: ${ie.links || 0} links, ${ie.buttons || 0} buttons, ${ie.inputs || 0} inputs, ${ie.forms || 0} forms\n`;
+        p += `Interactive: ${ie.links || 0}L ${ie.buttons || 0}B ${ie.inputs || 0}I ${ie.forms || 0}F\n`;
       }
     }
     p +=
-      "\nRespond clearly and concisely. If the user asks about page content, " +
-      "use the page context provided. For browser actions, suggest using " +
-      "slash commands like /dom, /click, /screenshot, /nav.";
+      "Be concise. For browser actions, use slash commands (/dom /click /screenshot /nav) or call tools directly.";
     return p;
   }
 

@@ -266,48 +266,6 @@
                         </div>
                     </section>
 
-                    <section class="panel">
-                        <div class="panel-header">
-                            <span class="section-label">Guardrails</span>
-                        </div>
-                        <div class="field-stack">
-                            <label class="checkbox-row" for="rateLimitToggle">
-                                <input type="checkbox" id="rateLimitToggle" />
-                                <span>Rate limiting per domain</span>
-                            </label>
-                            <div id="rateLimitSettings" class="nested-fields">
-                                <div class="field-row">
-                                    <input
-                                        type="number"
-                                        id="rateLimitMax"
-                                        value="100"
-                                        min="1"
-                                        max="10000"
-                                        class="config-input"
-                                    />
-                                    <select
-                                        id="rateLimitWindow"
-                                        class="config-input"
-                                    >
-                                        <option value="60000">1 min</option>
-                                        <option value="300000">5 min</option>
-                                        <option value="600000">10 min</option>
-                                    </select>
-                                </div>
-                            </div>
-                            <label
-                                class="checkbox-row"
-                                for="confirmSubmitToggle"
-                            >
-                                <input
-                                    type="checkbox"
-                                    id="confirmSubmitToggle"
-                                />
-                                <span>Confirm before submit or purchase</span>
-                            </label>
-                        </div>
-                    </section>
-
                     <section class="panel log-section">
                         <div class="panel-header">
                             <span class="section-label">Activity</span>
@@ -433,6 +391,47 @@ return { title: document.title, url: location.href };"
                             <div class="log-entry log-info">
                                 No audited actions yet.
                             </div>
+                        </div>
+                    </section>
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Guardrails</span>
+                        </div>
+                        <div class="field-stack">
+                            <label class="checkbox-row" for="rateLimitToggle">
+                                <input type="checkbox" id="rateLimitToggle" />
+                                <span>Rate limiting per domain</span>
+                            </label>
+                            <div id="rateLimitSettings" class="nested-fields">
+                                <div class="field-row">
+                                    <input
+                                        type="number"
+                                        id="rateLimitMax"
+                                        value="100"
+                                        min="1"
+                                        max="10000"
+                                        class="config-input"
+                                    />
+                                    <select
+                                        id="rateLimitWindow"
+                                        class="config-input"
+                                    >
+                                        <option value="60000">1 min</option>
+                                        <option value="300000">5 min</option>
+                                        <option value="600000">10 min</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <label
+                                class="checkbox-row"
+                                for="confirmSubmitToggle"
+                            >
+                                <input
+                                    type="checkbox"
+                                    id="confirmSubmitToggle"
+                                />
+                                <span>Confirm before submit or purchase</span>
+                            </label>
                         </div>
                     </section>
                 </div>

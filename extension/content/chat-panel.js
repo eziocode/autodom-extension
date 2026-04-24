@@ -5617,29 +5617,20 @@
     };
 
     // Get visible text summary, including modal/popup and open shadow DOM text.
+    // Wire-payload cap is intentionally tighter than the SW's prompt cap:
+    // SW truncates page text to 1200 chars, so sending more is pure waste.
     try {
       const pageText = extractMainPageText();
-      context.visibleTextPreview = pageText.substring(0, 3000);
-      const overlayText = getVisibleOverlayText(1500);
+      context.visibleTextPreview = pageText.substring(0, 1500);
+      const overlayText = getVisibleOverlayText(800);
       if (overlayText) context.visibleOverlayText = overlayText;
     } catch (_) {
       context.visibleTextPreview = "";
     }
 
-    // Get some metadata
-    try {
-      const metas = document.querySelectorAll("meta[name], meta[property]");
-      const metaData = {};
-      metas.forEach((meta) => {
-        const key = meta.getAttribute("name") || meta.getAttribute("property");
-        if (key)
-          metaData[key] = (meta.getAttribute("content") || "").substring(
-            0,
-            200,
-          );
-      });
-      context.meta = metaData;
-    } catch (_) {}
+    // Note: meta tags previously collected here weren't read by any
+    // server-side prompt builder — pure wire waste, removed. Re-add only
+    // if a future feature reads context.meta on the SW side.
 
     // Count interactive elements
     try {

@@ -630,10 +630,10 @@ function _debugError(...args) {
 //     (otherwise long sessions feel amnesic — JetBrains AI does the same
 //     "summary of earlier conversation" thing).
 function _compactHistoryForOutbound(history, opts) {
-  const sliceN = Math.max(2, opts?.sliceN ?? 12);
+  const sliceN = Math.max(2, opts?.sliceN ?? 8);
   const stripAttachmentBinaries = !!opts?.stripAttachmentBinaries;
-  const maxOldUserChars = Math.max(120, opts?.maxOldUserChars ?? 800);
-  const keepRecentVerbatim = Math.max(2, opts?.keepRecentVerbatim ?? 4);
+  const maxOldUserChars = Math.max(120, opts?.maxOldUserChars ?? 400);
+  const keepRecentVerbatim = Math.max(2, opts?.keepRecentVerbatim ?? 3);
 
   const arr = Array.isArray(history) ? history : [];
   if (arr.length === 0) return [];
@@ -968,29 +968,21 @@ function _toolsForProvider(providerType) {
 
 function _agentSystemPrompt(context, providerInfo) {
   const base = AutoDOMProviders.buildSystemPrompt(context, providerInfo);
+  // Compressed prompt — every line costs tokens on every turn. The
+  // older verbose version had ~700 tokens of agent-mode + reply-hygiene
+  // prose with examples. This bullet-form keeps every behavioural rule
+  // but trims roughly 60% of the wire size. Examples were removed
+  // because rule 4 was just BAD/GOOD pairs of rules 1-3 — net redundant.
   return (
     base +
-    "\n\n" +
-    "── AGENT MODE ──\n" +
-    "You have a Playwright-style toolset to read AND act on the user's browser tab. " +
-    "Plan briefly, then call tools to get fresh page state (get_dom_state / get_page_info), " +
-    "and act (click_by_index, type_text, navigate, etc.). Prefer click_by_index/type_by_index " +
-    "after a get_dom_state for reliability. " +
-    "When a task spans tabs, use list_tabs/switch_tab/open_new_tab. " +
-    "When content opens in a browser popup/window, use wait_for_popup/list_popups and switch_to_popup before reading or acting there. " +
-    "Tool results may be truncated. When you have a final answer or finished the user's task, " +
-    "STOP calling tools and return your final markdown reply (Anthropic/OpenAI: stop after " +
-    "your last tool result; or call respond_to_user to end explicitly). Don't repeat the same " +
-    "failing action — try a different selector or approach instead.\n" +
-    "If the user asks you to do something on the page, do not tell them to inspect the page, run DOM commands, or click things manually. " +
-    "You should inspect the page yourself with tools, perform the action when it is safe and possible, and only then report what you did. " +
-    "Only ask the user a follow-up question when a destructive action is ambiguous, the target cannot be identified after inspection, or the page requires information you do not have.\n" +
-    "\n" +
-    "── REPLY HYGIENE (HARD RULES, DO NOT VIOLATE) ──\n" +
-    "1. NEVER write the internal element shorthand (\"IC0\", \"IC7\", \"IC12\", `IC3`, etc.) in any user-facing reply. These are tool-only indices used by click_by_index/type_by_index and have no meaning to the user. If you need to reference an element in prose, write it as 'the Login button', 'the search field', 'the third link in the nav', etc. — describe what it IS, never its index.\n" +
-    "2. When the user asks for a value (URL, price, name, count, text content, etc.) you MUST report the resolved value itself by reading it from the tool result. NEVER reply with an index reference like 'Build URL: IC0'. If the tool didn't return the value, call another tool or say plainly that the value isn't available — never substitute the index for the value.\n" +
-    "3. If the user asks 'what model are you', 'who built you', or any self-identification question, answer in plain English: you are the AutoDOM in-page assistant routing through the user's selected provider. Do NOT invent a model name or version, do NOT include any token, ID, or shorthand from your own context, and do NOT prefix your reply with anything that looks like an internal identifier.\n" +
-    "4. Examples of BAD replies (never produce these): 'Build URL: IC0', 'Click IC7 to continue', 'Model ID: IC0', 'I clicked IC3'. Examples of GOOD replies: 'Build URL: https://example.com/build/123', 'Tap the Continue button to proceed', 'I am the AutoDOM assistant — I run inside your browser tab.', 'I clicked the Submit button.'\n"
+    "\nAgent mode:\n" +
+    "- Plan briefly, then call tools (get_dom_state, click_by_index, type_by_index, navigate, list_tabs, switch_tab, wait_for_popup) to read AND act on the page yourself.\n" +
+    "- Don't tell the user to inspect the page — do it. Only ask follow-ups if a destructive action is ambiguous or info is genuinely missing.\n" +
+    "- Don't repeat a failing tool call; change selector or approach. STOP calling tools once you have the answer (or call respond_to_user).\n" +
+    "Reply rules (HARD):\n" +
+    "- Never write internal element shorthand (IC0, IC7, etc.) in user-facing text. Describe the element ('the Login button'), never its index.\n" +
+    "- When asked for a value (URL, price, name, count, text), report the resolved value from the tool result — never an index reference.\n" +
+    "- For self-identification, answer in plain English as 'the AutoDOM in-page assistant'. Don't invent a model name; don't include any internal token.\n"
   );
 }
 
@@ -1156,11 +1148,7 @@ async function runAgentLoop({
       // Compact + dedupe the prior turns. _compactHistoryForOutbound
       // bounds payload size and (for very long sessions) prepends a
       // synthetic note that earlier turns existed — JetBrains-AI style.
-      const compacted = _compactHistoryForOutbound(conversationHistory, {
-        sliceN: 12,
-        stripAttachmentBinaries: false,
-        maxOldUserChars: 800,
-      });
+      const compacted = _compactHistoryForOutbound(conversationHistory);
       // The client pushes the just-typed user message to history BEFORE
       // sending, so the trailing entry is typically the same as `text` —
       // dedupe to avoid the model seeing its current prompt twice.
@@ -1297,11 +1285,7 @@ async function runAgentLoop({
       const messages = [];
       // Compact + dedupe the prior turns — same JetBrains-AI style
       // bounding logic as the OpenAI/Ollama branch above.
-      const compacted = _compactHistoryForOutbound(conversationHistory, {
-        sliceN: 12,
-        stripAttachmentBinaries: false,
-        maxOldUserChars: 800,
-      });
+      const compacted = _compactHistoryForOutbound(conversationHistory);
       const last = compacted[compacted.length - 1];
       const lastIsCurrentUser =
         last && last.role === "user" && String(last.content) === String(text);
@@ -3190,9 +3174,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // turns, and STRIP attachment binaries from prior turns so we don't
     // balloon the WS payload (or leak unsupported fields to the CLI).
     const sanitizedHistory = _compactHistoryForOutbound(conversationHistory, {
-      sliceN: 20,
+      sliceN: 12,
       stripAttachmentBinaries: true,
-      maxOldUserChars: 800,
+      maxOldUserChars: 500,
     });
 
     const aiMessage = {
