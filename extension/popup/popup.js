@@ -1307,12 +1307,13 @@ function _isBareOllamaBaseUrl(url) {
   );
 }
 
-function _modelLooksCompatibleWithProvider(model, source, baseUrl) {
+function _modelLooksCompatibleWithProvider(model, source, baseUrl, cliKind = "") {
   const id = String(model || "").trim();
   if (!id) return false;
   const d = id.toLowerCase();
   const s = (source || "").toLowerCase();
   const base = _normalizedProviderBaseUrl(baseUrl);
+  const cli = (cliKind || "").toLowerCase();
 
   if (s === "anthropic") return d.startsWith("claude");
   if (s === "openai") {
@@ -1329,14 +1330,29 @@ function _modelLooksCompatibleWithProvider(model, source, baseUrl) {
   if (s === "ollama") {
     return !d.startsWith("claude") && !/^(gpt-(?:3|4|5)|o\d|chatgpt|text-)/.test(d);
   }
+  if (s === "cli") {
+    if (cli === "claude") return d.startsWith("claude");
+    if (cli === "codex") return /^(gpt|o\d)/.test(d);
+    if (cli === "copilot") return /^(gpt|claude)/.test(d);
+    return false;
+  }
+  if (s === "ide") return false;
   return true;
 }
 
-function _defaultModelForProvider(source, baseUrl) {
+function _defaultModelForProvider(source, baseUrl, cliKind = "") {
   const s = (source || "").toLowerCase();
   const base = _normalizedProviderBaseUrl(baseUrl);
+  const cli = (cliKind || "").toLowerCase();
   if (s === "anthropic") return "claude-3-7-sonnet-latest";
   if (s === "ollama") return "llama3.2";
+  if (s === "cli") {
+    if (cli === "claude") return "claude-sonnet-4-6";
+    if (cli === "codex") return "gpt-5";
+    if (cli === "copilot") return "gpt-5";
+    return "";
+  }
+  if (s === "ide") return "";
   if (s !== "openai") return "";
   if (/deepseek/.test(base)) return "deepseek-chat";
   if (/bigmodel|zhipu/.test(base)) return "glm-4-plus";
@@ -1394,14 +1410,13 @@ function updateProviderUI(statusOverride) {
   if (DOM.providerModel) {
     DOM.providerModel.disabled = source === "ide";
     const baseUrl = DOM.providerBaseUrl?.value || providerSettings.baseUrl || "";
+    const cliKind = DOM.providerCliKind?.value || providerSettings.cliKind || "";
     const currentModel = (DOM.providerModel.value || providerSettings.model || "").trim();
-    const fallbackModel = _defaultModelForProvider(source, baseUrl);
+    const fallbackModel = _defaultModelForProvider(source, baseUrl, cliKind);
     const nextModel =
-      source === "ide"
-        ? currentModel
-        : !currentModel
+      !currentModel
           ? fallbackModel
-          : _modelLooksCompatibleWithProvider(currentModel, source, baseUrl)
+          : _modelLooksCompatibleWithProvider(currentModel, source, baseUrl, cliKind)
             ? currentModel
             : fallbackModel;
     if (DOM.providerModel.value !== nextModel) {

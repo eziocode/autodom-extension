@@ -249,7 +249,7 @@ async function _testProviderConnection(p) {
 //   • openai-compatible: GET {base}/models → map data[].id
 //   • ollama:            GET {base}/api/tags → map models[].name
 //   • anthropic:         no public /models endpoint → static curated list
-//   • ide + cliKind:     CLI binaries have no models API → static per-kind list
+//   • ide/cli + cliKind: CLI binaries have no models API → static per-kind list
 //
 // Returns an array of { id, label, description } suitable for the picker.
 // Always resolves (never rejects) — errors just become an empty list so the
@@ -305,7 +305,7 @@ async function _fetchProviderModels(p) {
       ];
     }
 
-    if (source === "ide") {
+    if (source === "ide" || source === "cli") {
       if (cliKind === "copilot") {
         return [
           { id: "gpt-5",             label: "GPT-5",             description: "GitHub Copilot" },
@@ -422,6 +422,7 @@ function _modelLooksCompatibleWithSettings(model, settings) {
   if (!id) return false;
   const source = (settings?.source || "").toLowerCase();
   const base = _normalizedProviderBaseUrl(settings?.baseUrl);
+  const cliKind = (settings?.cliKind || "").toLowerCase();
   const d = id.toLowerCase();
 
   if (source === "anthropic" || source === "claude") {
@@ -441,6 +442,13 @@ function _modelLooksCompatibleWithSettings(model, settings) {
   if (source === "ollama") {
     return !d.startsWith("claude") && !/^(gpt-(?:3|4|5)|o\d|chatgpt|text-)/.test(d);
   }
+  if (source === "cli") {
+    if (cliKind === "claude") return d.startsWith("claude");
+    if (cliKind === "codex") return /^(gpt|o\d)/.test(d);
+    if (cliKind === "copilot") return /^(gpt|claude)/.test(d);
+    return false;
+  }
+  if (source === "ide") return false;
   return true;
 }
 

@@ -254,7 +254,7 @@
 
   function _catalogBaseKey() {
     const src = _modelPickerState.providerSource;
-    if (src === "ide") {
+    if (src === "ide" || src === "cli") {
       const cli = (_modelPickerState.cliKind || "").toLowerCase();
       return `ide:${cli || "custom"}`;
     }
@@ -3966,16 +3966,35 @@
       .replace(/>/g, "&gt;");
   }
 
+  function _sanitizeAiResponseText(text) {
+    return String(text || "").replace(
+      /(^|[^\w`])IC(\d+)(?=[^\w`]|$)/g,
+      (_m, prefix, idx) => `${prefix}element #${idx}`,
+    );
+  }
+
+  function _visibleToolCalls(toolCalls) {
+    if (!Array.isArray(toolCalls)) return [];
+    return toolCalls.filter((tc) => {
+      const name = String(tc?.tool || tc?.name || "").trim();
+      return name && !name.startsWith("_");
+    });
+  }
+
   // Replace the forward-declared stub now that the DOM exists.
   _refreshModelPickerUI = function () {
     if (!_modelPickerBtn || !_modelPickerLabel) return;
     const src = _modelPickerState.providerSource;
     const cli = (_modelPickerState.cliKind || "").toLowerCase();
-    // Hide only when there is genuinely nothing to pick — i.e. IDE mode with
-    // no recognised CLI backend. Copilot/Claude/Codex CLIs all have their
-    // own curated model lists, so the picker belongs there too.
-    const hasModels = src && src !== "ide"
-      || (src === "ide" && (cli === "copilot" || cli === "claude" || cli === "codex"));
+    const hasKnownCliModels =
+      cli === "copilot" || cli === "claude" || cli === "codex";
+    // Hide only when there is genuinely nothing to pick. Direct providers have
+    // live/static model lists, and recognised local CLIs reuse curated lists.
+    const hasModels =
+      src === "openai" ||
+      src === "anthropic" ||
+      src === "ollama" ||
+      ((src === "ide" || src === "cli") && hasKnownCliModels);
     if (!hasModels) {
       _modelPickerBtn.hidden = true;
       _modelPickerClose();
@@ -4644,6 +4663,8 @@
   function addMessage(role, content, extra) {
     clearWelcome();
 
+    const visibleToolCalls = _visibleToolCalls(extra?.toolCalls);
+
     const msg = document.createElement("div");
     msg.className = `autodom-chat-msg ${role}`;
 
@@ -4693,18 +4714,21 @@
 
     // ─── assistant / ai-response: render markdown ────────────────
     if (role === "assistant" || role === "ai-response") {
+      const rendered = _sanitizeAiResponseText(String(content || ""));
       const md = document.createElement("div");
       md.className = "md";
-      renderMarkdownInto(md, String(content || ""));
+      renderMarkdownInto(md, rendered);
       msg.appendChild(md);
-      msg.appendChild(_makeCopyBtn(String(content || "")));
+      msg.appendChild(_makeCopyBtn(rendered));
       const modelId = (extra && extra.model) || _currentModelId();
       if (modelId) {
+        const modelMeta = _modelsForCurrentProvider().find((m) => m.id === modelId);
         const badge = document.createElement("span");
         badge.className = "autodom-model-badge";
-        badge.textContent = modelId;
+        badge.textContent = modelMeta?.label || modelId;
         msg.appendChild(badge);
       }
+      content = rendered;
     } else {
       const textNode = document.createTextNode(content);
       msg.appendChild(textNode);
@@ -4716,11 +4740,11 @@
     }
 
     // Show AI tool calls if present
-    if (extra && extra.toolCalls && extra.toolCalls.length > 0) {
+    if (visibleToolCalls.length > 0) {
       const toolCallsDiv = document.createElement("div");
       toolCallsDiv.className = "ai-tool-calls";
       toolCallsDiv.textContent = "Tools used:";
-      extra.toolCalls.forEach((tc) => {
+      visibleToolCalls.forEach((tc) => {
         const item = document.createElement("div");
         item.className = "ai-tool-call-item";
         const icon = document.createElement("span");
@@ -6207,8 +6231,9 @@
       hideTyping();
 
       if (aiResult && !aiResult.fallback && !aiResult.error) {
-        const responseText =
-          aiResult.response || "(AI returned an empty response)";
+        const responseText = _sanitizeAiResponseText(
+          aiResult.response || "(AI returned an empty response)",
+        );
         addMessage("ai-response", responseText, {
           toolCalls: aiResult.toolCalls || [],
         });
@@ -6374,7 +6399,9 @@
 
       if (aiResult && !aiResult.fallback && !aiResult.error) {
         // Successful AI response
-        const responseText = aiResult.response || "AI processed your request.";
+        const responseText = _sanitizeAiResponseText(
+          aiResult.response || "AI processed your request.",
+        );
         const toolCalls = aiResult.toolCalls || [];
         _log(
           "AI success, response length:",
