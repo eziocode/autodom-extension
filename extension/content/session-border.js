@@ -24,26 +24,26 @@
       transition: opacity 0.3s ease;
     `;
 
-    // Add a small indicator badge in the top-right corner
+    // Add a quiet indicator away from the chat panel header.
     const badge = document.createElement("div");
     badge.style.cssText = `
       position: fixed;
-      top: 6px;
-      right: 6px;
+      left: 10px;
+      bottom: 10px;
       pointer-events: none;
       z-index: 2147483647;
-      background: rgba(30, 30, 33, 0.92);
-      color: #c8c8cc;
+      background: rgba(24, 24, 27, 0.78);
+      color: rgba(232, 232, 236, 0.78);
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-      font-size: 10px;
-      font-weight: 600;
-      padding: 3px 8px;
-      border-radius: 4px;
+      font-size: 9px;
+      font-weight: 500;
+      padding: 3px 6px;
+      border-radius: 999px;
       letter-spacing: 0.04em;
-      border: 1px solid rgba(140, 140, 155, 0.25);
-      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.2);
+      border: 1px solid rgba(180, 180, 190, 0.18);
+      box-shadow: none;
     `;
-    badge.textContent = "● MCP ACTIVE";
+    badge.textContent = "MCP";
     badge.id = OVERLAY_ID + "_badge";
 
     const style = document.createElement("style");

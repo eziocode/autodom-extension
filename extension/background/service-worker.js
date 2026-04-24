@@ -14,6 +14,9 @@ try {
   if (typeof importScripts === "function" && !globalThis.AutoDOMProviders) {
     importScripts("providers.js");
   }
+  if (typeof importScripts === "function" && !globalThis.AutoDOMAgent) {
+    importScripts("agent-tools.js");
+  }
 } catch (_) {
   // Already loaded (Firefox path) — ignore.
 }
@@ -74,6 +77,167 @@ function _writeApiKey(value) {
   } catch (_) {}
 }
 
+// ─── Pre-activation Provider Connection Test ────────────────
+// Lightweight ping to verify a provider's credentials, base URL,
+// and (where possible) model before the user enables direct AI.
+//
+// Returns { ok: bool, latencyMs: number, error?: string, detail?: string }.
+//
+// Strategy per protocol:
+//   • openai-compatible: GET {base}/models. Falls back to a 1-token
+//     chat.completions ping when /models returns 4xx (some Chinese
+//     providers gate /models behind paid tiers but still allow chat).
+//   • anthropic: POST {base}/v1/messages with max_tokens=1. There is
+//     no public /models endpoint; this is the cheapest validating ping.
+//   • ollama: GET {base}/api/tags; if a model is set, also verify it
+//     exists in the returned tags (otherwise inference would 404).
+//
+// All requests are bounded by a short AbortController timeout so the
+// popup never hangs.
+async function _testProviderConnection(p) {
+  const TEST_TIMEOUT_MS = 8000;
+  const source = p?.source || "ide";
+  const apiKey = (p?.apiKey || "").trim();
+  const baseUrlRaw = (p?.baseUrl || "").trim();
+  const model = (p?.model || "").trim();
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), TEST_TIMEOUT_MS);
+  const t0 = Date.now();
+  try {
+    if (source === "openai" || source === "gpt") {
+      if (!apiKey) return { ok: false, error: "Missing API key" };
+      const base = (baseUrlRaw || "https://api.openai.com/v1").replace(
+        /\/+$/,
+        "",
+      );
+      // First try /models — cheap and proves auth.
+      let resp = await fetch(`${base}/models`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: ac.signal,
+      }).catch((e) => ({ _err: e }));
+
+      if (resp && !resp._err && resp.ok) {
+        const data = await resp.json().catch(() => ({}));
+        const count = Array.isArray(data?.data) ? data.data.length : 0;
+        return {
+          ok: true,
+          latencyMs: Date.now() - t0,
+          detail: `${count} models${model ? ` · ${model}` : ""}`,
+        };
+      }
+      // Fallback: tiny chat-completions ping (handles providers that
+      // 401/403 on /models but still serve /chat/completions).
+      const pingModel = model || "gpt-4.1-mini";
+      const ping = await fetch(`${base}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        signal: ac.signal,
+        body: JSON.stringify({
+          model: pingModel,
+          messages: [{ role: "user", content: "ping" }],
+          max_tokens: 1,
+        }),
+      });
+      if (ping.ok) {
+        return {
+          ok: true,
+          latencyMs: Date.now() - t0,
+          detail: `chat.completions OK · ${pingModel}`,
+        };
+      }
+      const errText = await ping.text().catch(() => "");
+      return {
+        ok: false,
+        error: `HTTP ${ping.status}: ${errText.substring(0, 200) || ping.statusText}`,
+      };
+    }
+
+    if (source === "anthropic" || source === "claude") {
+      if (!apiKey) return { ok: false, error: "Missing API key" };
+      const base = (baseUrlRaw || "https://api.anthropic.com").replace(
+        /\/+$/,
+        "",
+      );
+      const pingModel = model || "claude-3-5-haiku-latest";
+      const resp = await fetch(`${base}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        signal: ac.signal,
+        body: JSON.stringify({
+          model: pingModel,
+          max_tokens: 1,
+          messages: [{ role: "user", content: "ping" }],
+        }),
+      });
+      if (resp.ok) {
+        return {
+          ok: true,
+          latencyMs: Date.now() - t0,
+          detail: `messages OK · ${pingModel}`,
+        };
+      }
+      const errText = await resp.text().catch(() => "");
+      return {
+        ok: false,
+        error: `HTTP ${resp.status}: ${errText.substring(0, 200) || resp.statusText}`,
+      };
+    }
+
+    if (source === "ollama") {
+      const base = (baseUrlRaw || "http://localhost:11434").replace(
+        /\/+$/,
+        "",
+      );
+      const resp = await fetch(`${base}/api/tags`, {
+        method: "GET",
+        signal: ac.signal,
+      });
+      if (!resp.ok) {
+        return {
+          ok: false,
+          error: `HTTP ${resp.status}: ${resp.statusText}`,
+        };
+      }
+      const data = await resp.json().catch(() => ({}));
+      const tags = Array.isArray(data?.models) ? data.models : [];
+      if (model) {
+        const found = tags.some(
+          (t) => (t?.name || "").split(":")[0] === model.split(":")[0],
+        );
+        if (!found) {
+          return {
+            ok: false,
+            error: `Model '${model}' not pulled. Run: ollama pull ${model}`,
+          };
+        }
+      }
+      return {
+        ok: true,
+        latencyMs: Date.now() - t0,
+        detail: `${tags.length} model(s) installed${model ? ` · ${model} ✓` : ""}`,
+      };
+    }
+
+    return { ok: false, error: `Unsupported provider: ${source}` };
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      return { ok: false, error: `Timeout after ${TEST_TIMEOUT_MS}ms` };
+    }
+    return { ok: false, error: err?.message || String(err) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ─── Activity Log — In-Memory Buffer ─────────────────────────
 // Keeps the in-memory log as the source of truth and batch-flushes
 // to storage instead of doing a get+set on every single log call.
@@ -131,6 +295,15 @@ let aiProviderSettings = {
   apiKey: "",
   model: "",
   baseUrl: "",
+  cliBinary: "",
+  cliKind: "",
+  cliExtraArgs: "",
+  // `enabled` gates whether the direct (network) provider path is taken
+  // by CHAT_AI_MESSAGE. Saving credentials alone is not enough — the
+  // user must explicitly opt in via the popup toggle and pass a
+  // pre-activation connection test (see TEST_AI_PROVIDER).
+  enabled: false,
+  preset: "custom",
 };
 
 function _formatLogText(args) {
@@ -205,6 +378,526 @@ async function _callDirectProvider(
     context,
     conversationHistory,
     debug: _debugLog,
+  });
+}
+
+// ════════════════════════════════════════════════════════════
+// AGENT LOOP — Playwright-style automation from in-page chat
+// ════════════════════════════════════════════════════════════
+//
+// Lets the in-panel AI act on the page using the same TOOL_HANDLERS
+// the MCP bridge uses, without the IDE host. Works for OpenAI,
+// Anthropic, and Ollama (provided the model supports tool calls).
+//
+// Architecture:
+//   1. We give the provider a curated tool catalog (agent-tools.js)
+//   2. Provider returns either final text OR tool_calls
+//   3. For each tool_call: execute via executeAgentTool() and stream
+//      AGENT_TOOL_EVENT to the chat panel for live UI feedback
+//   4. Append the (provider-native) tool results to the transcript
+//   5. Loop until provider stops calling tools, hits a cap, or errors
+
+const AGENT_MAX_TURNS = 12;
+const AGENT_WALL_CLOCK_MS = 90 * 1000;
+// Per-panel run lock so two CHAT_AI_MESSAGEs don't fight the same tab
+const _agentRunLocks = new Set();
+
+// Active agent-run handle — so the chat panel can cancel it with STOP_AGENT_RUN.
+// Only one run can be active at a time (the lock above enforces this).
+let _activeAgentRun = null; // { runId, aborter: AbortController, aborted: boolean, panelTabId }
+let _agentRunIdCounter = 0;
+function _startAgentRunHandle(panelTabId) {
+  const runId = `run_${Date.now()}_${++_agentRunIdCounter}`;
+  _activeAgentRun = {
+    runId,
+    aborter: new AbortController(),
+    aborted: false,
+    panelTabId,
+  };
+  return _activeAgentRun;
+}
+function _endAgentRunHandle(runId) {
+  if (_activeAgentRun && _activeAgentRun.runId === runId) {
+    _activeAgentRun = null;
+  }
+}
+function _stopActiveAgentRun(reason) {
+  const run = _activeAgentRun;
+  if (!run) return false;
+  run.aborted = true;
+  try {
+    run.aborter.abort(reason || "stopped_by_user");
+  } catch (_) {}
+  return true;
+}
+
+// Pinned-tab execution context for the in-flight loop. Calls to active-tab
+// helpers route through this so user clicking a different tab mid-run
+// doesn't hijack the agent.
+let _agentRunContext = null; // { tabId, windowId } | null
+function _withAgentTabContext(ctx, fn) {
+  const prev = _agentRunContext;
+  _agentRunContext = ctx;
+  return Promise.resolve()
+    .then(fn)
+    .finally(() => {
+      _agentRunContext = prev;
+    });
+}
+
+// Single execution path for tool calls coming from the agent. Keeps rate
+// limiting; bypasses the sensitive-action confirmation gate per user
+// request ("auto-run all tools").
+async function executeAgentTool(toolName, params) {
+  const handler = TOOL_HANDLERS.get(toolName);
+  if (!handler) {
+    return { ok: false, error: `Unknown tool: ${toolName}` };
+  }
+  // Rate limit (re-uses bridge logic)
+  try {
+    const tab = await getActiveTab();
+    const domain = getDomainFromTab(tab);
+    const rateCheck = checkRateLimit(domain);
+    if (!rateCheck.allowed) {
+      return {
+        ok: false,
+        error: `Rate-limited on ${rateCheck.domain}: ${rateCheck.error}`,
+      };
+    }
+  } catch (_) {}
+
+  try {
+    touchToolActivity();
+    const raw = await handler(params || {});
+    return { ok: !raw?.error, ...(raw || {}) };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
+// Stream a "tool was called" event to the active chat panel so it can
+// render an inline chip in the in-flight assistant message.
+function _streamAgentToolEvent(tabId, evt) {
+  if (tabId == null) return;
+  try {
+    chrome.tabs
+      .sendMessage(tabId, { type: "AGENT_TOOL_EVENT", event: evt })
+      .catch(() => {});
+  } catch (_) {}
+}
+
+function _safeJsonParse(s) {
+  if (s == null) return {};
+  if (typeof s === "object") return s;
+  try {
+    return JSON.parse(s);
+  } catch (_) {
+    return {};
+  }
+}
+
+// When the agent successfully switches/opens a tab, follow it for
+// subsequent calls. Falls back silently for unexpected result shapes.
+function _maybeRepinAgentTab(toolName, rawResult) {
+  if (!rawResult || rawResult.error) return;
+  let newTabId = null;
+  let newWindowId = null;
+  if (toolName === "switch_tab" || toolName === "open_new_tab") {
+    newTabId =
+      rawResult.tabId ??
+      rawResult.tab?.id ??
+      rawResult.id ??
+      null;
+    newWindowId =
+      rawResult.windowId ??
+      rawResult.tab?.windowId ??
+      _agentRunContext?.windowId ??
+      null;
+  }
+  if (newTabId != null) {
+    _agentRunContext = { tabId: newTabId, windowId: newWindowId };
+  }
+}
+
+// Acquire the pinned tab for this agent run. Falls back to active tab if
+// nothing pinned yet.
+async function _resolveAgentTab(initialTabId) {
+  if (_agentRunContext?.tabId != null) {
+    try {
+      return await chrome.tabs.get(_agentRunContext.tabId);
+    } catch (_) {
+      _agentRunContext = null;
+    }
+  }
+  if (initialTabId != null) {
+    try {
+      return await chrome.tabs.get(initialTabId);
+    } catch (_) {}
+  }
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
+
+// Build provider-formatted tool definitions for the catalog
+function _toolsForProvider(providerType) {
+  const cat = globalThis.AutoDOMAgent?.TOOL_CATALOG;
+  if (!cat) return null;
+  if (providerType === "openai") return AutoDOMAgent.formatToolsForOpenAI(cat);
+  if (providerType === "anthropic")
+    return AutoDOMAgent.formatToolsForAnthropic(cat);
+  if (providerType === "ollama") return AutoDOMAgent.formatToolsForOllama(cat);
+  return null;
+}
+
+function _agentSystemPrompt(context) {
+  const base = AutoDOMProviders.buildSystemPrompt(context);
+  return (
+    base +
+    "\n\n" +
+    "── AGENT MODE ──\n" +
+    "You have a Playwright-style toolset to read AND act on the user's browser tab. " +
+    "Plan briefly, then call tools to get fresh page state (get_dom_state / get_page_info), " +
+    "and act (click_by_index, type_text, navigate, etc.). Prefer click_by_index/type_by_index " +
+    "after a get_dom_state for reliability. When a task spans tabs, use list_tabs/switch_tab/open_new_tab. " +
+    "Tool results may be truncated. When you have a final answer or finished the user's task, " +
+    "STOP calling tools and return your final markdown reply (Anthropic/OpenAI: stop after " +
+    "your last tool result; or call respond_to_user to end explicitly). Don't repeat the same " +
+    "failing action — try a different selector or approach instead.\n" +
+    "If the user asks you to do something on the page, do not tell them to inspect the page, run DOM commands, or click things manually. " +
+    "You should inspect the page yourself with tools, perform the action when it is safe and possible, and only then report what you did. " +
+    "Only ask the user a follow-up question when a destructive action is ambiguous, the target cannot be identified after inspection, or the page requires information you do not have."
+  );
+}
+
+// Detect if the same tool+args has been called repeatedly without progress
+function _isRepeatLoop(history, toolName, args) {
+  const key = toolName + "::" + JSON.stringify(args || {});
+  let count = 0;
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i] === key) count++;
+    else break;
+  }
+  history.push(key);
+  return count >= 2; // 3rd identical call in a row → loop
+}
+
+async function runAgentLoop({
+  providerType,
+  text,
+  context,
+  conversationHistory,
+  initialTabId,
+}) {
+  const ProvidersApi = globalThis.AutoDOMProviders;
+  const AgentApi = globalThis.AutoDOMAgent;
+  if (!ProvidersApi || !AgentApi) {
+    throw new Error("Agent modules not loaded");
+  }
+  const apiKey = (aiProviderSettings.apiKey || "").trim();
+  const tools = _toolsForProvider(providerType);
+  if (!tools) {
+    throw new Error(`Agent loop not supported for provider: ${providerType}`);
+  }
+
+  // Pin the tab where the chat originated so user focus changes don't hijack the run
+  const startTab = await _resolveAgentTab(initialTabId);
+  const runCtx = startTab
+    ? { tabId: startTab.id, windowId: startTab.windowId }
+    : null;
+  const panelTabId = startTab?.id ?? null;
+
+  return _withAgentTabContext(runCtx, async () => {
+    const startedAt = Date.now();
+    const callHistory = []; // for repeat-loop detection
+    const accumulatedToolCalls = []; // surfaced as chips in final response
+
+    // ── Abort / Stop plumbing ───────────────────────────────────
+    // A single active run handle lets the chat panel send STOP_AGENT_RUN
+    // and have both the in-flight provider fetch and the tool loop bail out.
+    const runHandle = _startAgentRunHandle(panelTabId);
+    const signal = runHandle.aborter.signal;
+    const isAborted = () => runHandle.aborted;
+    const abortedReply = () => ({
+      response: "⏹ Stopped by user.",
+      toolCalls: accumulatedToolCalls,
+      aborted: true,
+    });
+    _streamAgentToolEvent(panelTabId, {
+      phase: "run-start",
+      runId: runHandle.runId,
+    });
+    let _runEnded = false;
+    const endRun = (aborted) => {
+      if (_runEnded) return;
+      _runEnded = true;
+      _streamAgentToolEvent(panelTabId, {
+        phase: "run-end",
+        runId: runHandle.runId,
+        aborted: !!aborted,
+      });
+      _endAgentRunHandle(runHandle.runId);
+    };
+    const finish = (payload) => {
+      endRun(payload.aborted);
+      return payload;
+    };
+
+    try {
+    // ── OpenAI / Ollama style: messages = [{role, content/tool_calls/...}] ──
+    if (providerType === "openai" || providerType === "ollama") {
+      const sys = _agentSystemPrompt(context);
+      const messages = [{ role: "system", content: sys }];
+      if (Array.isArray(conversationHistory)) {
+        conversationHistory.slice(-12).forEach((m) => {
+          if (!m?.role || !m?.content) return;
+          messages.push({
+            role: m.role === "assistant" ? "assistant" : "user",
+            content: String(m.content),
+          });
+        });
+      }
+      messages.push({ role: "user", content: text });
+
+      for (let turn = 0; turn < AGENT_MAX_TURNS; turn++) {
+        if (isAborted()) return finish(abortedReply());
+        if (Date.now() - startedAt > AGENT_WALL_CLOCK_MS) {
+          return finish({
+            response:
+              "⚠️ Agent timed out (wall-clock limit). Returning partial results.",
+            toolCalls: accumulatedToolCalls,
+          });
+        }
+        const callFn =
+          providerType === "openai"
+            ? ProvidersApi.callOpenAI
+            : ProvidersApi.callOllama;
+        let resp;
+        try {
+          resp = await callFn({
+            apiKey,
+            baseUrl: aiProviderSettings.baseUrl,
+            model: aiProviderSettings.model,
+            tools,
+            messagesOverride: messages,
+            debug: _debugLog,
+            signal,
+          });
+        } catch (err) {
+          if (isAborted() || err?.name === "AbortError") {
+            return finish(abortedReply());
+          }
+          throw err;
+        }
+        // Append assistant message verbatim (preserves tool_calls structure)
+        const assistantMsg = resp.assistantMessage || {
+          role: "assistant",
+          content: resp.response || "",
+        };
+        messages.push(assistantMsg);
+
+        if (!resp.toolCalls || resp.toolCalls.length === 0) {
+          // Final reply
+          return finish({
+            response:
+              resp.response ||
+              "(Agent completed but returned no text response.)",
+            toolCalls: accumulatedToolCalls,
+          });
+        }
+
+        // Execute each tool call sequentially (parallel disabled in OpenAI body)
+        for (const tc of resp.toolCalls) {
+          if (isAborted()) return finish(abortedReply());
+          const args = _safeJsonParse(tc.arguments);
+          // Special "respond_to_user" tool short-circuits the loop
+          if (tc.name === "respond_to_user") {
+            return finish({
+              response: args.markdown || resp.response || "(no response)",
+              toolCalls: accumulatedToolCalls,
+            });
+          }
+          if (_isRepeatLoop(callHistory, tc.name, args)) {
+            const stuckMsg = `Aborting: tool '${tc.name}' called 3 times in a row with same args. Likely a loop on a flaky selector.`;
+            messages.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: JSON.stringify({ ok: false, error: stuckMsg }),
+            });
+            return finish({
+              response:
+                "⚠️ Agent stopped: detected a repeat-loop on tool `" +
+                tc.name +
+                "`. " +
+                "The page may not be in the expected state. Please refine your request or try again.",
+              toolCalls: accumulatedToolCalls,
+            });
+          }
+          _streamAgentToolEvent(panelTabId, {
+            phase: "start",
+            runId: runHandle.runId,
+            tool: tc.name,
+            args,
+          });
+          const rawResult = await executeAgentTool(tc.name, args);
+          const result = AgentApi.truncateToolResult(tc.name, rawResult);
+          // Re-pin the agent run to a new tab when the AI explicitly asked to.
+          _maybeRepinAgentTab(tc.name, rawResult);
+          accumulatedToolCalls.push({
+            tool: tc.name,
+            args,
+            ok: !!rawResult?.ok && !rawResult?.error,
+          });
+          _streamAgentToolEvent(panelTabId, {
+            phase: "end",
+            runId: runHandle.runId,
+            tool: tc.name,
+            ok: !!rawResult?.ok && !rawResult?.error,
+            error: rawResult?.error,
+            result,
+          });
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
+            content: JSON.stringify(result),
+          });
+        }
+      }
+      return finish({
+        response:
+          "⚠️ Agent reached the maximum tool-use turns. Returning what was gathered so far.",
+        toolCalls: accumulatedToolCalls,
+      });
+    }
+
+    // ── Anthropic style: messages = [{role:'user'|'assistant', content: blocks[]}] ──
+    if (providerType === "anthropic") {
+      const messages = [];
+      if (Array.isArray(conversationHistory)) {
+        conversationHistory.slice(-12).forEach((m) => {
+          if (!m?.role || !m?.content) return;
+          messages.push({
+            role: m.role === "assistant" ? "assistant" : "user",
+            content: String(m.content),
+          });
+        });
+      }
+      messages.push({ role: "user", content: text });
+
+      // Override system prompt to add agent instructions
+      const agentContext = { ...context, _agentMode: true };
+
+      for (let turn = 0; turn < AGENT_MAX_TURNS; turn++) {
+        if (isAborted()) return finish(abortedReply());
+        if (Date.now() - startedAt > AGENT_WALL_CLOCK_MS) {
+          return finish({
+            response:
+              "⚠️ Agent timed out (wall-clock limit). Returning partial results.",
+            toolCalls: accumulatedToolCalls,
+          });
+        }
+        let resp;
+        try {
+          resp = await ProvidersApi.callAnthropic({
+            apiKey,
+            baseUrl: aiProviderSettings.baseUrl,
+            model: aiProviderSettings.model,
+            context: agentContext, // buildSystemPrompt is called inside; we patch via agent prompt below
+            messagesOverride: messages,
+            tools,
+            debug: _debugLog,
+            signal,
+          });
+        } catch (err) {
+          if (isAborted() || err?.name === "AbortError") {
+            return finish(abortedReply());
+          }
+          throw err;
+        }
+
+        // Append assistant message with the raw blocks (text + tool_use)
+        const assistantBlocks = resp.assistantContent || [];
+        if (assistantBlocks.length === 0 && resp.response) {
+          messages.push({ role: "assistant", content: resp.response });
+        } else {
+          messages.push({ role: "assistant", content: assistantBlocks });
+        }
+
+        if (!resp.toolCalls || resp.toolCalls.length === 0) {
+          return finish({
+            response:
+              resp.response ||
+              "(Agent completed but returned no text response.)",
+            toolCalls: accumulatedToolCalls,
+          });
+        }
+
+        // Build a single user message containing all tool_result blocks
+        const toolResultBlocks = [];
+        let earlyReturn = null;
+        for (const tc of resp.toolCalls) {
+          if (isAborted()) return finish(abortedReply());
+          const args = _safeJsonParse(tc.arguments);
+          if (tc.name === "respond_to_user") {
+            earlyReturn = args.markdown || resp.response || "(no response)";
+            break;
+          }
+          if (_isRepeatLoop(callHistory, tc.name, args)) {
+            earlyReturn =
+              "⚠️ Agent stopped: detected a repeat-loop on tool `" +
+              tc.name +
+              "`. The page may not be in the expected state.";
+            break;
+          }
+          _streamAgentToolEvent(panelTabId, {
+            phase: "start",
+            runId: runHandle.runId,
+            tool: tc.name,
+            args,
+          });
+          const rawResult = await executeAgentTool(tc.name, args);
+          const result = AgentApi.truncateToolResult(tc.name, rawResult);
+          _maybeRepinAgentTab(tc.name, rawResult);
+          accumulatedToolCalls.push({
+            tool: tc.name,
+            args,
+            ok: !!rawResult?.ok && !rawResult?.error,
+          });
+          _streamAgentToolEvent(panelTabId, {
+            phase: "end",
+            runId: runHandle.runId,
+            tool: tc.name,
+            ok: !!rawResult?.ok && !rawResult?.error,
+            error: rawResult?.error,
+            result,
+          });
+          toolResultBlocks.push({
+            type: "tool_result",
+            tool_use_id: tc.id,
+            content: JSON.stringify(result),
+            is_error: !rawResult?.ok || !!rawResult?.error,
+          });
+        }
+        if (earlyReturn) {
+          return finish({
+            response: earlyReturn,
+            toolCalls: accumulatedToolCalls,
+          });
+        }
+        messages.push({ role: "user", content: toolResultBlocks });
+      }
+      return finish({
+        response:
+          "⚠️ Agent reached the maximum tool-use turns. Returning what was gathered so far.",
+        toolCalls: accumulatedToolCalls,
+      });
+    }
+
+    throw new Error(`Agent loop not implemented for provider: ${providerType}`);
+    } finally {
+      // Guarantee run-end fires even on uncaught throws, so the chat panel
+      // hides its "Running…" indicator and Stop button regardless.
+      endRun(runHandle.aborted);
+    }
   });
 }
 
@@ -688,6 +1381,20 @@ function connectWebSocket(port) {
         // Track server liveness from any inbound message
         _lastPongTime = Date.now();
 
+        // Handle CLI presence-check responses from the bridge
+        if (message.type === "CHECK_CLI_BINARY_RESPONSE") {
+          const pending = pendingCliChecks.get(message.id);
+          if (pending) {
+            pendingCliChecks.delete(message.id);
+            pending.resolve({
+              ok: !!message.ok,
+              version: message.version || "",
+              error: message.error || null,
+            });
+          }
+          return;
+        }
+
         // Handle AI chat responses from the bridge server
         if (message.type === "AI_CHAT_RESPONSE") {
           _debugLog(
@@ -776,6 +1483,10 @@ function connectWebSocket(port) {
             "id:",
             message.id,
           );
+          // Bridge is actively driving tools => the agent is alive.
+          // Reset the idle timeout for any in-flight AI request so we
+          // don't surface a spurious "timed out" while automation runs.
+          refreshAiRequestActivity();
           const result = await handleToolCallWithRecording(
             message.tool,
             message.params,
@@ -1006,6 +1717,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sender?.tab ? "tab:" + sender.tab.id : "popup/extension",
     );
   }
+  if (message.type === "STOP_AGENT_RUN") {
+    const stopped = _stopActiveAgentRun(message.reason || "stopped_by_user");
+    sendResponse({ ok: stopped });
+    return false;
+  }
+
   if (message.type === "START_MCP") {
     const port = message.port || getCurrentPort();
     wsPort = port;
@@ -1026,6 +1743,52 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       isConnected ? "success" : "info",
     );
     return false;
+  }
+
+  // ─── CLI presence check (popup → bridge → spawn binary --version) ──
+  if (message.type === "CHECK_CLI_BINARY") {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      sendResponse({
+        ok: false,
+        error:
+          "MCP bridge not connected. Click 'Connect / Start MCP' first — the CLI is launched by the bridge process, not the browser.",
+      });
+      return false;
+    }
+    const binary = (message.binary || "").trim();
+    const kind = message.kind || "claude";
+    if (!binary) {
+      sendResponse({ ok: false, error: "No binary provided" });
+      return false;
+    }
+    const id = ++cliCheckIdCounter;
+    const timer = setTimeout(() => {
+      if (pendingCliChecks.has(id)) {
+        pendingCliChecks.delete(id);
+        sendResponse({ ok: false, error: "Bridge did not respond in time" });
+      }
+    }, 8000);
+    pendingCliChecks.set(id, {
+      resolve: (r) => {
+        clearTimeout(timer);
+        sendResponse(r);
+      },
+    });
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "CHECK_CLI_BINARY",
+          id,
+          binary,
+          kind,
+        }),
+      );
+    } catch (err) {
+      pendingCliChecks.delete(id);
+      clearTimeout(timer);
+      sendResponse({ ok: false, error: err.message });
+    }
+    return true; // async
   }
 
   if (message.type === "ACTIVITY_LOG_APPEND") {
@@ -1126,6 +1889,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       apiKey: incomingProvider.apiKey || "",
       model: incomingProvider.model || "",
       baseUrl: incomingProvider.baseUrl || "",
+      // ── Local CLI provider settings (passed through to bridge) ──
+      cliBinary: incomingProvider.cliBinary || "",
+      cliKind: incomingProvider.cliKind || "",
+      cliExtraArgs: incomingProvider.cliExtraArgs || "",
+      enabled: incomingProvider.enabled === true,
+      preset: incomingProvider.preset || "custom",
     };
     _debugLog(
       "[AutoDOM SW] aiProviderSettings updated:",
@@ -1143,6 +1912,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         aiProviderSource: aiProviderSettings.source,
         aiProviderModel: aiProviderSettings.model,
         aiProviderBaseUrl: aiProviderSettings.baseUrl,
+        aiProviderCliBinary: aiProviderSettings.cliBinary,
+        aiProviderCliKind: aiProviderSettings.cliKind,
+        aiProviderCliExtraArgs: aiProviderSettings.cliExtraArgs,
+        aiProviderEnabled: aiProviderSettings.enabled,
+        aiProviderPreset: aiProviderSettings.preset,
       },
       () => {
         _debugLog(
@@ -1195,7 +1969,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     return false;
   }
+
+  // ─── Pre-activation Connection Test ──────────────────────────
+  // Sends a lightweight request to the chosen provider to verify
+  // the API key, base URL, and (where possible) the model are
+  // reachable BEFORE the user enables the direct path. Inspired by
+  // mostbean-cn/coding-switch's health-check pattern.
+  //
+  // The popup passes the *current form values* explicitly — we do NOT
+  // read aiProviderSettings here so the user can test edits without
+  // having to save them first.
+  if (message.type === "TEST_AI_PROVIDER") {
+    const p = message.provider || {};
+    (async () => {
+      try {
+        const result = await _testProviderConnection(p);
+        sendResponse({ success: true, ...result });
+      } catch (err) {
+        sendResponse({
+          success: true,
+          ok: false,
+          error: err?.message || String(err),
+        });
+      }
+    })();
+    return true; // async response
+  }
+
   // ─── Chat Panel Tool Calls ─────────────────────────────────
+
   // The in-browser chat panel (content script) sends tool calls here.
   // We execute them through the same TOOL_HANDLERS dispatch map and
   // return the result directly. This resets the inactivity timer too,
@@ -1347,6 +2149,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   //
   // For IDE/MCP mode the request is forwarded through the WebSocket
   // bridge so the IDE agent can handle it.
+  // ─── ABORT_AI_CHAT ──────────────────────────────────────────
+  // User pressed the stop button in the chat panel. Resolve every
+  // pending AI request locally with a "cancelled" marker so the UI
+  // returns to its idle state immediately, and forward an abort to
+  // the bridge so it can suppress any in-flight tool calls / further
+  // AI_CHAT_RESPONSE messages for those ids.
+  if (message.type === "ABORT_AI_CHAT") {
+    const cancelledIds = [];
+    for (const [id, pending] of pendingAiRequests.entries()) {
+      cancelledIds.push(id);
+      pendingAiRequests.delete(id);
+      try {
+        pending.resolve({
+          type: "AI_CHAT_RESPONSE",
+          aborted: true,
+          error: "Cancelled by user.",
+        });
+      } catch (_) {}
+    }
+    if (ws && ws.readyState === 1) {
+      for (const id of cancelledIds) {
+        try {
+          ws.send(JSON.stringify({ type: "AI_CHAT_ABORT", id }));
+        } catch (_) {}
+      }
+    }
+    sendResponse({ ok: true, cancelled: cancelledIds.length });
+    return false;
+  }
+
   if (message.type === "CHAT_AI_MESSAGE") {
     const { text, context, conversationHistory, provider } = message;
     _debugLog(
@@ -1370,7 +2202,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (providerType === "anthropic" || providerType === "claude") &&
       !!(aiProviderSettings.apiKey || "").trim();
     const isOllama = providerType === "ollama";
-    const isDirectProvider = hasDirectKey || hasDirectAnthropic || isOllama;
+    // Only take the direct path when the user has explicitly enabled
+    // the network provider via the popup toggle (and it passed the
+    // pre-activation connection test). Without `enabled`, the chat
+    // panel falls through to the IDE/MCP path.
+    const isDirectProvider =
+      aiProviderSettings.enabled === true &&
+      (hasDirectKey || hasDirectAnthropic || isOllama);
 
     _debugLog(
       "[AutoDOM SW] CHAT_AI_MESSAGE: providerType =",
@@ -1388,21 +2226,44 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     );
 
     // ─── Direct Provider Path (no bridge server needed) ──────
-    // Service worker calls OpenAI / Anthropic / Ollama API directly.
+    // Service worker calls OpenAI / Anthropic / Ollama API directly,
+    // running an AGENT LOOP so the AI can read AND act on the page
+    // (Playwright-style automation) without the IDE host.
     if (isDirectProvider) {
       _debugLog("[AutoDOM SW] Using DIRECT provider path for:", providerType);
 
+      // Per-tab run lock — block overlapping agent runs on the same panel
+      const lockKey = sender?.tab?.id || "popup";
+      if (_agentRunLocks.has(lockKey)) {
+        sendResponse({
+          type: "AI_CHAT_RESPONSE",
+          error:
+            "An agent run is already in progress on this tab. Please wait for it to finish.",
+        });
+        return false;
+      }
+      _agentRunLocks.add(lockKey);
+
       (async () => {
         try {
-          const result = await _callDirectProvider(
-            providerType,
+          const normalizedProvider =
+            providerType === "gpt" || providerType === "chatgpt"
+              ? "openai"
+              : providerType === "claude"
+                ? "anthropic"
+                : providerType;
+          const result = await runAgentLoop({
+            providerType: normalizedProvider,
             text,
-            context || {},
-            conversationHistory || [],
-          );
+            context: context || {},
+            conversationHistory: conversationHistory || [],
+            initialTabId: sender?.tab?.id,
+          });
           _debugLog(
-            "[AutoDOM SW] Direct provider responded, length:",
+            "[AutoDOM SW] Agent loop finished, length:",
             (result.response || "").length,
+            "toolCalls:",
+            (result.toolCalls || []).length,
           );
           sendResponse({
             type: "AI_CHAT_RESPONSE",
@@ -1411,11 +2272,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             error: null,
           });
         } catch (err) {
-          _debugError("[AutoDOM SW] Direct provider error:", err.message);
+          _debugError("[AutoDOM SW] Agent loop error:", err.message);
           sendResponse({
             type: "AI_CHAT_RESPONSE",
             error: `${providerType} error: ${err.message}`,
           });
+        } finally {
+          _agentRunLocks.delete(lockKey);
         }
       })();
 
@@ -1448,22 +2311,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       provider: providerType,
       providerConfig: {
         provider: aiProviderSettings.source || "ide",
+        cliBinary: aiProviderSettings.cliBinary || "",
+        cliKind: aiProviderSettings.cliKind || "",
+        cliExtraArgs: aiProviderSettings.cliExtraArgs || "",
       },
     };
 
-    // Set up a pending response handler with timeout
-    const aiTimeout = setTimeout(() => {
-      if (pendingAiRequests.has(aiRequestId)) {
-        const pending = pendingAiRequests.get(aiRequestId);
-        pendingAiRequests.delete(aiRequestId);
-        pending.resolve({
-          type: "AI_CHAT_RESPONSE",
-          error: "AI request timed out. The agent may be busy.",
-        });
-      }
-    }, 60000); // 60s timeout for AI responses
-
+    // Register the pending request first, then arm the idle timeout.
+    // The timeout is reset on bridge activity (TOOL_CALL) so long-running
+    // agent loops don't get killed mid-stream.
     pendingAiRequests.set(aiRequestId, {
+      timeoutHandle: null,
       resolve: (result) => {
         _debugLog(
           "[AutoDOM SW] AI response resolved for id:",
@@ -1471,10 +2329,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           "hasError:",
           !!(result && result.error),
         );
-        clearTimeout(aiTimeout);
+        const entry = pendingAiRequests.get(aiRequestId);
+        if (entry && entry.timeoutHandle) clearTimeout(entry.timeoutHandle);
         sendResponse(result);
       },
     });
+    armAiRequestTimeout(aiRequestId);
 
     try {
       _debugLog(
@@ -1483,7 +2343,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       );
       ws.send(JSON.stringify(aiMessage));
     } catch (err) {
-      clearTimeout(aiTimeout);
+      const entry = pendingAiRequests.get(aiRequestId);
+      if (entry && entry.timeoutHandle) clearTimeout(entry.timeoutHandle);
       pendingAiRequests.delete(aiRequestId);
       sendResponse({
         type: "AI_CHAT_RESPONSE",
@@ -1614,6 +2475,51 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // Stores pending AI chat requests waiting for responses from the bridge
 const pendingAiRequests = new Map();
 let aiCallIdCounter = 0;
+
+// Idle timeout for an in-flight AI request. The IDE agent can run for a
+// long time when it is chaining many tool calls (e.g. generating a Deluge
+// function). We use an *idle* timer that is reset every time the bridge
+// reports activity (a TOOL_CALL from the agent), so the user only sees a
+// timeout when the bridge has actually gone silent.
+const AI_REQUEST_IDLE_TIMEOUT_MS = 180000; // 3 minutes of no activity
+
+function armAiRequestTimeout(id) {
+  const pending = pendingAiRequests.get(id);
+  if (!pending) return;
+  if (pending.timeoutHandle) clearTimeout(pending.timeoutHandle);
+  pending.timeoutHandle = setTimeout(() => {
+    if (!pendingAiRequests.has(id)) return;
+    const entry = pendingAiRequests.get(id);
+    pendingAiRequests.delete(id);
+    // Tell the bridge to abort the still-running agent loop so it
+    // stops calling tools after we have already surfaced the timeout
+    // to the UI. Without this, the chat shows "AI request timed out"
+    // while the bridge keeps driving automation in the background.
+    if (ws && ws.readyState === 1) {
+      try {
+        ws.send(JSON.stringify({ type: "AI_CHAT_ABORT", id }));
+      } catch (_) {}
+    }
+    try {
+      entry.resolve({
+        type: "AI_CHAT_RESPONSE",
+        error: "AI request timed out. The agent may be busy.",
+      });
+    } catch (_) {}
+  }, AI_REQUEST_IDLE_TIMEOUT_MS);
+}
+
+function refreshAiRequestActivity() {
+  // Any signal of life from the bridge (e.g. an incoming TOOL_CALL)
+  // counts as activity for every in-flight AI request.
+  for (const id of pendingAiRequests.keys()) {
+    armAiRequestTimeout(id);
+  }
+}
+
+// Pending CLI presence-check requests (popup → SW → bridge → spawn → back)
+const pendingCliChecks = new Map();
+let cliCheckIdCounter = 0;
 
 function resolvePendingAiRequests(error) {
   for (const [id, pending] of pendingAiRequests.entries()) {
@@ -1807,6 +2713,13 @@ async function handleToolCall(tool, params, id) {
 // ─── Helper: Get active tab ──────────────────────────────────
 
 async function getActiveTab() {
+  if (_agentRunContext?.tabId != null) {
+    try {
+      return await chrome.tabs.get(_agentRunContext.tabId);
+    } catch (_) {
+      _agentRunContext = null;
+    }
+  }
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) throw new Error("No active tab found");
   return tab;
@@ -1839,6 +2752,49 @@ async function executeInTab(tabId, func, args = []) {
   }
 }
 
+async function waitForTabComplete(tabId, timeout = 15000) {
+  const initialTab = await chrome.tabs.get(tabId);
+  if (initialTab.status === "complete") {
+    return initialTab;
+  }
+
+  return await new Promise((resolve) => {
+    let settled = false;
+
+    const finish = (tab) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve(tab || initialTab);
+    };
+
+    const listener = (updatedTabId, changeInfo, tab) => {
+      if (updatedTabId !== tabId) return;
+      if (changeInfo.status === "complete" || tab?.status === "complete") {
+        finish(tab);
+      }
+    };
+
+    const timer = setTimeout(() => {
+      chrome.tabs
+        .get(tabId)
+        .then(finish)
+        .catch(() => finish(initialTab));
+    }, timeout);
+
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs
+      .get(tabId)
+      .then((tab) => {
+        if (tab?.status === "complete") {
+          finish(tab);
+        }
+      })
+      .catch(() => {});
+  });
+}
+
 // ─── Tool Implementations ────────────────────────────────────
 
 // 1. Navigate
@@ -1859,11 +2815,13 @@ async function toolNavigate(params) {
     return { success: true, action: "reload" };
   }
   if (url) {
-    await chrome.tabs.update(tab.id, { url });
-    // Wait a bit for navigation to start
-    await new Promise((r) => setTimeout(r, 1500));
-    const updatedTab = await chrome.tabs.get(tab.id);
-    return { success: true, url: updatedTab.url, title: updatedTab.title };
+    const updatedTab = await chrome.tabs.update(tab.id, { url });
+    return {
+      success: true,
+      url: updatedTab.pendingUrl || updatedTab.url || url,
+      title: updatedTab.title,
+      status: updatedTab.status,
+    };
   }
   return { error: "Provide url or action (back/forward/reload)" };
 }
@@ -1891,7 +2849,7 @@ async function toolClick(params) {
         }
       }
       if (!el) return { error: `Element not found: ${selector || text}` };
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.scrollIntoView({ behavior: "auto", block: "center" });
       const eventType = dblClick ? "dblclick" : "click";
       el.dispatchEvent(
         new MouseEvent(eventType, {
@@ -2085,7 +3043,7 @@ async function toolHover(params) {
     (selector) => {
       const el = document.querySelector(selector);
       if (!el) return { error: `Element not found: ${selector}` };
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.scrollIntoView({ behavior: "auto", block: "center" });
       el.dispatchEvent(
         new MouseEvent("mouseenter", { bubbles: true, cancelable: true }),
       );
@@ -2371,20 +3329,19 @@ async function toolWaitForNewTab(params) {
         resolved = true;
         clearTimeout(timer);
         chrome.tabs.onCreated.removeListener(listener);
-        // Wait a moment for the tab to load
-        await new Promise((r) => setTimeout(r, 1500));
-        const updatedTab = await chrome.tabs.get(tab.id);
         // Optionally switch to the new tab
         if (params?.switchTo !== false) {
           await chrome.tabs.update(tab.id, { active: true });
+          await chrome.windows.update(tab.windowId, { focused: true });
         }
         resolve({
           success: true,
           newTab: {
-            id: updatedTab.id,
-            title: updatedTab.title,
-            url: updatedTab.url,
-            status: updatedTab.status,
+            id: tab.id,
+            title: tab.title,
+            url: tab.pendingUrl || tab.url,
+            status: tab.status,
+            windowId: tab.windowId,
           },
         });
       }
@@ -2533,18 +3490,14 @@ async function toolWaitForNavigation(params) {
   const tab = await getActiveTab();
   const timeout = params?.timeout || 15000;
   const startTime = Date.now();
-
-  while (Date.now() - startTime < timeout) {
-    const updatedTab = await chrome.tabs.get(tab.id);
-    if (updatedTab.status === "complete") {
-      return {
-        success: true,
-        url: updatedTab.url,
-        title: updatedTab.title,
-        elapsed: Date.now() - startTime,
-      };
-    }
-    await new Promise((r) => setTimeout(r, 300));
+  const updatedTab = await waitForTabComplete(tab.id, timeout);
+  if (updatedTab.status === "complete") {
+    return {
+      success: true,
+      url: updatedTab.url,
+      title: updatedTab.title,
+      elapsed: Date.now() - startTime,
+    };
   }
   return {
     success: false,
@@ -2809,7 +3762,7 @@ async function toolRightClick(params) {
     (selector) => {
       const el = document.querySelector(selector);
       if (!el) return { error: `Element not found: ${selector}` };
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.scrollIntoView({ behavior: "auto", block: "center" });
       el.dispatchEvent(
         new MouseEvent("contextmenu", {
           bubbles: true,
@@ -2872,13 +3825,13 @@ async function toolOpenNewTab(params) {
   const { url, active } = params;
   try {
     const tab = await chrome.tabs.create({ url, active: active !== false });
-    await new Promise((r) => setTimeout(r, 1000));
-    const updatedTab = await chrome.tabs.get(tab.id);
     return {
       success: true,
-      tabId: updatedTab.id,
-      url: updatedTab.url,
-      title: updatedTab.title,
+      tabId: tab.id,
+      url: tab.pendingUrl || tab.url || url,
+      title: tab.title,
+      status: tab.status,
+      windowId: tab.windowId,
     };
   } catch (err) {
     return { error: `Open tab failed: ${err.message}` };
@@ -3358,6 +4311,11 @@ chrome.storage.local.get(
     "aiProviderApiKey",
     "aiProviderModel",
     "aiProviderBaseUrl",
+    "aiProviderCliBinary",
+    "aiProviderCliKind",
+    "aiProviderCliExtraArgs",
+    "aiProviderEnabled",
+    "aiProviderPreset",
   ],
   async (result) => {
     const port = result.mcpPort || 9876;
@@ -3389,6 +4347,11 @@ chrome.storage.local.get(
       apiKey,
       model: result.aiProviderModel || "",
       baseUrl: result.aiProviderBaseUrl || "",
+      cliBinary: result.aiProviderCliBinary || "",
+      cliKind: result.aiProviderCliKind || "",
+      cliExtraArgs: result.aiProviderCliExtraArgs || "",
+      enabled: result.aiProviderEnabled === true,
+      preset: result.aiProviderPreset || "custom",
     };
 
     _debugLog(
@@ -3840,7 +4803,7 @@ async function toolClickByIndex(params) {
         if (el.closest("script, style, noscript")) continue;
 
         if (currentIndex === index) {
-          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          el.scrollIntoView({ behavior: "auto", block: "center" });
           const eventType = dblClick ? "dblclick" : "click";
           el.dispatchEvent(
             new MouseEvent(eventType, {
@@ -4237,7 +5200,7 @@ async function toolIframeInteract(params) {
           }
           if (!el)
             return { error: `Element not found in iframe: ${selector || text}` };
-          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          el.scrollIntoView({ behavior: "auto", block: "center" });
           el.dispatchEvent(
             new MouseEvent("click", {
               bubbles: true,
@@ -4530,7 +5493,7 @@ async function toolShadowInteract(params) {
       }
 
       if (action === "click") {
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.scrollIntoView({ behavior: "auto", block: "center" });
         el.dispatchEvent(
           new MouseEvent("click", {
             bubbles: true,

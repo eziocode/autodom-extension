@@ -430,8 +430,7 @@ select.config-input {
 }
 
 .action-btn,
-.secondary-btn,
-#saveProviderBtn {
+.secondary-btn {
     appearance: none;
     display: inline-flex;
     align-items: center;
@@ -477,34 +476,29 @@ select.config-input {
     opacity: 0.9;
 }
 
-.secondary-btn,
-#saveProviderBtn {
+.secondary-btn {
     background: var(--bg);
     border: 1px solid var(--border-strong);
     color: var(--text);
 }
 
-.secondary-btn:hover,
-#saveProviderBtn:hover {
+.secondary-btn:hover {
     background: var(--bg-raised);
     border-color: var(--text-muted);
 }
 
-.secondary-btn:active,
-#saveProviderBtn:active {
+.secondary-btn:active {
     background: var(--bg-inset);
 }
 
 .action-btn:focus-visible,
-.secondary-btn:focus-visible,
-#saveProviderBtn:focus-visible {
+.secondary-btn:focus-visible {
     outline: none;
     box-shadow: var(--focus-ring-shadow);
 }
 
 .action-btn:disabled,
-.secondary-btn:disabled,
-#saveProviderBtn:disabled {
+.secondary-btn:disabled {
     opacity: 0.45;
     cursor: not-allowed;
 }
@@ -677,3 +671,185 @@ select.config-input {
 }
 
 /* Hide
+
+/* CLI binary prompt — appears under "Local CLI" provider inputs */
+.cli-prompt {
+    margin-top: 6px;
+    padding: 8px 10px;
+    border: 1px dashed var(--border-strong);
+    border-radius: 6px;
+    background: var(--bg-elev, rgba(255, 255, 255, 0.03));
+}
+.cli-prompt .field-hint { margin: 0 0 6px; }
+.cli-prompt pre.config-code {
+    margin: 0 0 6px;
+    padding: 6px 8px;
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 4px;
+}
+.cli-prompt .inline-row { gap: 8px; }
+
+/* ─── AI Provider Panel ─────────────────── */
+
+.provider-panel {
+    /* Subtle raised card so the provider setup reads as a distinct area */
+    background: linear-gradient(
+        180deg,
+        var(--bg-raised) 0%,
+        var(--bg) 60%
+    );
+}
+
+.provider-badge {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    padding: 2px 8px;
+    border-radius: 999px;
+    line-height: 1.5;
+    flex-shrink: 0;
+    display: none; /* populated + shown by JS */
+}
+
+.provider-badge:not(:empty) {
+    display: inline-flex;
+    align-items: center;
+}
+
+.provider-form {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.field-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.field-label {
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    line-height: 1.3;
+}
+
+.field-label-hint {
+    font-weight: 500;
+    text-transform: none;
+    letter-spacing: normal;
+    color: var(--text-muted);
+    opacity: 0.75;
+}
+
+.provider-enable {
+    margin-top: 2px;
+    padding: 6px 8px;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+}
+
+/* Row of action buttons — Save (primary) + Test / Check CLI (secondary).
+   Using CSS grid with auto-sized tracks so no single button hogs the row
+   and the text never wraps into a narrow column. */
+.provider-actions {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
+    gap: 8px;
+    margin-top: 4px;
+}
+
+.provider-actions .action-btn,
+.provider-actions .secondary-btn {
+    width: auto;
+    min-height: 34px;
+    padding: 0 12px;
+    font-size: 12.5px;
+}
+
+.provider-save {
+    /* Save is the primary commit — keep the accent style */
+}
+
+.provider-status-line {
+    min-height: 18px;
+    margin-top: 2px;
+    padding: 4px 2px 0;
+    border-top: 1px dashed var(--border);
+}
+
+.provider-status-line .field-hint {
+    margin: 0;
+    font-size: 11.5px;
+    line-height: 1.4;
+}
+
+/* ─── Config Tab (Setup Config) ─────────── */
+
+.config-info {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.config-block {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.config-block-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 20px;
+}
+
+.config-block-label {
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+
+.config-code {
+    margin: 0;
+    padding: 8px 10px;
+    background: var(--bg-inset);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 180px;
+    overflow: auto;
+}
+
+.config-note {
+    padding: 6px 10px;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    text-align: center;
+}
+
+.config-note span { display: inline; }

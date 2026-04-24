@@ -15,3 +15,4 @@ dist/*.zip
 
 autodom-extension/.envrc
 autodom-extension/scripts/copilot.sh
+AGENTS.md

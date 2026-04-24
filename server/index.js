@@ -18,7 +18,7 @@ import { FastMCP, imageContent } from "fastmcp";
 import { WebSocketServer, WebSocket } from "ws";
 import { z } from "zod";
 import { fileURLToPath } from "url";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { promises as fs, readFileSync, rmSync, createWriteStream } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -179,35 +179,50 @@ process.on("SIGTERM", () => {
 // Periodically check if our parent process is still alive.
 // This catches cases where the IDE dies abruptly (kill -9, crash, etc.)
 // without closing stdin, leaving us as an orphan zombie.
-// On macOS/Linux, when the parent dies the process gets reparented to
-// launchd (PID 1) or the nearest subreaper.
+//
+// We deliberately ONLY shut down when `process.kill(ppid, 0)` actually
+// fails (the parent process no longer exists). We used to also shut
+// down whenever `process.ppid` simply changed, but that produced false
+// positives on macOS — JetBrains, VSCode and similar IDEs reparent
+// child stdio processes during benign events (daemon refresh, window
+// reload, theme/plugin reloads, even Spotlight indexing on the IDE
+// folder). Each spurious shutdown caused a full restart cycle: the IDE
+// respawned us, the extension briefly saw ERR_CONNECTION_REFUSED, and
+// the chat panel/border state churned. The kill-0 check below is the
+// only reliable orphan signal.
 const HEARTBEAT_INTERVAL_MS = parseInt(
   process.env.AUTODOM_HEARTBEAT_MS || "15000",
   10,
 );
 const _parentPid = process.ppid;
 const _heartbeatInterval = setInterval(() => {
-  try {
-    // Check if parent is still alive (signal 0 = no signal, just check)
-    process.kill(_parentPid, 0);
-  } catch (_) {
-    // Parent is gone — we are orphaned
+  // Probe the *current* parent (which may have changed legitimately).
+  // If we have no parent at all (PID 0) treat as orphan.
+  const currentPpid = process.ppid;
+  if (!currentPpid || currentPpid === 0) {
     process.stderr.write(
-      `[AutoDOM] Parent process (PID ${_parentPid}) is gone — orphan detected, shutting down\n`,
+      `[AutoDOM] Parent PID is 0 — orphan detected, shutting down\n`,
     );
     clearInterval(_heartbeatInterval);
     void shutdown(0);
     return;
   }
-
-  // Also check if we've been reparented (PPID changed to 1 or different)
-  // process.ppid is live on Node.js and reflects the current parent
-  if (process.ppid !== _parentPid) {
+  try {
+    process.kill(currentPpid, 0);
+  } catch (_) {
+    // Current parent is gone — we are truly orphaned.
     process.stderr.write(
-      `[AutoDOM] Parent PID changed from ${_parentPid} to ${process.ppid} — reparented, shutting down\n`,
+      `[AutoDOM] Parent process (PID ${currentPpid}) is gone — orphan detected, shutting down\n`,
     );
     clearInterval(_heartbeatInterval);
     void shutdown(0);
+    return;
+  }
+  // PPID changes alone are NOT a shutdown signal — see comment above.
+  if (currentPpid !== _parentPid) {
+    diagLog(
+      `Parent PID changed from ${_parentPid} to ${currentPpid} (still alive — not shutting down)`,
+    );
   }
 }, HEARTBEAT_INTERVAL_MS);
 _heartbeatInterval.unref(); // Don't let the timer alone keep the process alive
@@ -442,6 +457,14 @@ const directProviderConfig = {
     process.env.AUTODOM_ANTHROPIC_MODEL || "claude-3-5-sonnet-latest",
   ollamaBaseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
   ollamaModel: process.env.AUTODOM_OLLAMA_MODEL || "llama3.2",
+  // ── Local CLI provider (Claude Code, Codex CLI, custom) ────
+  // The bridge spawns a locally-installed AI CLI binary, pipes the
+  // composed prompt to it, and returns stdout. Lets users reuse
+  // their existing `claude` / `codex` auth without API keys.
+  cliBinary: process.env.AUTODOM_CLI_BINARY || "claude",
+  cliKind: process.env.AUTODOM_CLI_KIND || "claude", // claude | codex | custom
+  cliExtraArgs: process.env.AUTODOM_CLI_EXTRA_ARGS || "", // space-separated
+  cliTimeoutMs: Number(process.env.AUTODOM_CLI_TIMEOUT_MS || 90000),
 };
 
 // ─── WebSocket Message Batching ──────────────────────────────
@@ -813,6 +836,33 @@ async function shutdown(code = 0) {
 
 let proxyClient = null; // If we are a secondary instance, we connect to the primary instance here
 let isPrimaryServer = true;
+
+// Tracks AI chat request ids the user has cancelled via the chat
+// panel's stop button. The agent loop checks this set between awaits
+// (callExtensionTool, direct provider calls) to short-circuit further
+// work, and the AI_CHAT_RESPONSE emit path skips sending late results.
+const abortedAiRequests = new Set();
+class AiAbortError extends Error {
+  constructor(id) {
+    super(`AI request ${id} aborted by user`);
+    this.name = "AiAbortError";
+    this.aiAborted = true;
+  }
+}
+function _isAborted(id) {
+  return id != null && abortedAiRequests.has(id);
+}
+function _safeSendAiResponse(socket, payload) {
+  if (_isAborted(payload?.id)) {
+    process.stderr.write(
+      `[AutoDOM] Suppressing AI_CHAT_RESPONSE for cancelled id=${payload.id}\n`,
+    );
+    return;
+  }
+  try {
+    socket.send(JSON.stringify(payload));
+  } catch (_) {}
+}
 
 // ─── Pre-startup Cleanup ─────────────────────────────────────
 // Kill any stale/zombie processes on the port before trying to bind.
@@ -1201,6 +1251,23 @@ function setupWssConnection(wss) {
 }
 
 function _processWsMessage(socket, message) {
+  // ─── Cancellation: chat-panel stop button ────────────────────
+  // The extension forwards user-initiated aborts here. We mark the
+  // request id as aborted so any in-progress agent loop can short-
+  // circuit between awaits, and so we never emit a late
+  // AI_CHAT_RESPONSE for a request the UI has already torn down.
+  if (message.type === "AI_CHAT_ABORT") {
+    if (typeof message.id !== "undefined" && message.id !== null) {
+      abortedAiRequests.add(message.id);
+      // Auto-evict after 5 minutes so the set doesn't grow forever.
+      setTimeout(() => abortedAiRequests.delete(message.id), 300000).unref?.();
+      process.stderr.write(
+        `[AutoDOM] AI_CHAT_ABORT received for id=${message.id}\n`,
+      );
+    }
+    return;
+  }
+
   // ─── AI Chat Request from In-Browser Chat Panel ────────────
   // The browser's chat panel sends natural language messages here.
   // We process them by:
@@ -1211,6 +1278,92 @@ function _processWsMessage(socket, message) {
   // When a full AI agent (Claude, GPT, etc.) is connected via the IDE,
   // the agent handles the request. Otherwise, we provide a smart
   // tool-dispatch fallback using the page context + NLP heuristics.
+  // ─── CLI presence check (popup → bridge → spawn binary --version) ──
+  // Verifies the configured local CLI binary is installed and reachable
+  // so the user gets immediate feedback before sending real chat messages.
+  if (message.type === "CHECK_CLI_BINARY") {
+    const { id, binary, kind } = message;
+    const send = (payload) => {
+      try {
+        socket.send(
+          JSON.stringify({
+            type: "CHECK_CLI_BINARY_RESPONSE",
+            id,
+            ...payload,
+          }),
+        );
+      } catch (_) {}
+    };
+    if (!binary || typeof binary !== "string") {
+      send({ ok: false, error: "Missing binary" });
+      return;
+    }
+    // Pick a safe "is this CLI alive?" probe per kind.
+    // claude: `claude --version` (Anthropic CLI prints e.g. "1.x.x (Claude Code)")
+    // codex:  `codex --version` (OpenAI Codex CLI)
+    // custom: `<binary> --version`
+    const args = ["--version"];
+    process.stderr.write(
+      `[AutoDOM] CLI check: spawning '${binary}' ${JSON.stringify(args)}\n`,
+    );
+    let proc;
+    try {
+      proc = spawn(binary, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: process.env,
+      });
+    } catch (spawnErr) {
+      send({
+        ok: false,
+        error: `Failed to spawn '${binary}': ${spawnErr.message}`,
+      });
+      return;
+    }
+    const out = [];
+    const err = [];
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { proc.kill("SIGTERM"); } catch (_) {}
+      send({ ok: false, error: `Timed out probing '${binary}'` });
+    }, 6000);
+    proc.stdout.on("data", (d) => out.push(d));
+    proc.stderr.on("data", (d) => err.push(d));
+    proc.on("error", (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      send({
+        ok: false,
+        error:
+          e.code === "ENOENT"
+            ? `Binary '${binary}' not found on PATH. Install it (e.g. npm i -g @anthropic-ai/claude-code) or use the absolute path.`
+            : e.message,
+      });
+    });
+    proc.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const stdout = Buffer.concat(out).toString("utf8").trim();
+      const stderr = Buffer.concat(err).toString("utf8").trim();
+      // Some CLIs print --version to stderr; accept either.
+      const version = stdout || stderr;
+      if (code === 0 && version) {
+        send({ ok: true, version, kind });
+      } else if (code === 0) {
+        send({ ok: true, version: "(no version output)", kind });
+      } else {
+        send({
+          ok: false,
+          error: `'${binary} --version' exited ${code}.${stderr ? " " + stderr.substring(0, 200) : ""}`,
+        });
+      }
+    });
+    return;
+  }
+
   if (message.type === "AI_CHAT_REQUEST") {
     const { id, text, context, conversationHistory, provider, providerConfig } =
       message;
@@ -1230,20 +1383,24 @@ function _processWsMessage(socket, message) {
     );
 
     if (!extensionSocket || extensionSocket.readyState !== 1) {
-      try {
-        socket.send(
-          JSON.stringify({
-            type: "AI_CHAT_RESPONSE",
-            id: id,
-            error: "Chrome extension is not connected.",
-          }),
-        );
-      } catch (_) {}
+      _safeSendAiResponse(socket, {
+        type: "AI_CHAT_RESPONSE",
+        id: id,
+        error: "Chrome extension is not connected.",
+      });
       return;
     }
 
     (async () => {
+      // Helper: throw if the user has cancelled this request. Awaited
+      // points in the agent loop should call this to short-circuit
+      // before doing more work (extra tool calls, follow-up provider
+      // round-trips, etc.).
+      const _checkAbort = () => {
+        if (_isAborted(id)) throw new AiAbortError(id);
+      };
       try {
+        _checkAbort();
         const lower = (text || "").toLowerCase().trim();
         const toolCalls = [];
         let responseText = "";
@@ -1302,16 +1459,16 @@ function _processWsMessage(socket, message) {
             toolCalls.push(...providerResult.toolCalls);
           }
 
-          socket.send(
-            JSON.stringify({
-              type: "AI_CHAT_RESPONSE",
-              id: id,
-              response: responseText,
-              toolCalls: toolCalls,
-            }),
-          );
+          _safeSendAiResponse(socket, {
+            type: "AI_CHAT_RESPONSE",
+            id: id,
+            response: responseText,
+            toolCalls: toolCalls,
+          });
           return;
         }
+
+        _checkAbort();
 
         // ── Heuristic AI routing ──────────────────────────────
         // Map natural language intents to tool calls and compose
@@ -1556,9 +1713,12 @@ function _processWsMessage(socket, message) {
             }
           }
 
-          // ── Fallback: Queue for IDE agent polling ──────────────
-          // If sampling isn't supported or failed, store the request
-          // so the IDE agent can pick it up via get_pending_chat_requests tool.
+          // ── Fallback: No AI is actually connected ─────────────
+          // Sampling didn't work and no direct provider is configured.
+          // Show a short, actionable message instead of the verbose
+          // queue dump — the queued request rarely gets picked up
+          // unless the user has explicitly told their IDE agent to
+          // poll get_pending_chat_requests.
           if (!aiRouted) {
             const chatReqId = ++chatRequestIdCounter;
             pendingChatRequests.set(chatReqId, {
@@ -1577,48 +1737,38 @@ function _processWsMessage(socket, message) {
               }
             }, 120000).unref();
 
-            responseText = `I've queued your request for the AI agent connected to your IDE.\n\n`;
-            responseText += `Request: "${text}"\n`;
-            responseText += `Page: ${context?.title || "Unknown page"} (${context?.url || ""})\n\n`;
-
-            if (context?.interactiveElements) {
-              const ie = context.interactiveElements;
-              responseText += `This page has ${ie.links || 0} links, ${ie.buttons || 0} buttons, ${ie.inputs || 0} inputs, and ${ie.forms || 0} forms.\n\n`;
-            }
-
-            responseText += `If your IDE agent doesn't pick this up automatically, you can:\n`;
-            responseText += `• Ask the agent in your IDE: "Use get_pending_chat_requests to see what I need"\n`;
-            responseText += `• Or use slash commands: /dom, /screenshot, /click, /help\n`;
-
-            if (effectiveProvider !== "ide") {
-              responseText += `• Or configure a valid ${effectiveProvider === "openai" ? "OpenAI" : "Anthropic"} API key to use direct provider mode\n`;
-            }
+            responseText =
+              `**No AI provider is connected.**\n\n` +
+              `To chat with AutoDOM, please connect an AI:\n\n` +
+              `• Open the AutoDOM extension settings and add an **OpenAI**, **Anthropic**, or **Ollama** key/endpoint, **or**\n` +
+              `• Ask the AI agent in your IDE (Copilot, Codex, Cursor, etc.) to call \`get_pending_chat_requests\` to pick up this message.\n\n` +
+              `Slash commands like \`/dom\`, \`/screenshot\`, \`/click\`, \`/help\` work without an AI.`;
 
             // Also emit a notification to stderr so IDE-side logs show the pending request
             process.stderr.write(
-              `[AutoDOM] ⚡ Pending chat request #${chatReqId}: "${(text || "").substring(0, 100)}"\n`,
+              `[AutoDOM] ⚡ Pending chat request #${chatReqId} (no AI connected): "${(text || "").substring(0, 100)}"\n`,
             );
           }
         }
 
-        socket.send(
-          JSON.stringify({
-            type: "AI_CHAT_RESPONSE",
-            id: id,
-            response: responseText,
-            toolCalls: toolCalls,
-          }),
-        );
+        _safeSendAiResponse(socket, {
+          type: "AI_CHAT_RESPONSE",
+          id: id,
+          response: responseText,
+          toolCalls: toolCalls,
+        });
       } catch (err) {
-        try {
-          socket.send(
-            JSON.stringify({
-              type: "AI_CHAT_RESPONSE",
-              id: id,
-              error: `AI processing error: ${err.message}`,
-            }),
+        if (err && err.aiAborted) {
+          process.stderr.write(
+            `[AutoDOM] AI request id=${id} aborted mid-flight — not sending response.\n`,
           );
-        } catch (_) {}
+          return;
+        }
+        _safeSendAiResponse(socket, {
+          type: "AI_CHAT_RESPONSE",
+          id: id,
+          error: `AI processing error: ${err.message}`,
+        });
       }
     })();
     return;
@@ -1916,6 +2066,14 @@ function normalizeProviderSelection(provider) {
   ) {
     return "ollama";
   }
+  if (
+    normalized === "cli" ||
+    normalized === "claude-cli" ||
+    normalized === "codex-cli" ||
+    normalized === "local-cli"
+  ) {
+    return "cli";
+  }
   return "ide";
 }
 
@@ -1950,6 +2108,17 @@ function mergeProviderConfig(incoming = {}) {
       "http://localhost:11434",
     ollamaModel:
       incoming.ollamaModel || directProviderConfig.ollamaModel || "llama3.2",
+    cliBinary:
+      incoming.cliBinary || directProviderConfig.cliBinary || "claude",
+    cliKind: incoming.cliKind || directProviderConfig.cliKind || "claude",
+    cliExtraArgs:
+      incoming.cliExtraArgs != null
+        ? incoming.cliExtraArgs
+        : directProviderConfig.cliExtraArgs || "",
+    cliTimeoutMs:
+      Number(incoming.cliTimeoutMs) ||
+      directProviderConfig.cliTimeoutMs ||
+      90000,
   };
 }
 
@@ -1957,6 +2126,7 @@ function providerHasCredentials(provider, config) {
   if (provider === "openai") return !!config.openaiApiKey;
   if (provider === "anthropic") return !!config.anthropicApiKey;
   if (provider === "ollama") return true; // Ollama runs locally, no API key needed
+  if (provider === "cli") return !!(config.cliBinary || "").trim();
   return false;
 }
 
@@ -2212,7 +2382,191 @@ async function routeDirectProviderChat({
     });
   }
 
+  if (provider === "cli") {
+    return callCliProvider({
+      text,
+      context,
+      conversationHistory,
+      providerConfig,
+    });
+  }
+
   throw new Error(`Unsupported direct provider: ${provider}`);
+}
+
+// ─── Local CLI provider (Claude Code / Codex / custom) ─────
+// Spawns the locally-installed AI CLI binary, pipes the composed
+// prompt to it, and returns stdout. The user's existing CLI auth
+// (Anthropic OAuth token, OpenAI key, etc.) is reused — no API
+// key needed in the extension. Best for users who already use
+// `claude` or `codex` daily.
+//
+// Supported kinds:
+//   claude  → spawn `<binary> -p` and write prompt to stdin
+//   codex   → spawn `<binary> exec -` and write prompt to stdin
+//   custom  → spawn `<binary> <extraArgs...>` and write prompt to stdin
+async function callCliProvider({
+  text,
+  context,
+  conversationHistory,
+  providerConfig,
+}) {
+  const binary = (providerConfig.cliBinary || "claude").trim();
+  const kind = (providerConfig.cliKind || "claude").trim().toLowerCase();
+  const extraArgs = (providerConfig.cliExtraArgs || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  const timeoutMs = Math.max(
+    5000,
+    Math.min(600000, Number(providerConfig.cliTimeoutMs) || 90000),
+  );
+
+  if (!binary) {
+    throw new Error(
+      "CLI provider: no binary configured. Set the CLI binary (e.g. 'claude' or 'codex') in the AutoDOM extension popup.",
+    );
+  }
+
+  // Compose the prompt: system context + conversation + new user turn
+  const systemPreamble = buildProviderSystemPrompt(context);
+  const historyText = conversationToProviderText(conversationHistory);
+  const composedPrompt =
+    `${systemPreamble}\n\n` +
+    (historyText ? `Conversation so far:\n${historyText}\n\n` : "") +
+    `User: ${text}\n\nRespond as the AutoDOM browser assistant.`;
+
+  // Resolve the binary kind → argv. Different CLIs accept the prompt
+  // in different ways (stdin for claude/codex, -p flag for copilot).
+  let args;
+  // When true, the composed prompt is written to the child's stdin.
+  // When false, the prompt is embedded in argv and stdin is closed.
+  let writePromptToStdin = true;
+  if (kind === "claude") {
+    // `claude -p` reads prompt from stdin in non-interactive (print) mode.
+    args = ["-p", ...extraArgs];
+  } else if (kind === "codex") {
+    // `codex exec -` reads prompt from stdin and prints assistant reply.
+    // `--skip-git-repo-check` (must come AFTER `exec`) lets codex run
+    // when the server's cwd is not a trusted git repo. Harmless inside
+    // a repo too.
+    args = ["exec", "--skip-git-repo-check", "-", ...extraArgs];
+  } else if (kind === "copilot") {
+    // GitHub Copilot CLI takes the prompt via `-p` as an argv string and
+    // exits after one response in non-interactive mode. `--allow-all-tools`
+    // skips the interactive tool-approval loop which would otherwise hang
+    // the spawn forever. Users can still override via extraArgs.
+    args = ["--allow-all-tools", "-p", composedPrompt, ...extraArgs];
+    writePromptToStdin = false;
+  } else {
+    // Custom: caller fully controls argv (extraArgs only)
+    args = [...extraArgs];
+  }
+
+  process.stderr.write(
+    `[AutoDOM] CLI provider: spawning '${binary}' kind=${kind} args=${JSON.stringify(args)} timeout=${timeoutMs}ms\n`,
+  );
+
+  return await new Promise((resolve, reject) => {
+    let proc;
+    try {
+      proc = spawn(binary, args, {
+        stdio: ["pipe", "pipe", "pipe"],
+        // Inherit env so the CLI finds its own auth token files
+        env: process.env,
+      });
+    } catch (spawnErr) {
+      reject(
+        new Error(
+          `CLI provider: failed to spawn '${binary}': ${spawnErr.message}. Ensure the binary is installed and on PATH.`,
+        ),
+      );
+      return;
+    }
+
+    let stdoutChunks = [];
+    let stderrChunks = [];
+    let settled = false;
+
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      try {
+        clearTimeout(timer);
+      } catch (_) {}
+      fn(value);
+    };
+
+    const timer = setTimeout(() => {
+      try {
+        proc.kill("SIGTERM");
+      } catch (_) {}
+      setTimeout(() => {
+        try {
+          proc.kill("SIGKILL");
+        } catch (_) {}
+      }, 1500).unref();
+      finish(
+        reject,
+        new Error(
+          `CLI provider: '${binary}' timed out after ${Math.round(timeoutMs / 1000)}s`,
+        ),
+      );
+    }, timeoutMs);
+    timer.unref?.();
+
+    proc.stdout.on("data", (d) => stdoutChunks.push(d));
+    proc.stderr.on("data", (d) => stderrChunks.push(d));
+
+    proc.on("error", (err) => {
+      finish(
+        reject,
+        new Error(
+          err.code === "ENOENT"
+            ? `CLI provider: binary '${binary}' not found on PATH. Install it (e.g. 'npm i -g @anthropic-ai/claude-code') or use the absolute path.`
+            : `CLI provider error: ${err.message}`,
+        ),
+      );
+    });
+
+    proc.on("close", (code) => {
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8").trim();
+      const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
+      if (code !== 0 && !stdout) {
+        finish(
+          reject,
+          new Error(
+            `CLI provider: '${binary}' exited with code ${code}.${stderr ? " stderr: " + stderr.substring(0, 500) : ""}`,
+          ),
+        );
+        return;
+      }
+      finish(resolve, {
+        response: stdout || "(CLI returned no output)",
+        toolCalls: [
+          {
+            tool: "_direct_provider",
+            via: "cli",
+            binary,
+            kind,
+          },
+        ],
+      });
+    });
+
+    try {
+      if (writePromptToStdin) {
+        proc.stdin.end(composedPrompt);
+      } else {
+        proc.stdin.end();
+      }
+    } catch (writeErr) {
+      finish(
+        reject,
+        new Error(`CLI provider: failed to write prompt: ${writeErr.message}`),
+      );
+    }
+  });
 }
 
 const server = new FastMCP({

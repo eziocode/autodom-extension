@@ -27,9 +27,20 @@ const DOM = {
   providerApiKey: $("#providerApiKey"),
   providerModel: $("#providerModel"),
   providerBaseUrl: $("#providerBaseUrl"),
+  providerCliKind: $("#providerCliKind"),
+  providerCliBinary: $("#providerCliBinary"),
+  providerCliExtraArgs: $("#providerCliExtraArgs"),
   providerEnabledToggle: $("#providerEnabledToggle"),
+  providerPreset: $("#providerPreset"),
   saveProviderBtn: $("#saveProviderBtn"),
+  testProviderBtn: $("#testProviderBtn"),
+  checkCliBtn: $("#checkCliBtn"),
   providerStatus: $("#providerStatus"),
+  cliPromptBox: $("#cliPromptBox"),
+  cliPromptText: $("#cliPromptText"),
+  cliPromptInstall: $("#cliPromptInstall"),
+  cliPromptUseDefault: $("#cliPromptUseDefault"),
+  cliPromptDocsBtn: $("#cliPromptDocsBtn"),
   rateLimitToggle: $("#rateLimitToggle"),
   rateLimitMax: $("#rateLimitMax"),
   rateLimitWindow: $("#rateLimitWindow"),
@@ -52,6 +63,94 @@ let providerSettings = {
   source: "ide",
   apiKey: "",
   model: "",
+  baseUrl: "",
+  cliBinary: "",
+  cliKind: "claude",
+  cliExtraArgs: "",
+  enabled: false,
+  preset: "custom",
+};
+
+// Provider presets — each maps a vendor to the underlying API protocol
+// AutoDOM already speaks (openai-compatible / anthropic / ollama) plus
+// sensible default base URL and model. Inspired by mostbean-cn/coding-switch.
+const PROVIDER_PRESETS = {
+  custom: null,
+  "openai-official": {
+    source: "openai",
+    baseUrl: "https://api.openai.com/v1",
+    model: "gpt-4.1-mini",
+  },
+  "anthropic-official": {
+    source: "anthropic",
+    baseUrl: "https://api.anthropic.com",
+    model: "claude-3-5-sonnet-latest",
+  },
+  "ollama-local": {
+    source: "ollama",
+    baseUrl: "http://localhost:11434",
+    model: "llama3.2",
+  },
+  deepseek: {
+    source: "openai",
+    baseUrl: "https://api.deepseek.com/v1",
+    model: "deepseek-chat",
+  },
+  zhipu: {
+    source: "openai",
+    baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+    model: "glm-4-plus",
+  },
+  moonshot: {
+    source: "openai",
+    baseUrl: "https://api.moonshot.cn/v1",
+    model: "moonshot-v1-8k",
+  },
+  qianfan: {
+    source: "openai",
+    baseUrl: "https://qianfan.baidubce.com/v2",
+    model: "ernie-4.0-8k",
+  },
+  dashscope: {
+    source: "openai",
+    baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    model: "qwen-turbo",
+  },
+};
+
+// Suppress autosave / preset-reset while we're programmatically applying a preset.
+let _suppressFieldEvents = false;
+
+// Per-CLI-kind metadata used to prompt the user to install / configure
+// the chosen local CLI binary. Inspired by mostbean-cn/coding-switch's
+// CLI-aware provider flow.
+const CLI_KIND_INFO = {
+  claude: {
+    label: "Claude Code CLI",
+    binary: "claude",
+    install: "npm install -g @anthropic-ai/claude-code",
+    docsUrl: "https://docs.anthropic.com/en/docs/claude-code/quickstart",
+  },
+  codex: {
+    label: "Codex CLI",
+    binary: "codex",
+    install: "npm install -g @openai/codex",
+    docsUrl: "https://github.com/openai/codex",
+  },
+  copilot: {
+    label: "GitHub Copilot CLI",
+    binary: "copilot",
+    install: "npm install -g @github/copilot",
+    docsUrl: "https://docs.github.com/en/copilot/github-copilot-in-the-cli",
+    authHint:
+      "Run `copilot` once interactively and follow the GitHub device-login prompt to authenticate.",
+  },
+  custom: {
+    label: "Custom CLI",
+    binary: "",
+    install: "# Install your CLI of choice, then enter its name or absolute path above.",
+    docsUrl: "",
+  },
 };
 let activityLogs = [];
 let activityFilter = "all";
@@ -96,6 +195,11 @@ const _secretAreaName =
     "aiProviderApiKey",
     "aiProviderModel",
     "aiProviderBaseUrl",
+    "aiProviderCliBinary",
+    "aiProviderCliKind",
+    "aiProviderCliExtraArgs",
+    "aiProviderEnabled",
+    "aiProviderPreset",
   ]);
   const secretStored = await new Promise((resolve) => {
     try {
@@ -121,6 +225,11 @@ const _secretAreaName =
     apiKey,
     model: stored.aiProviderModel || "",
     baseUrl: stored.aiProviderBaseUrl || "",
+    cliBinary: stored.aiProviderCliBinary || "",
+    cliKind: stored.aiProviderCliKind || "claude",
+    cliExtraArgs: stored.aiProviderCliExtraArgs || "",
+    enabled: stored.aiProviderEnabled === true,
+    preset: stored.aiProviderPreset || "custom",
   };
 
   DOM.portInput.value = port;
@@ -129,6 +238,16 @@ const _secretAreaName =
   if (DOM.providerApiKey) DOM.providerApiKey.value = providerSettings.apiKey;
   if (DOM.providerModel) DOM.providerModel.value = providerSettings.model;
   if (DOM.providerBaseUrl) DOM.providerBaseUrl.value = providerSettings.baseUrl;
+  if (DOM.providerCliBinary)
+    DOM.providerCliBinary.value = providerSettings.cliBinary;
+  if (DOM.providerCliKind)
+    DOM.providerCliKind.value = providerSettings.cliKind || "claude";
+  if (DOM.providerCliExtraArgs)
+    DOM.providerCliExtraArgs.value = providerSettings.cliExtraArgs;
+  if (DOM.providerEnabledToggle)
+    DOM.providerEnabledToggle.checked = !!providerSettings.enabled;
+  if (DOM.providerPreset)
+    DOM.providerPreset.value = providerSettings.preset || "custom";
   updateProviderUI();
 
   const storedActivity = await activityStorage.get([ACTIVITY_LOG_KEY]);
@@ -276,15 +395,108 @@ const _secretAreaName =
 
   if (DOM.providerSelect) {
     DOM.providerSelect.addEventListener("change", () => {
+      if (_suppressFieldEvents) return;
       providerSettings.source = DOM.providerSelect.value || "ide";
+      // Manual change → preset no longer matches.
+      _resetPresetIfManualEdit();
       updateProviderUI();
       // Auto-save when provider changes so settings persist immediately
       saveProviderSettings();
     });
   }
 
+  if (DOM.providerPreset) {
+    DOM.providerPreset.addEventListener("change", () => {
+      applyPreset(DOM.providerPreset.value || "custom");
+    });
+  }
+
+  // Manual edits to baseUrl / model should drop the preset label to "custom"
+  // (otherwise the UI would lie about which preset is active).
+  ["providerBaseUrl", "providerModel", "providerApiKey"].forEach((k) => {
+    const el = DOM[k];
+    if (!el) return;
+    el.addEventListener("input", () => {
+      if (_suppressFieldEvents) return;
+      _resetPresetIfManualEdit();
+    });
+  });
+
   if (DOM.saveProviderBtn) {
-    DOM.saveProviderBtn.addEventListener("click", saveProviderSettings);
+    DOM.saveProviderBtn.addEventListener("click", () => saveProviderSettings());
+  }
+
+  if (DOM.testProviderBtn) {
+    DOM.testProviderBtn.addEventListener("click", testProviderConnection);
+  }
+
+  // ─── CLI prompt wiring ────────────────────────────────────
+  // When the user picks "Local CLI" we render an inline hint with the
+  // expected default binary, an install command, and a one-click
+  // "Use default" autofill. Triggered on kind/provider change.
+  if (DOM.providerCliKind) {
+    DOM.providerCliKind.addEventListener("change", () => {
+      if (_suppressFieldEvents) return;
+      // Auto-fill / replace the binary when the user switches CLI kind.
+      // Behaviour:
+      //   • If the binary field is empty → fill with the new default.
+      //   • If the binary still matches a *different* kind's default
+      //     (e.g. user had "claude" and switched to "codex") → swap to
+      //     the new default so it actually works.
+      //   • Otherwise the user has typed a custom path/binary — leave
+      //     it alone so we don't clobber their override.
+      const kind = DOM.providerCliKind.value || "claude";
+      const info = CLI_KIND_INFO[kind] || CLI_KIND_INFO.claude;
+      const knownDefaults = Object.values(CLI_KIND_INFO)
+        .map((i) => (i.binary || "").trim())
+        .filter(Boolean);
+      const current = (DOM.providerCliBinary?.value || "").trim();
+      if (DOM.providerCliBinary && (!current || knownDefaults.includes(current))) {
+        DOM.providerCliBinary.value = info.binary || "";
+      }
+      updateProviderUI();
+      saveProviderSettings({ skipTest: true });
+    });
+  }
+
+  if (DOM.providerCliBinary) {
+    DOM.providerCliBinary.addEventListener("input", () => {
+      if (_suppressFieldEvents) return;
+      // Re-render so the prompt hides as soon as the user types a binary.
+      renderCliPrompt();
+    });
+  }
+
+  if (DOM.cliPromptUseDefault) {
+    DOM.cliPromptUseDefault.addEventListener("click", () => {
+      const kind = DOM.providerCliKind?.value || "claude";
+      const info = CLI_KIND_INFO[kind] || CLI_KIND_INFO.claude;
+      if (!info.binary) {
+        updateProviderUI(
+          "Custom CLI has no default — enter the binary name or absolute path.",
+        );
+        DOM.providerCliBinary?.focus();
+        return;
+      }
+      if (DOM.providerCliBinary) DOM.providerCliBinary.value = info.binary;
+      saveProviderSettings({ skipTest: true });
+      // Try a real probe so the user gets immediate feedback.
+      checkCliBinary();
+    });
+  }
+
+  if (DOM.cliPromptDocsBtn) {
+    DOM.cliPromptDocsBtn.addEventListener("click", () => {
+      const kind = DOM.providerCliKind?.value || "claude";
+      const info = CLI_KIND_INFO[kind] || CLI_KIND_INFO.claude;
+      if (info.docsUrl) {
+        chrome.tabs.create({ url: info.docsUrl });
+      }
+    });
+  }
+
+  if (DOM.checkCliBtn) {
+    DOM.checkCliBtn.addEventListener("click", checkCliBinary);
   }
 
   if (DOM.logFilter) {
@@ -426,18 +638,60 @@ DOM.aiChatBtn.addEventListener("click", async () => {
   }
 });
 
-async function saveProviderSettings() {
+async function saveProviderSettings(opts) {
+  const { skipTest = false } = opts || {};
+
   providerSettings = {
     source: DOM.providerSelect?.value || "ide",
     apiKey: DOM.providerApiKey?.value?.trim() || "",
     model: DOM.providerModel?.value?.trim() || "",
     baseUrl: DOM.providerBaseUrl?.value?.trim() || "",
+    cliBinary: DOM.providerCliBinary?.value?.trim() || "",
+    cliKind: DOM.providerCliKind?.value || "claude",
+    cliExtraArgs: DOM.providerCliExtraArgs?.value?.trim() || "",
+    enabled: !!DOM.providerEnabledToggle?.checked,
+    preset: DOM.providerPreset?.value || "custom",
   };
+
+  // ── Pre-activation gating ─────────────────────────────────
+  // If the user wants to enable a direct (network) provider, run a
+  // connection test first. On failure, persist settings but flip
+  // `enabled` off so the chat panel falls back to IDE / safe mode.
+  // Inspired by coding-switch's pre-activation health check pattern.
+  let activationDeniedReason = null;
+  const isNetworkSource =
+    providerSettings.source === "openai" ||
+    providerSettings.source === "anthropic" ||
+    providerSettings.source === "ollama";
+
+  if (!skipTest && providerSettings.enabled && isNetworkSource) {
+    updateProviderUI("Testing connection before activating…");
+    const test = await runConnectionTest(providerSettings);
+    if (!test.ok) {
+      providerSettings.enabled = false;
+      if (DOM.providerEnabledToggle) DOM.providerEnabledToggle.checked = false;
+      activationDeniedReason = test.error || "connection test failed";
+      addLog(
+        `Provider activation denied: ${activationDeniedReason}`,
+        "error",
+      );
+    } else {
+      addLog(
+        `Provider connection OK (${test.latencyMs}ms${test.detail ? ` · ${test.detail}` : ""})`,
+        "success",
+      );
+    }
+  }
 
   await chrome.storage.local.set({
     aiProviderSource: providerSettings.source,
     aiProviderModel: providerSettings.model,
     aiProviderBaseUrl: providerSettings.baseUrl,
+    aiProviderCliBinary: providerSettings.cliBinary,
+    aiProviderCliKind: providerSettings.cliKind,
+    aiProviderCliExtraArgs: providerSettings.cliExtraArgs,
+    aiProviderEnabled: providerSettings.enabled,
+    aiProviderPreset: providerSettings.preset,
   });
   // Persist API key into RAM-only session storage (never written to disk).
   try {
@@ -452,18 +706,185 @@ async function saveProviderSettings() {
       apiKey: providerSettings.apiKey,
       model: providerSettings.model,
       baseUrl: providerSettings.baseUrl,
+      cliBinary: providerSettings.cliBinary,
+      cliKind: providerSettings.cliKind,
+      cliExtraArgs: providerSettings.cliExtraArgs,
+      enabled: providerSettings.enabled,
+      preset: providerSettings.preset,
     },
   });
 
-  updateProviderUI();
+  updateProviderUI(
+    activationDeniedReason
+      ? `✕ Activation denied: ${activationDeniedReason}`
+      : undefined,
+  );
 
   if (response?.success) {
     addLog(
-      `AI provider saved: ${formatProviderLabel(providerSettings.source)}`,
-      "success",
+      `AI provider saved: ${formatProviderLabel(providerSettings.source)}${providerSettings.enabled ? " · enabled" : ""}`,
+      activationDeniedReason ? "warn" : "success",
     );
   } else {
     addLog(response?.error || "Failed to save AI provider settings", "error");
+  }
+}
+
+// ─── Connection test (popup → SW → provider API) ────────────
+// Calls the service worker which performs the actual network ping
+// in its own context. Returns { ok, latencyMs, error, detail }.
+async function runConnectionTest(settings) {
+  try {
+    const resp = await sendRuntimeMessage({
+      type: "TEST_AI_PROVIDER",
+      provider: {
+        source: settings.source,
+        apiKey: settings.apiKey,
+        model: settings.model,
+        baseUrl: settings.baseUrl,
+      },
+    });
+    if (resp && resp.success && resp.ok) {
+      return {
+        ok: true,
+        latencyMs: resp.latencyMs || 0,
+        detail: resp.detail || "",
+      };
+    }
+    return {
+      ok: false,
+      error: (resp && (resp.error || resp.detail)) || "no response",
+    };
+  } catch (err) {
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
+async function testProviderConnection() {
+  if (!DOM.testProviderBtn) return;
+  const settings = {
+    source: DOM.providerSelect?.value || "ide",
+    apiKey: DOM.providerApiKey?.value?.trim() || "",
+    model: DOM.providerModel?.value?.trim() || "",
+    baseUrl: DOM.providerBaseUrl?.value?.trim() || "",
+  };
+  if (settings.source === "ide" || settings.source === "cli") {
+    updateProviderUI(
+      "Test connection only applies to OpenAI / Anthropic / Ollama providers.",
+    );
+    return;
+  }
+  if (
+    (settings.source === "openai" || settings.source === "anthropic") &&
+    !settings.apiKey
+  ) {
+    updateProviderUI("Enter an API key before testing.");
+    return;
+  }
+  DOM.testProviderBtn.disabled = true;
+  updateProviderUI("Testing connection…");
+  try {
+    const t0 = Date.now();
+    const test = await runConnectionTest(settings);
+    const elapsed = Date.now() - t0;
+    if (test.ok) {
+      const latency = test.latencyMs || elapsed;
+      const detail = test.detail ? ` · ${test.detail}` : "";
+      updateProviderUI(`✓ Connected · ${latency}ms${detail}`);
+      addLog(
+        `Provider test OK: ${formatProviderLabel(settings.source)} (${latency}ms)`,
+        "success",
+      );
+    } else {
+      updateProviderUI(`✕ ${(test.error || "test failed").substring(0, 140)}`);
+      addLog(`Provider test failed: ${test.error}`, "error");
+    }
+  } finally {
+    DOM.testProviderBtn.disabled = false;
+  }
+}
+
+// ─── Preset application ─────────────────────────────────────
+// Applies a preset by writing source + baseUrl + model into the form.
+// Suppresses field-event handlers so we don't trigger autosave or
+// preset-reset partway through. Saves at the end (without test) so
+// the user still has to explicitly opt-in by toggling "Enable".
+function applyPreset(presetKey) {
+  const preset = PROVIDER_PRESETS[presetKey];
+  providerSettings.preset = presetKey;
+  if (!preset) {
+    // "custom" — no field changes, just persist the label
+    chrome.storage.local.set({ aiProviderPreset: presetKey });
+    updateProviderUI();
+    return;
+  }
+  _suppressFieldEvents = true;
+  try {
+    if (DOM.providerSelect) DOM.providerSelect.value = preset.source;
+    if (DOM.providerBaseUrl) DOM.providerBaseUrl.value = preset.baseUrl || "";
+    if (DOM.providerModel) DOM.providerModel.value = preset.model || "";
+    providerSettings.source = preset.source;
+    providerSettings.baseUrl = preset.baseUrl || "";
+    providerSettings.model = preset.model || "";
+  } finally {
+    _suppressFieldEvents = false;
+  }
+  updateProviderUI();
+  // Persist immediately, but skip the test — user must explicitly enable.
+  saveProviderSettings({ skipTest: true });
+}
+
+function _resetPresetIfManualEdit() {
+  if (!DOM.providerPreset) return;
+  const current = DOM.providerPreset.value;
+  if (current === "custom") return;
+  const preset = PROVIDER_PRESETS[current];
+  if (!preset) return;
+  const stillMatches =
+    DOM.providerSelect?.value === preset.source &&
+    (DOM.providerBaseUrl?.value || "") === (preset.baseUrl || "") &&
+    (DOM.providerModel?.value || "") === (preset.model || "");
+  if (!stillMatches) {
+    DOM.providerPreset.value = "custom";
+    providerSettings.preset = "custom";
+  }
+}
+
+// ─── CLI presence check ─────────────────────────────────────
+// Asks the bridge to spawn `<binary> --version` (short timeout) so the
+// user can verify the chosen CLI is installed and reachable on PATH
+// before sending real chat messages. Requires the MCP bridge to be
+// connected (CLI execution itself happens server-side).
+async function checkCliBinary() {
+  if (!DOM.checkCliBtn) return;
+  const binary = (DOM.providerCliBinary?.value || "").trim();
+  const kind = DOM.providerCliKind?.value || "claude";
+  if (!binary) {
+    DOM.providerStatus.textContent = "Set a CLI binary first (e.g. claude).";
+    return;
+  }
+  DOM.checkCliBtn.disabled = true;
+  DOM.providerStatus.textContent = `Checking '${binary}'…`;
+  try {
+    const response = await sendRuntimeMessage({
+      type: "CHECK_CLI_BINARY",
+      binary,
+      kind,
+    });
+    if (response?.ok) {
+      const ver = (response.version || "").trim().split(/\r?\n/)[0] || "ok";
+      DOM.providerStatus.textContent = `✓ ${kind} CLI ready · ${ver.substring(0, 80)}`;
+      addLog(`CLI ready: ${binary} (${ver.substring(0, 60)})`, "success");
+    } else {
+      const err = response?.error || "CLI check failed";
+      DOM.providerStatus.textContent = `✕ ${err.substring(0, 100)}`;
+      addLog(`CLI check failed: ${err}`, "error");
+    }
+  } catch (err) {
+    DOM.providerStatus.textContent = `✕ ${err.message || err}`;
+    addLog(`CLI check error: ${err.message || err}`, "error");
+  } finally {
+    DOM.checkCliBtn.disabled = false;
   }
 }
 
@@ -578,6 +999,7 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "AI_PROVIDER_STATUS") {
     if (message.provider) {
       providerSettings = {
+        ...providerSettings,
         source: message.provider.source || providerSettings.source || "ide",
         apiKey: message.provider.apiKey || providerSettings.apiKey || "",
         model: message.provider.model || providerSettings.model || "",
@@ -587,7 +1009,9 @@ chrome.runtime.onMessage.addListener((message) => {
       if (DOM.providerModel)
         DOM.providerModel.value = providerSettings.model || "";
     }
-    updateProviderUI(message.statusText);
+    // Ignore service-worker statusText — popup recomputes it locally
+    // using the active preset (e.g. "DeepSeek" instead of "GPT").
+    updateProviderUI();
   }
 });
 
@@ -618,15 +1042,85 @@ function updateUI() {
 }
 
 function formatProviderLabel(source) {
+  // Prefer the human-readable preset label when one is active — e.g.
+  // a DeepSeek preset (source=openai) should display as "DeepSeek",
+  // not "GPT".
+  const presetKey = providerSettings.preset || "custom";
+  if (presetKey && presetKey !== "custom") {
+    const presetLabels = {
+      "openai-official": "OpenAI",
+      "anthropic-official": "Anthropic Claude",
+      "ollama-local": "Ollama",
+      deepseek: "DeepSeek",
+      zhipu: "Zhipu GLM",
+      moonshot: "Kimi (Moonshot)",
+      qianfan: "Baidu Qianfan",
+      dashscope: "Alibaba DashScope",
+    };
+    if (presetLabels[presetKey]) return presetLabels[presetKey];
+  }
   switch (source) {
     case "openai":
-      return "GPT";
+      return "OpenAI-compatible";
     case "anthropic":
-      return "Claude";
+      return "Anthropic";
     case "ollama":
       return "Ollama";
+    case "cli":
+      return "Local CLI";
     default:
       return "IDE Agent";
+  }
+}
+
+// Helper: show/hide a field row. If the element sits inside a
+// `.field-group` wrapper (label + input together), toggle the wrapper so
+// the orphan label doesn't linger when its input is hidden.
+function _setFieldVisible(el, visible) {
+  if (!el) return;
+  const target = el.closest(".field-group") || el;
+  target.style.display = visible ? "" : "none";
+}
+
+// Renders the inline CLI install/help prompt under the Local CLI inputs.
+// Visible only when source === "cli". Surfaces the default binary name
+// for the chosen kind, the install command, and a docs link so a new
+// user can get to a working state without leaving the popup.
+function renderCliPrompt() {
+  if (!DOM.cliPromptBox) return;
+  const source = providerSettings.source || "ide";
+  if (source !== "cli") {
+    DOM.cliPromptBox.style.display = "none";
+    return;
+  }
+  const kind = DOM.providerCliKind?.value || providerSettings.cliKind || "claude";
+  const info = CLI_KIND_INFO[kind] || CLI_KIND_INFO.claude;
+  const currentBinary = (DOM.providerCliBinary?.value || "").trim();
+
+  // If the user already supplied a binary, the prompt becomes redundant —
+  // hide it to keep the popup compact.
+  if (currentBinary) {
+    DOM.cliPromptBox.style.display = "none";
+    return;
+  }
+
+  DOM.cliPromptBox.style.display = "";
+  if (DOM.cliPromptText) {
+    const base = info.binary
+      ? `${info.label} not configured. Default binary: '${info.binary}'. If it isn't on your $PATH yet, install it:`
+      : `${info.label} selected — enter the binary name or absolute path above.`;
+    DOM.cliPromptText.textContent = info.authHint
+      ? `${base}\nAuth: ${info.authHint}`
+      : base;
+  }
+  if (DOM.cliPromptInstall) {
+    DOM.cliPromptInstall.textContent = info.install;
+  }
+  if (DOM.cliPromptUseDefault) {
+    DOM.cliPromptUseDefault.style.display = info.binary ? "" : "none";
+  }
+  if (DOM.cliPromptDocsBtn) {
+    DOM.cliPromptDocsBtn.style.display = info.docsUrl ? "" : "none";
   }
 }
 
@@ -635,14 +1129,41 @@ function updateProviderUI(statusOverride) {
 
   const source = providerSettings.source || "ide";
   const label = formatProviderLabel(source);
+  const isCli = source === "cli";
+
+  // Surface the active provider as a compact badge in the panel header
+  // so the user can tell at a glance which path is wired up.
+  const badge = document.getElementById("providerBadge");
+  if (badge) badge.textContent = label;
+
+  // ─── Field visibility per provider ─────────────────────
+  // CLI mode hides model/apiKey/baseUrl (irrelevant) and shows CLI inputs.
+  _setFieldVisible(DOM.providerModel, !isCli);
+  _setFieldVisible(DOM.providerApiKey, !isCli);
+  _setFieldVisible(DOM.providerBaseUrl, !isCli);
+  _setFieldVisible(DOM.providerCliKind, isCli);
+  _setFieldVisible(DOM.providerCliBinary, isCli);
+  _setFieldVisible(DOM.providerCliExtraArgs, isCli);
+  // The protocol/source dropdown is redundant when a non-custom preset
+  // is active — the preset already determines the underlying API
+  // protocol. Hide it to avoid confusing labels (e.g. "OpenAI-compatible
+  // API" showing for a DeepSeek preset).
+  const presetKey = providerSettings.preset || "custom";
+  _setFieldVisible(DOM.providerSelect, presetKey === "custom");
+  // The "Enable direct provider" checkbox is meaningless for IDE/CLI
+  if (DOM.providerEnabledToggle?.parentElement) {
+    DOM.providerEnabledToggle.parentElement.style.display =
+      source === "ide" || isCli ? "none" : "";
+  }
 
   if (DOM.providerApiKey) {
     DOM.providerApiKey.disabled = source === "ide" || source === "ollama";
+    const friendly = formatProviderLabel(source);
     DOM.providerApiKey.placeholder =
       source === "openai"
-        ? "OpenAI API key"
+        ? `${friendly} API key`
         : source === "anthropic"
-          ? "Anthropic API key"
+          ? `${friendly} API key`
           : source === "ollama"
             ? "Not required for local Ollama"
             : "Not required for IDE Agent mode";
@@ -668,6 +1189,20 @@ function updateProviderUI(statusOverride) {
     }
   }
 
+  // Sensible defaults for CLI inputs the first time the user picks "cli"
+  if (isCli && DOM.providerCliBinary && !DOM.providerCliBinary.value) {
+    const kindKey = DOM.providerCliKind?.value || providerSettings.cliKind || "claude";
+    const info = CLI_KIND_INFO[kindKey] || CLI_KIND_INFO.claude;
+    DOM.providerCliBinary.value =
+      providerSettings.cliBinary || info.binary || "";
+  }
+
+  // "Check CLI" button is only useful in CLI mode
+  _setFieldVisible(DOM.checkCliBtn, isCli);
+
+  // Render the inline CLI install/help prompt (no-op for non-CLI sources)
+  renderCliPrompt();
+
   if (statusOverride) {
     DOM.providerStatus.textContent = statusOverride;
     return;
@@ -677,6 +1212,15 @@ function updateProviderUI(statusOverride) {
     DOM.providerStatus.textContent = isConnected
       ? "Using IDE Agent over MCP"
       : "IDE Agent selected — connect MCP to enable full AI";
+    return;
+  }
+
+  if (isCli) {
+    const bin = (providerSettings.cliBinary || "").trim();
+    const kind = providerSettings.cliKind || "claude";
+    DOM.providerStatus.textContent = bin
+      ? `Local ${kind} CLI · ${bin} (click "Check CLI" to verify)`
+      : `Local CLI selected — set the binary (e.g. claude or codex)`;
     return;
   }
 

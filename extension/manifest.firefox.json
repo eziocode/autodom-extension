@@ -25,7 +25,7 @@
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
-    "scripts": ["background/providers.js", "background/service-worker.js"]
+    "scripts": ["background/providers.js", "background/agent-tools.js", "background/service-worker.js"]
   },
   "action": {
     "default_popup": "popup/popup.html",

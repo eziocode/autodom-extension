@@ -95,62 +95,138 @@
                         </div>
                     </section>
 
-                    <section class="panel">
+                    <section class="panel provider-panel">
                         <div class="panel-header">
-                            <label class="section-label" for="providerSelect"
-                                >AI Provider</label
-                            >
+                            <span class="section-label">AI Provider</span>
+                            <span class="provider-badge" id="providerBadge"></span>
                         </div>
-                        <div class="field-stack">
-                            <select id="providerSelect" class="config-input">
-                                <option value="ide">IDE Agent (MCP)</option>
-                                <option value="openai">Connect with GPT</option>
-                                <option value="anthropic">
-                                    Connect with Claude
-                                </option>
-                                <option value="ollama">
-                                    Connect with Ollama (Local)
-                                </option>
-                            </select>
-                            <input
-                                type="text"
-                                id="providerModel"
-                                class="config-input"
-                                placeholder="Model"
-                            />
-                            <input
-                                type="password"
-                                id="providerApiKey"
-                                class="config-input"
-                                placeholder="API key"
-                            />
-                            <input
-                                type="text"
-                                id="providerBaseUrl"
-                                class="config-input"
-                                placeholder="Base URL (optional)"
-                            />
-                            <label
-                                class="checkbox-row"
-                                for="providerEnabledToggle"
-                            >
+                        <div class="provider-form">
+                            <div class="field-group">
+                                <label class="field-label" for="providerPreset">Preset</label>
+                                <select id="providerPreset" class="config-input">
+                                    <option value="custom">Custom / Advanced</option>
+                                    <optgroup label="Official">
+                                        <option value="openai-official">OpenAI</option>
+                                        <option value="anthropic-official">Anthropic Claude</option>
+                                        <option value="ollama-local">Ollama (Local)</option>
+                                    </optgroup>
+                                    <optgroup label="OpenAI-compatible">
+                                        <option value="deepseek">DeepSeek</option>
+                                        <option value="zhipu">Zhipu GLM</option>
+                                        <option value="moonshot">Kimi (Moonshot)</option>
+                                        <option value="qianfan">Baidu Qianfan</option>
+                                        <option value="dashscope">Alibaba DashScope (Qwen)</option>
+                                    </optgroup>
+                                </select>
+                            </div>
+
+                            <div class="field-group" id="providerSelectGroup">
+                                <label class="field-label" for="providerSelect">Protocol</label>
+                                <select id="providerSelect" class="config-input">
+                                    <option value="ide">IDE Agent (MCP)</option>
+                                    <option value="openai">OpenAI-compatible API</option>
+                                    <option value="anthropic">Anthropic API</option>
+                                    <option value="ollama">Ollama (Local API)</option>
+                                    <option value="cli">Local CLI (Claude / Codex)</option>
+                                </select>
+                            </div>
+
+                            <div class="field-group" id="providerCliKindGroup" style="display: none">
+                                <label class="field-label" for="providerCliKind">CLI</label>
+                                <select id="providerCliKind" class="config-input">
+                                    <option value="claude">Claude Code CLI</option>
+                                    <option value="codex">Codex CLI</option>
+                                    <option value="copilot">GitHub Copilot CLI</option>
+                                    <option value="custom">Custom command</option>
+                                </select>
+                            </div>
+
+                            <div class="field-group" id="providerCliBinaryGroup" style="display: none">
+                                <label class="field-label" for="providerCliBinary">Binary</label>
                                 <input
-                                    type="checkbox"
-                                    id="providerEnabledToggle"
+                                    type="text"
+                                    id="providerCliBinary"
+                                    class="config-input"
+                                    placeholder="e.g. claude, /usr/local/bin/codex"
                                 />
+                            </div>
+
+                            <div class="field-group" id="providerCliExtraArgsGroup" style="display: none">
+                                <label class="field-label" for="providerCliExtraArgs">Extra args</label>
+                                <input
+                                    type="text"
+                                    id="providerCliExtraArgs"
+                                    class="config-input"
+                                    placeholder="Optional"
+                                />
+                            </div>
+
+                            <div id="cliPromptBox" class="cli-prompt" style="display: none">
+                                <p class="field-hint" id="cliPromptText"></p>
+                                <pre class="config-code" id="cliPromptInstall"></pre>
+                                <div class="inline-row">
+                                    <button id="cliPromptUseDefault" class="text-btn">Use default</button>
+                                    <button id="cliPromptDocsBtn" class="text-btn">Open docs</button>
+                                </div>
+                            </div>
+
+                            <div class="field-group" id="providerModelGroup">
+                                <label class="field-label" for="providerModel">Model</label>
+                                <input
+                                    type="text"
+                                    id="providerModel"
+                                    class="config-input"
+                                    placeholder="e.g. gpt-4.1-mini"
+                                />
+                            </div>
+
+                            <div class="field-group" id="providerApiKeyGroup">
+                                <label class="field-label" for="providerApiKey">API key</label>
+                                <input
+                                    type="password"
+                                    id="providerApiKey"
+                                    class="config-input"
+                                    placeholder="Paste API key"
+                                />
+                            </div>
+
+                            <div class="field-group" id="providerBaseUrlGroup">
+                                <label class="field-label" for="providerBaseUrl">Base URL <span class="field-label-hint">(optional)</span></label>
+                                <input
+                                    type="text"
+                                    id="providerBaseUrl"
+                                    class="config-input"
+                                    placeholder="https://api.example.com"
+                                />
+                            </div>
+
+                            <label class="checkbox-row provider-enable" for="providerEnabledToggle">
+                                <input type="checkbox" id="providerEnabledToggle" />
                                 <span>Enable direct provider</span>
                             </label>
-                            <div class="inline-row">
-                                <button
-                                    id="saveProviderBtn"
-                                    class="secondary-btn"
-                                >
-                                    Save provider
+
+                            <div class="provider-actions">
+                                <button id="saveProviderBtn" class="action-btn provider-save">
+                                    Save
                                 </button>
-                                <span
-                                    id="providerStatus"
-                                    class="field-hint"
-                                ></span>
+                                <button
+                                    id="testProviderBtn"
+                                    class="secondary-btn provider-test"
+                                    title="Send a lightweight request to verify the API key, base URL, and model"
+                                >
+                                    Test
+                                </button>
+                                <button
+                                    id="checkCliBtn"
+                                    class="secondary-btn provider-check-cli"
+                                    style="display: none"
+                                    title="Check that the CLI binary is installed and reachable"
+                                >
+                                    Check CLI
+                                </button>
+                            </div>
+                            <div class="provider-status-line">
+                                <span id="providerStatus" class="field-hint"></span>
                             </div>
                         </div>
                     </section>
