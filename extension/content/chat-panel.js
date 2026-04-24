@@ -197,33 +197,44 @@
   const STORAGE_KEY_SETTINGS = "__autodom_chat_settings"; // { verboseLogs: bool }
   const STORAGE_KEY_MODEL_OVERRIDES = "__autodom_chat_model_overrides"; // { [providerSource]: modelId }
 
-  // Curated model catalog keyed by provider "source". The list is
-  // intentionally short — we surface the commonly-used tiers and let the
-  // configured default (set in the extension popup) be the fallback for
-  // anything outside the catalog.
+  // Static fallback catalog, keyed by provider "source" or "ide:<cliKind>".
+  // Used for providers that don't expose a live /models endpoint (Anthropic,
+  // CLI-based IDE integrations). Live results from the service worker
+  // override this when available.
   const MODEL_CATALOG = {
-    openai: [
-      { id: "gpt-4o-mini",   label: "GPT-4o mini",   description: "Fast · lowest cost" },
-      { id: "gpt-4o",        label: "GPT-4o",        description: "Most capable" },
-      { id: "gpt-4.1-mini",  label: "GPT-4.1 mini",  description: "Balanced" },
-    ],
     anthropic: [
       { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5",  description: "Fastest" },
       { id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6", description: "Balanced" },
       { id: "claude-opus-4-7",           label: "Claude Opus 4.7",   description: "Most capable" },
     ],
-    ollama: [
-      { id: "llama3.2", label: "Llama 3.2", description: "Local" },
-      { id: "qwen2.5",  label: "Qwen 2.5",  description: "Local" },
+    "ide:copilot": [
+      { id: "gpt-5",              label: "GPT-5",             description: "GitHub Copilot" },
+      { id: "claude-sonnet-4.5",  label: "Claude Sonnet 4.5", description: "GitHub Copilot" },
     ],
+    "ide:claude": [
+      { id: "claude-sonnet-4-6",          label: "Claude Sonnet 4.6", description: "Claude Code CLI" },
+      { id: "claude-opus-4-7",            label: "Claude Opus 4.7",   description: "Claude Code CLI" },
+      { id: "claude-haiku-4-5-20251001",  label: "Claude Haiku 4.5",  description: "Claude Code CLI" },
+    ],
+    "ide:codex": [
+      { id: "gpt-5",    label: "GPT-5",   description: "Codex CLI" },
+      { id: "o4-mini",  label: "o4-mini", description: "Codex CLI" },
+    ],
+    "ide:custom": [],
   };
 
   // Runtime state the model picker reads/writes.
   const _modelPickerState = {
     providerSource: "ide",  // snapshotted from popup's aiProviderSource
+    cliKind: "",            // snapshotted from popup's aiProviderCliKind (only when source==="ide")
     defaultModel: "",       // snapshotted from popup's aiProviderModel
-    overrides: {},          // per-provider user overrides
+    overrides: {},          // per-provider user overrides, keyed by catalog key
   };
+
+  // Live model lists fetched from the service worker, keyed by catalog key.
+  // Takes precedence over MODEL_CATALOG when non-empty.
+  const _liveModels = {};
+  const _modelFetchState = {}; // key → "idle" | "loading" | "error"
 
   function _normalizeProviderSource(src) {
     const s = (src || "").toLowerCase();
@@ -232,21 +243,72 @@
     return s || "ide";
   }
 
-  function _currentModelId() {
+  function _catalogKey() {
     const src = _modelPickerState.providerSource;
-    return _modelPickerState.overrides[src] || _modelPickerState.defaultModel || "";
+    if (src === "ide") {
+      const cli = (_modelPickerState.cliKind || "").toLowerCase();
+      return `ide:${cli || "custom"}`;
+    }
+    return src;
+  }
+
+  function _currentModelId() {
+    const key = _catalogKey();
+    return _modelPickerState.overrides[key] || _modelPickerState.defaultModel || "";
   }
 
   function _modelsForCurrentProvider() {
-    const src = _modelPickerState.providerSource;
-    const list = MODEL_CATALOG[src] ? [...MODEL_CATALOG[src]] : [];
-    // If the configured default isn't in our curated list, prepend it so
-    // the user can always pick their own model back.
+    const key = _catalogKey();
+    const live = _liveModels[key];
+    const base = live && live.length ? live : (MODEL_CATALOG[key] || []);
+    const list = [...base];
+    // Surface the configured default ONLY if it actually belongs to the
+    // current provider's list — prevents stale defaults (e.g. "llama3.2"
+    // from a prior Ollama selection) from leaking into unrelated providers
+    // like Copilot.
     const def = _modelPickerState.defaultModel;
-    if (def && !list.find((m) => m.id === def)) {
+    if (def && !list.find((m) => m.id === def) && _defaultBelongsToCurrent(def, key)) {
       list.unshift({ id: def, label: def, description: "Configured default" });
     }
     return list;
+  }
+
+  // Heuristic: a bare ollama-style default like "llama3.2" should not show
+  // up under anything except ollama. Known provider-specific prefixes gate
+  // this. When the live catalog is populated, we already filtered correctly
+  // so the default is either included or genuinely foreign.
+  function _defaultBelongsToCurrent(def, key) {
+    if (!def) return false;
+    const d = def.toLowerCase();
+    if (key === "openai") return /^(gpt|o\d|text-|chatgpt)/.test(d);
+    if (key === "anthropic" || key === "ide:claude") return d.startsWith("claude");
+    if (key === "ollama") return /^(llama|qwen|mistral|phi|gemma|deepseek)/.test(d);
+    if (key === "ide:copilot") return /^(gpt|claude)/.test(d);
+    if (key === "ide:codex") return /^(gpt|o\d)/.test(d);
+    return true; // unknown key → don't filter
+  }
+
+  function _requestProviderModels(force = false) {
+    const key = _catalogKey();
+    if (!force && (_liveModels[key]?.length || _modelFetchState[key] === "loading")) return;
+    _modelFetchState[key] = "loading";
+    try {
+      chrome.runtime.sendMessage(
+        { type: "LIST_PROVIDER_MODELS" },
+        (resp) => {
+          try { void chrome.runtime.lastError; } catch (_) {}
+          if (resp && resp.ok && Array.isArray(resp.models) && resp.models.length) {
+            _liveModels[key] = resp.models;
+            _modelFetchState[key] = "idle";
+          } else {
+            _modelFetchState[key] = "error";
+          }
+          try { _refreshModelPickerUI(); } catch (_) {}
+        },
+      );
+    } catch (_) {
+      _modelFetchState[key] = "error";
+    }
   }
 
   function _loadModelPickerState() {
@@ -254,6 +316,7 @@
       chrome.storage?.local?.get?.(
         [
           "aiProviderSource",
+          "aiProviderCliKind",
           "aiProviderModel",
           STORAGE_KEY_MODEL_OVERRIDES,
         ],
@@ -261,18 +324,26 @@
           _modelPickerState.providerSource = _normalizeProviderSource(
             items?.aiProviderSource,
           );
+          _modelPickerState.cliKind = (items?.aiProviderCliKind || "").toLowerCase();
           _modelPickerState.defaultModel = items?.aiProviderModel || "";
           _modelPickerState.overrides = items?.[STORAGE_KEY_MODEL_OVERRIDES] || {};
           try { _refreshModelPickerUI(); } catch (_) {}
+          _requestProviderModels();
         },
       );
       // Stay in sync with changes from the popup.
       chrome.storage?.onChanged?.addListener?.((changes, area) => {
         if (area !== "local") return;
+        let providerChanged = false;
         if (changes.aiProviderSource) {
           _modelPickerState.providerSource = _normalizeProviderSource(
             changes.aiProviderSource.newValue,
           );
+          providerChanged = true;
+        }
+        if (changes.aiProviderCliKind) {
+          _modelPickerState.cliKind = (changes.aiProviderCliKind.newValue || "").toLowerCase();
+          providerChanged = true;
         }
         if (changes.aiProviderModel) {
           _modelPickerState.defaultModel = changes.aiProviderModel.newValue || "";
@@ -282,15 +353,16 @@
             changes[STORAGE_KEY_MODEL_OVERRIDES].newValue || {};
         }
         try { _refreshModelPickerUI(); } catch (_) {}
+        if (providerChanged) _requestProviderModels(true);
       });
     } catch (_) {}
   }
 
   function _setModelOverride(modelId) {
-    const src = _modelPickerState.providerSource;
+    const key = _catalogKey();
     _modelPickerState.overrides = {
       ..._modelPickerState.overrides,
-      [src]: modelId,
+      [key]: modelId,
     };
     try {
       chrome.storage?.local?.set?.({
@@ -298,6 +370,32 @@
       });
     } catch (_) {}
     try { _refreshModelPickerUI(); } catch (_) {}
+  }
+
+  // Validate that the currently-selected model id belongs to the current
+  // provider's list. If not, clear the override and fall back to the first
+  // available model. Returns the final (validated) model id, or "" if the
+  // provider has no known models.
+  function _validateSelectedModel() {
+    const list = _modelsForCurrentProvider();
+    const id = _currentModelId();
+    if (!list.length) return id; // unknown catalog — trust the stored id
+    if (id && list.find((m) => m.id === id)) return id;
+    const fallback = list[0]?.id || "";
+    if (fallback) {
+      const key = _catalogKey();
+      _modelPickerState.overrides = {
+        ..._modelPickerState.overrides,
+        [key]: fallback,
+      };
+      try {
+        chrome.storage?.local?.set?.({
+          [STORAGE_KEY_MODEL_OVERRIDES]: _modelPickerState.overrides,
+        });
+      } catch (_) {}
+      try { _refreshModelPickerUI(); } catch (_) {}
+    }
+    return fallback;
   }
 
   // Forward declaration so _loadModelPickerState can call it before the
@@ -3700,6 +3798,9 @@
 
   function _modelPickerOpen() {
     if (!_modelPickerMenu || !_modelPickerBtn) return;
+    // Refresh from the provider on every open so newly pulled Ollama
+    // models / revoked OpenAI keys / switched CLI kinds show up.
+    _requestProviderModels(true);
     _renderModelMenu();
     _modelPickerMenu.hidden = false;
     _modelPickerBtn.setAttribute("aria-expanded", "true");
@@ -3724,11 +3825,17 @@
     _modelPickerMenu.innerHTML = "";
     const current = _currentModelId();
     const models = _modelsForCurrentProvider();
+    const key = _catalogKey();
     if (!models.length) {
       const empty = document.createElement("div");
       empty.className = "autodom-model-item";
       empty.style.color = "var(--c-text-3)";
-      empty.textContent = "No models configured for this provider.";
+      empty.textContent =
+        _modelFetchState[key] === "loading"
+          ? "Loading models…"
+          : _modelFetchState[key] === "error"
+            ? "Could not fetch models for this provider."
+            : "No models configured for this provider.";
       _modelPickerMenu.appendChild(empty);
       return;
     }
@@ -6029,6 +6136,19 @@
       isProcessing,
     );
     if (!text || isProcessing) return;
+
+    // Validate selected model belongs to the active provider before we
+    // dispatch. If the override is stale (e.g. provider just switched to
+    // Copilot but the saved override was an Ollama model), we transparently
+    // fall back to the first model in the provider's list and toast the
+    // user so they notice the swap.
+    try {
+      const prev = _currentModelId();
+      const validated = _validateSelectedModel();
+      if (prev && validated && validated !== prev) {
+        _showChatToast(`Model reset to ${validated} for this provider`);
+      }
+    } catch (_) {}
 
     // Intercept "summarize this page" intent BEFORE adding the user
     // message — aiSummarizePage adds its own short label and runs the

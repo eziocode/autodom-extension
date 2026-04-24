@@ -241,6 +241,101 @@ async function _testProviderConnection(p) {
   }
 }
 
+// Fetch the available models for the given provider config. Used by the
+// chat panel's model picker so the dropdown reflects the selected AI
+// provider instead of showing stale defaults.
+//
+// Strategy per protocol:
+//   • openai-compatible: GET {base}/models → map data[].id
+//   • ollama:            GET {base}/api/tags → map models[].name
+//   • anthropic:         no public /models endpoint → static curated list
+//   • ide + cliKind:     CLI binaries have no models API → static per-kind list
+//
+// Returns an array of { id, label, description } suitable for the picker.
+// Always resolves (never rejects) — errors just become an empty list so the
+// UI falls back to its static catalog.
+async function _fetchProviderModels(p) {
+  const TIMEOUT_MS = 6000;
+  const source = (p?.source || "ide").toLowerCase();
+  const apiKey = (p?.apiKey || "").trim();
+  const baseUrlRaw = (p?.baseUrl || "").trim();
+  const cliKind = (p?.cliKind || "").toLowerCase();
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
+
+  try {
+    if (source === "openai" || source === "gpt") {
+      if (!apiKey) return [];
+      const base = (baseUrlRaw || "https://api.openai.com/v1").replace(/\/+$/, "");
+      const resp = await fetch(`${base}/models`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: ac.signal,
+      });
+      if (!resp.ok) return [];
+      const data = await resp.json().catch(() => ({}));
+      const arr = Array.isArray(data?.data) ? data.data : [];
+      return arr
+        .filter((m) => typeof m?.id === "string")
+        // Keep chat-capable models; filter embeddings / tts / whisper / moderation.
+        .filter((m) => !/^(text-embedding|whisper|tts|dall-e|omni-moderation)/.test(m.id))
+        .map((m) => ({ id: m.id, label: m.id, description: m.owned_by || source }));
+    }
+
+    if (source === "ollama") {
+      const base = (baseUrlRaw || "http://localhost:11434").replace(/\/+$/, "");
+      const resp = await fetch(`${base}/api/tags`, {
+        method: "GET",
+        signal: ac.signal,
+      });
+      if (!resp.ok) return [];
+      const data = await resp.json().catch(() => ({}));
+      const tags = Array.isArray(data?.models) ? data.models : [];
+      return tags
+        .filter((t) => typeof t?.name === "string")
+        .map((t) => ({ id: t.name, label: t.name, description: "Local · Ollama" }));
+    }
+
+    if (source === "anthropic" || source === "claude") {
+      return [
+        { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5",  description: "Fastest" },
+        { id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6", description: "Balanced" },
+        { id: "claude-opus-4-7",           label: "Claude Opus 4.7",   description: "Most capable" },
+      ];
+    }
+
+    if (source === "ide") {
+      if (cliKind === "copilot") {
+        return [
+          { id: "gpt-5",             label: "GPT-5",             description: "GitHub Copilot" },
+          { id: "claude-sonnet-4.5", label: "Claude Sonnet 4.5", description: "GitHub Copilot" },
+        ];
+      }
+      if (cliKind === "claude") {
+        return [
+          { id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6", description: "Claude Code CLI" },
+          { id: "claude-opus-4-7",           label: "Claude Opus 4.7",   description: "Claude Code CLI" },
+          { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5",  description: "Claude Code CLI" },
+        ];
+      }
+      if (cliKind === "codex") {
+        return [
+          { id: "gpt-5",   label: "GPT-5",   description: "Codex CLI" },
+          { id: "o4-mini", label: "o4-mini", description: "Codex CLI" },
+        ];
+      }
+      return [];
+    }
+
+    return [];
+  } catch (_) {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ─── Activity Log — In-Memory Buffer ─────────────────────────
 // Keeps the in-memory log as the source of truth and batch-flushes
 // to storage instead of doing a get+set on every single log call.
@@ -1907,6 +2002,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // chrome.action.openPopup is MV3-only and some Chrome versions require a
   // recent user gesture — we try, swallow errors, and return ok so the
   // caller doesn't surface yet another alert if it fails.
+  // Return the list of models supported by the currently-configured AI
+  // provider. Live fetch for openai-compatible + ollama; static catalog for
+  // anthropic and CLI-backed IDE providers (no public list endpoint).
+  if (message.type === "LIST_PROVIDER_MODELS") {
+    _fetchProviderModels(aiProviderSettings)
+      .then((models) => sendResponse({ ok: true, models }))
+      .catch((err) =>
+        sendResponse({ ok: false, error: err?.message || String(err), models: [] }),
+      );
+    return true; // async response
+  }
+
   if (message.type === "OPEN_POPUP") {
     try {
       if (chrome.action && typeof chrome.action.openPopup === "function") {
