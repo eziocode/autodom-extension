@@ -245,7 +245,7 @@
   const STORAGE_KEY_HISTORY = "__autodom_chat_history";
   const STORAGE_KEY_OPEN = "__autodom_chat_open";
   const STORAGE_KEY_THEME = "__autodom_chat_theme";
-  const STORAGE_KEY_SETTINGS = "__autodom_chat_settings"; // { verboseLogs: bool }
+  const STORAGE_KEY_SETTINGS = "__autodom_chat_settings"; // { verboseLogs: bool, panelWidth: number }
   const STORAGE_KEY_MODEL_OVERRIDES = "__autodom_chat_model_overrides"; // { [providerSource]: modelId }
 
   // Static fallback catalog, keyed by provider "source" or "ide:<cliKind>".
@@ -546,12 +546,13 @@
 
   // User-adjustable runtime settings (persisted to chrome.storage.local so
   // the choice survives tab reloads + applies across tabs).
-  const _chatSettings = { verboseLogs: true, panelWidth: 440 };
   const PANEL_WIDTH_MIN = 320;
   const PANEL_WIDTH_MAX = 800;
+  const PANEL_WIDTH_DEFAULT = 440;
+  const _chatSettings = { verboseLogs: true, panelWidth: PANEL_WIDTH_DEFAULT };
   function _clampPanelWidth(w) {
     const n = Number(w);
-    if (!Number.isFinite(n)) return 440;
+    if (!Number.isFinite(n)) return PANEL_WIDTH_DEFAULT;
     const ceiling = Math.min(PANEL_WIDTH_MAX, Math.floor(window.innerWidth * 0.8));
     return Math.max(PANEL_WIDTH_MIN, Math.min(ceiling, Math.round(n)));
   }
@@ -2270,8 +2271,14 @@
     }
     /* When a chat request is in flight, the button morphs into a stop
        control (matching ChatGPT / Claude.ai). The .stop-icon child is
-       only shown in this state; the .send-icon is hidden. */
-    .autodom-chat-send-btn .stop-icon { display: none !important; }
+       only shown in this state; the .send-icon is hidden.
+
+       Important: these rules MUST out-specify the panel-wide reset rule
+       that sets every SVG to display: inline-block — otherwise the
+       up-arrow keeps rendering on top of the stop square and the user
+       just sees the arrow during loading. We do that by prefixing with
+       the panel ID below. */
+    #${PANEL_ID} .autodom-chat-send-btn .stop-icon { display: none !important; }
     .autodom-chat-send-btn.is-stop {
       background: var(--c-danger) !important;
       cursor: pointer !important;
@@ -2285,13 +2292,18 @@
       background: var(--c-danger) !important;
       cursor: pointer !important;
     }
-    .autodom-chat-send-btn.is-stop .send-icon { display: none !important; }
-    .autodom-chat-send-btn.is-stop .stop-icon {
+    #${PANEL_ID} .autodom-chat-send-btn.is-stop .send-icon { display: none !important; }
+    #${PANEL_ID} .autodom-chat-send-btn.is-stop .stop-icon {
       display: block !important;
-      width: 12px !important;
-      height: 12px !important;
-      background: #fff;
-      border-radius: 2px;
+      width: 14px !important;
+      height: 14px !important;
+      background: #fff !important;
+      border-radius: 3px !important;
+      /* Subtle inner shadow on the white square so it reads as a button
+         glyph rather than a flat sticker on the red disc — important on
+         OLED / high-contrast Windows themes where pure white on red can
+         look like a render artefact. */
+      box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.06) inset !important;
     }
     .autodom-chat-input-hint {
       position: static;
@@ -4209,7 +4221,7 @@
     handle.addEventListener("dblclick", (e) => {
       e.preventDefault();
       e.stopPropagation();
-      _commitWidth(440, true);
+      _commitWidth(PANEL_WIDTH_DEFAULT, true);
     });
     // Keyboard accessibility: focus the handle then nudge with arrows.
     handle.setAttribute("tabindex", "0");
@@ -4226,7 +4238,7 @@
         next = Math.min(PANEL_WIDTH_MAX, Math.floor(window.innerWidth * 0.8));
       else if (e.key === "Enter" || e.key === " ") {
         // Activate-style reset, matches double-click affordance.
-        next = 440;
+        next = PANEL_WIDTH_DEFAULT;
       } else return;
       e.preventDefault();
       e.stopPropagation();
@@ -4236,15 +4248,23 @@
 
   // If the viewport shrinks below the current panel width (e.g. user
   // narrows the window or rotates a tablet), re-clamp so the panel
-  // never exceeds 80vw and the host page stays usable.
-  window.addEventListener("resize", () => {
-    const before = _chatSettings.panelWidth;
-    const after = _clampPanelWidth(before);
-    if (after !== before) {
-      _chatSettings.panelWidth = after;
-      _applyPanelWidth();
-    }
-  });
+  // never exceeds 80vw and the host page stays usable. Persist the
+  // clamped value so reopening with a still-narrow viewport doesn't
+  // resurrect the stale (oversized) width from storage.
+  // Guard against double-binding if this content script is ever
+  // re-initialised on the same page (e.g. SPA route swaps).
+  if (!window.__autodom_panel_resize_bound) {
+    window.__autodom_panel_resize_bound = true;
+    window.addEventListener("resize", () => {
+      const before = _chatSettings.panelWidth;
+      const after = _clampPanelWidth(before);
+      if (after !== before) {
+        _chatSettings.panelWidth = after;
+        _applyPanelWidth();
+        _saveChatSettings();
+      }
+    });
+  }
 
   // ─── Model Picker wiring ───────────────────────────────────
   const _modelPickerBtn = document.getElementById("__autodom_model_picker");
