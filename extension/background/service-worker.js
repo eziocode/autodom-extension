@@ -3015,7 +3015,54 @@ async function toolTypeText(params) {
 // 4. Screenshot
 async function toolScreenshot(params) {
   const tab = await getActiveTab();
+
+  // Temporarily hide AutoDOM's own injected UI (chat panel, overlays,
+  // stop button, run indicator) so the screenshot reflects what the
+  // user is automating — not our own widgets.
+  const HIDE_IDS = [
+    "__autodom_chat_panel",
+    "__autodom_inline_overlay",
+    "__autodom_automation_overlay",
+    "__autodom_automation_stop",
+    "__autodom_run_indicator",
+    "__bmcp_session_border",
+    "__bmcp_session_border_badge",
+  ];
+  const HIDE_MARK = "data-autodom-screenshot-hidden";
+
+  async function setHiddenState(hidden) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        args: [HIDE_IDS, HIDE_MARK, hidden],
+        func: (ids, mark, on) => {
+          for (const id of ids) {
+            const el = document.getElementById(id);
+            if (!el) continue;
+            if (on) {
+              if (!el.hasAttribute(mark)) {
+                el.setAttribute(mark, el.style.visibility || "");
+              }
+              el.style.visibility = "hidden";
+            } else if (el.hasAttribute(mark)) {
+              el.style.visibility = el.getAttribute(mark);
+              el.removeAttribute(mark);
+            }
+          }
+        },
+      });
+    } catch (_e) {
+      // Tab may not allow scripting (e.g. chrome:// pages); fall through.
+    }
+  }
+
+  let hidden = false;
   try {
+    await setHiddenState(true);
+    hidden = true;
+    // One animation frame so the visibility change paints before capture.
+    await new Promise((r) => setTimeout(r, 30));
+
     const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
       format: params?.format || "png",
       quality: params?.quality || 80,
@@ -3023,6 +3070,8 @@ async function toolScreenshot(params) {
     return { success: true, screenshot: dataUrl };
   } catch (err) {
     return { error: `Screenshot failed: ${err.message}` };
+  } finally {
+    if (hidden) await setHiddenState(false);
   }
 }
 
