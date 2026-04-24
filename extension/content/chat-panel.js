@@ -5636,27 +5636,37 @@
       msg.appendChild(_makeCopyBtn(rendered));
       const modelId = (extra && extra.model) || _currentModelId();
       // Always render a model badge so the user sees what's answering
-      // them. Order of preference:
-      //   1) The model picker's friendly label (matches a known catalog
-      //      entry like "Claude Sonnet 4.5", "GPT-5.4", etc.)
-      //   2) The raw model id if it looks human-readable (no internal
-      //      shorthand leaks like "IC0").
-      //   3) A friendly provider-based name ("Claude", "Copilot",
-      //      "GPT", "Gemini", "Ollama", "AI") derived from the
-      //      currently-selected provider source / CLI kind. This is the
-      //      fallback used when we can't fetch the exact model — better
-      //      than showing nothing or a hallucinated id.
+      // them. Strategy:
+      //   • For CLI-bridged providers (Copilot / Claude / Codex /
+      //     Gemini / Ollama CLI), show ONLY the friendly provider name
+      //     ("Copilot", "Claude", "Codex", ...). The CLI often pins its
+      //     own model and silently ignores --model overrides, so the
+      //     stored aiProviderModel is unreliable; printing a version
+      //     number we can't verify would be a lie.
+      //   • For direct API providers (anthropic / openai / gemini /
+      //     ollama / google), prefer the catalog label, fall back to
+      //     the raw id, and only fall back to the friendly name as a
+      //     last resort. These calls go through our request layer, so
+      //     the model id is trustworthy.
+      //   • Always block leaked internal shorthand (IC0, IC7, etc.).
       const friendlyLabel = _friendlyProviderLabel();
+      const isCliBridge =
+        _modelPickerState.providerSource === "ide" ||
+        _modelPickerState.providerSource === "cli";
       let badgeText = "";
-      const knownMeta = modelId
-        ? _modelsForCurrentProvider().find((m) => m.id === modelId)
-        : null;
-      if (knownMeta && knownMeta.label) {
-        badgeText = knownMeta.label;
-      } else if (modelId && /^[\w./@:+-]+$/.test(modelId) && !/\bIC\d+\b/.test(modelId)) {
-        badgeText = modelId;
-      } else {
+      if (isCliBridge) {
         badgeText = friendlyLabel;
+      } else {
+        const knownMeta = modelId
+          ? _modelsForCurrentProvider().find((m) => m.id === modelId)
+          : null;
+        if (knownMeta && knownMeta.label) {
+          badgeText = knownMeta.label;
+        } else if (modelId && /^[\w./@:+-]+$/.test(modelId) && !/\bIC\d+\b/.test(modelId)) {
+          badgeText = modelId;
+        } else {
+          badgeText = friendlyLabel;
+        }
       }
       if (badgeText) {
         const badge = document.createElement("span");
