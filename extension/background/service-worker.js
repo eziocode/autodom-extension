@@ -1809,6 +1809,7 @@ function connectWebSocket(port) {
               type: "AI_CHAT_RESPONSE",
               response: message.response,
               toolCalls: message.toolCalls || [],
+              model: message.model || null,
               error: message.error || null,
             });
           } else {

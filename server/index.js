@@ -1503,6 +1503,7 @@ function _processWsMessage(socket, message) {
             id: id,
             response: responseText,
             toolCalls: toolCalls,
+            model: providerResult.model || null,
           });
           return;
         }
@@ -2544,6 +2545,17 @@ async function callCliProvider({
   // ignored and every CLI ran on its built-in default model.
   const pickedModel = (providerConfig.cliModel || "").trim();
   const modelArgs = pickedModel ? ["--model", pickedModel] : [];
+  // For CLIs that support structured output, request JSON so we can
+  // (1) extract the assistant text cleanly and (2) discover the *actual*
+  // model the CLI ran with — useful when the picker selection isn't
+  // honoured (e.g. unknown id) so the UI can surface the real default
+  // instead of lying about what just executed.
+  const userArgsJoined = " " + extraArgs.join(" ") + " ";
+  const userPickedJsonOutput =
+    /\s--output-format(\s|=)/.test(userArgsJoined) ||
+    /\s--json(\s|$)/.test(userArgsJoined);
+  const wantClaudeJson = kind === "claude" && !userPickedJsonOutput;
+  const claudeJsonArgs = wantClaudeJson ? ["--output-format", "json"] : [];
   const configuredTimeout = Number(providerConfig.cliTimeoutMs);
   const timeoutMs =
     Number.isFinite(configuredTimeout) && configuredTimeout > 0
@@ -2572,7 +2584,7 @@ async function callCliProvider({
   let writePromptToStdin = true;
   if (kind === "claude") {
     // `claude -p` reads prompt from stdin in non-interactive (print) mode.
-    args = ["-p", ...modelArgs, ...extraArgs];
+    args = ["-p", ...claudeJsonArgs, ...modelArgs, ...extraArgs];
   } else if (kind === "codex") {
     // `codex exec -` reads prompt from stdin and prints assistant reply.
     // `--skip-git-repo-check` (must come AFTER `exec`) lets codex run
@@ -2693,8 +2705,43 @@ async function callCliProvider({
         );
         return;
       }
+
+      // Parse claude's structured JSON output when we asked for it. Extract
+      // the assistant text and the model id the CLI actually used. If
+      // parsing fails for any reason, fall through to the raw stdout path
+      // so we never lose the response.
+      let parsedResponse = null;
+      let actualModel = pickedModel || "";
+      if (wantClaudeJson && stdout) {
+        try {
+          const data = JSON.parse(stdout);
+          if (data && typeof data === "object") {
+            const text =
+              typeof data.result === "string"
+                ? data.result
+                : typeof data.response === "string"
+                  ? data.response
+                  : "";
+            if (text) parsedResponse = text;
+            const detected =
+              data.model ||
+              data.model_id ||
+              (data.model_usage && typeof data.model_usage === "object"
+                ? Object.keys(data.model_usage)[0]
+                : null);
+            if (detected && typeof detected === "string") {
+              actualModel = detected;
+            }
+          }
+        } catch (_) {
+          // Non-JSON (or stream-json) output — leave parsedResponse null
+          // so the raw stdout is returned as-is.
+        }
+      }
+
       finish(resolve, {
-        response: stdout || "(CLI returned no output)",
+        response: parsedResponse || stdout || "(CLI returned no output)",
+        model: actualModel || undefined,
         toolCalls: [
           {
             tool: "_direct_provider",

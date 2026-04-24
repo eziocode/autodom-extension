@@ -477,6 +477,30 @@
     try { _refreshModelPickerUI(); } catch (_) {}
   }
 
+  // When the bridge tells us which model the underlying CLI actually ran
+  // with (claude --output-format json), update the picker so it reflects
+  // reality. Otherwise the dropdown keeps showing the user's selection
+  // even when the CLI silently ignored --model and used its own default.
+  function _reconcileActualModel(actualId) {
+    if (!actualId || typeof actualId !== "string") return;
+    const id = actualId.trim();
+    if (!id) return;
+    const current = _currentModelId();
+    if (current === id) return;
+    const key = _catalogKey();
+    _modelPickerState.defaultModel = id;
+    const overrides = { ..._modelPickerState.overrides };
+    if (overrides[key] && overrides[key] !== id) delete overrides[key];
+    _modelPickerState.overrides = overrides;
+    try {
+      chrome.storage?.local?.set?.({
+        aiProviderModel: id,
+        [STORAGE_KEY_MODEL_OVERRIDES]: overrides,
+      });
+    } catch (_) {}
+    try { _refreshModelPickerUI(); } catch (_) {}
+  }
+
   // Validate that the currently-selected model id belongs to the current
   // provider's list. If not, clear the override and fall back to the first
   // available model. Returns the final (validated) model id, or "" if the
@@ -532,6 +556,18 @@
   function _applySettingsToUI() {
     const toggle = document.getElementById("__autodom_verbose_toggle");
     if (toggle) toggle.checked = !!_chatSettings.verboseLogs;
+    _applyVerboseAttr();
+  }
+  // Reflect the verbose preference onto the panel + inline overlay as a
+  // data attribute so a single CSS rule can hide every per-step tool card
+  // and tool-result <details> instantly when the user toggles it off —
+  // without rebuilding the message list or losing persisted history.
+  function _applyVerboseAttr() {
+    const value = _chatSettings.verboseLogs ? "true" : "false";
+    [PANEL_ID, INLINE_OVERLAY_ID].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.setAttribute("data-verbose", value);
+    });
   }
   const MAX_PERSISTED_MESSAGES = 50;
   const THEME_VALUES = new Set(["system", "dark", "light"]);
@@ -1667,6 +1703,17 @@
       border-radius: 10px;
       overflow: hidden;
       font-size: 12px;
+    }
+    /* Honour the "Verbose automation logs" setting — when off, hide every
+       per-step tool card (live or restored) and every persisted tool-result
+       <details> message so the chat shows only the user's prompts and the
+       AI's final replies. The data stays in the messages array; toggling
+       verbose back on reveals it instantly without reloading. */
+    #${PANEL_ID}[data-verbose="false"] .ai-tool-card,
+    #${PANEL_ID}[data-verbose="false"] .autodom-chat-msg.tool-result,
+    #${INLINE_OVERLAY_ID}[data-verbose="false"] .ai-tool-card,
+    #${INLINE_OVERLAY_ID}[data-verbose="false"] .autodom-chat-msg.tool-result {
+      display: none !important;
     }
     .ai-tool-card-head {
       display: flex;
@@ -4015,10 +4062,29 @@
   }
 
   function _sanitizeAiResponseText(text) {
-    return String(text || "").replace(
+    let out = String(text || "").replace(
       /(^|[^\w`])IC(\d+)(?=[^\w`]|$)/g,
       (_m, prefix, idx) => `${prefix}element #${idx}`,
     );
+    // When the user has turned "Verbose automation logs" off, also strip the
+    // CLI-style inline tool-call trace that Claude Code / Codex / Copilot
+    // CLIs print into stdout and which is forwarded verbatim into the
+    // assistant message body. These lines look like:
+    //   ● click (MCP: autodom) · text: "Timeline"
+    //   └ {"success":true, ...}
+    //   ⎿  Done in 2.1s
+    // The leading glyphs (●, └, ⎿) are never produced by normal prose or
+    // by markdown bullet lists (which use *, -, +, or digits), so it's safe
+    // to drop any line whose first non-whitespace character is one of them.
+    if (!_chatSettings.verboseLogs) {
+      out = out
+        .split("\n")
+        .filter((line) => !/^\s*[●└⎿]/.test(line))
+        .join("\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+    }
+    return out;
   }
 
   function _visibleToolCalls(toolCalls) {
@@ -4157,6 +4223,7 @@
     verboseToggle.addEventListener("change", () => {
       _chatSettings.verboseLogs = !!verboseToggle.checked;
       _saveChatSettings();
+      _applyVerboseAttr();
     });
   }
   // Load persisted settings now that DOM refs exist
@@ -6441,6 +6508,13 @@
           "toolCalls:",
           toolCalls.length,
         );
+
+        // If the bridge reported the actual model the underlying CLI used
+        // (claude --output-format json surfaces this), reconcile the model
+        // picker with reality. The picker is otherwise stuck showing the
+        // user's last guess, even when the CLI silently ignored --model
+        // (unknown id, locked session, etc.).
+        try { _reconcileActualModel(aiResult.model); } catch (_) {}
 
         addMessage("ai-response", responseText, {
           toolCalls,
