@@ -5331,25 +5331,19 @@
 
   function _sanitizeAiResponseText(text) {
     let out = String(text || "");
-    // Hard scrub: the model sometimes leaks the internal element shorthand
-    // ("IC0", "IC7", `IC12`, etc. — used by get_dom_state to give every
-    // interactive element a stable numeric index) directly into its
-    // user-facing reply. It's never useful to a human and, worse, the
-    // model has been seen quoting it back as a value (e.g. "Build URL:
-    // IC0") or hallucinating it as its own model ID. Replace every
-    // standalone IC<digits> with a plain "element #N" so the rendered
-    // text is at least readable; downstream prose like "URL: element #0"
-    // makes it obvious to the user that the AI failed to resolve a real
-    // value, instead of looking like a valid identifier.
+    // Hard scrub: models sometimes leak internal renderer/tool shorthand
+    // directly into user-facing replies. IC<N> is an interactive element
+    // index; CB<N> is a markdown code-block placeholder. Neither is useful
+    // as an instruction or answer.
     //
-    // Match in any context (incl. inside backticks/code spans) but only
-    // when IC is on a word boundary so we don't mangle words like
-    // "logIC0" or genuine identifiers ending in IC followed by digits.
+    // Match in any context (incl. inside backticks/code spans) but only on
+    // word boundaries so we don't mangle genuine identifiers.
     out = out.replace(/\bIC(\d+)\b/g, "element #$1");
+    out = out.replace(/\bCB(\d+)\b/g, "the referenced command");
     // Also strip any code-span that ends up containing only the now-
-    // expanded form, e.g. `element #0` left behind from `IC0` — keeps
-    // the prose clean without breaking real code references.
+    // expanded form — keeps prose clean without breaking real code refs.
     out = out.replace(/`element #(\d+)`/g, "element #$1");
+    out = out.replace(/`the referenced command`/g, "the referenced command");
     // When the user has turned "Verbose automation logs" off, also strip the
     // CLI-style inline tool-call trace that Claude Code / Codex / Copilot
     // CLIs print into stdout and which is forwarded verbatim into the
@@ -5660,12 +5654,20 @@
   if (SIDE_PANEL_MODE && chrome?.tabs && !window.__autodom_panel_tab_bound) {
     window.__autodom_panel_tab_bound = true;
     try {
-      chrome.tabs.onActivated?.addListener(() => updateContext());
-      chrome.tabs.onUpdated?.addListener((_id, changeInfo) => {
-        if (changeInfo && (changeInfo.url || changeInfo.title))
-          updateContext();
+      chrome.tabs.onActivated?.addListener(() => {
+        _clearPageContextCache();
+        updateContext();
       });
-      chrome.windows?.onFocusChanged?.addListener(() => updateContext());
+      chrome.tabs.onUpdated?.addListener((_id, changeInfo) => {
+        if (changeInfo && (changeInfo.url || changeInfo.title)) {
+          _clearPageContextCache();
+          updateContext();
+        }
+      });
+      chrome.windows?.onFocusChanged?.addListener(() => {
+        _clearPageContextCache();
+        updateContext();
+      });
     } catch (_) {}
   }
 
@@ -5675,10 +5677,83 @@
   let _pageContextCacheTime = 0;
   const _PAGE_CONTEXT_TTL = 3000; // 3 second cache
 
-  function getPageContext() {
+  function _clearPageContextCache() {
+    _cachedPageContext = null;
+    _pageContextCacheTime = 0;
+  }
+
+  async function getPageContext() {
     const now = Date.now();
     if (_cachedPageContext && now - _pageContextCacheTime < _PAGE_CONTEXT_TTL) {
       return _cachedPageContext;
+    }
+
+    if (SIDE_PANEL_MODE) {
+      const pageInfo = await getActivePageInfo(1500);
+      if (pageInfo && !pageInfo.blocked) {
+        let parsedUrl = null;
+        try {
+          parsedUrl = new URL(pageInfo.url || "");
+        } catch (_) {}
+        const context = {
+          url: pageInfo.url || "",
+          title: pageInfo.title || "(untitled)",
+          domain: parsedUrl ? parsedUrl.hostname : "",
+          pathname: parsedUrl ? parsedUrl.pathname : "",
+          readyState: "complete",
+          visibleTextPreview: String(pageInfo.text || "").substring(0, 1500),
+          interactiveElements: pageInfo.counts || {
+            links: 0,
+            buttons: 0,
+            inputs: 0,
+            forms: 0,
+          },
+        };
+        if (pageInfo.headings && pageInfo.headings.length) {
+          context.outline = pageInfo.headings
+            .map((h) => `heading: ${h}`)
+            .join("\n");
+        }
+        _cachedPageContext = context;
+        _pageContextCacheTime = now;
+        return context;
+      }
+      if (pageInfo && pageInfo.blocked) {
+        const context = {
+          url: pageInfo.url || "",
+          title: pageInfo.title || "(restricted page)",
+          domain: "",
+          pathname: "",
+          readyState: "blocked",
+          visibleTextPreview: "",
+          interactiveElements: pageInfo.counts || {
+            links: 0,
+            buttons: 0,
+            inputs: 0,
+            forms: 0,
+          },
+        };
+        _cachedPageContext = context;
+        _pageContextCacheTime = now;
+        return context;
+      }
+      const context = {
+        url: "",
+        title: "(active page unavailable)",
+        domain: "",
+        pathname: "",
+        readyState: "unavailable",
+        visibleTextPreview: "",
+        interactiveElements: {
+          links: 0,
+          buttons: 0,
+          inputs: 0,
+          forms: 0,
+        },
+      };
+      _cachedPageContext = context;
+      _pageContextCacheTime = now;
+      return context;
     }
 
     const context = {
@@ -7293,20 +7368,30 @@
   // ─── AI Chat via MCP ───────────────────────────────────────
   // Routes messages to the MCP AI agent for context-aware responses.
   // Falls back to local tool dispatch if AI routing is unavailable.
-  function sendAiMessage(text, options) {
+  async function sendAiMessage(text, options) {
     const attachments =
       options && Array.isArray(options.attachments) ? options.attachments : [];
     _log("sendAiMessage:", text.substring(0, 80), attachments.length ? `(+${attachments.length} image)` : "");
-    return new Promise((resolve) => {
-      if (_contextInvalidated) {
-        resolve({
-          fallback: true,
-          error: "Extension context invalidated — please reload the page.",
-        });
-        return;
-      }
-      const context = getPageContext();
+    if (_contextInvalidated) {
+      return {
+        fallback: true,
+        error: "Extension context invalidated — please reload the page.",
+      };
+    }
 
+    let context;
+    try {
+      context = await getPageContext();
+    } catch (err) {
+      const msg = (err && err.message) || String(err || "");
+      _err("getPageContext exception:", msg);
+      return {
+        fallback: true,
+        error: `Failed to read page context: ${msg}`,
+      };
+    }
+
+    return new Promise((resolve) => {
       try {
         const runtime = chrome && chrome.runtime;
         if (!runtime || !runtime.sendMessage || !runtime.id) {

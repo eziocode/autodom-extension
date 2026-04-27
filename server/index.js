@@ -2218,7 +2218,7 @@ function buildProviderSystemPrompt(context) {
     "You may reference the current page title, URL, and interactive element counts.\n";
   prompt +=
     "Respond clearly and actionably. If you need more precise browser control, instruct the user to use AutoDOM tools such as /dom, /click, /type, /nav, or IDE agent mode. " +
-    "Never use raw internal shorthand like IC7 or IC8 in the user-facing answer; if you need to mention an indexed element, say element #7 and describe it in plain English.\n\n";
+    "Never use raw internal shorthand like IC7 or CB0 in the user-facing answer; if you need to mention an indexed element, say element #7 and describe it in plain English, and never tell users to type placeholder tokens.\n\n";
   prompt += `Page title: ${context?.title || "Unknown"}\n`;
   prompt += `Page URL: ${context?.url || "Unknown"}\n`;
   if (context?.visibleOverlayText) {

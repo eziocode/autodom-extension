@@ -1039,7 +1039,7 @@ function _agentSystemPrompt(context, providerInfo, cacheKey) {
     "- Don't tell the user to inspect the page — do it. Only ask follow-ups if a destructive action is ambiguous or info is genuinely missing.\n" +
     "- Don't repeat a failing tool call; change selector or approach. STOP calling tools once you have the answer (or call respond_to_user).\n" +
     "Reply rules (HARD):\n" +
-    "- Never write internal element shorthand (IC0, IC7, etc.) in user-facing text. Describe the element ('the Login button'), never its index.\n" +
+    "- Never write internal shorthand (IC0, CB0, etc.) in user-facing text. Describe the element/action in plain English; never tell users to type placeholder tokens.\n" +
     "- When asked for a value (URL, price, name, count, text), report the resolved value from the tool result — never an index reference.\n" +
     "- For self-identification, answer in plain English as 'the AutoDOM in-page assistant'. Don't invent a model name; don't include any internal token.\n"
   );

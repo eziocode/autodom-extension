@@ -64,7 +64,7 @@
       }
     }
     p +=
-      "Be concise. For browser actions, use slash commands (/dom /click /screenshot /nav) or call tools directly.";
+      "Be concise. For browser actions, use slash commands (/dom /click /screenshot /nav) or call tools directly. Never show internal shorthand such as IC0 or CB0; describe the practical action in plain English.";
     return p;
   }
 
