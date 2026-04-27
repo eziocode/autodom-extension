@@ -1477,6 +1477,23 @@ function _processWsMessage(socket, message) {
           );
         }
 
+        if (isZgidExtractionRequest(lower)) {
+          _checkAbort();
+          const result = await callExtensionTool("execute_code", {
+            code: buildZgidExtractionScript(),
+            timeout: 20000,
+          });
+          toolCalls.push({ tool: "execute_code" });
+          responseText = formatZgidExtractionResponse(result, context);
+          _safeSendAiResponse(socket, {
+            type: "AI_CHAT_RESPONSE",
+            id: id,
+            response: responseText,
+            toolCalls: toolCalls,
+          });
+          return;
+        }
+
         if (effectiveProvider !== "ide" && _hasCredentials) {
           process.stderr.write(
             `[AutoDOM] ✓ Routing to direct provider: ${effectiveProvider}\n`,
@@ -1718,7 +1735,7 @@ function _processWsMessage(socket, message) {
               }
               samplingPrompt += `\nUser request: "${text}"\n\n`;
               samplingPrompt += `You have access to AutoDOM MCP tools (get_dom_state, click_by_index, type_by_index, execute_code, navigate, screenshot, scroll, etc.).\n`;
-              samplingPrompt += `Please fulfill the user's request using the available tools. Respond with a clear, helpful answer describing what you found or did. Never expose raw internal element shorthand like IC7 or IC8 in the final answer; if you need to mention an indexed element, say element #7 and describe it in plain English.`;
+              samplingPrompt += `Please fulfill the user's request using the available tools. Do not ask the user to run browser-console snippets, paste DOM output, or type internal placeholder tokens. Respond with a clear, helpful answer describing what you found or did. Never expose raw internal shorthand like IC7 or CB0 in the final answer; if you need to mention an indexed element, say element #7 and describe it in plain English.`;
 
               const samplingResult = await activeMcpSession.requestSampling(
                 {
@@ -2211,13 +2228,185 @@ function providerHasCredentials(provider, config) {
   return false;
 }
 
+function isZgidExtractionRequest(lowerText) {
+  const lower = String(lowerText || "");
+  if (!/\bzgids?\b/.test(lower)) return false;
+  return (
+    /\b(?:get|extract|list|show|copy|find|read|fetch)\b/.test(lower) ||
+    /\b(?:all|page|table|current)\b/.test(lower)
+  );
+}
+
+function buildZgidExtractionScript() {
+  return `
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const normalize = (text) => String(text || "").replace(/\\s+/g, " ").trim();
+    const compactId = (text) => normalize(text).replace(/\\D+/g, "");
+    const seen = new Set();
+    const rows = [];
+
+    function add(raw, source) {
+      const zgid = compactId(raw);
+      if (zgid.length < 6 || zgid.length > 20 || seen.has(zgid)) return;
+      seen.add(zgid);
+      rows.push({ zgid, raw: normalize(raw), source });
+    }
+
+    function textOf(el) {
+      return normalize(el && (el.innerText || el.textContent));
+    }
+
+    function isVisible(el) {
+      if (!el || !el.getBoundingClientRect) return false;
+      const style = getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    }
+
+    function collectFromNativeTables() {
+      document.querySelectorAll("table").forEach((table) => {
+        const tableRows = Array.from(table.querySelectorAll("tr"));
+        let zgidIndex = -1;
+        for (const row of tableRows.slice(0, 5)) {
+          const cells = Array.from(row.children);
+          const idx = cells.findIndex((cell) => /^z\\s*gid$/i.test(textOf(cell)) || /^zgid$/i.test(textOf(cell)));
+          if (idx >= 0) {
+            zgidIndex = idx;
+            break;
+          }
+        }
+        if (zgidIndex < 0) return;
+        tableRows.forEach((row) => {
+          const cells = Array.from(row.children);
+          if (cells[zgidIndex]) add(textOf(cells[zgidIndex]), "table");
+        });
+      });
+    }
+
+    function collectFromAriaTables() {
+      document.querySelectorAll('[role="table"],[role="grid"],[role="treegrid"]').forEach((grid) => {
+        const gridRows = Array.from(grid.querySelectorAll('[role="row"]'));
+        let zgidIndex = -1;
+        for (const row of gridRows.slice(0, 8)) {
+          const cells = Array.from(row.querySelectorAll('[role="columnheader"],[role="cell"],[role="gridcell"]'));
+          const idx = cells.findIndex((cell) => /^z\\s*gid$/i.test(textOf(cell)) || /^zgid$/i.test(textOf(cell)));
+          if (idx >= 0) {
+            zgidIndex = idx;
+            break;
+          }
+        }
+        if (zgidIndex < 0) return;
+        gridRows.forEach((row) => {
+          const cells = Array.from(row.querySelectorAll('[role="columnheader"],[role="cell"],[role="gridcell"]'));
+          if (cells[zgidIndex]) add(textOf(cells[zgidIndex]), "aria-grid");
+        });
+      });
+    }
+
+    function collectByColumnGeometry() {
+      const all = Array.from(document.querySelectorAll("body *")).filter(isVisible);
+      const headers = all.filter((el) => {
+        const text = textOf(el);
+        return /^z\\s*gid$/i.test(text) || /^zgid$/i.test(text);
+      });
+      headers.forEach((header) => {
+        const hr = header.getBoundingClientRect();
+        const left = hr.left - Math.max(24, hr.width * 0.75);
+        const right = hr.right + Math.max(24, hr.width * 0.75);
+        all.forEach((el) => {
+          if (el === header || el.contains(header) || header.contains(el)) return;
+          const text = textOf(el);
+          if (!/\\d/.test(text) || /^z\\s*gid$/i.test(text)) return;
+          if (Array.from(el.children || []).some((child) => /\\d/.test(textOf(child)))) return;
+          const rect = el.getBoundingClientRect();
+          const cx = rect.left + rect.width / 2;
+          if (cx >= left && cx <= right && rect.top > hr.bottom - 4) {
+            add(text, "zgid-column");
+          }
+        });
+      });
+    }
+
+    function collectNearbyTextFallback() {
+      const text = document.body ? document.body.innerText || "" : "";
+      const regex = /z\\s*gid\\D{0,20}(\\d[\\d\\s]{5,30})/gi;
+      let match;
+      while ((match = regex.exec(text))) add(match[1], "text-near-zgid");
+    }
+
+    function collectAll() {
+      collectFromNativeTables();
+      collectFromAriaTables();
+      collectByColumnGeometry();
+      if (rows.length === 0) collectNearbyTextFallback();
+    }
+
+    function scrollContainers() {
+      const candidates = [
+        document.scrollingElement || document.documentElement,
+        ...Array.from(document.querySelectorAll("main,section,article,div,[role='grid'],[role='table']")),
+      ];
+      return candidates.filter((el, idx, arr) => {
+        if (!el || arr.indexOf(el) !== idx) return false;
+        const style = el === document.scrollingElement ? { overflowY: "auto" } : getComputedStyle(el);
+        return el.scrollHeight > el.clientHeight + 40 && /(auto|scroll|overlay)/i.test(style.overflowY || "auto");
+      });
+    }
+
+    collectAll();
+    for (const scroller of scrollContainers().slice(0, 4)) {
+      const original = scroller.scrollTop;
+      const max = scroller.scrollHeight - scroller.clientHeight;
+      if (max <= 0) continue;
+      const steps = Math.min(30, Math.max(4, Math.ceil(max / Math.max(1, scroller.clientHeight * 0.75))));
+      for (let i = 0; i <= steps; i++) {
+        scroller.scrollTop = Math.round((max * i) / steps);
+        await sleep(70);
+        collectAll();
+      }
+      scroller.scrollTop = original;
+    }
+
+    const totalMatch = (document.body?.innerText || "").match(/\\bTotal\\s*:\\s*(\\d+)\\b/i);
+    return {
+      title: document.title,
+      url: location.href,
+      count: rows.length,
+      zgids: rows.map((row) => row.zgid),
+      rows,
+      total: totalMatch ? Number(totalMatch[1]) : null,
+    };
+  `;
+}
+
+function formatZgidExtractionResponse(result, context) {
+  if (result?.error) {
+    return `I couldn't extract ZGIDs from the active page: ${result.error}`;
+  }
+  const data = result?.result && typeof result.result === "object" ? result.result : result;
+  const zgids = Array.isArray(data?.zgids) ? data.zgids : [];
+  const title = data?.title || context?.title || "the active page";
+  if (zgids.length === 0) {
+    return `I couldn't find any ZGIDs on ${title}. Make sure the Aalam table is loaded and the Zgid column is visible.`;
+  }
+  let out = `Found ${zgids.length} ZGID${zgids.length === 1 ? "" : "s"} on ${title}`;
+  if (data?.total && data.total > zgids.length) {
+    out += ` (the page shows Total: ${data.total}; extracted from loaded/scrollable rows)`;
+  }
+  out += `:\n\n${zgids.map((zgid, i) => `${i + 1}. ${zgid}`).join("\n")}`;
+  return out;
+}
+
 function buildProviderSystemPrompt(context) {
   let prompt =
     "You are AutoDOM's browser agent. Help the user interact with the current web page.\n";
   prompt +=
     "You may reference the current page title, URL, and interactive element counts.\n";
   prompt +=
-    "Respond clearly and actionably. If you need more precise browser control, instruct the user to use AutoDOM tools such as /dom, /click, /type, /nav, or IDE agent mode. " +
+    "Respond clearly and actionably. If browser data is needed, use AutoDOM/MCP browser tools instead of asking the user to run commands or paste DOM output. " +
     "Never use raw internal shorthand like IC7 or CB0 in the user-facing answer; if you need to mention an indexed element, say element #7 and describe it in plain English, and never tell users to type placeholder tokens.\n\n";
   prompt += `Page title: ${context?.title || "Unknown"}\n`;
   prompt += `Page URL: ${context?.url || "Unknown"}\n`;

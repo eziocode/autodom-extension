@@ -780,6 +780,8 @@
   let _pendingChatStateSnapshot = null;
   let _longLivedPersistTimer = null;
   let _pendingLongLivedSnapshot = null;
+  let _chatClearGeneration = 0;
+  let _blockLongLivedRestore = false;
 
   function _buildChatStateSnapshot() {
     return {
@@ -918,11 +920,16 @@
   // present (covers the normal in-tab reload case).
   function _restoreLongLivedIfNeeded() {
     if (!_chatSettings.persistAcrossSessions) return;
+    if (_blockLongLivedRestore) return;
     if (messages && messages.length > 0) return;
+    const restoreGeneration = _chatClearGeneration;
     try {
       chrome.storage?.local?.get?.(
         [PERSIST_KEY_MESSAGES, PERSIST_KEY_HISTORY],
         (items) => {
+          if (_blockLongLivedRestore) return;
+          if (restoreGeneration !== _chatClearGeneration) return;
+          if (messages && messages.length > 0) return;
           const m = items && items[PERSIST_KEY_MESSAGES];
           const h = items && items[PERSIST_KEY_HISTORY];
           if (!Array.isArray(m) || m.length === 0) return;
@@ -5581,6 +5588,8 @@
       return;
     }
     _disarmClear();
+    _chatClearGeneration++;
+    _blockLongLivedRestore = true;
     messages = [];
     conversationHistory = [];
     persistChatState(true);
