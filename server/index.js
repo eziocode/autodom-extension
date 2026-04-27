@@ -3077,7 +3077,7 @@ async function callOllamaProvider({
   };
 }
 
-const CLI_AGENT_MAX_TURNS = 8;
+const CLI_AGENT_MAX_TURNS = 5;
 const CLI_AGENT_RESULT_LIMIT = 12000;
 const CLI_AGENT_TOOLS = [
   {
@@ -3178,12 +3178,18 @@ function shouldUseCliBrowserAgent(text, context, conversationHistory) {
     return true;
   }
 
-  return (
-    !!(context?.url || context?.title) &&
-    /\b(?:create|open|click|fill|type|select|choose|submit|save|go to|navigate|search|start|launch|lead|crm|module|form|button|link|field)\b/.test(
-      lower,
-    )
-  );
+  if (!(context?.url || context?.title)) return false;
+
+  // Multi-step / compound automation — chatty agent loop is worth its cost.
+  const multiStep =
+    /\b(?:and|then|after|next|finally)\b/.test(lower) ||
+    /\bcreate\s+(?:a|an|the|new)\b/.test(lower) ||
+    /\bfill\s+(?:in\s+|out\s+)?(?:the\s+)?form\b/.test(lower) ||
+    /\bsubmit\b/.test(lower) ||
+    /\b(?:register|sign\s*up|book|order|purchase|enroll)\b/.test(lower) ||
+    isAutomationIntent(lower);
+
+  return multiStep;
 }
 
 function containsManualBrowserGuidance(text) {
@@ -3339,6 +3345,7 @@ async function callCliBrowserAgent({
   const toolCalls = [];
   let invalidResponse = "";
   let lastCliMeta = {};
+  let skipBootstrapDomState = false;
 
   // ── Vision-plan fast path: one snapshot → JSON plan → replay ──
   // CLI bridges are text-only, so we send the snapshot tree (not a
@@ -3363,6 +3370,14 @@ async function callCliBrowserAgent({
       const snap = await callExtensionTool("take_snapshot", { maxDepth: 4 });
       toolCalls.push({ tool: "take_snapshot", via: "vision_plan", ok: !snap?.error });
       const snapStr = JSON.stringify(snap || {}).substring(0, 9000);
+      if (!snap?.error && snapStr) {
+        observations.push({
+          tool: "take_snapshot",
+          params: { maxDepth: 4 },
+          result: snapStr,
+        });
+        skipBootstrapDomState = true;
+      }
 
       const planPrompt =
         `You are AutoDOM's one-shot browser automation planner.\n` +
@@ -3413,6 +3428,9 @@ async function callCliBrowserAgent({
             break;
           }
           const args = step.args && typeof step.args === "object" ? step.args : {};
+          // Once a plan step runs, the original snapshot may be stale; let
+          // the chatty fallback refresh DOM state if this step fails.
+          skipBootstrapDomState = false;
           const r = await callExtensionTool(step.tool, args);
           const ok = !r?.error && !r?.blocked;
           toolCalls.push({ tool: step.tool, via: "vision_plan", ok });
@@ -3447,7 +3465,7 @@ async function callCliBrowserAgent({
     // Fall through to chatty loop below with seeded observations/toolCalls.
   }
 
-  if (context?.url || context?.title) {
+  if ((context?.url || context?.title) && !skipBootstrapDomState) {
     if (_isAborted(requestId)) throw new AiAbortError(requestId);
     const result = await callExtensionTool("get_dom_state", { maxElements: 80 });
     toolCalls.push({
