@@ -2723,6 +2723,68 @@
       isolation: isolate;
       box-shadow: none;
     }
+    .autodom-slash-menu {
+      position: absolute !important;
+      left: 14px !important;
+      right: 14px !important;
+      bottom: calc(100% - 6px) !important;
+      z-index: 2147483647 !important;
+      max-height: min(320px, 42vh) !important;
+      overflow-y: auto !important;
+      padding: 8px !important;
+      border: 1px solid var(--c-border) !important;
+      border-radius: 14px !important;
+      background: var(--c-raised, #0d0d0f) !important;
+      color: var(--c-text, #f4f4f5) !important;
+      box-shadow: 0 18px 42px rgba(0, 0, 0, 0.42) !important;
+      box-sizing: border-box !important;
+    }
+    .autodom-slash-menu[hidden] {
+      display: none !important;
+    }
+    .autodom-slash-menu-title {
+      padding: 4px 6px 8px !important;
+      font-size: 11px !important;
+      font-weight: 700 !important;
+      letter-spacing: 0.03em !important;
+      text-transform: uppercase !important;
+      color: var(--c-text-3) !important;
+    }
+    .autodom-slash-menu-item {
+      display: flex !important;
+      align-items: baseline !important;
+      gap: 10px !important;
+      width: 100% !important;
+      padding: 8px 10px !important;
+      border: 0 !important;
+      border-radius: 10px !important;
+      background: transparent !important;
+      color: var(--c-text) !important;
+      text-align: left !important;
+      cursor: pointer !important;
+      box-sizing: border-box !important;
+    }
+    .autodom-slash-menu-item:hover,
+    .autodom-slash-menu-item.is-active,
+    .autodom-slash-menu-item:focus-visible {
+      background: var(--c-surface) !important;
+      outline: none !important;
+    }
+    .autodom-slash-menu-command {
+      flex: 0 0 auto !important;
+      min-width: 104px !important;
+      color: var(--c-accent-2) !important;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
+      font-size: 12px !important;
+      font-weight: 700 !important;
+    }
+    .autodom-slash-menu-desc {
+      flex: 1 1 auto !important;
+      min-width: 0 !important;
+      color: var(--c-text-2) !important;
+      font-size: 12px !important;
+      line-height: 1.35 !important;
+    }
     .autodom-chat-input-shell {
       flex: 1 1 auto !important;
       min-width: 0 !important;
@@ -4405,6 +4467,7 @@
     <!-- Input Area -->
     <div class="autodom-chat-input-area">
       <div class="autodom-chat-attachments" id="__autodom_attachments" hidden role="list" aria-label="Attached images"></div>
+      <div class="autodom-slash-menu" id="__autodom_slash_menu" role="listbox" aria-label="Slash commands" hidden></div>
       <div class="autodom-chat-input-shell">
         <button
           class="autodom-chat-attach-btn"
@@ -4718,6 +4781,7 @@
   const newChatBtn = document.getElementById("__autodom_new_chat_btn");
   const pastChatsBtn = document.getElementById("__autodom_past_chats_btn");
   const pastChatsMenu = document.getElementById("__autodom_past_chats_menu");
+  const slashMenu = document.getElementById("__autodom_slash_menu");
   const statusBadge = document.getElementById("__autodom_status_badge");
   const contextText = document.getElementById("__autodom_context_text");
   const quickActions = document.getElementById("__autodom_quick_actions");
@@ -4740,6 +4804,134 @@
     if (inlineInput) inlineInput.setAttribute("placeholder", text);
   }
   rotateChatPlaceholder();
+
+  const SLASH_COMMAND_OPTIONS = [
+    { command: "/help", insert: "/help", description: "Show all chat commands" },
+    { command: "/dom", insert: "/dom", description: "Show interactive elements" },
+    { command: "/screenshot", insert: "/screenshot", description: "Capture the current page" },
+    { command: "/snapshot", insert: "/snapshot", description: "Capture a DOM tree snapshot" },
+    { command: "/info", insert: "/info", description: "Show page metadata" },
+    { command: "/extract", insert: "/extract", description: "Extract visible page text" },
+    { command: "/click", insert: "/click ", description: "Click by index or text" },
+    { command: "/type", insert: "/type ", description: "Type into an indexed input" },
+    { command: "/nav", insert: "/nav ", description: "Navigate to a URL" },
+    { command: "/js", insert: "/js ", description: "Run JavaScript on the page" },
+    { command: "/run", insert: "/run ", description: "Run automation script" },
+  ];
+  let _slashActiveIndex = 0;
+
+  function _slashQuery() {
+    if (!chatInput) return null;
+    const value = chatInput.value || "";
+    if (!value.startsWith("/")) return null;
+    if (/\s/.test(value.slice(1))) return null;
+    return value.slice(1).toLowerCase();
+  }
+
+  function _slashMatches() {
+    const query = _slashQuery();
+    if (query == null) return [];
+    return SLASH_COMMAND_OPTIONS.filter((opt) =>
+      opt.command.slice(1).toLowerCase().startsWith(query),
+    );
+  }
+
+  function _hideSlashMenu() {
+    if (!slashMenu) return;
+    slashMenu.hidden = true;
+    slashMenu.textContent = "";
+    _slashActiveIndex = 0;
+    if (chatInput) chatInput.removeAttribute("aria-activedescendant");
+  }
+
+  function _insertSlashCommand(opt) {
+    if (!chatInput || !opt) return;
+    chatInput.value = opt.insert;
+    chatInput.focus();
+    try {
+      chatInput.selectionStart = chatInput.selectionEnd = chatInput.value.length;
+    } catch (_) {}
+    _hideSlashMenu();
+    try { autoResizeInput(); } catch (_) {}
+    try { _refreshSendBtnEnabled(); } catch (_) {}
+  }
+
+  function _renderSlashMenu() {
+    if (!slashMenu || !chatInput || isProcessing) return;
+    const matches = _slashMatches();
+    if (matches.length === 0) {
+      _hideSlashMenu();
+      return;
+    }
+    _slashActiveIndex = Math.max(0, Math.min(_slashActiveIndex, matches.length - 1));
+    slashMenu.textContent = "";
+    const title = document.createElement("div");
+    title.className = "autodom-slash-menu-title";
+    title.textContent = "Slash commands";
+    slashMenu.appendChild(title);
+    matches.forEach((opt, index) => {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "autodom-slash-menu-item";
+      item.id = `__autodom_slash_option_${index}`;
+      item.setAttribute("role", "option");
+      item.setAttribute("aria-selected", index === _slashActiveIndex ? "true" : "false");
+      if (index === _slashActiveIndex) item.classList.add("is-active");
+      const command = document.createElement("span");
+      command.className = "autodom-slash-menu-command";
+      command.textContent = opt.command;
+      const desc = document.createElement("span");
+      desc.className = "autodom-slash-menu-desc";
+      desc.textContent = opt.description;
+      item.append(command, desc);
+      item.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        _insertSlashCommand(opt);
+      });
+      slashMenu.appendChild(item);
+    });
+    slashMenu.hidden = false;
+    chatInput.setAttribute("aria-activedescendant", `__autodom_slash_option_${_slashActiveIndex}`);
+  }
+
+  function _handleSlashMenuKeydown(e) {
+    if (!slashMenu || slashMenu.hidden) return false;
+    const matches = _slashMatches();
+    if (matches.length === 0) return false;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      _slashActiveIndex = (_slashActiveIndex + 1) % matches.length;
+      _renderSlashMenu();
+      return true;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      _slashActiveIndex = (_slashActiveIndex - 1 + matches.length) % matches.length;
+      _renderSlashMenu();
+      return true;
+    }
+    if (e.key === "Tab") {
+      e.preventDefault();
+      _insertSlashCommand(matches[_slashActiveIndex]);
+      return true;
+    }
+    if (e.key === "Enter") {
+      const current = (chatInput && chatInput.value.trim()) || "";
+      const exact = matches.some((opt) => opt.command === current);
+      if (!exact) {
+        e.preventDefault();
+        _insertSlashCommand(matches[_slashActiveIndex]);
+        return true;
+      }
+      return false;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      _hideSlashMenu();
+      return true;
+    }
+    return false;
+  }
 
   function _formatThreadTime(value) {
     const d = new Date(value || Date.now());
@@ -9285,7 +9477,11 @@
 
   chatInput.addEventListener("input", autoResizeInput);
   chatInput.addEventListener("input", () => {
-    if (isProcessing) return; // don't fight the stop button while busy
+    if (isProcessing) {
+      _hideSlashMenu();
+      return; // don't fight the stop button while busy
+    }
+    _renderSlashMenu();
     _refreshSendBtnEnabled();
   });
 
@@ -9372,14 +9568,20 @@
   })();
 
   chatInput.addEventListener("keydown", (e) => {
+    if (_handleSlashMenuKeydown(e)) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       if (isProcessing) {
         abortChat();
       } else {
+        _hideSlashMenu();
         sendMessage();
       }
     }
+  });
+
+  chatInput.addEventListener("blur", () => {
+    setTimeout(_hideSlashMenu, 120);
   });
 
   sendBtn.addEventListener("click", () => {

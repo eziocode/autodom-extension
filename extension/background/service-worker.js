@@ -2100,6 +2100,7 @@ function connectWebSocket(port) {
           const pending = pendingAiRequests.get(message.id);
           if (pending) {
             pendingAiRequests.delete(message.id);
+            _streamBridgeRunEnd(pending, !!message.aborted);
             pending.resolve({
               type: "AI_CHAT_RESPONSE",
               response: message.response,
@@ -2180,11 +2181,23 @@ function connectWebSocket(port) {
           // Reset the idle timeout for any in-flight AI request so we
           // don't surface a spurious "timed out" while automation runs.
           refreshAiRequestActivity();
+          _streamBridgeToolEvent({
+            phase: "start",
+            tool: message.tool,
+            args: message.params || {},
+          });
           const result = await handleToolCallWithRecording(
             message.tool,
             message.params,
             message.id,
           );
+          _streamBridgeToolEvent({
+            phase: "end",
+            tool: message.tool,
+            ok: !result?.error,
+            error: result?.error,
+            result: _compactBridgeToolResult(result),
+          });
           if (!ws || ws.readyState !== WebSocket.OPEN) {
             return;
           }
@@ -2411,7 +2424,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     );
   }
   if (message.type === "STOP_AGENT_RUN") {
-    const stopped = _stopActiveAgentRun(message.reason || "stopped_by_user");
+    let stopped = _stopActiveAgentRun(message.reason || "stopped_by_user");
+    if (!stopped && typeof message.runId === "string" && message.runId.startsWith("bridge_")) {
+      const id = Number.parseInt(message.runId.slice("bridge_".length), 10);
+      const pending = pendingAiRequests.get(id);
+      if (pending) {
+        _streamBridgeRunEnd(pending, true);
+        pendingAiRequests.delete(id);
+        try {
+          pending.resolve({
+            type: "AI_CHAT_RESPONSE",
+            aborted: true,
+            error: "Cancelled by user.",
+          });
+        } catch (_) {}
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: "AI_CHAT_ABORT", id }));
+          } catch (_) {}
+        }
+        stopped = true;
+      }
+    }
     sendResponse({ ok: stopped });
     return false;
   }
@@ -3097,6 +3131,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const cancelledIds = [];
     for (const [id, pending] of pendingAiRequests.entries()) {
       cancelledIds.push(id);
+      _streamBridgeRunEnd(pending, true);
       pendingAiRequests.delete(id);
       try {
         pending.resolve({
@@ -3279,6 +3314,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     const aiRequestId = ++aiCallIdCounter;
+    const bridgeRunId = `bridge_${aiRequestId}`;
+    const panelTabId = sender?.tab?.id ?? null;
 
     // Sanitize the outbound history: bound size, truncate older user
     // turns, and STRIP attachment binaries from prior turns so we don't
@@ -3315,6 +3352,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // agent loops don't get killed mid-stream.
     pendingAiRequests.set(aiRequestId, {
       timeoutHandle: null,
+      panelTabId,
+      runId: bridgeRunId,
       resolve: (result) => {
         _debugLog(
           "[AutoDOM SW] AI response resolved for id:",
@@ -3322,6 +3361,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           "hasError:",
           !!(result && result.error),
         );
+        const pending = pendingAiRequests.get(aiRequestId);
+        if (pending) _streamBridgeRunEnd(pending, !!result?.aborted);
         const entry = pendingAiRequests.get(aiRequestId);
         if (entry && entry.timeoutHandle) clearTimeout(entry.timeoutHandle);
         sendResponse(result);
@@ -3469,6 +3510,49 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 const pendingAiRequests = new Map();
 let aiCallIdCounter = 0;
 
+function _streamBridgeRunEnd(pending, aborted) {
+  if (!pending || pending._runEnded) return;
+  pending._runEnded = true;
+  if (!pending._runStarted) return;
+  _streamAgentToolEvent(pending.panelTabId, {
+    phase: "run-end",
+    runId: pending.runId,
+    aborted: !!aborted,
+  });
+}
+
+function _streamBridgeToolEvent(evt) {
+  for (const pending of pendingAiRequests.values()) {
+    if (!pending._runStarted) {
+      pending._runStarted = true;
+      _streamAgentToolEvent(pending.panelTabId, {
+        phase: "run-start",
+        runId: pending.runId,
+      });
+    }
+    _streamAgentToolEvent(pending.panelTabId, {
+      runId: pending.runId,
+      ...evt,
+    });
+  }
+}
+
+function _compactBridgeToolResult(result) {
+  if (result == null) return result;
+  try {
+    const json = JSON.stringify(result);
+    if (json.length > 6000) {
+      return {
+        truncated: true,
+        summary: json.substring(0, 6000),
+      };
+    }
+  } catch (_) {
+    return { summary: String(result).substring(0, 4000) };
+  }
+  return result;
+}
+
 // Idle timeout for an in-flight AI request. The IDE agent can run for a
 // long time when it is chaining many tool calls (e.g. generating a Deluge
 // function). We use an *idle* timer that is reset every time the bridge
@@ -3488,6 +3572,7 @@ function armAiRequestTimeout(id) {
   pending.timeoutHandle = setTimeout(() => {
     if (!pendingAiRequests.has(id)) return;
     const entry = pendingAiRequests.get(id);
+    _streamBridgeRunEnd(entry, true);
     pendingAiRequests.delete(id);
     // Tell the bridge to abort the still-running agent loop so it
     // stops calling tools after we have already surfaced the timeout
@@ -3525,6 +3610,7 @@ let automationValidationIdCounter = 0;
 
 function resolvePendingAiRequests(error) {
   for (const [id, pending] of pendingAiRequests.entries()) {
+    _streamBridgeRunEnd(pending, false);
     pendingAiRequests.delete(id);
     try {
       pending.resolve({

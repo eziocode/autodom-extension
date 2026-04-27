@@ -1480,14 +1480,26 @@ function _processWsMessage(socket, message) {
           );
         }
 
-        if (
-          _willRouteToProvider &&
+        const _pageValueExtraction = isPageValueExtractionRequest(lower);
+        // Attach a snapshot whenever the user is asking about page content —
+        // the IDE-sampling path also benefits, since otherwise the IDE-side
+        // LLM only sees title/URL and has nothing to extract from.
+        const _attachSnapshotForIde =
+          !_willRouteToProvider &&
           !_preferLocalBrowserHeuristic &&
-          shouldAttachBrowserSnapshot(lower)
+          shouldAttachBrowserSnapshot(lower);
+        if (
+          (
+            _willRouteToProvider &&
+            !_preferLocalBrowserHeuristic &&
+            shouldAttachBrowserSnapshot(lower)
+          ) ||
+          _pageValueExtraction ||
+          _attachSnapshotForIde
         ) {
           _checkAbort();
           const snapshotResult = await callExtensionTool("execute_code", {
-            code: buildActivePageSnapshotScript(),
+            code: buildActivePageSnapshotScript(text || ""),
             timeout: 20000,
           });
           toolCalls.push({ tool: "execute_code", purpose: "active_page_snapshot" });
@@ -1497,6 +1509,19 @@ function _processWsMessage(socket, message) {
               ? { error: snapshotResult.error }
               : snapshotResult?.result || snapshotResult,
           };
+          if (_pageValueExtraction) {
+            const extractionResponse = effectiveContext.browserSnapshot?.error
+              ? `AutoDOM couldn't scan the active page: ${effectiveContext.browserSnapshot.error}`
+              : formatRequestedDataExtraction(effectiveContext.browserSnapshot);
+            _safeSendAiResponse(socket, {
+              type: "AI_CHAT_RESPONSE",
+              id: id,
+              response: extractionResponse || "AutoDOM checked the active page, but no requested page values were found.",
+              toolCalls: toolCalls,
+              model: null,
+            });
+            return;
+          }
         }
 
         if (
@@ -1755,6 +1780,12 @@ function _processWsMessage(socket, message) {
               if (context?.interactiveElements) {
                 const ie = context.interactiveElements;
                 samplingPrompt += `Interactive elements: ${ie.links || 0} links, ${ie.buttons || 0} buttons, ${ie.inputs || 0} inputs, ${ie.forms || 0} forms\n`;
+              }
+              if (effectiveContext?.browserSnapshot && !effectiveContext.browserSnapshot.error) {
+                const snap = formatBrowserSnapshotForPrompt(effectiveContext.browserSnapshot);
+                if (snap) {
+                  samplingPrompt += `\nActive page data already captured by AutoDOM (use this directly; do not ask the user to run /dom or paste DOM output):\n${snap}\n`;
+                }
               }
               samplingPrompt += `\nUser request: "${text}"\n\n`;
               samplingPrompt += `You have access to AutoDOM MCP tools (get_dom_state, click_by_index, type_by_index, execute_code, navigate, screenshot, scroll, etc.).\n`;
@@ -2263,6 +2294,18 @@ function shouldAttachBrowserSnapshot(lowerText) {
   );
 }
 
+function isPageValueExtractionRequest(lowerText) {
+  const lower = String(lowerText || "");
+  return (
+    /\b(?:extract|list|show|get|find|read|fetch|collect|copy)\b/.test(lower) &&
+    /\b(?:values?|ids?|identifiers?|keys?|fields?|tokens?)\b/.test(lower) &&
+    (
+      /\b(?:this|current|active)\s+(?:page|tab|site)\b/.test(lower) ||
+      /\b(?:from|on|in)\s+(?:the\s+)?(?:page|tab|site|screen|dom|html)\b/.test(lower)
+    )
+  );
+}
+
 function shouldPreferLocalBrowserHeuristic(lowerText) {
   const lower = String(lowerText || "");
   return (
@@ -2328,17 +2371,40 @@ function collapseOmittedAccountIds(text) {
 function scrubSensitiveContextText(text) {
   const out = String(text || "")
     .replace(/\u0000(?:IC|CB)\d+\u0000/g, "")
+    .replace(/\uE000(?:IC|CB)\d+\uE001/g, "")
     .replace(ACCOUNT_CONTEXT_ID_RE, "[account identifier omitted]");
   return collapseOmittedAccountIds(out);
 }
 
-function buildActivePageSnapshotScript() {
+function extractBrowserSnapshotHints(text) {
+  const stop = new Set([
+    "the", "this", "that", "current", "active", "page", "tab", "site", "screen",
+    "dom", "html", "from", "with", "into", "onto", "values", "value", "ids", "id",
+    "identifiers", "identifier", "keys", "key", "fields", "field", "tokens", "token",
+    "get", "extract", "list", "show", "find", "read", "fetch", "collect", "copy",
+    "all", "any", "please", "now", "and", "or", "for", "to", "of", "in", "on",
+  ]);
+  const found = [];
+  String(text || "")
+    .toLowerCase()
+    .match(/[a-z][a-z0-9_-]{1,40}/g)?.forEach((token) => {
+      if (stop.has(token)) return;
+      if (/^\d+$/.test(token)) return;
+      if (!found.includes(token)) found.push(token);
+    });
+  return found.slice(0, 8);
+}
+
+function buildActivePageSnapshotScript(userText = "") {
+  const queryHints = extractBrowserSnapshotHints(userText);
   return `
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     const MAX_TEXT = 12000;
     const MAX_TABLES = 8;
     const MAX_ROWS_PER_TABLE = 80;
     const MAX_SCROLL_BLOCKS = 40;
+    const MAX_REQUESTED_MATCHES = 300;
+    const QUERY_HINTS = ${JSON.stringify(queryHints)};
     const ACCOUNT_CONTEXT_ID_RE = /\\b(?:IC|CB)(?=[A-Z0-9_.-])(?:[A-Za-z0-9_.-]{1,})\\b/g;
     function collapseOmittedAccountIds(text) {
       return String(text || "")
@@ -2375,6 +2441,8 @@ function buildActivePageSnapshotScript() {
     const seenBlocks = new Set();
     const scrollTextBlocks = [];
     const tables = [];
+    const requestedData = { hints: QUERY_HINTS, matches: [] };
+    const seenRequested = new Set();
 
     function addTextBlock(text) {
       const block = normalize(text);
@@ -2404,6 +2472,104 @@ function buildActivePageSnapshotScript() {
           .map((row) => row.map(normalize).filter(Boolean))
           .filter((row) => row.length > 0)
           .slice(0, MAX_ROWS_PER_TABLE),
+      });
+    }
+
+    function addRequestedMatch(hint, value, source, tag, label) {
+      if (!hint || value == null || requestedData.matches.length >= MAX_REQUESTED_MATCHES) return;
+      const cleanValue = String(value).replace(/\\s+/g, " ").trim();
+      if (!cleanValue || cleanValue.length > 500) return;
+      const key = hint + "\\n" + source + "\\n" + cleanValue;
+      if (seenRequested.has(key)) return;
+      seenRequested.add(key);
+      requestedData.matches.push({
+        hint,
+        value: cleanValue,
+        source: String(source || "").slice(0, 80),
+        tag: String(tag || "").toLowerCase().slice(0, 30),
+        label: normalize(label || "").slice(0, 160),
+      });
+    }
+
+    function includesHint(text, hint) {
+      return String(text || "").toLowerCase().includes(String(hint || "").toLowerCase());
+    }
+
+    function collectRequestedDomValues() {
+      if (!QUERY_HINTS.length) return;
+      const elements = Array.from(document.querySelectorAll("*"));
+      elements.forEach((el) => {
+        const tag = el.tagName || "";
+        const label = el.getAttribute("aria-label") ||
+          el.getAttribute("title") ||
+          el.getAttribute("placeholder") ||
+          el.getAttribute("name") ||
+          el.getAttribute("id") ||
+          textOf(el).slice(0, 120);
+        QUERY_HINTS.forEach((hint) => {
+          for (const attr of Array.from(el.attributes || [])) {
+            const attrName = attr.name || "";
+            const attrValue = attr.value || "";
+            if (includesHint(attrName, hint) && attrValue) {
+              addRequestedMatch(hint, attrValue, "attribute:" + attrName, tag, label);
+            } else if (includesHint(attrValue, hint)) {
+              addRequestedMatch(hint, attrValue, "attribute-value:" + attrName, tag, label);
+            }
+          }
+          if (
+            "value" in el &&
+            el.value &&
+            (
+              includesHint(el.name, hint) ||
+              includesHint(el.id, hint) ||
+              includesHint(el.getAttribute("aria-label"), hint) ||
+              includesHint(el.getAttribute("placeholder"), hint)
+            )
+          ) {
+            addRequestedMatch(hint, el.value, "form-value", tag, label);
+          }
+        });
+      });
+    }
+
+    function collectRequestedScriptValues() {
+      if (!QUERY_HINTS.length) return;
+      const scripts = Array.from(document.querySelectorAll("script")).slice(0, 80);
+      QUERY_HINTS.forEach((hint) => {
+        const escaped = hint.replace(/[.*+?^\${}()|[\\]\\\\]/g, "\\\\$&");
+        const pattern = new RegExp(
+          "(?:\\\\\\\"|')?" + escaped + "(?:\\\\\\\"|')?\\\\s*[:=]\\\\s*(?:\\\\\\\"([^\\\\\\\"]{1,160})\\\\\\\"|'([^']{1,160})'|([A-Za-z0-9_.:-]{1,160}))",
+          "ig",
+        );
+        scripts.forEach((script) => {
+          const body = script.textContent || "";
+          let match;
+          let count = 0;
+          while ((match = pattern.exec(body)) && count < 40) {
+            addRequestedMatch(hint, match[1] || match[2] || match[3], "script", "script", "");
+            count++;
+          }
+        });
+      });
+    }
+
+    function collectRequestedTextValues() {
+      if (!QUERY_HINTS.length) return;
+      const text = document.body ? document.body.innerText || document.body.textContent || "" : "";
+      const lines = text.split(/\\n+/).slice(0, 5000);
+      QUERY_HINTS.forEach((hint) => {
+        const escaped = hint.replace(/[.*+?^\${}()|[\\]\\\\]/g, "\\\\$&");
+        const pattern = new RegExp(
+          "\\\\b" + escaped + "\\\\b\\\\s*(?:[:=\\-]|is|as)?\\\\s*([A-Za-z0-9_.:-]{2,160})",
+          "i",
+        );
+        lines.forEach((line) => {
+          if (!includesHint(line, hint)) return;
+          const match = line.match(pattern);
+          if (match && match[1] && !includesHint(match[1], hint)) {
+            addRequestedMatch(hint, match[1], "visible-text", "text", line.slice(0, 120));
+          }
+        });
       });
     }
 
@@ -2452,17 +2618,39 @@ function buildActivePageSnapshotScript() {
     }
 
     collectSnapshot();
-    for (const scroller of scrollContainers().slice(0, 4)) {
-      const original = scroller.scrollTop;
-      const max = scroller.scrollHeight - scroller.clientHeight;
-      if (max <= 0) continue;
-      const steps = Math.min(20, Math.max(3, Math.ceil(max / Math.max(1, scroller.clientHeight * 0.9))));
-      for (let i = 0; i <= steps; i++) {
-        scroller.scrollTop = Math.round((max * i) / steps);
-        await sleep(60);
-        collectSnapshot();
+    collectRequestedDomValues();
+    collectRequestedScriptValues();
+    collectRequestedTextValues();
+    // Short-circuit the scroll loop once the request is satisfied — for
+    // table-style pages the initial collect already captures every row's
+    // values, so 4 scroll containers x ~20 steps x 60ms (4-6s) is wasted
+    // wall-clock time.
+    function hintAlreadyMatchedInTable() {
+      if (!QUERY_HINTS.length || tables.length === 0) return false;
+      return tables.some((table) =>
+        (table.headers || []).some((h) =>
+          QUERY_HINTS.some((hint) => includesHint(h, hint)),
+        ),
+      );
+    }
+    const _haveEnough = () =>
+      requestedData.matches.length > 0 || hintAlreadyMatchedInTable();
+    if (!_haveEnough()) {
+      for (const scroller of scrollContainers().slice(0, 3)) {
+        const original = scroller.scrollTop;
+        const max = scroller.scrollHeight - scroller.clientHeight;
+        if (max <= 0) continue;
+        const steps = Math.min(12, Math.max(2, Math.ceil(max / Math.max(1, scroller.clientHeight * 0.9))));
+        for (let i = 0; i <= steps; i++) {
+          scroller.scrollTop = Math.round((max * i) / steps);
+          await sleep(25);
+          collectSnapshot();
+          collectRequestedDomValues();
+          if (_haveEnough()) break;
+        }
+        scroller.scrollTop = original;
+        if (_haveEnough()) break;
       }
-      scroller.scrollTop = original;
     }
 
     return {
@@ -2471,8 +2659,69 @@ function buildActivePageSnapshotScript() {
       visibleText: normalize(document.body ? document.body.innerText || document.body.textContent || "" : "").substring(0, MAX_TEXT),
       scrollText: scrollTextBlocks.join("\\n---\\n").substring(0, MAX_TEXT),
       tables,
+      requestedData,
     };
   `;
+}
+
+function formatRequestedDataExtraction(snapshot) {
+  // Caller may pass either the full snapshot or the legacy requestedData
+  // payload — accept both so downstream changes don't break older callers.
+  const requestedData =
+    snapshot && (snapshot.requestedData || snapshot.matches)
+      ? snapshot.requestedData || snapshot
+      : snapshot || {};
+  const tables = Array.isArray(snapshot?.tables) ? snapshot.tables : [];
+  const matches = Array.isArray(requestedData?.matches) ? [...requestedData.matches] : [];
+  const hints = Array.isArray(requestedData?.hints) ? requestedData.hints.filter(Boolean) : [];
+
+  // Table-column extraction: when a hint matches a table header, pull every
+  // value in that column. Aalam-style admin grids put zgid/email/etc. in
+  // table cells, which the snapshot's attribute/script/text scanners miss.
+  if (tables.length > 0 && hints.length > 0) {
+    const seen = new Set(matches.map((m) => `${m?.hint}\n${m?.value}`));
+    for (const table of tables) {
+      const headers = Array.isArray(table?.headers) ? table.headers : [];
+      const rows = Array.isArray(table?.rows) ? table.rows : [];
+      headers.forEach((header, colIdx) => {
+        const headerLower = String(header || "").toLowerCase();
+        for (const hint of hints) {
+          if (!headerLower.includes(String(hint).toLowerCase())) continue;
+          for (const row of rows) {
+            const cell = String(row?.[colIdx] || "").trim();
+            if (!cell) continue;
+            const key = `${hint}\n${cell}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            matches.push({ hint, value: cell, source: "table-cell", tag: "td", label: header });
+          }
+        }
+      });
+    }
+  }
+
+  const label = hints.length ? hints.join(", ") : "requested";
+  if (matches.length === 0) {
+    return (
+      `AutoDOM checked the active page for ${label} values and found none.\n\n` +
+      "Checked DOM attributes, form values, embedded scripts, and visible text. " +
+      "No manual browser-console steps are required."
+    );
+  }
+  const uniqueValues = [];
+  const seenValues = new Set();
+  for (const match of matches) {
+    const value = String(match?.value || "").trim();
+    if (!value || seenValues.has(value)) continue;
+    seenValues.add(value);
+    uniqueValues.push(value);
+    if (uniqueValues.length >= 200) break;
+  }
+  return (
+    `Found ${uniqueValues.length} ${label} value${uniqueValues.length === 1 ? "" : "s"} on the active page:\n\n` +
+    uniqueValues.map((value) => `- \`${value}\``).join("\n") +
+    (matches.length > uniqueValues.length ? `\n\n_Showing the first ${uniqueValues.length} unique values._` : "")
+  );
 }
 
 function formatBrowserSnapshotForPrompt(snapshot) {
@@ -2484,6 +2733,17 @@ function formatBrowserSnapshotForPrompt(snapshot) {
   }
   if (snapshot.url) {
     parts.push(`Snapshot URL: ${scrubSensitiveContextText(snapshot.url)}`);
+  }
+  if (snapshot.requestedData && Array.isArray(snapshot.requestedData.matches)) {
+    const hints = Array.isArray(snapshot.requestedData.hints)
+      ? snapshot.requestedData.hints.join(", ")
+      : "requested fields";
+    const matches = snapshot.requestedData.matches.slice(0, 120);
+    parts.push(
+      matches.length > 0
+        ? `Requested DOM/script/text value matches for ${hints}:\n${JSON.stringify(matches, null, 2).substring(0, 12000)}`
+        : `AutoDOM checked DOM attributes, form values, scripts, and visible text for ${hints}; no matching values were found.`,
+    );
   }
   if (snapshot.visibleText) {
     parts.push(
@@ -2528,7 +2788,7 @@ function buildProviderSystemPrompt(context) {
     if (snapshotText) {
       prompt += `\nActive page data already read by AutoDOM:\n${snapshotText}\n`;
       prompt +=
-        "Use this active-page data to answer page extraction questions directly; do not ask the user to run console snippets or provide DOM output.\n";
+        "Use this active-page data to answer page extraction questions directly; do not ask the user to run /dom, console snippets, developer tools, or provide DOM output. If the requested value scan says no matches were found, say AutoDOM checked the active page and found none.\n";
     }
   }
   return prompt;
@@ -2765,6 +3025,377 @@ async function callOllamaProvider({
   };
 }
 
+const CLI_AGENT_MAX_TURNS = 8;
+const CLI_AGENT_RESULT_LIMIT = 12000;
+const CLI_AGENT_TOOLS = [
+  {
+    name: "get_dom_state",
+    description:
+      "Snapshot interactive elements with numeric indexes. Call before clicking or typing unless you have a fresh index map.",
+    params: { maxElements: 80 },
+  },
+  {
+    name: "click_by_index",
+    description: "Click an element by index from get_dom_state.",
+    params: { index: 0 },
+  },
+  {
+    name: "type_by_index",
+    description: "Type text into an element by index from get_dom_state.",
+    params: { index: 0, text: "value", clearFirst: true },
+  },
+  {
+    name: "click",
+    description: "Click by CSS selector or visible text.",
+    params: { selector: "button[type='submit']" },
+  },
+  {
+    name: "type_text",
+    description: "Type text into an input/textarea by CSS selector.",
+    params: { selector: "input[name='Last Name']", text: "Example", clearFirst: true },
+  },
+  {
+    name: "navigate",
+    description: "Navigate the active tab to an absolute URL.",
+    params: { url: "https://example.com" },
+  },
+  {
+    name: "wait_for_navigation",
+    description: "Wait for the current tab to finish loading after a click/navigation.",
+    params: { timeout: 10000 },
+  },
+  {
+    name: "wait_for_element",
+    description: "Wait for a CSS selector to appear.",
+    params: { selector: "form", timeout: 10000 },
+  },
+  {
+    name: "wait_for_text",
+    description: "Wait for visible text to appear on the page.",
+    params: { text: "Leads", timeout: 10000 },
+  },
+  {
+    name: "scroll",
+    description: "Scroll the page.",
+    params: { direction: "down", amount: 500 },
+  },
+  {
+    name: "get_page_info",
+    description: "Read current URL, title, and page metadata.",
+    params: {},
+  },
+  {
+    name: "query_elements",
+    description: "Find elements by CSS selector and return text/attributes.",
+    params: { selector: "button", limit: 20 },
+  },
+  {
+    name: "extract_text",
+    description: "Extract visible page text or text under a selector.",
+    params: { selector: "body" },
+  },
+  {
+    name: "press_key",
+    description: "Press a keyboard key, optionally targeting a selector.",
+    params: { key: "Enter" },
+  },
+];
+const CLI_AGENT_TOOL_NAMES = new Set(CLI_AGENT_TOOLS.map((tool) => tool.name));
+
+function shouldUseCliBrowserAgent(text, context, conversationHistory) {
+  const lower = String(text || "").toLowerCase().trim();
+  if (!lower) return false;
+
+  const proceedIntent =
+    /^(?:do it|do ti|do that|yes|yeah|yep|ok|okay|go ahead|proceed|continue|start)(?:\s+now)?[.!]?$/i.test(
+      lower,
+    );
+  const historyText = Array.isArray(conversationHistory)
+    ? conversationHistory
+        .slice(-6)
+        .map((msg) => String(msg?.content || ""))
+        .join("\n")
+        .toLowerCase()
+    : "";
+  if (
+    proceedIntent &&
+    /\b(?:create|open|click|fill|type|select|submit|save|lead|crm|form)\b/.test(
+      historyText,
+    )
+  ) {
+    return true;
+  }
+
+  return (
+    !!(context?.url || context?.title) &&
+    /\b(?:create|open|click|fill|type|select|choose|submit|save|go to|navigate|search|start|launch|lead|crm|module|form|button|link|field)\b/.test(
+      lower,
+    )
+  );
+}
+
+function containsManualBrowserGuidance(text) {
+  const lower = String(text || "").toLowerCase();
+  return (
+    /\bi\s+(?:can(?:not|'t)|am unable to)\s+directly\s+(?:execute|interact|control|click|type)/.test(
+      lower,
+    ) ||
+    /\b(?:please\s+)?run\s+`?\/(?:dom|click|nav|screenshot)\b/.test(lower) ||
+    /\bshare\s+the\s+\/dom\s+output\b/.test(lower) ||
+    /\bclick\s+.+\bmanually\b/.test(lower)
+  );
+}
+
+function truncateCliAgentResult(value) {
+  let text;
+  try {
+    text = JSON.stringify(value, null, 2);
+  } catch (_) {
+    text = String(value);
+  }
+  if (text.length <= CLI_AGENT_RESULT_LIMIT) return text;
+  return `${text.substring(0, CLI_AGENT_RESULT_LIMIT)}\n...[truncated ${text.length - CLI_AGENT_RESULT_LIMIT} chars]`;
+}
+
+function extractFirstJsonObject(text) {
+  const raw = String(text || "").trim();
+  const unfenced = raw
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  const start = unfenced.indexOf("{");
+  if (start < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < unfenced.length; i++) {
+    const ch = unfenced[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{") depth++;
+    if (ch === "}") {
+      depth--;
+      if (depth === 0) return unfenced.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+function parseCliAgentDecision(outputText) {
+  const jsonText = extractFirstJsonObject(outputText);
+  if (!jsonText) {
+    return { kind: "invalid", reason: "No JSON object returned" };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (err) {
+    return { kind: "invalid", reason: `Invalid JSON: ${err.message}` };
+  }
+
+  const action = String(parsed.action || parsed.type || "").toLowerCase();
+  if (action === "final" || action === "respond") {
+    return {
+      kind: "final",
+      response: String(parsed.response || parsed.markdown || parsed.message || ""),
+    };
+  }
+  if (action === "tool" || action === "tool_call") {
+    const tool = String(parsed.tool || parsed.name || "");
+    return {
+      kind: "tool",
+      tool,
+      params:
+        parsed.params && typeof parsed.params === "object" ? parsed.params : {},
+      reason: parsed.reason ? String(parsed.reason) : "",
+    };
+  }
+  return { kind: "invalid", reason: `Unsupported action: ${action || "(missing)"}` };
+}
+
+function buildCliAgentPrompt({
+  text,
+  context,
+  conversationHistory,
+  observations,
+  invalidResponse,
+}) {
+  const historyText = conversationToProviderText(conversationHistory).substring(
+    0,
+    6000,
+  );
+  const observationText = observations.length
+    ? observations
+        .map(
+          (item, index) =>
+            `#${index + 1} ${item.tool}(${JSON.stringify(item.params || {})}) =>\n${item.result}`,
+        )
+        .join("\n\n")
+    : "No tools have been called yet.";
+
+  return (
+    `You are AutoDOM's browser automation planner. The server will execute browser tools for you; your only job is to choose the next tool call or final user response.\n\n` +
+    `Current page title: ${scrubSensitiveContextText(context?.title || "Unknown")}\n` +
+    `Current page URL: ${scrubSensitiveContextText(context?.url || "Unknown")}\n` +
+    (context?.visibleOverlayText
+      ? `Visible popup/dialog text:\n${scrubSensitiveContextText(context.visibleOverlayText).substring(0, 1200)}\n`
+      : "") +
+    (context?.visibleTextPreview
+      ? `Visible page text preview:\n${scrubSensitiveContextText(context.visibleTextPreview).substring(0, 1800)}\n`
+      : "") +
+    (historyText ? `\nConversation so far:\n${historyText}\n` : "") +
+    `\nUser request: ${text}\n\n` +
+    `Available tools:\n${JSON.stringify(CLI_AGENT_TOOLS, null, 2)}\n\n` +
+    `Return exactly one JSON object and no markdown/code fences.\n` +
+    `To call a tool: {"action":"tool","tool":"get_dom_state","params":{"maxElements":80},"reason":"inspect current page"}\n` +
+    `To finish: {"action":"final","response":"Done — ..."}\n\n` +
+    `Rules:\n` +
+    `- Do not run shell commands, terminal commands, or CLI tools. Return only the JSON decision for AutoDOM to execute.\n` +
+    `- For browser actions, call tools. Never ask the user to run /dom, /click, /nav, paste DOM output, or manually click/type when a tool can do it.\n` +
+    `- For multi-step tasks, call get_dom_state first, then click/type/wait as needed.\n` +
+    `- For "create a lead", open/navigate to Leads and the create form if possible. If required lead values are missing, stop and ask for those values; do not invent data or save/submit a record with missing user-provided details.\n` +
+    `- If a tool fails, replan using the result instead of repeating the same failed call.\n\n` +
+    `Tool observations:\n${observationText}\n` +
+    (invalidResponse
+      ? `\nYour previous response was rejected because it was not an executable AutoDOM JSON decision:\n${invalidResponse.substring(0, 1200)}\n`
+      : "")
+  );
+}
+
+async function callCliBrowserAgent({
+  text,
+  context,
+  conversationHistory,
+  providerConfig,
+  requestId,
+}) {
+  const observations = [];
+  const toolCalls = [];
+  let invalidResponse = "";
+  let lastCliMeta = {};
+
+  if (context?.url || context?.title) {
+    if (_isAborted(requestId)) throw new AiAbortError(requestId);
+    const result = await callExtensionTool("get_dom_state", { maxElements: 80 });
+    toolCalls.push({
+      tool: "get_dom_state",
+      via: "cli_agent_bootstrap",
+      ok: !result?.error,
+    });
+    observations.push({
+      tool: "get_dom_state",
+      params: { maxElements: 80 },
+      result: truncateCliAgentResult(result),
+    });
+  }
+
+  for (let turn = 0; turn < CLI_AGENT_MAX_TURNS; turn++) {
+    if (_isAborted(requestId)) throw new AiAbortError(requestId);
+    const prompt = buildCliAgentPrompt({
+      text,
+      context,
+      conversationHistory,
+      observations,
+      invalidResponse,
+    });
+    const cliResult = await runCliPrompt({ prompt, providerConfig, requestId });
+    lastCliMeta = cliResult;
+    const responseText = cliResult.response || "";
+    const decision = parseCliAgentDecision(responseText);
+
+    if (decision.kind === "final") {
+      if (containsManualBrowserGuidance(decision.response)) {
+        if (toolCalls.length === 0 && turn === 0) {
+          const result = await callExtensionTool("get_dom_state", {
+            maxElements: 80,
+          });
+          toolCalls.push({
+            tool: "get_dom_state",
+            via: "cli_agent_recovery",
+            ok: !result?.error,
+          });
+          observations.push({
+            tool: "get_dom_state",
+            params: { maxElements: 80 },
+            result:
+              "The CLI tried to give manual instructions instead of acting. AutoDOM ran get_dom_state so you can choose the next executable tool.\n" +
+              truncateCliAgentResult(result),
+          });
+          invalidResponse = decision.response;
+          continue;
+        }
+        return {
+          response:
+            "I couldn't complete the browser action because the configured CLI returned guidance instead of an executable AutoDOM tool decision. Please retry once; if it repeats, use a direct AI provider or adjust the CLI model/settings.",
+          toolCalls,
+          model: cliResult.model,
+        };
+      }
+      return {
+        response: decision.response || "Done.",
+        toolCalls,
+        model: cliResult.model,
+      };
+    }
+
+    if (decision.kind !== "tool") {
+      invalidResponse = `${decision.reason}\n\nRaw response:\n${responseText}`;
+      continue;
+    }
+
+    if (!CLI_AGENT_TOOL_NAMES.has(decision.tool)) {
+      invalidResponse = `Unsupported tool "${decision.tool}". Use one of: ${[
+        ...CLI_AGENT_TOOL_NAMES,
+      ].join(", ")}`;
+      continue;
+    }
+
+    if (_isAborted(requestId)) throw new AiAbortError(requestId);
+    const result = await callExtensionTool(decision.tool, decision.params || {});
+    const ok = !result?.error && !result?.blocked;
+    toolCalls.push({
+      tool: decision.tool,
+      via: "cli_agent",
+      ok,
+    });
+    observations.push({
+      tool: decision.tool,
+      params: decision.params || {},
+      result: truncateCliAgentResult(result),
+    });
+
+    if (result?.confirmRequired) {
+      return {
+        response:
+          result.message ||
+          `Action "${decision.tool}" requires confirmation before AutoDOM can continue.`,
+        toolCalls,
+        model: cliResult.model,
+      };
+    }
+  }
+
+  return {
+    response:
+      "AutoDOM reached the maximum CLI automation turns before completing the request. The browser may not be in the expected state; please refine the request or retry.",
+    toolCalls,
+    model: lastCliMeta.model,
+  };
+}
+
 async function routeDirectProviderChat({
   provider,
   text,
@@ -2803,6 +3434,15 @@ async function routeDirectProviderChat({
   }
 
   if (provider === "cli") {
+    if (shouldUseCliBrowserAgent(text, context, conversationHistory)) {
+      return callCliBrowserAgent({
+        text,
+        context,
+        conversationHistory,
+        providerConfig,
+        requestId,
+      });
+    }
     return callCliProvider({
       text,
       context,
@@ -2826,13 +3466,7 @@ async function routeDirectProviderChat({
 //   claude  → spawn `<binary> -p` and write prompt to stdin
 //   codex   → spawn `<binary> exec -` and write prompt to stdin
 //   custom  → spawn `<binary> <extraArgs...>` and write prompt to stdin
-async function callCliProvider({
-  text,
-  context,
-  conversationHistory,
-  providerConfig,
-  requestId,
-}) {
+async function runCliPrompt({ prompt, providerConfig, requestId }) {
   if (_isAborted(requestId)) throw new AiAbortError(requestId);
   const binary = (providerConfig.cliBinary || "claude").trim();
   const kind = (providerConfig.cliKind || "claude").trim().toLowerCase();
@@ -2840,16 +3474,8 @@ async function callCliProvider({
     .trim()
     .split(/\s+/)
     .filter(Boolean);
-  // Picker-selected model (if any). Honoured per kind below by injecting
-  // a `--model <id>` flag — without this, the dropdown was silently
-  // ignored and every CLI ran on its built-in default model.
   const pickedModel = (providerConfig.cliModel || "").trim();
   const modelArgs = pickedModel ? ["--model", pickedModel] : [];
-  // For CLIs that support structured output, request JSON so we can
-  // (1) extract the assistant text cleanly and (2) discover the *actual*
-  // model the CLI ran with — useful when the picker selection isn't
-  // honoured (e.g. unknown id) so the UI can surface the real default
-  // instead of lying about what just executed.
   const userArgsJoined = " " + extraArgs.join(" ") + " ";
   const userPickedJsonOutput =
     /\s--output-format(\s|=)/.test(userArgsJoined) ||
@@ -2868,40 +3494,16 @@ async function callCliProvider({
     );
   }
 
-  // Compose the prompt: system context + conversation + new user turn
-  const systemPreamble = buildProviderSystemPrompt(context);
-  const historyText = conversationToProviderText(conversationHistory);
-  const composedPrompt =
-    `${systemPreamble}\n\n` +
-    (historyText ? `Conversation so far:\n${historyText}\n\n` : "") +
-    `User: ${text}\n\nRespond as the AutoDOM browser assistant.`;
-
-  // Resolve the binary kind → argv. Different CLIs accept the prompt
-  // in different ways (stdin for claude/codex, -p flag for copilot).
   let args;
-  // When true, the composed prompt is written to the child's stdin.
-  // When false, the prompt is embedded in argv and stdin is closed.
   let writePromptToStdin = true;
   if (kind === "claude") {
-    // `claude -p` reads prompt from stdin in non-interactive (print) mode.
     args = ["-p", ...claudeJsonArgs, ...modelArgs, ...extraArgs];
   } else if (kind === "codex") {
-    // `codex exec -` reads prompt from stdin and prints assistant reply.
-    // `--skip-git-repo-check` (must come AFTER `exec`) lets codex run
-    // when the server's cwd is not a trusted git repo. Harmless inside
-    // a repo too.
     args = ["exec", "--skip-git-repo-check", ...modelArgs, "-", ...extraArgs];
   } else if (kind === "copilot") {
-    // GitHub Copilot CLI takes the prompt via `-p` as an argv string and
-    // exits after one response in non-interactive mode. `--allow-all-tools`
-    // skips the interactive tool-approval loop which would otherwise hang
-    // the spawn forever. Users can still override via extraArgs.
-    args = ["--allow-all-tools", ...modelArgs, "-p", composedPrompt, ...extraArgs];
+    args = ["--allow-all-tools", ...modelArgs, "-p", prompt, ...extraArgs];
     writePromptToStdin = false;
   } else {
-    // Custom: caller fully controls argv (extraArgs only). We still pass
-    // --model so picker-selected models propagate to user-supplied CLIs
-    // that accept the standard flag.
     args = [...modelArgs, ...extraArgs];
   }
 
@@ -2914,10 +3516,7 @@ async function callCliProvider({
     try {
       proc = spawn(binary, args, {
         stdio: ["pipe", "pipe", "pipe"],
-        // Inherit env so the CLI finds its own auth token files
         env: process.env,
-        // Put local AI CLIs in their own process group so Stop can kill
-        // child workers they spawn for MCP/tool execution too.
         detached: process.platform !== "win32",
       });
       if (requestId != null) {
@@ -2953,25 +3552,25 @@ async function callCliProvider({
 
     const timer = timeoutMs
       ? setTimeout(() => {
-        if (requestId != null) {
-          _killCliProviderProcess(requestId, "CLI provider timeout");
-        } else {
-          try {
-            proc.kill("SIGTERM");
-          } catch (_) {}
-          setTimeout(() => {
+          if (requestId != null) {
+            _killCliProviderProcess(requestId, "CLI provider timeout");
+          } else {
             try {
-              proc.kill("SIGKILL");
+              proc.kill("SIGTERM");
             } catch (_) {}
-          }, 1500).unref();
-        }
-        finish(
-          reject,
-          new Error(
-            `CLI provider: '${binary}' timed out after ${Math.round(timeoutMs / 1000)}s`,
-          ),
-        );
-      }, timeoutMs)
+            setTimeout(() => {
+              try {
+                proc.kill("SIGKILL");
+              } catch (_) {}
+            }, 1500).unref();
+          }
+          finish(
+            reject,
+            new Error(
+              `CLI provider: '${binary}' timed out after ${Math.round(timeoutMs / 1000)}s`,
+            ),
+          );
+        }, timeoutMs)
       : null;
     timer?.unref?.();
 
@@ -3006,10 +3605,6 @@ async function callCliProvider({
         return;
       }
 
-      // Parse claude's structured JSON output when we asked for it. Extract
-      // the assistant text and the model id the CLI actually used. If
-      // parsing fails for any reason, fall through to the raw stdout path
-      // so we never lose the response.
       let parsedResponse = null;
       let actualModel = pickedModel || "";
       if (wantClaudeJson && stdout) {
@@ -3034,28 +3629,21 @@ async function callCliProvider({
             }
           }
         } catch (_) {
-          // Non-JSON (or stream-json) output — leave parsedResponse null
-          // so the raw stdout is returned as-is.
+          // Non-JSON (or stream-json) output — return raw stdout.
         }
       }
 
       finish(resolve, {
         response: parsedResponse || stdout || "(CLI returned no output)",
         model: actualModel || undefined,
-        toolCalls: [
-          {
-            tool: "_direct_provider",
-            via: "cli",
-            binary,
-            kind,
-          },
-        ],
+        binary,
+        kind,
       });
     });
 
     try {
       if (writePromptToStdin) {
-        proc.stdin.end(composedPrompt);
+        proc.stdin.end(prompt);
       } else {
         proc.stdin.end();
       }
@@ -3066,6 +3654,50 @@ async function callCliProvider({
       );
     }
   });
+}
+
+async function callCliProvider({
+  text,
+  context,
+  conversationHistory,
+  providerConfig,
+  requestId,
+}) {
+  if (_isAborted(requestId)) throw new AiAbortError(requestId);
+  const binary = (providerConfig.cliBinary || "claude").trim();
+  const kind = (providerConfig.cliKind || "claude").trim().toLowerCase();
+
+  if (!binary) {
+    throw new Error(
+      "CLI provider: no binary configured. Set the CLI binary (e.g. 'claude' or 'codex') in the AutoDOM extension popup.",
+    );
+  }
+
+  // Compose the prompt: system context + conversation + new user turn
+  const systemPreamble = buildProviderSystemPrompt(context);
+  const historyText = conversationToProviderText(conversationHistory);
+  const composedPrompt =
+    `${systemPreamble}\n\n` +
+    (historyText ? `Conversation so far:\n${historyText}\n\n` : "") +
+    `User: ${text}\n\nRespond as the AutoDOM browser assistant.`;
+
+  const cliResult = await runCliPrompt({
+    prompt: composedPrompt,
+    providerConfig,
+    requestId,
+  });
+  return {
+    response: cliResult.response || "(CLI returned no output)",
+    model: cliResult.model,
+    toolCalls: [
+      {
+        tool: "_direct_provider",
+        via: "cli",
+        binary: cliResult.binary || binary,
+        kind: cliResult.kind || kind,
+      },
+    ],
+  };
 }
 
 const server = new FastMCP({
