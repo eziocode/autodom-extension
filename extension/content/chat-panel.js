@@ -8353,7 +8353,15 @@
           return { tool: "execute_code", params: { code: rest } };
         case "run":
         case "playwright":
-        case "selenium":
+        case "selenium": {
+          // If the argument looks like natural language (no JS tokens),
+          // route through the AI agent as an automation request instead
+          // of executing it as code. Otherwise the V8 parser throws on
+          // phrases like "create a sample lead" (Unexpected identifier 'a').
+          const looksLikeJs = /[(){};=]|=>|\bawait\b|\bconst\b|\blet\b|\bvar\b|\bfunction\b|\bfor\b|\bwhile\b|\breturn\b|\bif\b/.test(rest);
+          if (!rest.trim() || !looksLikeJs) {
+            return { type: "ai_automate", prompt: rest.trim() };
+          }
           return {
             tool: "execute_code",
             params: {
@@ -8361,6 +8369,7 @@
               timeout: 60000,
             },
           };
+        }
         case "extract":
           return {
             tool: "execute_code",
@@ -8964,7 +8973,7 @@
 
   // ─── Send Message (Main Handler) ───────────────────────────
   async function sendMessage() {
-    const text = chatInput.value.trim();
+    let text = chatInput.value.trim();
     _log(
       "sendMessage called, text:",
       text ? text.substring(0, 50) : "(empty)",
@@ -9021,7 +9030,20 @@
 
     // Check for slash commands first (direct tool invocation)
     // Slash commands use local tool handlers and do NOT require MCP bridge
-    const command = parseCommand(text);
+    let command = parseCommand(text);
+
+    // /run with natural-language argument: drop into AI routing with an
+    // explicit automation framing, so the agent picks tools instead of
+    // V8 trying to parse the description as JavaScript.
+    if (command && command.type === "ai_automate") {
+      const goal = command.prompt || "";
+      if (!goal) {
+        addMessage("assistant", "Usage: /run <JS code> or /run <task description>.");
+        return;
+      }
+      text = `Automate this on the current page. Plan, then call browser tools (click, type, navigate, etc.) to do it. Stop when finished. Task: ${goal}`;
+      command = null;
+    }
 
     if (command && command.type === "help") {
       // Help is always available regardless of connection status

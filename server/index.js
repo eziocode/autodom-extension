@@ -1758,6 +1758,28 @@ function _processWsMessage(socket, message) {
           });
           toolCalls.push({ tool: "execute_code" });
           responseText = `Extracted text from "${context?.title || "this page"}":\n\n${result?.result || JSON.stringify(result)}`;
+        } else if (isAutomationIntent(lower)) {
+          // ── Refuse early on non-agentic providers ───────────────
+          // We're in this branch because no direct provider was wired
+          // up (Copilot/IDE-only). The MCP sampling fallback can only
+          // do a single text reply — it cannot iteratively call tools,
+          // so multi-step automation ("create a lead", "fill the form
+          // and submit", etc.) will silently spin until the 55s timeout
+          // and then return useless advice. Fail fast with a clear
+          // message instead.
+          process.stderr.write(
+            `[AutoDOM] ⚠ Automation intent on non-agentic provider "${effectiveProvider}". Refusing early.\n`,
+          );
+          responseText =
+            `**Automation needs a direct AI provider.**\n\n` +
+            `Your request looks like a multi-step automation task ("${(text || "").substring(0, 80)}"), ` +
+            `but the current provider (\`${effectiveProvider}\`) only supports one-shot text replies via MCP sampling — ` +
+            `it cannot iteratively call browser tools.\n\n` +
+            `To run automations like this, open the AutoDOM popup and switch to a direct provider:\n` +
+            `- **Anthropic (Claude)** — recommended for complex automation\n` +
+            `- **OpenAI (GPT)** — works well with GPT-4-class models\n` +
+            `- **Ollama** — for local models (needs a capable tool-use model)\n\n` +
+            `Slash commands like \`/dom\`, \`/click <index>\`, \`/type <index> <text>\`, and \`/nav <url>\` work without a direct provider.`;
         } else {
           // ── Route to IDE AI agent via MCP sampling ──────────────
           // Instead of showing a generic help menu, try to forward
@@ -2292,6 +2314,35 @@ function shouldAttachBrowserSnapshot(lowerText) {
       /\b(?:page|table|screen|visible|data|rows?|columns?|values?|ids?|names?|emails?|urls?|text|content)\b/.test(lower)
     )
   );
+}
+
+function isAutomationIntent(lowerText) {
+  // Detects user requests that imply iterative tool-use ("click and submit",
+  // "create a lead", "fill the form", multi-step task descriptions). These
+  // CANNOT be served by the MCP sampling fallback (one-shot text only) —
+  // we want to refuse early instead of spinning for 55 s.
+  const lower = String(lowerText || "").trim();
+  if (!lower) return false;
+  // Verb that implies a write/action on the page.
+  const actionVerb =
+    /\b(?:create|add|insert|make|fill|submit|register|enroll|sign\s*up|book|order|purchase|delete|remove|update|edit|change|set|toggle|enable|disable|select|choose|pick|upload|download|save|send|post|complete|finish|automate|do|perform|execute)\b/.test(
+      lower,
+    );
+  // Multi-step compound phrasing — "click X and Y", "do X then Y".
+  const compound =
+    /\b(?:click|tap|press|enter|type)\b.*\b(?:and|then|after|next|finally)\b/.test(
+      lower,
+    ) ||
+    /\b(?:and|then)\s+(?:click|submit|save|send|press|tap|enter|type|fill)\b/.test(
+      lower,
+    );
+  // "create a/an/the X" / "add a/an/the X" — strong automation signal even
+  // without a recognized noun.
+  const createNoun =
+    /\b(?:create|add|insert|make|new)\s+(?:a|an|the|sample|test|new)?\s*\w+/.test(
+      lower,
+    );
+  return actionVerb && (createNoun || compound || lower.split(/\s+/).length >= 3);
 }
 
 function isPageValueExtractionRequest(lowerText) {
