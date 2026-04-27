@@ -17,6 +17,40 @@
  * this file.
  */
 (function () {
+  const ACCOUNT_CONTEXT_ID_RE =
+    /\b(?:IC|CB)(?=[A-Z0-9_.-])(?:[A-Za-z0-9_.-]{1,})\b/g;
+
+  function collapseOmittedAccountIds(text) {
+    return String(text || "")
+      .replace(
+        /(?:\s*\[account identifier omitted\][,;|/\s-]*){3,}/g,
+        " [multiple account identifiers omitted] ",
+      )
+      .split("\n")
+      .map((line) => {
+        const matches = line.match(/\[account identifier omitted\]/g) || [];
+        if (matches.length < 2) return line;
+        const remainder = line
+          .replace(/\[account identifier omitted\]/g, "")
+          .replace(/[,;|/\s_.-]/g, "");
+        return remainder.length < 12
+          ? "[multiple account identifiers omitted]"
+          : line;
+      })
+      .join("\n")
+      .replace(
+        /(?:\[multiple account identifiers omitted\][,;|/\s-]*){2,}/g,
+        "[multiple account identifiers omitted] ",
+      );
+  }
+
+  function scrubContextIdentifiers(text) {
+    const out = String(text || "")
+      .replace(/\u0000(?:IC|CB)\d+\u0000/g, "")
+      .replace(ACCOUNT_CONTEXT_ID_RE, "[account identifier omitted]");
+    return collapseOmittedAccountIds(out);
+  }
+
   function buildSystemPrompt(context, providerInfo) {
     let p = "You are AutoDOM, an in-page browser assistant.\n";
     if (providerInfo && (providerInfo.model || providerInfo.provider)) {
@@ -27,13 +61,13 @@
       p += `Identity: provider=${prov}, model=${m}. When asked, answer truthfully with this exact pair; don't invent another model.\n`;
     }
     if (context) {
-      if (context.title) p += `Page: ${context.title}\n`;
-      if (context.url) p += `URL: ${context.url}\n`;
+      if (context.title) p += `Page: ${scrubContextIdentifiers(context.title)}\n`;
+      if (context.url) p += `URL: ${scrubContextIdentifiers(context.url)}\n`;
       // Outline is dense and cheap (~150 tokens). Send it on every turn,
       // including unchanged ones, so the model has structural anchors
       // even after we drop the visible-text body for dedup.
       if (context.outline) {
-        p += `Outline:\n${String(context.outline).substring(0, 800)}\n`;
+        p += `Outline:\n${scrubContextIdentifiers(context.outline).substring(0, 800)}\n`;
       }
       if (context._pageUnchanged) {
         // Page-context dedup: SW detected this page is identical to the
@@ -52,10 +86,10 @@
         // can be tighter still: 600/800 chars. Model can call
         // get_dom_state for full content when it needs detail.
         if (context.visibleOverlayText) {
-          p += `Popup text:\n${String(context.visibleOverlayText).substring(0, 600)}\n`;
+          p += `Popup text:\n${scrubContextIdentifiers(context.visibleOverlayText).substring(0, 600)}\n`;
         }
         if (context.visibleTextPreview) {
-          p += `Page text:\n${String(context.visibleTextPreview).substring(0, 800)}\n`;
+          p += `Page text:\n${scrubContextIdentifiers(context.visibleTextPreview).substring(0, 800)}\n`;
         }
         if (context.interactiveElements) {
           const ie = context.interactiveElements;

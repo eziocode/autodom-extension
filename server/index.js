@@ -1442,6 +1442,7 @@ function _processWsMessage(socket, message) {
         const lower = (text || "").toLowerCase().trim();
         const toolCalls = [];
         let responseText = "";
+        let effectiveContext = context || {};
 
         const effectiveProvider = normalizeProviderSelection(
           provider || providerConfig?.provider || directProviderConfig.provider,
@@ -1454,6 +1455,8 @@ function _processWsMessage(socket, message) {
         );
         const _willRouteToProvider =
           effectiveProvider !== "ide" && _hasCredentials;
+        const _preferLocalBrowserHeuristic =
+          shouldPreferLocalBrowserHeuristic(lower);
 
         process.stderr.write(
           `[AutoDOM]   normalizeProviderSelection input: ${JSON.stringify(provider || providerConfig?.provider || directProviderConfig.provider)}\n` +
@@ -1477,31 +1480,37 @@ function _processWsMessage(socket, message) {
           );
         }
 
-        if (isZgidExtractionRequest(lower)) {
+        if (
+          _willRouteToProvider &&
+          !_preferLocalBrowserHeuristic &&
+          shouldAttachBrowserSnapshot(lower)
+        ) {
           _checkAbort();
-          const result = await callExtensionTool("execute_code", {
-            code: buildZgidExtractionScript(),
+          const snapshotResult = await callExtensionTool("execute_code", {
+            code: buildActivePageSnapshotScript(),
             timeout: 20000,
           });
-          toolCalls.push({ tool: "execute_code" });
-          responseText = formatZgidExtractionResponse(result, context);
-          _safeSendAiResponse(socket, {
-            type: "AI_CHAT_RESPONSE",
-            id: id,
-            response: responseText,
-            toolCalls: toolCalls,
-          });
-          return;
+          toolCalls.push({ tool: "execute_code", purpose: "active_page_snapshot" });
+          effectiveContext = {
+            ...effectiveContext,
+            browserSnapshot: snapshotResult?.error
+              ? { error: snapshotResult.error }
+              : snapshotResult?.result || snapshotResult,
+          };
         }
 
-        if (effectiveProvider !== "ide" && _hasCredentials) {
+        if (
+          effectiveProvider !== "ide" &&
+          _hasCredentials &&
+          !_preferLocalBrowserHeuristic
+        ) {
           process.stderr.write(
             `[AutoDOM] ✓ Routing to direct provider: ${effectiveProvider}\n`,
           );
           const providerResult = await routeDirectProviderChat({
             provider: effectiveProvider,
             text,
-            context,
+            context: effectiveContext,
             conversationHistory,
             providerConfig: mergedProviderConfig,
             requestId: id,
@@ -1592,16 +1601,30 @@ function _processWsMessage(socket, message) {
           toolCalls.push({ tool: "execute_code" });
           const r = result?.result || {};
           const title =
-            (r.title || context?.title || "this page").toString().trim();
+            scrubSensitiveContextText(r.title || context?.title || "this page")
+              .toString()
+              .trim();
           responseText = `## ${title}\n\n`;
           if (Array.isArray(r.h1) && r.h1.length) {
-            responseText += `**Main heading**\n- ${r.h1.join("\n- ")}\n\n`;
+            const h1 = r.h1
+              .map((item) => scrubSensitiveContextText(item))
+              .filter(Boolean);
+            if (h1.length) {
+              responseText += `**Main heading**\n- ${h1.join("\n- ")}\n\n`;
+            }
           }
           if (Array.isArray(r.h2) && r.h2.length) {
-            responseText += `**Sections**\n- ${r.h2.join("\n- ")}\n\n`;
+            const h2 = r.h2
+              .map((item) => scrubSensitiveContextText(item))
+              .filter(Boolean);
+            if (h2.length) {
+              responseText += `**Sections**\n- ${h2.join("\n- ")}\n\n`;
+            }
           }
           if (typeof r.text === "string" && r.text.trim()) {
-            const preview = r.text.substring(0, 1500).trim();
+            const preview = scrubSensitiveContextText(r.text)
+              .substring(0, 1500)
+              .trim();
             responseText += `**Excerpt**\n\n${preview}`;
             if (r.text.length > 1500) responseText += "\n\n_(truncated)_";
             responseText += "\n\n";
@@ -1727,8 +1750,8 @@ function _processWsMessage(socket, message) {
 
               // Build a rich prompt with page context for the AI agent
               let samplingPrompt = `The user is interacting with a web page through the AutoDOM browser extension's chat panel.\n\n`;
-              samplingPrompt += `Page: ${context?.title || "Unknown"}\n`;
-              samplingPrompt += `URL: ${context?.url || "Unknown"}\n`;
+              samplingPrompt += `Page: ${scrubSensitiveContextText(context?.title || "Unknown")}\n`;
+              samplingPrompt += `URL: ${scrubSensitiveContextText(context?.url || "Unknown")}\n`;
               if (context?.interactiveElements) {
                 const ie = context.interactiveElements;
                 samplingPrompt += `Interactive elements: ${ie.links || 0} links, ${ie.buttons || 0} buttons, ${ie.inputs || 0} inputs, ${ie.forms || 0} forms\n`;
@@ -2228,35 +2251,141 @@ function providerHasCredentials(provider, config) {
   return false;
 }
 
-function isZgidExtractionRequest(lowerText) {
+function shouldAttachBrowserSnapshot(lowerText) {
   const lower = String(lowerText || "");
-  if (!/\bzgids?\b/.test(lower)) return false;
   return (
-    /\b(?:get|extract|list|show|copy|find|read|fetch)\b/.test(lower) ||
-    /\b(?:all|page|table|current)\b/.test(lower)
+    /\b(?:this|current|active)\s+(?:page|tab|site)\b/.test(lower) ||
+    /\b(?:from|on|in)\s+(?:the\s+)?(?:page|tab|site|screen|table)\b/.test(lower) ||
+    (
+      /\b(?:extract|list|show|get|find|read|fetch|collect|copy|count|summari[sz]e|what|which)\b/.test(lower) &&
+      /\b(?:page|table|screen|visible|data|rows?|columns?|values?|ids?|names?|emails?|urls?|text|content)\b/.test(lower)
+    )
   );
 }
 
-function buildZgidExtractionScript() {
+function shouldPreferLocalBrowserHeuristic(lowerText) {
+  const lower = String(lowerText || "");
+  return (
+    lower.includes("screenshot") ||
+    lower.includes("capture") ||
+    lower === "ss" ||
+    lower.includes("dom state") ||
+    lower.includes("interactive") ||
+    lower.includes("what can i click") ||
+    lower.includes("elements") ||
+    lower.includes("page info") ||
+    lower.includes("page details") ||
+    lower.includes("what page") ||
+    lower.includes("where am i") ||
+    lower.includes("summarize") ||
+    lower.includes("summary") ||
+    lower === "tldr" ||
+    lower === "tl;dr" ||
+    lower.includes("what's on this page") ||
+    lower.includes("what is this page") ||
+    lower.includes("accessibility") ||
+    lower.includes("a11y") ||
+    lower.startsWith("go to ") ||
+    lower.startsWith("navigate to ") ||
+    lower.startsWith("open ") ||
+    lower.startsWith("click ") ||
+    lower.includes("scroll down") ||
+    lower.includes("scroll up") ||
+    (
+      lower.includes("extract") &&
+      (lower.includes("text") || lower.includes("content"))
+    )
+  );
+}
+
+const ACCOUNT_CONTEXT_ID_RE =
+  /\b(?:IC|CB)(?=[A-Z0-9_.-])(?:[A-Za-z0-9_.-]{1,})\b/g;
+
+function collapseOmittedAccountIds(text) {
+  return String(text || "")
+    .replace(
+      /(?:\s*\[account identifier omitted\][,;|/\s-]*){3,}/g,
+      " [multiple account identifiers omitted] ",
+    )
+    .split("\n")
+    .map((line) => {
+      const matches = line.match(/\[account identifier omitted\]/g) || [];
+      if (matches.length < 2) return line;
+      const remainder = line
+        .replace(/\[account identifier omitted\]/g, "")
+        .replace(/[,;|/\s_.-]/g, "");
+      return remainder.length < 12
+        ? "[multiple account identifiers omitted]"
+        : line;
+    })
+    .join("\n")
+    .replace(
+      /(?:\[multiple account identifiers omitted\][,;|/\s-]*){2,}/g,
+      "[multiple account identifiers omitted] ",
+    );
+}
+
+function scrubSensitiveContextText(text) {
+  const out = String(text || "")
+    .replace(/\u0000(?:IC|CB)\d+\u0000/g, "")
+    .replace(ACCOUNT_CONTEXT_ID_RE, "[account identifier omitted]");
+  return collapseOmittedAccountIds(out);
+}
+
+function buildActivePageSnapshotScript() {
   return `
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    const normalize = (text) => String(text || "").replace(/\\s+/g, " ").trim();
-    const compactId = (text) => normalize(text).replace(/\\D+/g, "");
-    const seen = new Set();
-    const rows = [];
+    const MAX_TEXT = 12000;
+    const MAX_TABLES = 8;
+    const MAX_ROWS_PER_TABLE = 80;
+    const MAX_SCROLL_BLOCKS = 40;
+    const ACCOUNT_CONTEXT_ID_RE = /\\b(?:IC|CB)(?=[A-Z0-9_.-])(?:[A-Za-z0-9_.-]{1,})\\b/g;
+    function collapseOmittedAccountIds(text) {
+      return String(text || "")
+        .replace(
+          /(?:\\s*\\[account identifier omitted\\][,;|/\\s-]*){3,}/g,
+          " [multiple account identifiers omitted] ",
+        )
+        .split("\\n")
+        .map((line) => {
+          const matches = line.match(/\\[account identifier omitted\\]/g) || [];
+          if (matches.length < 2) return line;
+          const remainder = line
+            .replace(/\\[account identifier omitted\\]/g, "")
+            .replace(/[,;|/\\s_.-]/g, "");
+          return remainder.length < 12
+            ? "[multiple account identifiers omitted]"
+            : line;
+        })
+        .join("\\n")
+        .replace(
+          /(?:\\[multiple account identifiers omitted\\][,;|/\\s-]*){2,}/g,
+          "[multiple account identifiers omitted] ",
+        );
+    }
+    function scrubSensitiveContextText(text) {
+      const out = String(text || "")
+        .replace(/\\u0000(?:IC|CB)\\d+\\u0000/g, "")
+        .replace(ACCOUNT_CONTEXT_ID_RE, "[account identifier omitted]");
+      return collapseOmittedAccountIds(out);
+    }
+    const normalize = (text) =>
+      scrubSensitiveContextText(String(text || "").replace(/\\s+/g, " ").trim());
+    const textOf = (el) => normalize(el && (el.innerText || el.textContent));
+    const seenBlocks = new Set();
+    const scrollTextBlocks = [];
+    const tables = [];
 
-    function add(raw, source) {
-      const zgid = compactId(raw);
-      if (zgid.length < 6 || zgid.length > 20 || seen.has(zgid)) return;
-      seen.add(zgid);
-      rows.push({ zgid, raw: normalize(raw), source });
+    function addTextBlock(text) {
+      const block = normalize(text);
+      if (!block || block.length < 20 || seenBlocks.has(block)) return;
+      seenBlocks.add(block);
+      if (scrollTextBlocks.length < MAX_SCROLL_BLOCKS) {
+        scrollTextBlocks.push(block.substring(0, 2000));
+      }
     }
 
-    function textOf(el) {
-      return normalize(el && (el.innerText || el.textContent));
-    }
-
-    function isVisible(el) {
+    function isVisibleElement(el) {
       if (!el || !el.getBoundingClientRect) return false;
       const style = getComputedStyle(el);
       if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
@@ -2266,82 +2395,48 @@ function buildZgidExtractionScript() {
       return rect.width > 0 && rect.height > 0;
     }
 
-    function collectFromNativeTables() {
+    function pushTable(label, headers, rows) {
+      if (tables.length >= MAX_TABLES || rows.length === 0) return;
+      tables.push({
+        label,
+        headers: headers.map(normalize).filter(Boolean).slice(0, 20),
+        rows: rows
+          .map((row) => row.map(normalize).filter(Boolean))
+          .filter((row) => row.length > 0)
+          .slice(0, MAX_ROWS_PER_TABLE),
+      });
+    }
+
+    function collectNativeTables() {
       document.querySelectorAll("table").forEach((table) => {
-        const tableRows = Array.from(table.querySelectorAll("tr"));
-        let zgidIndex = -1;
-        for (const row of tableRows.slice(0, 5)) {
-          const cells = Array.from(row.children);
-          const idx = cells.findIndex((cell) => /^z\\s*gid$/i.test(textOf(cell)) || /^zgid$/i.test(textOf(cell)));
-          if (idx >= 0) {
-            zgidIndex = idx;
-            break;
-          }
-        }
-        if (zgidIndex < 0) return;
-        tableRows.forEach((row) => {
-          const cells = Array.from(row.children);
-          if (cells[zgidIndex]) add(textOf(cells[zgidIndex]), "table");
-        });
+        if (!isVisibleElement(table)) return;
+        const rows = Array.from(table.querySelectorAll("tr"))
+          .map((row) => Array.from(row.children).map(textOf))
+          .filter((row) => row.some(Boolean));
+        if (rows.length === 0) return;
+        const first = rows[0] || [];
+        const hasHeader = Array.from(table.querySelectorAll("th")).length > 0;
+        pushTable("table", hasHeader ? first : [], hasHeader ? rows.slice(1) : rows);
       });
     }
 
-    function collectFromAriaTables() {
+    function collectAriaTables() {
       document.querySelectorAll('[role="table"],[role="grid"],[role="treegrid"]').forEach((grid) => {
+        if (!isVisibleElement(grid)) return;
         const gridRows = Array.from(grid.querySelectorAll('[role="row"]'));
-        let zgidIndex = -1;
-        for (const row of gridRows.slice(0, 8)) {
-          const cells = Array.from(row.querySelectorAll('[role="columnheader"],[role="cell"],[role="gridcell"]'));
-          const idx = cells.findIndex((cell) => /^z\\s*gid$/i.test(textOf(cell)) || /^zgid$/i.test(textOf(cell)));
-          if (idx >= 0) {
-            zgidIndex = idx;
-            break;
-          }
-        }
-        if (zgidIndex < 0) return;
-        gridRows.forEach((row) => {
-          const cells = Array.from(row.querySelectorAll('[role="columnheader"],[role="cell"],[role="gridcell"]'));
-          if (cells[zgidIndex]) add(textOf(cells[zgidIndex]), "aria-grid");
-        });
+        const rows = gridRows
+          .map((row) => Array.from(row.querySelectorAll('[role="columnheader"],[role="cell"],[role="gridcell"]')).map(textOf))
+          .filter((row) => row.some(Boolean));
+        if (rows.length === 0) return;
+        const firstRowHasHeaders = gridRows[0]?.querySelector('[role="columnheader"]');
+        pushTable("aria-table", firstRowHasHeaders ? rows[0] : [], firstRowHasHeaders ? rows.slice(1) : rows);
       });
     }
 
-    function collectByColumnGeometry() {
-      const all = Array.from(document.querySelectorAll("body *")).filter(isVisible);
-      const headers = all.filter((el) => {
-        const text = textOf(el);
-        return /^z\\s*gid$/i.test(text) || /^zgid$/i.test(text);
-      });
-      headers.forEach((header) => {
-        const hr = header.getBoundingClientRect();
-        const left = hr.left - Math.max(24, hr.width * 0.75);
-        const right = hr.right + Math.max(24, hr.width * 0.75);
-        all.forEach((el) => {
-          if (el === header || el.contains(header) || header.contains(el)) return;
-          const text = textOf(el);
-          if (!/\\d/.test(text) || /^z\\s*gid$/i.test(text)) return;
-          if (Array.from(el.children || []).some((child) => /\\d/.test(textOf(child)))) return;
-          const rect = el.getBoundingClientRect();
-          const cx = rect.left + rect.width / 2;
-          if (cx >= left && cx <= right && rect.top > hr.bottom - 4) {
-            add(text, "zgid-column");
-          }
-        });
-      });
-    }
-
-    function collectNearbyTextFallback() {
-      const text = document.body ? document.body.innerText || "" : "";
-      const regex = /z\\s*gid\\D{0,20}(\\d[\\d\\s]{5,30})/gi;
-      let match;
-      while ((match = regex.exec(text))) add(match[1], "text-near-zgid");
-    }
-
-    function collectAll() {
-      collectFromNativeTables();
-      collectFromAriaTables();
-      collectByColumnGeometry();
-      if (rows.length === 0) collectNearbyTextFallback();
+    function collectSnapshot() {
+      collectNativeTables();
+      collectAriaTables();
+      addTextBlock(document.body ? document.body.innerText || document.body.textContent || "" : "");
     }
 
     function scrollContainers() {
@@ -2356,48 +2451,56 @@ function buildZgidExtractionScript() {
       });
     }
 
-    collectAll();
+    collectSnapshot();
     for (const scroller of scrollContainers().slice(0, 4)) {
       const original = scroller.scrollTop;
       const max = scroller.scrollHeight - scroller.clientHeight;
       if (max <= 0) continue;
-      const steps = Math.min(30, Math.max(4, Math.ceil(max / Math.max(1, scroller.clientHeight * 0.75))));
+      const steps = Math.min(20, Math.max(3, Math.ceil(max / Math.max(1, scroller.clientHeight * 0.9))));
       for (let i = 0; i <= steps; i++) {
         scroller.scrollTop = Math.round((max * i) / steps);
-        await sleep(70);
-        collectAll();
+        await sleep(60);
+        collectSnapshot();
       }
       scroller.scrollTop = original;
     }
 
-    const totalMatch = (document.body?.innerText || "").match(/\\bTotal\\s*:\\s*(\\d+)\\b/i);
     return {
       title: document.title,
       url: location.href,
-      count: rows.length,
-      zgids: rows.map((row) => row.zgid),
-      rows,
-      total: totalMatch ? Number(totalMatch[1]) : null,
+      visibleText: normalize(document.body ? document.body.innerText || document.body.textContent || "" : "").substring(0, MAX_TEXT),
+      scrollText: scrollTextBlocks.join("\\n---\\n").substring(0, MAX_TEXT),
+      tables,
     };
   `;
 }
 
-function formatZgidExtractionResponse(result, context) {
-  if (result?.error) {
-    return `I couldn't extract ZGIDs from the active page: ${result.error}`;
+function formatBrowserSnapshotForPrompt(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return "";
+  if (snapshot.error) return `Browser snapshot error: ${snapshot.error}`;
+  const parts = [];
+  if (snapshot.title) {
+    parts.push(`Snapshot title: ${scrubSensitiveContextText(snapshot.title)}`);
   }
-  const data = result?.result && typeof result.result === "object" ? result.result : result;
-  const zgids = Array.isArray(data?.zgids) ? data.zgids : [];
-  const title = data?.title || context?.title || "the active page";
-  if (zgids.length === 0) {
-    return `I couldn't find any ZGIDs on ${title}. Make sure the Aalam table is loaded and the Zgid column is visible.`;
+  if (snapshot.url) {
+    parts.push(`Snapshot URL: ${scrubSensitiveContextText(snapshot.url)}`);
   }
-  let out = `Found ${zgids.length} ZGID${zgids.length === 1 ? "" : "s"} on ${title}`;
-  if (data?.total && data.total > zgids.length) {
-    out += ` (the page shows Total: ${data.total}; extracted from loaded/scrollable rows)`;
+  if (snapshot.visibleText) {
+    parts.push(
+      `Visible page text:\n${scrubSensitiveContextText(snapshot.visibleText).substring(0, 8000)}`,
+    );
   }
-  out += `:\n\n${zgids.map((zgid, i) => `${i + 1}. ${zgid}`).join("\n")}`;
-  return out;
+  if (snapshot.scrollText && snapshot.scrollText !== snapshot.visibleText) {
+    parts.push(
+      `Additional text gathered while scrolling:\n${scrubSensitiveContextText(snapshot.scrollText).substring(0, 8000)}`,
+    );
+  }
+  if (Array.isArray(snapshot.tables) && snapshot.tables.length > 0) {
+    parts.push(
+      `Detected tables/grids:\n${scrubSensitiveContextText(JSON.stringify(snapshot.tables, null, 2)).substring(0, 10000)}`,
+    );
+  }
+  return parts.join("\n\n").substring(0, 18000);
 }
 
 function buildProviderSystemPrompt(context) {
@@ -2408,17 +2511,25 @@ function buildProviderSystemPrompt(context) {
   prompt +=
     "Respond clearly and actionably. If browser data is needed, use AutoDOM/MCP browser tools instead of asking the user to run commands or paste DOM output. " +
     "Never use raw internal shorthand like IC7 or CB0 in the user-facing answer; if you need to mention an indexed element, say element #7 and describe it in plain English, and never tell users to type placeholder tokens.\n\n";
-  prompt += `Page title: ${context?.title || "Unknown"}\n`;
-  prompt += `Page URL: ${context?.url || "Unknown"}\n`;
+  prompt += `Page title: ${scrubSensitiveContextText(context?.title || "Unknown")}\n`;
+  prompt += `Page URL: ${scrubSensitiveContextText(context?.url || "Unknown")}\n`;
   if (context?.visibleOverlayText) {
-    prompt += `Visible popup/dialog text:\n${String(context.visibleOverlayText).substring(0, 1500)}\n`;
+    prompt += `Visible popup/dialog text:\n${scrubSensitiveContextText(context.visibleOverlayText).substring(0, 1500)}\n`;
   }
   if (context?.visibleTextPreview) {
-    prompt += `Visible page text preview:\n${String(context.visibleTextPreview).substring(0, 2500)}\n`;
+    prompt += `Visible page text preview:\n${scrubSensitiveContextText(context.visibleTextPreview).substring(0, 2500)}\n`;
   }
   if (context?.interactiveElements) {
     const ie = context.interactiveElements;
     prompt += `Interactive elements: links=${ie.links || 0}, buttons=${ie.buttons || 0}, inputs=${ie.inputs || 0}, forms=${ie.forms || 0}\n`;
+  }
+  if (context?.browserSnapshot) {
+    const snapshotText = formatBrowserSnapshotForPrompt(context.browserSnapshot);
+    if (snapshotText) {
+      prompt += `\nActive page data already read by AutoDOM:\n${snapshotText}\n`;
+      prompt +=
+        "Use this active-page data to answer page extraction questions directly; do not ask the user to run console snippets or provide DOM output.\n";
+    }
   }
   return prompt;
 }
