@@ -4817,6 +4817,7 @@
     { command: "/nav", insert: "/nav ", description: "Navigate to a URL" },
     { command: "/js", insert: "/js ", description: "Run JavaScript on the page" },
     { command: "/run", insert: "/run ", description: "Run automation script" },
+    { command: "/auto", insert: "/auto ", description: "Vision-plan: one-shot screenshot→plan→execute (faster)" },
   ];
   let _slashActiveIndex = 0;
 
@@ -8030,7 +8031,14 @@
   async function sendAiMessage(text, options) {
     const attachments =
       options && Array.isArray(options.attachments) ? options.attachments : [];
-    _log("sendAiMessage:", text.substring(0, 80), attachments.length ? `(+${attachments.length} image)` : "");
+    // /auto <task> opts in to vision-plan mode (single screenshot+snapshot →
+    // planning call → local replay). Strip the prefix before sending.
+    let mode = null;
+    if (typeof text === "string" && /^\/auto(\s|$)/i.test(text.trim())) {
+      mode = "vision-plan";
+      text = text.trim().replace(/^\/auto\s*/i, "");
+    }
+    _log("sendAiMessage:", text.substring(0, 80), attachments.length ? `(+${attachments.length} image)` : "", mode ? `[mode=${mode}]` : "");
     if (_contextInvalidated) {
       return {
         fallback: true,
@@ -8068,6 +8076,7 @@
             context: context,
             conversationHistory: conversationHistory.slice(-20), // Last 20 messages
             model: _currentModelId() || undefined,
+            mode: mode || undefined,
             attachments: attachments.length > 0
               ? attachments.map((a) => ({
                   name: a.name,

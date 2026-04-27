@@ -1186,6 +1186,7 @@ async function runAgentLoop({
   initialTabId,
   modelOverride,
   attachments,
+  mode,
 }) {
   const ProvidersApi = globalThis.AutoDOMProviders;
   const AgentApi = globalThis.AutoDOMAgent;
@@ -1249,6 +1250,132 @@ async function runAgentLoop({
     };
 
     try {
+    // ── Vision-plan mode: one-shot plan from screenshot+snapshot, then replay ──
+    // Triggered via /auto. Skips the chatty per-step model loop entirely:
+    // 1 vision call → JSON action script → local replay. On any failure we
+    // surface a clear error and stop — caller can retry without /auto.
+    if (mode === "vision-plan") {
+      const ALLOWED_PLAN_TOOLS = new Set([
+        "click_by_index",
+        "type_by_index",
+        "navigate",
+        "scroll",
+        "wait_for_element",
+        "select_option",
+        "press_key",
+      ]);
+      const PLAN_PROMPT =
+        "You are a browser automation planner. Output ONLY a single JSON object " +
+        '(no prose, no code fences) with shape: {"steps":[{"tool":"<name>","args":{...}}]}. ' +
+        "Allowed tools: click_by_index, type_by_index, navigate, scroll, wait_for_element, " +
+        "select_option, press_key. Use snapshot indices (e.g. CB0, IC0) for click_by_index/type_by_index. " +
+        "Keep steps minimal and deterministic.";
+
+      let snap, shot;
+      try {
+        snap = await executeAgentTool("take_snapshot", { maxDepth: 4 });
+      } catch (e) {
+        return finish({ response: `⚠️ Vision plan: snapshot failed (${e.message}).`, toolCalls: accumulatedToolCalls });
+      }
+      try {
+        shot = await executeAgentTool("take_screenshot", {});
+      } catch (_) {
+        shot = null;
+      }
+      const dataUrl = shot?.screenshot || shot?.dataUrl || null;
+      const snapStr = JSON.stringify(snap || {}).substring(0, 8000);
+
+      const planText = `${PLAN_PROMPT}\n\nUser task: ${text}\n\nSnapshot:\n${snapStr}`;
+
+      let planResp;
+      try {
+        if (providerType === "openai" || providerType === "ollama") {
+          const callFn =
+            providerType === "openai" ? ProvidersApi.callOpenAI : ProvidersApi.callOllama;
+          const parts = [{ type: "text", text: planText }];
+          if (dataUrl && providerType === "openai") {
+            parts.push({ type: "image_url", image_url: { url: dataUrl } });
+          }
+          planResp = await callFn({
+            apiKey,
+            baseUrl: aiProviderSettings.baseUrl,
+            model: _model,
+            messagesOverride: [{ role: "user", content: parts }],
+            debug: _debugLog,
+            signal,
+          });
+        } else if (providerType === "anthropic") {
+          const userMsg = _buildUserMessageForProvider(
+            planText,
+            dataUrl ? [{ dataUrl, mime: "image/png", name: "page.png" }] : [],
+            "anthropic",
+          );
+          planResp = await ProvidersApi.callAnthropic({
+            apiKey,
+            baseUrl: aiProviderSettings.baseUrl,
+            model: _model,
+            context: { ...(context || {}), _agentMode: true },
+            providerInfo: { model: _model, provider: "anthropic" },
+            messagesOverride: [{ role: "user", ...userMsg }],
+            systemPromptOverride:
+              "Output ONLY the JSON object described by the user. No prose.",
+            debug: _debugLog,
+            signal,
+          });
+        } else {
+          return finish({ response: `⚠️ Vision plan not supported for provider: ${providerType}.`, toolCalls: accumulatedToolCalls });
+        }
+      } catch (err) {
+        if (isAborted() || err?.name === "AbortError") return finish(abortedReply());
+        return finish({ response: `⚠️ Vision plan call failed: ${err.message}`, toolCalls: accumulatedToolCalls });
+      }
+
+      // Parse JSON — tolerate optional ```json fences just in case.
+      const raw = String(planResp?.response || "").trim()
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/\s*```$/, "");
+      const plan = _safeJsonParse(raw);
+      const steps = Array.isArray(plan?.steps) ? plan.steps : [];
+      if (!steps.length) {
+        return finish({
+          response: "⚠️ Vision plan: model did not return a valid step list. Try without /auto.",
+          toolCalls: accumulatedToolCalls,
+        });
+      }
+
+      for (let i = 0; i < steps.length; i++) {
+        if (isAborted()) return finish(abortedReply());
+        const step = steps[i] || {};
+        if (!ALLOWED_PLAN_TOOLS.has(step.tool)) {
+          return finish({
+            response: `⚠️ Vision plan: step ${i + 1} used disallowed tool '${step.tool}'. Aborting.`,
+            toolCalls: accumulatedToolCalls,
+          });
+        }
+        const args = step.args && typeof step.args === "object" ? step.args : {};
+        _streamAgentToolEvent(panelTabId, {
+          phase: "start", runId: runHandle.runId, tool: step.tool, args,
+        });
+        const r = await executeAgentTool(step.tool, args);
+        const ok = !!r?.ok && !r?.error;
+        accumulatedToolCalls.push({ tool: step.tool, args, ok });
+        _streamAgentToolEvent(panelTabId, {
+          phase: "end", runId: runHandle.runId, tool: step.tool, ok,
+          error: r?.error, result: AgentApi.truncateToolResult(step.tool, r),
+        });
+        if (!ok) {
+          return finish({
+            response: `⚠️ Vision plan stopped at step ${i + 1}/${steps.length} (${step.tool}): ${r?.error || "tool returned not-ok"}.`,
+            toolCalls: accumulatedToolCalls,
+          });
+        }
+      }
+      return finish({
+        response: `✅ Executed ${steps.length} step(s) via vision plan.`,
+        toolCalls: accumulatedToolCalls,
+      });
+    }
+
     // ── OpenAI / Ollama style: messages = [{role, content/tool_calls/...}] ──
     if (providerType === "openai" || providerType === "ollama") {
       const providerInfo = { model: _model, provider: providerType };
@@ -3153,7 +3280,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "CHAT_AI_MESSAGE") {
-    const { text, context, conversationHistory, provider, attachments } = message;
+    const { text, context, conversationHistory, provider, attachments, mode } = message;
     _debugLog(
       "[AutoDOM SW] CHAT_AI_MESSAGE received, text:",
       (text || "").substring(0, 80),
@@ -3251,6 +3378,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             initialTabId: sender?.tab?.id,
             modelOverride: effectiveModel,
             attachments: Array.isArray(attachments) ? attachments : [],
+            mode: mode || null,
           });
           _debugLog(
             "[AutoDOM SW] Agent loop finished, length:",
