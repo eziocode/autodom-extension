@@ -8388,6 +8388,9 @@
           };
         case "help":
           return { type: "help" };
+        case "auto":
+          // Vision-plan mode: one-shot screenshot+snapshot → JSON plan → replay.
+          return { type: "ai_automate", prompt: rest.trim(), mode: "vision-plan" };
         default:
           return { tool: tool, params: rest ? tryParseJSON(rest) : {} };
       }
@@ -9047,10 +9050,21 @@
     if (command && command.type === "ai_automate") {
       const goal = command.prompt || "";
       if (!goal) {
-        addMessage("assistant", "Usage: /run <JS code> or /run <task description>.");
+        addMessage(
+          "assistant",
+          command.mode === "vision-plan"
+            ? "Usage: /auto <task description>."
+            : "Usage: /run <JS code> or /run <task description>.",
+        );
         return;
       }
-      text = `Automate this on the current page. Plan, then call browser tools (click, type, navigate, etc.) to do it. Stop when finished. Task: ${goal}`;
+      // For /auto, re-prefix so sendAiMessage's prefix detector flips on
+      // vision-plan mode. The planner has its own framing — skip the
+      // chatty "Automate this..." wrapper used by /run.
+      text =
+        command.mode === "vision-plan"
+          ? `/auto ${goal}`
+          : `Automate this on the current page. Plan, then call browser tools (click, type, navigate, etc.) to do it. Stop when finished. Task: ${goal}`;
       command = null;
     }
 

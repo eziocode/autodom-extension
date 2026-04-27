@@ -3461,6 +3461,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       context: context || {},
       conversationHistory: sanitizedHistory,
       provider: providerType,
+      mode: mode || undefined,
       providerConfig: {
         provider: aiProviderSettings.source || "ide",
         cliBinary: aiProviderSettings.cliBinary || "",

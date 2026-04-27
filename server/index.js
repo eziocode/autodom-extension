@@ -1403,7 +1403,7 @@ function _processWsMessage(socket, message) {
   }
 
   if (message.type === "AI_CHAT_REQUEST") {
-    const { id, text, context, conversationHistory, provider, providerConfig } =
+    const { id, text, context, conversationHistory, provider, providerConfig, mode } =
       message;
     touchActivity();
 
@@ -1539,6 +1539,7 @@ function _processWsMessage(socket, message) {
             conversationHistory,
             providerConfig: mergedProviderConfig,
             requestId: id,
+            mode: mode || null,
           });
 
           process.stderr.write(
@@ -3332,11 +3333,119 @@ async function callCliBrowserAgent({
   conversationHistory,
   providerConfig,
   requestId,
+  mode,
 }) {
   const observations = [];
   const toolCalls = [];
   let invalidResponse = "";
   let lastCliMeta = {};
+
+  // ── Vision-plan fast path: one snapshot → JSON plan → replay ──
+  // CLI bridges are text-only, so we send the snapshot tree (not a
+  // screenshot) to the planner. Form-filling and basic flows usually
+  // have enough signal in the snapshot indices alone.
+  // On any plan/parse/step failure, we fall through to the chatty
+  // loop below with the partial observations seeded — the chatty
+  // agent then has a head start instead of starting from zero.
+  if (mode === "vision-plan") {
+    const PLAN_TOOLS = new Set([
+      "click_by_index",
+      "type_by_index",
+      "navigate",
+      "scroll",
+      "wait_for_element",
+      "select_option",
+      "press_key",
+    ]);
+    let visionPlanFell = false;
+    try {
+      if (_isAborted(requestId)) throw new AiAbortError(requestId);
+      const snap = await callExtensionTool("take_snapshot", { maxDepth: 4 });
+      toolCalls.push({ tool: "take_snapshot", via: "vision_plan", ok: !snap?.error });
+      const snapStr = JSON.stringify(snap || {}).substring(0, 9000);
+
+      const planPrompt =
+        `You are AutoDOM's one-shot browser automation planner.\n` +
+        `Output ONLY a single JSON object (no prose, no markdown fences) of shape:\n` +
+        `{"steps":[{"tool":"<name>","args":{...}}]}\n\n` +
+        `Allowed tools: click_by_index, type_by_index, navigate, scroll, wait_for_element, select_option, press_key.\n` +
+        `Use snapshot indices (e.g. CB0, IC0) for click_by_index/type_by_index.\n` +
+        `Keep steps minimal and deterministic. Do not include get_dom_state — you already have the snapshot.\n\n` +
+        `Page: ${context?.title || ""} (${context?.url || ""})\n` +
+        `User task: ${text}\n\n` +
+        `Snapshot:\n${snapStr}\n`;
+
+      if (_isAborted(requestId)) throw new AiAbortError(requestId);
+      const cliResult = await runCliPrompt({
+        prompt: planPrompt,
+        providerConfig,
+        requestId,
+      });
+      lastCliMeta = cliResult;
+
+      // Tolerate optional ```json fences from the CLI.
+      const raw = String(cliResult.response || "")
+        .trim()
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/\s*```$/, "");
+      let plan = null;
+      try { plan = JSON.parse(raw); } catch (_) { plan = null; }
+      const steps = Array.isArray(plan?.steps) ? plan.steps : [];
+
+      if (!steps.length) {
+        observations.push({
+          tool: "_vision_plan",
+          params: {},
+          result: `Vision plan produced no steps; falling back to chatty loop. Raw CLI response head: ${raw.substring(0, 400)}`,
+        });
+        visionPlanFell = true;
+      } else {
+        for (let i = 0; i < steps.length; i++) {
+          if (_isAborted(requestId)) throw new AiAbortError(requestId);
+          const step = steps[i] || {};
+          if (!PLAN_TOOLS.has(step.tool)) {
+            observations.push({
+              tool: "_vision_plan",
+              params: {},
+              result: `Step ${i + 1} used disallowed tool '${step.tool}'; falling back to chatty loop.`,
+            });
+            visionPlanFell = true;
+            break;
+          }
+          const args = step.args && typeof step.args === "object" ? step.args : {};
+          const r = await callExtensionTool(step.tool, args);
+          const ok = !r?.error && !r?.blocked;
+          toolCalls.push({ tool: step.tool, via: "vision_plan", ok });
+          observations.push({
+            tool: step.tool,
+            params: args,
+            result: truncateCliAgentResult(r),
+          });
+          if (!ok) {
+            // Hand control to chatty loop with this failure context seeded.
+            visionPlanFell = true;
+            break;
+          }
+        }
+        if (!visionPlanFell) {
+          return {
+            response: `Done — executed ${steps.length} step(s) via vision plan.`,
+            toolCalls,
+            model: cliResult.model,
+          };
+        }
+      }
+    } catch (err) {
+      if (err instanceof AiAbortError) throw err;
+      observations.push({
+        tool: "_vision_plan",
+        params: {},
+        result: `Vision plan threw: ${err.message}; falling back to chatty loop.`,
+      });
+      visionPlanFell = true;
+    }
+    // Fall through to chatty loop below with seeded observations/toolCalls.
+  }
 
   if (context?.url || context?.title) {
     if (_isAborted(requestId)) throw new AiAbortError(requestId);
@@ -3454,6 +3563,7 @@ async function routeDirectProviderChat({
   conversationHistory,
   providerConfig: incomingConfig,
   requestId,
+  mode,
 }) {
   const providerConfig = mergeProviderConfig(incomingConfig || { provider });
 
@@ -3485,13 +3595,14 @@ async function routeDirectProviderChat({
   }
 
   if (provider === "cli") {
-    if (shouldUseCliBrowserAgent(text, context, conversationHistory)) {
+    if (mode === "vision-plan" || shouldUseCliBrowserAgent(text, context, conversationHistory)) {
       return callCliBrowserAgent({
         text,
         context,
         conversationHistory,
         providerConfig,
         requestId,
+        mode,
       });
     }
     return callCliProvider({
