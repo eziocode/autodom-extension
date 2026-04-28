@@ -446,6 +446,7 @@ const TOOL_TIERS = new Map([
   // Destructive tools — irreversible actions (navigation, form submission)
   ["navigate", "destructive"],
   ["fill_form", "destructive"],
+  ["batch_actions", "destructive"],
   ["respond_to_chat", "destructive"],
 ]);
 
@@ -3084,7 +3085,16 @@ const CLI_AGENT_TOOLS = [
     name: "get_dom_state",
     description:
       "Snapshot interactive elements with numeric indexes. Call before clicking or typing unless you have a fresh index map.",
-    params: { maxElements: 80 },
+    params: { maxElements: 60 },
+  },
+  {
+    name: "batch_actions",
+    description:
+      "Execute up to 8 known browser actions sequentially in one call. Prefer this after get_dom_state when the next click/type/wait steps are clear.",
+    params: {
+      actions: [{ tool: "click_by_index", params: { index: 0 } }],
+      stopOnError: true,
+    },
   },
   {
     name: "click_by_index",
@@ -3318,11 +3328,12 @@ function buildCliAgentPrompt({
     `\nUser request: ${text}\n\n` +
     `Available tools:\n${JSON.stringify(CLI_AGENT_TOOLS, null, 2)}\n\n` +
     `Return exactly one JSON object and no markdown/code fences.\n` +
-    `To call a tool: {"action":"tool","tool":"get_dom_state","params":{"maxElements":80},"reason":"inspect current page"}\n` +
+    `To call a tool: {"action":"tool","tool":"get_dom_state","params":{"maxElements":60},"reason":"inspect current page"}\n` +
     `To finish: {"action":"final","response":"Done — ..."}\n\n` +
     `Rules:\n` +
     `- Do not run shell commands, terminal commands, or CLI tools. Return only the JSON decision for AutoDOM to execute.\n` +
     `- For browser actions, call tools. Never ask the user to run /dom, /click, /nav, paste DOM output, or manually click/type when a tool can do it.\n` +
+    `- When 2+ next browser steps are known, prefer batch_actions so AutoDOM can execute them without another AI round-trip.\n` +
     `- For multi-step tasks, call get_dom_state first, then click/type/wait as needed.\n` +
     `- For "create a lead", open/navigate to Leads and the create form if possible. If required lead values are missing, stop and ask for those values; do not invent data or save/submit a record with missing user-provided details.\n` +
     `- If a tool fails, replan using the result instead of repeating the same failed call.\n\n` +
@@ -3467,7 +3478,7 @@ async function callCliBrowserAgent({
 
   if ((context?.url || context?.title) && !skipBootstrapDomState) {
     if (_isAborted(requestId)) throw new AiAbortError(requestId);
-    const result = await callExtensionTool("get_dom_state", { maxElements: 80 });
+    const result = await callExtensionTool("get_dom_state", { maxElements: 60 });
     toolCalls.push({
       tool: "get_dom_state",
       via: "cli_agent_bootstrap",
@@ -3475,7 +3486,7 @@ async function callCliBrowserAgent({
     });
     observations.push({
       tool: "get_dom_state",
-      params: { maxElements: 80 },
+      params: { maxElements: 60 },
       result: truncateCliAgentResult(result),
     });
   }
@@ -3498,7 +3509,7 @@ async function callCliBrowserAgent({
       if (containsManualBrowserGuidance(decision.response)) {
         if (toolCalls.length === 0 && turn === 0) {
           const result = await callExtensionTool("get_dom_state", {
-            maxElements: 80,
+            maxElements: 60,
           });
           toolCalls.push({
             tool: "get_dom_state",
@@ -3507,7 +3518,7 @@ async function callCliBrowserAgent({
           });
           observations.push({
             tool: "get_dom_state",
-            params: { maxElements: 80 },
+            params: { maxElements: 60 },
             result:
               "The CLI tried to give manual instructions instead of acting. AutoDOM ran get_dom_state so you can choose the next executable tool.\n" +
               truncateCliAgentResult(result),

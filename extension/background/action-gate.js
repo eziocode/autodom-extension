@@ -65,6 +65,7 @@
   // always prompted unless the origin is Full Trust (v2 — not yet exposed).
   const DESTRUCTIVE = new Set([
     "navigate",
+    "batch_actions",
     "evaluate_script",
     "execute_async_script",
     "execute_code",

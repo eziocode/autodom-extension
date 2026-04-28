@@ -851,7 +851,7 @@ async function executeAgentTool(toolName, params) {
 
   // ── ActionGate: Ask Before Act ──────────────────────────────
   const Gate = globalThis.AutoDOMActionGate;
-  if (Gate) {
+  if (Gate && _agentBatchDepth === 0) {
     try {
       const origin = Gate.normalizeOrigin(_gateTab?.url || "");
       const decision = await Gate.requestDecision({
@@ -1035,7 +1035,8 @@ function _agentSystemPrompt(context, providerInfo, cacheKey) {
   return (
     base +
     "\nAgent mode:\n" +
-    "- Plan briefly, then call tools (get_dom_state, click_by_index, type_by_index, navigate, list_tabs, switch_tab, wait_for_popup) to read AND act on the page yourself.\n" +
+    "- Plan briefly, then call tools (get_dom_state, batch_actions, click_by_index, type_by_index, navigate, list_tabs, switch_tab, wait_for_popup) to read AND act on the page yourself.\n" +
+    "- Prefer batch_actions when you already know 2+ browser steps (click/type/wait/scroll). One batched call is much faster than one model round-trip per action.\n" +
     "- Don't tell the user to inspect the page — do it. Only ask follow-ups if a destructive action is ambiguous or info is genuinely missing.\n" +
     "- Don't repeat a failing tool call; change selector or approach. STOP calling tools once you have the answer (or call respond_to_user).\n" +
     "Reply rules (HARD):\n" +
@@ -1217,6 +1218,7 @@ async function runAgentLoop({
     const callHistory = []; // for repeat-loop detection
     const accumulatedToolCalls = []; // surfaced as chips in final response
     const deduper = _makeToolResultDeduper();
+    const fastPlanFallbackMessages = [];
 
     // ── Abort / Stop plumbing ───────────────────────────────────
     // A single active run handle lets the chat panel send STOP_AGENT_RUN
@@ -1254,7 +1256,7 @@ async function runAgentLoop({
     // Triggered via /auto. Skips the chatty per-step model loop entirely:
     // 1 vision call → JSON action script → local replay. On any failure we
     // surface a clear error and stop — caller can retry without /auto.
-    if (mode === "vision-plan") {
+    visionPlanFastPath: if (mode === "vision-plan") {
       const ALLOWED_PLAN_TOOLS = new Set([
         "click_by_index",
         "type_by_index",
@@ -1275,7 +1277,8 @@ async function runAgentLoop({
       try {
         snap = await executeAgentTool("take_snapshot", { maxDepth: 4 });
       } catch (e) {
-        return finish({ response: `⚠️ Vision plan: snapshot failed (${e.message}).`, toolCalls: accumulatedToolCalls });
+        fastPlanFallbackMessages.push(`Vision plan snapshot failed (${e.message}); continue with the normal tool loop.`);
+        break visionPlanFastPath;
       }
       try {
         shot = await executeAgentTool("take_screenshot", {});
@@ -1327,7 +1330,8 @@ async function runAgentLoop({
         }
       } catch (err) {
         if (isAborted() || err?.name === "AbortError") return finish(abortedReply());
-        return finish({ response: `⚠️ Vision plan call failed: ${err.message}`, toolCalls: accumulatedToolCalls });
+        fastPlanFallbackMessages.push(`Vision plan call failed (${err.message}); continue with the normal tool loop.`);
+        break visionPlanFastPath;
       }
 
       // Parse JSON — tolerate optional ```json fences just in case.
@@ -1337,20 +1341,16 @@ async function runAgentLoop({
       const plan = _safeJsonParse(raw);
       const steps = Array.isArray(plan?.steps) ? plan.steps : [];
       if (!steps.length) {
-        return finish({
-          response: "⚠️ Vision plan: model did not return a valid step list. Try without /auto.",
-          toolCalls: accumulatedToolCalls,
-        });
+        fastPlanFallbackMessages.push("Vision plan returned no executable steps; continue with the normal tool loop.");
+        break visionPlanFastPath;
       }
 
       for (let i = 0; i < steps.length; i++) {
         if (isAborted()) return finish(abortedReply());
         const step = steps[i] || {};
         if (!ALLOWED_PLAN_TOOLS.has(step.tool)) {
-          return finish({
-            response: `⚠️ Vision plan: step ${i + 1} used disallowed tool '${step.tool}'. Aborting.`,
-            toolCalls: accumulatedToolCalls,
-          });
+          fastPlanFallbackMessages.push(`Vision plan step ${i + 1} used disallowed tool '${step.tool}'; continue with the normal tool loop.`);
+          break visionPlanFastPath;
         }
         const args = step.args && typeof step.args === "object" ? step.args : {};
         _streamAgentToolEvent(panelTabId, {
@@ -1364,10 +1364,8 @@ async function runAgentLoop({
           error: r?.error, result: AgentApi.truncateToolResult(step.tool, r),
         });
         if (!ok) {
-          return finish({
-            response: `⚠️ Vision plan stopped at step ${i + 1}/${steps.length} (${step.tool}): ${r?.error || "tool returned not-ok"}.`,
-            toolCalls: accumulatedToolCalls,
-          });
+          fastPlanFallbackMessages.push(`Vision plan stopped at step ${i + 1}/${steps.length} (${step.tool}): ${r?.error || "tool returned not-ok"}. Continue from the current page state.`);
+          break visionPlanFastPath;
         }
       }
       return finish({
@@ -1375,6 +1373,10 @@ async function runAgentLoop({
         toolCalls: accumulatedToolCalls,
       });
     }
+
+    const activeText = fastPlanFallbackMessages.length
+      ? `${text}\n\n[Fast-plan fallback: ${fastPlanFallbackMessages.join(" ")}]`
+      : text;
 
     // ── OpenAI / Ollama style: messages = [{role, content/tool_calls/...}] ──
     if (providerType === "openai" || providerType === "ollama") {
@@ -1401,7 +1403,7 @@ async function runAgentLoop({
       });
       messages.push({
         role: "user",
-        ..._buildUserMessageForProvider(text, attachments, providerType),
+        ..._buildUserMessageForProvider(activeText, attachments, providerType),
       });
 
       for (let turn = 0; turn < AGENT_MAX_TURNS; turn++) {
@@ -1535,7 +1537,7 @@ async function runAgentLoop({
       });
       messages.push({
         role: "user",
-        ..._buildUserMessageForProvider(text, attachments, "anthropic"),
+        ..._buildUserMessageForProvider(activeText, attachments, "anthropic"),
       });
 
       // Build the system prompt here (with agent instructions + identity)
@@ -1690,6 +1692,7 @@ function stopInactivityTimer() {
 // can resolve indices to real DOM elements without re-scanning.
 let _indexedElements = []; // Array of serialised element descriptors
 let _indexedTabId = null; // Tab the index map belongs to
+let _agentBatchDepth = 0; // Nested batch_actions skip duplicate confirmation prompts
 
 function getCurrentPort() {
   return typeof wsPort === "number" && Number.isFinite(wsPort) ? wsPort : 9876;
@@ -3849,6 +3852,7 @@ const TOOL_HANDLERS = new Map([
   ["execute_code", toolExecuteCode],
   ["run_browser_script", toolRunBrowserScript],
   ["get_dom_state", toolGetDomState],
+  ["batch_actions", toolBatchActions],
   ["click_by_index", toolClickByIndex],
   ["type_by_index", toolTypeByIndex],
   ["extract_data", toolExtractData],
@@ -4096,7 +4100,8 @@ async function toolClick(params) {
 // 3. Type text
 async function toolTypeText(params) {
   const tab = await getActiveTab();
-  const { selector, text, clearFirst } = params;
+  const { selector, text } = params;
+  const clearFirst = params?.clearFirst ?? params?.clear ?? false;
   return await executeInTab(
     tab.id,
     (selector, text, clearFirst) => {
@@ -6116,7 +6121,7 @@ async function toolRunBrowserScript(params) {
 async function toolGetDomState(params) {
   const tab = await getActiveTab();
   const includeHidden = params?.includeHidden || false;
-  const maxElements = params?.maxElements || 80;
+  const maxElements = params?.maxElements || 60;
 
   const result = await executeInTab(
     tab.id,
@@ -6287,6 +6292,7 @@ async function toolGetDomState(params) {
       function collectElements(root, excludeChrome) {
         const seen = new Set();
         const elements = [];
+        const refs = [];
         const allEls = root.querySelectorAll(INTERACTIVE_QUERY);
 
         for (const el of allEls) {
@@ -6299,10 +6305,11 @@ async function toolGetDomState(params) {
           if (isNoisyContainer(el)) continue;
 
           elements.push(serializeElement(el, elements.length));
+          refs.push(el);
           if (elements.length >= maxElements) break;
         }
 
-        return elements;
+        return { elements, refs };
       }
 
       function pickPreferredRoot() {
@@ -6361,34 +6368,43 @@ async function toolGetDomState(params) {
 
       let scope = { strategy: "document-filtered", label: "document body" };
       let elements = [];
+      let indexRefs = [];
 
       const overlayRoot = pickVisibleOverlay();
       if (overlayRoot) {
-        elements = collectElements(overlayRoot, false);
+        const collected = collectElements(overlayRoot, false);
+        elements = collected.elements;
+        indexRefs = collected.refs;
         scope = describeRoot(overlayRoot, "visible-overlay");
       }
 
       const preferredRoot = elements.length ? null : pickPreferredRoot();
       if (preferredRoot) {
-        elements = collectElements(preferredRoot, true);
+        const collected = collectElements(preferredRoot, true);
+        elements = collected.elements;
+        indexRefs = collected.refs;
         scope = describeRoot(preferredRoot, "main-root");
       }
 
       if (elements.length < Math.min(maxElements, 8)) {
         const fallback = collectElements(document, true);
-        if (fallback.length > elements.length) {
-          elements = fallback;
+        if (fallback.elements.length > elements.length) {
+          elements = fallback.elements;
+          indexRefs = fallback.refs;
           scope = { strategy: "document-filtered", label: "document body" };
         }
       }
 
       if (elements.length < Math.min(maxElements, 4)) {
         const fullPage = collectElements(document, false);
-        if (fullPage.length > elements.length) {
-          elements = fullPage;
+        if (fullPage.elements.length > elements.length) {
+          elements = fullPage.elements;
+          indexRefs = fullPage.refs;
           scope = { strategy: "full-document", label: "document body" };
         }
       }
+
+      window.__autodomIndexedElements = indexRefs;
 
       return {
         title: document.title,
@@ -6418,6 +6434,48 @@ async function toolClickByIndex(params) {
   return await executeInTab(
     tab.id,
     (index, dblClick, includeHidden) => {
+      function isUsable(el) {
+        if (!el || !el.isConnected) return false;
+        if (!includeHidden) {
+          const style = window.getComputedStyle(el);
+          if (
+            style.display === "none" ||
+            style.visibility === "hidden" ||
+            style.opacity === "0"
+          ) {
+            return false;
+          }
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 && rect.height === 0) return false;
+        }
+        return !el.closest("script, style, noscript");
+      }
+
+      function clickElement(el) {
+        el.scrollIntoView({ behavior: "auto", block: "center" });
+        const eventType = dblClick ? "dblclick" : "click";
+        el.dispatchEvent(
+          new MouseEvent(eventType, {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+          }),
+        );
+        el.click();
+        return {
+          success: true,
+          index,
+          tag: el.tagName.toLowerCase(),
+          text: (el.textContent || "").trim().substring(0, 80),
+          cached: true,
+        };
+      }
+
+      const cached = Array.isArray(window.__autodomIndexedElements)
+        ? window.__autodomIndexedElements[index]
+        : null;
+      if (isUsable(cached)) return clickElement(cached);
+
       // Re-discover interactive elements in the same order as get_dom_state
       const INTERACTIVE_SELECTORS = [
         "a[href]",
@@ -6449,36 +6507,10 @@ async function toolClickByIndex(params) {
         if (seen.has(el)) continue;
         seen.add(el);
 
-        if (!includeHidden) {
-          const style = window.getComputedStyle(el);
-          if (
-            style.display === "none" ||
-            style.visibility === "hidden" ||
-            style.opacity === "0"
-          )
-            continue;
-          const rect = el.getBoundingClientRect();
-          if (rect.width === 0 && rect.height === 0) continue;
-        }
-        if (el.closest("script, style, noscript")) continue;
+        if (!isUsable(el)) continue;
 
         if (currentIndex === index) {
-          el.scrollIntoView({ behavior: "auto", block: "center" });
-          const eventType = dblClick ? "dblclick" : "click";
-          el.dispatchEvent(
-            new MouseEvent(eventType, {
-              bubbles: true,
-              cancelable: true,
-              view: window,
-            }),
-          );
-          el.click();
-          return {
-            success: true,
-            index,
-            tag: el.tagName.toLowerCase(),
-            text: (el.textContent || "").trim().substring(0, 80),
-          };
+          return { ...clickElement(el), cached: false };
         }
         currentIndex++;
       }
@@ -6494,11 +6526,63 @@ async function toolClickByIndex(params) {
 // type_by_index: Type text into element by numeric index from get_dom_state
 async function toolTypeByIndex(params) {
   const tab = await getActiveTab();
-  const { index, text, clearFirst } = params;
+  const { index, text } = params;
+  const clearFirst = params?.clearFirst ?? params?.clear ?? false;
 
   return await executeInTab(
     tab.id,
     (index, text, clearFirst) => {
+      function isUsable(el) {
+        if (!el || !el.isConnected) return false;
+        const style = window.getComputedStyle(el);
+        if (
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          style.opacity === "0"
+        ) {
+          return false;
+        }
+        const rect = el.getBoundingClientRect();
+        return (rect.width > 0 || rect.height > 0) && !el.closest("script, style, noscript");
+      }
+
+      function typeIntoElement(el) {
+        el.focus();
+        if (clearFirst) {
+          el.value = "";
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        const nativeInputValueSetter =
+          Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype,
+            "value",
+          )?.set ||
+          Object.getOwnPropertyDescriptor(
+            window.HTMLTextAreaElement.prototype,
+            "value",
+          )?.set;
+        const newValue = (clearFirst ? "" : el.value || "") + text;
+        if (nativeInputValueSetter) {
+          nativeInputValueSetter.call(el, newValue);
+        } else {
+          el.value = newValue;
+        }
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return {
+          success: true,
+          index,
+          tag: el.tagName.toLowerCase(),
+          value: el.value,
+          cached: true,
+        };
+      }
+
+      const cached = Array.isArray(window.__autodomIndexedElements)
+        ? window.__autodomIndexedElements[index]
+        : null;
+      if (isUsable(cached)) return typeIntoElement(cached);
+
       const INTERACTIVE_SELECTORS = [
         "a[href]",
         "button",
@@ -6529,46 +6613,10 @@ async function toolTypeByIndex(params) {
         if (seen.has(el)) continue;
         seen.add(el);
 
-        const style = window.getComputedStyle(el);
-        if (
-          style.display === "none" ||
-          style.visibility === "hidden" ||
-          style.opacity === "0"
-        )
-          continue;
-        const rect = el.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) continue;
-        if (el.closest("script, style, noscript")) continue;
+        if (!isUsable(el)) continue;
 
         if (currentIndex === index) {
-          el.focus();
-          if (clearFirst) {
-            el.value = "";
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-          }
-          const nativeInputValueSetter =
-            Object.getOwnPropertyDescriptor(
-              window.HTMLInputElement.prototype,
-              "value",
-            )?.set ||
-            Object.getOwnPropertyDescriptor(
-              window.HTMLTextAreaElement.prototype,
-              "value",
-            )?.set;
-          const newValue = (clearFirst ? "" : el.value || "") + text;
-          if (nativeInputValueSetter) {
-            nativeInputValueSetter.call(el, newValue);
-          } else {
-            el.value = newValue;
-          }
-          el.dispatchEvent(new Event("input", { bubbles: true }));
-          el.dispatchEvent(new Event("change", { bubbles: true }));
-          return {
-            success: true,
-            index,
-            tag: el.tagName.toLowerCase(),
-            value: el.value,
-          };
+          return { ...typeIntoElement(el), cached: false };
         }
         currentIndex++;
       }
@@ -6579,6 +6627,78 @@ async function toolTypeByIndex(params) {
     },
     [index, text, clearFirst || false],
   );
+}
+
+// batch_actions: Execute several known actions without another model round-trip.
+async function toolBatchActions(params) {
+  const actions = Array.isArray(params?.actions) ? params.actions : [];
+  const stopOnError = params?.stopOnError !== false;
+  const maxActions = Math.min(Math.max(Number(params?.maxActions) || 8, 1), 12);
+  const allowed = new Set([
+    "get_dom_state",
+    "click_by_index",
+    "type_by_index",
+    "click",
+    "type_text",
+    "fill_form",
+    "select_option",
+    "press_key",
+    "scroll",
+    "navigate",
+    "wait_for_element",
+    "wait_for_text",
+    "wait_for_navigation",
+    "wait_for_new_tab",
+    "list_popups",
+    "switch_to_popup",
+    "wait_for_popup",
+    "list_tabs",
+    "switch_tab",
+    "open_new_tab",
+    "close_tab",
+  ]);
+
+  if (actions.length === 0) {
+    return { ok: false, error: "batch_actions requires at least one action" };
+  }
+
+  const results = [];
+  _agentBatchDepth++;
+  try {
+    for (let i = 0; i < Math.min(actions.length, maxActions); i++) {
+      const action = actions[i] || {};
+      const tool = String(action.tool || action.name || "").trim();
+      const args =
+        action.args && typeof action.args === "object"
+          ? action.args
+          : action.params && typeof action.params === "object"
+            ? action.params
+            : {};
+
+      if (!allowed.has(tool)) {
+        const result = { ok: false, error: `batch_actions cannot run tool: ${tool || "(missing)"}` };
+        results.push({ step: i, tool, result });
+        if (stopOnError) break;
+        continue;
+      }
+
+      const result = await executeAgentTool(tool, args);
+      _maybeRepinAgentTab(tool, result);
+      results.push({ step: i, tool, args, result });
+      if (stopOnError && (!result?.ok || result?.error || result?.blocked || result?.denied)) {
+        break;
+      }
+    }
+  } finally {
+    _agentBatchDepth--;
+  }
+
+  return {
+    ok: results.every((item) => item.result?.ok && !item.result?.error),
+    executed: results.length,
+    skipped: Math.max(0, actions.length - results.length),
+    results,
+  };
 }
 
 // extract_data: Extract structured data using CSS selector + field mapping

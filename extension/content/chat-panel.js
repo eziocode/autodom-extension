@@ -8368,8 +8368,11 @@
           // of executing it as code. Otherwise the V8 parser throws on
           // phrases like "create a sample lead" (Unexpected identifier 'a').
           const looksLikeJs = /[(){};=]|=>|\bawait\b|\bconst\b|\blet\b|\bvar\b|\bfunction\b|\bfor\b|\bwhile\b|\breturn\b|\bif\b/.test(rest);
-          if (!rest.trim() || !looksLikeJs) {
+          if (!rest.trim()) {
             return { type: "ai_automate", prompt: rest.trim() };
+          }
+          if (!looksLikeJs) {
+            return { type: "ai_automate", prompt: rest.trim(), mode: "vision-plan" };
           }
           return {
             tool: "execute_code",
@@ -9058,9 +9061,8 @@
         );
         return;
       }
-      // For /auto, re-prefix so sendAiMessage's prefix detector flips on
-      // vision-plan mode. The planner has its own framing — skip the
-      // chatty "Automate this..." wrapper used by /run.
+      // Natural-language automation uses vision-plan by default: one planner
+      // call, then local replay. This is much faster than the chatty loop.
       text =
         command.mode === "vision-plan"
           ? `/auto ${goal}`
@@ -9087,6 +9089,7 @@
         "  /info \u2014 Page metadata\n" +
         "  /js <code> \u2014 Execute JavaScript\n" +
         "  /run <code> \u2014 Run local Playwright/Selenium-style automation\n" +
+        "  /run <task> or /auto <task> \u2014 Fast AI automation plan + replay\n" +
         "  /extract \u2014 Extract page text\n\n" +
         "Shortcuts:\n" +
         "  Cmd/Ctrl+Shift+K \u2014 Toggle sidebar\n" +

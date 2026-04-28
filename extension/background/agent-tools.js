@@ -38,7 +38,7 @@
       parameters: {
         type: "object",
         properties: {
-          maxElements: { type: "integer", description: "Cap (default 80)" },
+          maxElements: { type: "integer", description: "Cap (default 60)" },
         },
         additionalProperties: false,
       },
@@ -170,6 +170,59 @@
           },
         },
         required: ["fields"],
+      },
+      danger: "write",
+    },
+    {
+      name: "batch_actions",
+      description:
+        "Execute up to 8 known browser steps sequentially in one tool call. Use this after get_dom_state when you can chain click/type/wait/scroll actions to avoid slow model round-trips.",
+      parameters: {
+        type: "object",
+        properties: {
+          actions: {
+            type: "array",
+            maxItems: 8,
+            items: {
+              type: "object",
+              properties: {
+                tool: {
+                  type: "string",
+                  enum: [
+                    "get_dom_state",
+                    "click_by_index",
+                    "type_by_index",
+                    "click",
+                    "type_text",
+                    "fill_form",
+                    "select_option",
+                    "press_key",
+                    "scroll",
+                    "navigate",
+                    "wait_for_element",
+                    "wait_for_text",
+                    "wait_for_navigation",
+                    "wait_for_new_tab",
+                    "list_popups",
+                    "switch_to_popup",
+                    "wait_for_popup",
+                    "list_tabs",
+                    "switch_tab",
+                    "open_new_tab",
+                    "close_tab",
+                  ],
+                },
+                args: { type: "object", additionalProperties: true },
+                params: { type: "object", additionalProperties: true },
+              },
+              required: ["tool"],
+              additionalProperties: false,
+            },
+          },
+          stopOnError: { type: "boolean", description: "Default true" },
+        },
+        required: ["actions"],
+        additionalProperties: false,
       },
       danger: "write",
     },
