@@ -625,6 +625,10 @@
     verboseLogs: true,
     panelWidth: PANEL_WIDTH_DEFAULT,
     persistAcrossSessions: false,
+    // Reply formatting style. concise|jetbrains|chatbar — plumbed end-to-end
+    // (panel → SW → providers/bridge → CLI prompt). The provider system
+    // prompt picks up a matching instruction so every code path obeys it.
+    responseStyle: "concise",
     // Per-hostname overrides. Resolved via _resolvedPanelWidth(); falls back
     // to `panelWidth` (the global default) when the current host has no
     // explicit entry. Hostnames are normalised by stripping a leading "www.".
@@ -667,6 +671,9 @@
             _chatSettings.panelWidth = _clampPanelWidth(s.panelWidth);
           if (typeof s.persistAcrossSessions === "boolean")
             _chatSettings.persistAcrossSessions = s.persistAcrossSessions;
+          if (typeof s.responseStyle === "string" &&
+              ["concise", "jetbrains", "chatbar"].includes(s.responseStyle))
+            _chatSettings.responseStyle = s.responseStyle;
           if (s.widthByHost && typeof s.widthByHost === "object")
             _chatSettings.widthByHost = { ...s.widthByHost };
           if (s.collapsedByHost && typeof s.collapsedByHost === "object")
@@ -1881,6 +1888,20 @@
     }
 
     /* Assistant — borderless flowing reply with avatar gutter */
+    .autodom-chat-msg.ai-response.streaming .stream-text {
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: inherit;
+    }
+    .autodom-chat-msg.ai-response.streaming .stream-cursor {
+      display: inline-block;
+      margin-left: 2px;
+      animation: autodom-stream-blink 1s steps(2, start) infinite;
+      opacity: 0.6;
+    }
+    @keyframes autodom-stream-blink {
+      to { visibility: hidden; }
+    }
     .autodom-chat-msg.assistant,
     .autodom-chat-msg.ai-response {
       align-self: stretch !important;
@@ -5734,6 +5755,9 @@
         _chatSettings.widthByHost = { ...s.widthByHost };
       if (s.collapsedByHost && typeof s.collapsedByHost === "object")
         _chatSettings.collapsedByHost = { ...s.collapsedByHost };
+      if (typeof s.responseStyle === "string" &&
+          ["concise", "jetbrains", "chatbar"].includes(s.responseStyle))
+        _chatSettings.responseStyle = s.responseStyle;
       // Mirror the persist-across-sessions flag too, since the popup's
       // Chat tab is now the only place this is toggled. Apply the
       // same side effects the legacy in-panel toggle did so flipping
@@ -7511,6 +7535,91 @@
     } catch (_) { return ""; }
   }
 
+  // ── Token-streaming bubble state (Phase A/C) ──────────────────────
+  // _streamingBubbles holds the per-runId transient assistant bubble
+  // and accumulated text. _streamedRunIds remembers runs whose final
+  // reply we've already painted via streaming so the late-arriving
+  // AI_CHAT_RESPONSE can skip a duplicate addMessage.
+  const _streamingBubbles = new Map(); // runId → {bubble, textNode, text}
+  const _streamedRunIds = new Set();
+
+  function _ensureMessageList() {
+    return document.getElementById("__autodom_messages");
+  }
+
+  function _ensureStreamingBubble(runId) {
+    if (!runId) return null;
+    let entry = _streamingBubbles.get(runId);
+    if (entry && entry.bubble && entry.bubble.isConnected) return entry;
+    const list = _ensureMessageList();
+    if (!list) return null;
+    const wrap = document.createElement("div");
+    wrap.className = "autodom-chat-msg ai-response streaming";
+    wrap.dataset.runId = runId;
+    const textNode = document.createElement("div");
+    textNode.className = "stream-text";
+    wrap.appendChild(textNode);
+    const cursor = document.createElement("span");
+    cursor.className = "stream-cursor";
+    cursor.textContent = "▍";
+    wrap.appendChild(cursor);
+    list.appendChild(wrap);
+    try { list.scrollTop = list.scrollHeight; } catch (_) {}
+    entry = { bubble: wrap, textNode, text: "" };
+    _streamingBubbles.set(runId, entry);
+    return entry;
+  }
+
+  function _appendStreamingDelta(runId, chunk) {
+    if (!runId || typeof chunk !== "string" || !chunk) return;
+    const entry = _ensureStreamingBubble(runId);
+    if (!entry) return;
+    // Sanitise interim deltas — internal index tokens (IC0/CB0/account-ids)
+    // must never be painted into a user-visible bubble even mid-stream.
+    let safe = chunk;
+    try { safe = _scrubContextIdentifiers(chunk); } catch (_) {}
+    entry.text += safe;
+    // textContent (NOT innerHTML) — interim text is plain, the final
+    // markdown render arrives separately via AI_CHAT_RESPONSE.
+    entry.textNode.textContent = entry.text;
+    try {
+      const list = _ensureMessageList();
+      if (list) list.scrollTop = list.scrollHeight;
+    } catch (_) {}
+  }
+
+  function _resetStreamingBubble(runId) {
+    if (!runId) return;
+    const entry = _streamingBubbles.get(runId);
+    if (entry?.bubble?.parentNode) entry.bubble.parentNode.removeChild(entry.bubble);
+    _streamingBubbles.delete(runId);
+  }
+
+  function _finalizeStreamingBubble(runId) {
+    if (!runId) return;
+    // Mark this run as already-streamed so the final AI_CHAT_RESPONSE
+    // skips a duplicate addMessage. Leave the transient bubble in place
+    // until the final markdown render replaces it (sendAiMessage), which
+    // calls _resetStreamingBubble for us once it has the rich version.
+    _streamedRunIds.add(runId);
+    const entry = _streamingBubbles.get(runId);
+    if (entry?.bubble) {
+      entry.bubble.classList.add("done");
+      const cursor = entry.bubble.querySelector(".stream-cursor");
+      if (cursor) cursor.remove();
+    }
+  }
+
+  function _consumeStreamedRunId(runId) {
+    if (!runId) return false;
+    const had = _streamedRunIds.has(runId);
+    if (had) {
+      _streamedRunIds.delete(runId);
+      _resetStreamingBubble(runId);
+    }
+    return had;
+  }
+
   function appendAgentToolChip(evt) {
     if (!evt) return;
     // Track active run id so the Stop button knows which run to cancel.
@@ -7533,8 +7642,36 @@
           c.classList.add("fail");
         });
       }
+      // If a streaming bubble is still up at run-end without a final flush
+      // (e.g. abort/error), drop it so the slot can be replaced by the
+      // final AI_CHAT_RESPONSE bubble (or stay clean on abort).
+      _resetStreamingBubble(evt.runId);
       return;
     }
+
+    // ── Token streaming (Phase A/C) ─────────────────────────────────
+    // The bridge / direct providers emit answer-* phases so the panel
+    // can paint tokens in real time into a transient assistant bubble.
+    // Final markdown rendering still happens in sendAiMessage's response
+    // handler — _streamingBubbles tracks runIds whose final reply has
+    // already been streamed so we can skip the duplicate addMessage.
+    if (evt.phase === "answer-reset") {
+      _resetStreamingBubble(evt.runId);
+      return;
+    }
+    if (evt.phase === "answer-discard") {
+      _resetStreamingBubble(evt.runId);
+      return;
+    }
+    if (evt.phase === "answer-delta") {
+      _appendStreamingDelta(evt.runId, evt.chunk);
+      return;
+    }
+    if (evt.phase === "answer-final") {
+      _finalizeStreamingBubble(evt.runId);
+      return;
+    }
+
     // Update the floating pill label with the current tool name so the
     // user can see progress at a glance when the chat panel is closed.
     if (evt.phase === "start" && evt.tool) {
@@ -8077,6 +8214,7 @@
             conversationHistory: conversationHistory.slice(-20), // Last 20 messages
             model: _currentModelId() || undefined,
             mode: mode || undefined,
+            responseStyle: _chatSettings.responseStyle || "concise",
             attachments: attachments.length > 0
               ? attachments.map((a) => ({
                   name: a.name,
@@ -9172,6 +9310,16 @@
         // user's last guess, even when the CLI silently ignored --model
         // (unknown id, locked session, etc.).
         try { _reconcileActualModel(aiResult.model); } catch (_) {}
+
+        // Clear any in-flight streaming bubble for this turn so we don't
+        // show the plain-text stream + the markdown-rendered final side
+        // by side. The markdown render below is always authoritative.
+        try {
+          for (const rid of Array.from(_streamingBubbles.keys())) {
+            _resetStreamingBubble(rid);
+          }
+          _streamedRunIds.clear();
+        } catch (_) {}
 
         addMessage("ai-response", responseText, {
           toolCalls,

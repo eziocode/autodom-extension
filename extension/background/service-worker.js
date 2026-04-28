@@ -1012,7 +1012,7 @@ function _slimContextForRepeat(ctx) {
   };
 }
 
-function _agentSystemPrompt(context, providerInfo, cacheKey) {
+function _agentSystemPrompt(context, providerInfo, cacheKey, opts) {
   let effectiveCtx = context;
   if (cacheKey != null && context) {
     const fp = _ctxFingerprint(context);
@@ -1026,7 +1026,7 @@ function _agentSystemPrompt(context, providerInfo, cacheKey) {
     }
     _pageCtxCache.set(cacheKey, { fingerprint: fp, ts: Date.now() });
   }
-  const base = AutoDOMProviders.buildSystemPrompt(effectiveCtx, providerInfo);
+  const base = AutoDOMProviders.buildSystemPrompt(effectiveCtx, providerInfo, opts);
   // Compressed prompt — every line costs tokens on every turn. The
   // older verbose version had ~700 tokens of agent-mode + reply-hygiene
   // prose with examples. This bullet-form keeps every behavioural rule
@@ -1252,6 +1252,68 @@ async function runAgentLoop({
       return payload;
     };
 
+    // ── Token-streaming helpers (Phase A/C) ─────────────────────────
+    // Forward provider text deltas to the chat panel as a transient
+    // bubble so the user sees tokens immediately. We can't know up-front
+    // whether the current turn will end with tool_calls (planner text
+    // would leak), so we always buffer and discard on tool turns. A 40ms
+    // batcher coalesces tiny chunks to keep paint cost low.
+    let _deltaBuf = "";
+    let _deltaTimer = null;
+    const _flushDelta = () => {
+      if (!_deltaBuf) return;
+      const chunk = _deltaBuf;
+      _deltaBuf = "";
+      _streamAgentToolEvent(panelTabId, {
+        phase: "answer-delta",
+        runId: runHandle.runId,
+        chunk,
+      });
+    };
+    const onDelta = (chunk) => {
+      if (typeof chunk !== "string" || !chunk) return;
+      _deltaBuf += chunk;
+      if (_deltaTimer) return;
+      _deltaTimer = setTimeout(() => {
+        _deltaTimer = null;
+        _flushDelta();
+      }, 40);
+    };
+    const resetTurnBuffer = () => {
+      _deltaBuf = "";
+      if (_deltaTimer) {
+        clearTimeout(_deltaTimer);
+        _deltaTimer = null;
+      }
+      _streamAgentToolEvent(panelTabId, {
+        phase: "answer-reset",
+        runId: runHandle.runId,
+      });
+    };
+    const discardTurnBuffer = () => {
+      _deltaBuf = "";
+      if (_deltaTimer) {
+        clearTimeout(_deltaTimer);
+        _deltaTimer = null;
+      }
+      _streamAgentToolEvent(panelTabId, {
+        phase: "answer-discard",
+        runId: runHandle.runId,
+      });
+    };
+    const finalizeStream = () => {
+      if (_deltaTimer) {
+        clearTimeout(_deltaTimer);
+        _deltaTimer = null;
+      }
+      _flushDelta();
+      _streamAgentToolEvent(panelTabId, {
+        phase: "answer-final",
+        runId: runHandle.runId,
+      });
+    };
+    const _styleOpts = { responseStyle: responseStyle || "concise" };
+
     try {
     // ── Vision-plan mode: one-shot plan from screenshot+snapshot, then replay ──
     // Triggered via /auto. Skips the chatty per-step model loop entirely:
@@ -1382,7 +1444,7 @@ async function runAgentLoop({
     // ── OpenAI / Ollama style: messages = [{role, content/tool_calls/...}] ──
     if (providerType === "openai" || providerType === "ollama") {
       const providerInfo = { model: _model, provider: providerType };
-      const sys = _agentSystemPrompt(context, providerInfo, panelTabId);
+      const sys = _agentSystemPrompt(context, providerInfo, panelTabId, _styleOpts);
       const messages = [{ role: "system", content: sys }];
       // Compact + dedupe the prior turns. _compactHistoryForOutbound
       // bounds payload size and (for very long sessions) prepends a
@@ -1421,6 +1483,7 @@ async function runAgentLoop({
             ? ProvidersApi.callOpenAI
             : ProvidersApi.callOllama;
         let resp;
+        resetTurnBuffer();
         try {
           resp = await callFn({
             apiKey,
@@ -1430,8 +1493,11 @@ async function runAgentLoop({
             messagesOverride: messages,
             debug: _debugLog,
             signal,
+            onDelta,
+            responseStyle: responseStyle || "concise",
           });
         } catch (err) {
+          discardTurnBuffer();
           if (isAborted() || err?.name === "AbortError") {
             return finish(abortedReply());
           }
@@ -1446,6 +1512,7 @@ async function runAgentLoop({
 
         if (!resp.toolCalls || resp.toolCalls.length === 0) {
           // Final reply
+          finalizeStream();
           return finish({
             response:
               resp.response ||
@@ -1453,6 +1520,11 @@ async function runAgentLoop({
             toolCalls: accumulatedToolCalls,
           });
         }
+
+        // This turn ended with tool_calls — discard any planner-text
+        // delta we streamed so the user doesn't see "let me look at..."
+        // chatter. The next turn will stream fresh content.
+        discardTurnBuffer();
 
         // Execute each tool call sequentially (parallel disabled in OpenAI body)
         for (const tc of resp.toolCalls) {
@@ -1546,7 +1618,7 @@ async function runAgentLoop({
       // prompt from `context` and miss both the agent appendix and the
       // model identity disclosure.
       const agentContext = { ...context, _agentMode: true };
-      const agentSystemPrompt = _agentSystemPrompt(agentContext, providerInfo, panelTabId);
+      const agentSystemPrompt = _agentSystemPrompt(agentContext, providerInfo, panelTabId, _styleOpts);
 
       for (let turn = 0; turn < AGENT_MAX_TURNS; turn++) {
         if (isAborted()) return finish(abortedReply());
@@ -1558,6 +1630,7 @@ async function runAgentLoop({
           });
         }
         let resp;
+        resetTurnBuffer();
         try {
           resp = await ProvidersApi.callAnthropic({
             apiKey,
@@ -1570,8 +1643,11 @@ async function runAgentLoop({
             tools,
             debug: _debugLog,
             signal,
+            onDelta,
+            responseStyle: responseStyle || "concise",
           });
         } catch (err) {
+          discardTurnBuffer();
           if (isAborted() || err?.name === "AbortError") {
             return finish(abortedReply());
           }
@@ -1587,6 +1663,7 @@ async function runAgentLoop({
         }
 
         if (!resp.toolCalls || resp.toolCalls.length === 0) {
+          finalizeStream();
           return finish({
             response:
               resp.response ||
@@ -1594,6 +1671,9 @@ async function runAgentLoop({
             toolCalls: accumulatedToolCalls,
           });
         }
+
+        // Tool turn — drop streamed planner text from the panel.
+        discardTurnBuffer();
 
         // Build a single user message containing all tool_result blocks
         const toolResultBlocks = [];

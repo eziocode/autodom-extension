@@ -585,6 +585,17 @@ return { title: document.title, url: location.href };"
                                 <input type="checkbox" id="chatPersistToggle" class="chat-toggle-input" />
                                 <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
                             </label>
+                            <label class="chat-toggle-row" for="chatResponseStyle">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Reply style</span>
+                                    <span class="chat-toggle-desc">How the assistant formats answers. Concise = one line + bullets. JetBrains = Summary/Details/Next steps. Chat bar = conversational markdown.</span>
+                                </span>
+                                <select id="chatResponseStyle" class="chat-toggle-input" style="min-width:140px;">
+                                    <option value="concise">Concise (default)</option>
+                                    <option value="jetbrains">JetBrains AI style</option>
+                                    <option value="chatbar">GPT chat bar</option>
+                                </select>
+                            </label>
                             <p class="field-hint">
                                 Stop button is always shown while automation is running.
                             </p>

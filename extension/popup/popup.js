@@ -700,6 +700,7 @@ function initChatSettingsTab() {
   const STORAGE_KEY = "__autodom_chat_settings";
   const verboseToggle = document.getElementById("chatVerboseToggle");
   const persistToggle = document.getElementById("chatPersistToggle");
+  const styleSelect = document.getElementById("chatResponseStyle");
   if (!verboseToggle || !persistToggle) return;
 
   function applyToUI(s) {
@@ -708,15 +709,20 @@ function initChatSettingsTab() {
       verboseToggle.checked = s.verboseLogs;
     if (typeof s.persistAcrossSessions === "boolean")
       persistToggle.checked = s.persistAcrossSessions;
+    if (styleSelect && typeof s.responseStyle === "string" &&
+        ["concise", "jetbrains", "chatbar"].includes(s.responseStyle)) {
+      styleSelect.value = s.responseStyle;
+    }
   }
 
   // Initial load — defaults match chat-panel.js (verboseLogs:true,
-  // persistAcrossSessions:false) so first-time users see the same
-  // state regardless of which surface they look at first.
+  // persistAcrossSessions:false, responseStyle:"concise") so first-time
+  // users see the same state regardless of which surface they look at.
   chrome.storage?.local?.get?.([STORAGE_KEY], (items) => {
     const s = (items && items[STORAGE_KEY]) || {
       verboseLogs: true,
       persistAcrossSessions: false,
+      responseStyle: "concise",
     };
     applyToUI({
       verboseLogs:
@@ -725,6 +731,8 @@ function initChatSettingsTab() {
         typeof s.persistAcrossSessions === "boolean"
           ? s.persistAcrossSessions
           : false,
+      responseStyle:
+        typeof s.responseStyle === "string" ? s.responseStyle : "concise",
     });
   });
 
@@ -742,6 +750,14 @@ function initChatSettingsTab() {
   persistToggle.addEventListener("change", () => {
     persistField("persistAcrossSessions", !!persistToggle.checked);
   });
+  if (styleSelect) {
+    styleSelect.addEventListener("change", () => {
+      const v = styleSelect.value;
+      if (["concise", "jetbrains", "chatbar"].includes(v)) {
+        persistField("responseStyle", v);
+      }
+    });
+  }
 
   if (chrome.storage?.onChanged?.addListener) {
     chrome.storage.onChanged.addListener((changes, area) => {
