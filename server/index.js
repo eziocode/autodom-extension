@@ -3865,28 +3865,101 @@ async function runCliPrompt({ prompt, providerConfig, requestId }) {
       let parsedResponse = null;
       let actualModel = pickedModel || "";
       if (wantClaudeJson && stdout) {
+        // Claude CLI emits one of:
+        //   1. A single JSON object: { result, model, ... }
+        //   2. A JSON array of stream events (stream-json mode, or when the
+        //      CLI is wrapped by another agent that aggregates output):
+        //      [{type:"system",...}, {type:"assistant",...},
+        //       {type:"result", result:"...final text...", ...}]
+        //   3. NDJSON: one JSON object per line, terminating with a
+        //      {type:"result", ...} record.
+        // Extract the final assistant text from whichever shape we receive
+        // so the chat panel doesn't render the raw session dump.
+        const pickFromResultRecord = (rec) => {
+          if (!rec || typeof rec !== "object") return null;
+          if (typeof rec.result === "string") return rec.result;
+          if (typeof rec.response === "string") return rec.response;
+          return null;
+        };
+        const pickFromAssistantRecord = (rec) => {
+          if (!rec || typeof rec !== "object") return null;
+          const msg = rec.message;
+          if (msg && Array.isArray(msg.content)) {
+            const texts = msg.content
+              .filter((c) => c && c.type === "text" && typeof c.text === "string")
+              .map((c) => c.text);
+            if (texts.length) return texts.join("");
+          }
+          return null;
+        };
+        const pickModelFromRecord = (rec) => {
+          if (!rec || typeof rec !== "object") return null;
+          const m =
+            rec.model ||
+            rec.model_id ||
+            (rec.message && rec.message.model) ||
+            (rec.modelUsage && typeof rec.modelUsage === "object"
+              ? Object.keys(rec.modelUsage)[0]
+              : null) ||
+            (rec.model_usage && typeof rec.model_usage === "object"
+              ? Object.keys(rec.model_usage)[0]
+              : null);
+          return typeof m === "string" ? m : null;
+        };
+
+        const extractFromRecords = (records) => {
+          let text = null;
+          let model = null;
+          // Walk in reverse so we prefer the final result/assistant message.
+          for (let i = records.length - 1; i >= 0; i--) {
+            const rec = records[i];
+            if (!rec || typeof rec !== "object") continue;
+            if (!text && rec.type === "result") text = pickFromResultRecord(rec);
+            if (!text && rec.type === "assistant") {
+              text = pickFromAssistantRecord(rec);
+            }
+            if (!model) model = pickModelFromRecord(rec);
+            if (text && model) break;
+          }
+          return { text, model };
+        };
+
+        let handled = false;
         try {
           const data = JSON.parse(stdout);
-          if (data && typeof data === "object") {
-            const text =
-              typeof data.result === "string"
-                ? data.result
-                : typeof data.response === "string"
-                  ? data.response
-                  : "";
+          if (Array.isArray(data)) {
+            const { text, model } = extractFromRecords(data);
             if (text) parsedResponse = text;
-            const detected =
-              data.model ||
-              data.model_id ||
-              (data.model_usage && typeof data.model_usage === "object"
-                ? Object.keys(data.model_usage)[0]
-                : null);
-            if (detected && typeof detected === "string") {
-              actualModel = detected;
-            }
+            if (model) actualModel = model;
+            handled = true;
+          } else if (data && typeof data === "object") {
+            const text =
+              pickFromResultRecord(data) || pickFromAssistantRecord(data);
+            if (text) parsedResponse = text;
+            const model = pickModelFromRecord(data);
+            if (model) actualModel = model;
+            handled = true;
           }
         } catch (_) {
-          // Non-JSON (or stream-json) output — return raw stdout.
+          // Fall through to NDJSON parsing below.
+        }
+
+        if (!handled) {
+          const records = [];
+          for (const line of stdout.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              records.push(JSON.parse(trimmed));
+            } catch (_) {
+              // Ignore non-JSON lines (logs etc.).
+            }
+          }
+          if (records.length) {
+            const { text, model } = extractFromRecords(records);
+            if (text) parsedResponse = text;
+            if (model) actualModel = model;
+          }
         }
       }
 
