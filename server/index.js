@@ -3426,6 +3426,9 @@ async function callCliBrowserAgent({
         });
         visionPlanFell = true;
       } else {
+        const MAX_REPAIRS = 2;
+        let repairs = 0;
+        let executed = 0;
         for (let i = 0; i < steps.length; i++) {
           if (_isAborted(requestId)) throw new AiAbortError(requestId);
           const step = steps[i] || {};
@@ -3439,8 +3442,6 @@ async function callCliBrowserAgent({
             break;
           }
           const args = step.args && typeof step.args === "object" ? step.args : {};
-          // Once a plan step runs, the original snapshot may be stale; let
-          // the chatty fallback refresh DOM state if this step fails.
           skipBootstrapDomState = false;
           const r = await callExtensionTool(step.tool, args);
           const ok = !r?.error && !r?.blocked;
@@ -3450,17 +3451,78 @@ async function callCliBrowserAgent({
             params: args,
             result: truncateCliAgentResult(r),
           });
-          if (!ok) {
-            // Hand control to chatty loop with this failure context seeded.
+          if (ok) {
+            executed++;
+            continue;
+          }
+          // Per-step repair: re-snapshot and ask planner to fix only the
+          // remaining tail. Keeps replay deterministic when the page is
+          // stable and recovers cheaply when indices shift mid-flow.
+          if (repairs >= MAX_REPAIRS) {
             visionPlanFell = true;
             break;
           }
+          repairs++;
+          let repairSnap = null;
+          try {
+            repairSnap = await callExtensionTool("take_snapshot", { maxDepth: 4 });
+          } catch (_) { repairSnap = null; }
+          const repairSnapStr = JSON.stringify(repairSnap || {}).substring(0, 9000);
+          const failedStepStr = JSON.stringify({ tool: step.tool, args });
+          const failureStr = JSON.stringify(r || {}).substring(0, 600);
+          const remaining = steps.slice(i + 1);
+          const repairPrompt =
+            `You are AutoDOM's plan-repair agent. The previous step failed; the page may have shifted (new modal, re-rendered list, changed indices).\n` +
+            `Output ONLY a JSON object: {"steps":[{"tool":"<name>","args":{...}}]}\n` +
+            `Allowed tools: click_by_index, type_by_index, navigate, scroll, wait_for_element, select_option, press_key.\n` +
+            `Use indices from the NEW snapshot below. Return the steps needed to recover and finish the task (do not repeat already-completed steps).\n\n` +
+            `Original task: ${text}\n` +
+            `Failed step: ${failedStepStr}\n` +
+            `Failure: ${failureStr}\n` +
+            `Remaining planned steps (may be stale): ${JSON.stringify(remaining)}\n\n` +
+            `New snapshot:\n${repairSnapStr}\n`;
+          if (_isAborted(requestId)) throw new AiAbortError(requestId);
+          let repairResult;
+          try {
+            repairResult = await runCliPrompt({ prompt: repairPrompt, providerConfig, requestId });
+          } catch (e) {
+            observations.push({
+              tool: "_vision_plan_repair",
+              params: {},
+              result: `Repair planner threw: ${e.message}`,
+            });
+            visionPlanFell = true;
+            break;
+          }
+          lastCliMeta = repairResult;
+          const repairRaw = String(repairResult.response || "")
+            .trim()
+            .replace(/^```(?:json)?\s*/i, "")
+            .replace(/\s*```$/, "");
+          let repairPlan = null;
+          try { repairPlan = JSON.parse(repairRaw); } catch (_) { repairPlan = null; }
+          const repairSteps = Array.isArray(repairPlan?.steps) ? repairPlan.steps : [];
+          if (!repairSteps.length) {
+            observations.push({
+              tool: "_vision_plan_repair",
+              params: {},
+              result: `Repair produced no steps. Raw head: ${repairRaw.substring(0, 400)}`,
+            });
+            visionPlanFell = true;
+            break;
+          }
+          // Splice repair steps in and continue from the same index.
+          steps.splice(i, steps.length - i, ...repairSteps);
+          i--; // retry at this index with the first repair step
         }
         if (!visionPlanFell) {
           return {
-            response: `Done — executed ${steps.length} step(s) via vision plan.`,
+            response:
+              repairs > 0
+                ? `Done — executed ${executed} step(s) via vision plan (repaired ${repairs}x).`
+                : `Done — executed ${executed} step(s) via vision plan.`,
             toolCalls,
-            model: cliResult.model,
+            model: lastCliMeta.model || cliResult.model,
           };
         }
       }
@@ -3625,13 +3687,17 @@ async function routeDirectProviderChat({
 
   if (provider === "cli") {
     if (mode === "vision-plan" || shouldUseCliBrowserAgent(text, context, conversationHistory)) {
+      // Default natural-language browser-automation requests to the
+      // one-shot vision-plan path (Comet-like UX, Playwright-like speed).
+      // Chatty per-turn loop remains as a fallback inside the agent for
+      // cases where the planner returns no/invalid steps.
       return callCliBrowserAgent({
         text,
         context,
         conversationHistory,
         providerConfig,
         requestId,
-        mode,
+        mode: mode || "vision-plan",
       });
     }
     return callCliProvider({
