@@ -2524,7 +2524,7 @@ function connectWebSocket(port) {
             `Disconnected from ws://127.0.0.1:${currentPort}. Falling back to last working port ${fallbackPort}.`,
             "warn",
           );
-          startAutoConnect(fallbackPort);
+          startAutoConnect(fallbackPort, { initialDelayMs: 5000 });
         } else if (shouldRunMcp) {
           // After the fallback cycle is exhausted, always retry the user-requested
           // port so the extension doesn't permanently drift to lastConnectedPort.
@@ -2535,7 +2535,11 @@ function connectWebSocket(port) {
             "Disconnected from MCP bridge server. Auto-reconnect is retrying.",
             "warn",
           );
-          startAutoConnect(_requestedPort);
+          // Wait 5 s before the first reconnect attempt so a node-server
+          // restart can finish binding the port. Without this delay Chrome
+          // logs ERR_CONNECTION_REFUSED for every retry that lands during
+          // the boot window — which is harmless but visually noisy.
+          startAutoConnect(_requestedPort, { initialDelayMs: 5000 });
         } else {
           stopAutoConnect();
           chrome.storage.local.set({ mcpRunning: false });
@@ -2583,7 +2587,7 @@ function connectWebSocket(port) {
             `Connection refused on port ${currentPort}. Trying last working port ${lastConnectedPort}.`,
             "warn",
           );
-          startAutoConnect(lastConnectedPort);
+          startAutoConnect(lastConnectedPort, { initialDelayMs: 5000 });
         }
       }
     };
@@ -5775,13 +5779,18 @@ let autoConnectPort = null;
 let _autoConnectAttempt = 0;
 let _startupRestoreOnly = false;
 
-function startAutoConnect(port) {
+function startAutoConnect(port, opts) {
   const nextPort = port || getCurrentPort();
   wsPort = nextPort;
   if (autoConnectInterval && autoConnectPort === nextPort) return;
   stopAutoConnect();
   autoConnectPort = nextPort;
   _autoConnectAttempt = 0;
+  // initialDelayMs: defer the first reconnect attempt. Used right after
+  // ws.onclose so a node-server restart finishes binding the port before
+  // we hit it — otherwise Chrome logs ERR_CONNECTION_REFUSED for every
+  // attempt that lands during the boot window. Default 0 (legacy behavior).
+  const initialDelayMs = Math.max(0, Number(opts?.initialDelayMs) || 0);
   const tryConnect = () => {
     if (!shouldRunMcp || isConnected || _sessionTimedOut) return;
     _autoConnectAttempt++;
@@ -5799,7 +5808,11 @@ function startAutoConnect(port) {
     );
     autoConnectInterval = setTimeout(tryConnect, nextDelay);
   };
-  tryConnect();
+  if (initialDelayMs > 0) {
+    autoConnectInterval = setTimeout(tryConnect, initialDelayMs);
+  } else {
+    tryConnect();
+  }
 }
 
 function stopAutoConnect() {
