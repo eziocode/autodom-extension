@@ -2248,23 +2248,26 @@
     .autodom-chat-msg .autodom-msg-meta.is-expanded .autodom-meta-tools-chip .twisty {
       transform: rotate(180deg);
     }
-    /* Hide the full tool list by default. Reveal it when:
-         • the user clicks the chip (.is-expanded), or
-         • the panel/overlay has verbose logs enabled. */
+    /* Tools-used summary visibility:
+         • verbose ON  → full list rendered inline
+         • verbose OFF → hide the chip AND the list entirely; the
+           operator chose minimal mode, so don't even tease it.
+       The model badge in the same meta footer stays visible either
+       way so the user always sees which provider answered. */
     .autodom-chat-msg .autodom-msg-meta .ai-tool-calls {
       display: none;
       flex-basis: 100%;
       margin-top: 4px;
     }
-    .autodom-chat-msg .autodom-msg-meta.is-expanded .ai-tool-calls,
     #${PANEL_ID}[data-verbose="true"] .autodom-chat-msg .autodom-msg-meta .ai-tool-calls,
     #${INLINE_OVERLAY_ID}[data-verbose="true"] .autodom-chat-msg .autodom-msg-meta .ai-tool-calls {
       display: block;
     }
-    /* In verbose mode the chip is redundant — the list is already
-       open and can't be collapsed without flipping the global flag. */
-    #${PANEL_ID}[data-verbose="true"] .autodom-chat-msg .autodom-meta-tools-chip,
-    #${INLINE_OVERLAY_ID}[data-verbose="true"] .autodom-chat-msg .autodom-meta-tools-chip {
+    /* Hide the click-to-expand chip when verbose is off — the user
+       explicitly opted into minimal mode, so don't show the chip
+       either. The chip is also redundant in verbose mode (list is
+       already open), so it's hidden in both states. */
+    .autodom-chat-msg .autodom-meta-tools-chip {
       display: none;
     }
 
