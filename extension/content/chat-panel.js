@@ -2198,6 +2198,76 @@
       flex-shrink: 0;
     }
 
+    /* ─── Assistant message meta footer ─────────────────────────
+       Keeps the "AI provider" badge and the "tools used" summary
+       visually de-emphasised so they don't read like part of the
+       assistant's actual answer. The full tool list is collapsed
+       by default; users open it by clicking the tools chip, and
+       it auto-expands when verbose-logs is on. */
+    .autodom-chat-msg .autodom-msg-meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px 10px;
+      margin-top: 8px;
+      padding-top: 6px;
+      border-top: 1px dashed color-mix(in oklch, var(--c-border) 60%, transparent);
+      font-size: 10px;
+      line-height: 1.3;
+      color: var(--c-text-3);
+      opacity: 0.7;
+      transition: opacity 120ms ease;
+    }
+    .autodom-chat-msg .autodom-msg-meta:hover { opacity: 1; }
+    .autodom-chat-msg .autodom-msg-meta .autodom-model-badge {
+      margin-top: 0;
+    }
+    .autodom-chat-msg .autodom-meta-tools-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      border: 1px solid var(--c-border);
+      background: transparent;
+      color: var(--c-text-3);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 10px;
+      line-height: 1.4;
+      cursor: pointer;
+      user-select: none;
+    }
+    .autodom-chat-msg .autodom-meta-tools-chip:hover {
+      color: var(--c-text-1);
+      border-color: color-mix(in oklch, var(--c-border) 30%, var(--c-text-3));
+    }
+    .autodom-chat-msg .autodom-meta-tools-chip .twisty {
+      display: inline-block;
+      transition: transform 120ms ease;
+    }
+    .autodom-chat-msg .autodom-msg-meta.is-expanded .autodom-meta-tools-chip .twisty {
+      transform: rotate(180deg);
+    }
+    /* Hide the full tool list by default. Reveal it when:
+         • the user clicks the chip (.is-expanded), or
+         • the panel/overlay has verbose logs enabled. */
+    .autodom-chat-msg .autodom-msg-meta .ai-tool-calls {
+      display: none;
+      flex-basis: 100%;
+      margin-top: 4px;
+    }
+    .autodom-chat-msg .autodom-msg-meta.is-expanded .ai-tool-calls,
+    #${PANEL_ID}[data-verbose="true"] .autodom-chat-msg .autodom-msg-meta .ai-tool-calls,
+    #${INLINE_OVERLAY_ID}[data-verbose="true"] .autodom-chat-msg .autodom-msg-meta .ai-tool-calls {
+      display: block;
+    }
+    /* In verbose mode the chip is redundant — the list is already
+       open and can't be collapsed without flipping the global flag. */
+    #${PANEL_ID}[data-verbose="true"] .autodom-chat-msg .autodom-meta-tools-chip,
+    #${INLINE_OVERLAY_ID}[data-verbose="true"] .autodom-chat-msg .autodom-meta-tools-chip {
+      display: none;
+    }
+
     /* ─── Automation Run Card (Claude-style grouped assistant turn) ─
        No ::before tricks — host pages (Zoho CRM, Gmail) override padding
        and positioning unpredictably. Build the header with real flex
@@ -7043,7 +7113,10 @@
         const badge = document.createElement("span");
         badge.className = "autodom-model-badge";
         badge.textContent = badgeText;
-        msg.appendChild(badge);
+        // Stashed on the message; appended to a meta footer below
+        // alongside the (collapsed) tool-calls summary so neither
+        // reads like part of the assistant's actual answer.
+        msg.__autodomModelBadge = badge;
       }
       content = rendered;
     } else {
@@ -7090,8 +7163,9 @@
     }
 
     // Show AI tool calls if present
+    let toolCallsDiv = null;
     if (visibleToolCalls.length > 0) {
-      const toolCallsDiv = document.createElement("div");
+      toolCallsDiv = document.createElement("div");
       toolCallsDiv.className = "ai-tool-calls";
       toolCallsDiv.textContent = "Tools used:";
       visibleToolCalls.forEach((tc) => {
@@ -7106,7 +7180,41 @@
         item.appendChild(label);
         toolCallsDiv.appendChild(item);
       });
-      msg.appendChild(toolCallsDiv);
+    }
+
+    // Group the model badge + tool-call summary into a single meta
+    // footer so they read as secondary metadata rather than message
+    // content. The tool list collapses behind a chip by default and
+    // auto-expands when verbose-logs is on (handled in CSS).
+    const modelBadge = msg.__autodomModelBadge || null;
+    if (modelBadge || toolCallsDiv) {
+      const meta = document.createElement("div");
+      meta.className = "autodom-msg-meta";
+      if (modelBadge) meta.appendChild(modelBadge);
+      if (toolCallsDiv) {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "autodom-meta-tools-chip";
+        chip.setAttribute("aria-expanded", "false");
+        chip.title = "Show tools used in this response";
+        const count = visibleToolCalls.length;
+        const label = document.createElement("span");
+        label.textContent = `\u2699 ${count} tool${count === 1 ? "" : "s"}`;
+        const twisty = document.createElement("span");
+        twisty.className = "twisty";
+        twisty.textContent = "\u25BE";
+        chip.appendChild(label);
+        chip.appendChild(twisty);
+        chip.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const expanded = meta.classList.toggle("is-expanded");
+          chip.setAttribute("aria-expanded", expanded ? "true" : "false");
+        });
+        meta.appendChild(chip);
+        meta.appendChild(toolCallsDiv);
+      }
+      msg.appendChild(meta);
+      delete msg.__autodomModelBadge;
     }
 
     messagesContainer.appendChild(msg);

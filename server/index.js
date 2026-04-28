@@ -3419,60 +3419,108 @@ async function callCliBrowserAgent({
       "select_option",
       "press_key",
     ]);
+    const MAX_PASSES = 5;
+    const MAX_REPAIRS_PER_PASS = 2;
+    // Planner-only flag tells runCliPrompt to skip CLI agent loops
+    // (copilot's --allow-all-tools etc.) — we want a single LLM reply.
+    const plannerProviderConfig = {
+      ...providerConfig,
+      cliPlannerOnly: true,
+    };
     let visionPlanFell = false;
+    let totalExecuted = 0;
+    let totalRepairs = 0;
+    let lastPlanCli = null;
+    const completedHistory = []; // [{tool, args, ok, error}]
     try {
-      if (_isAborted(requestId)) throw new AiAbortError(requestId);
-      const snap = await callExtensionTool("take_snapshot", { maxDepth: 4 });
-      toolCalls.push({ tool: "take_snapshot", via: "vision_plan", ok: !snap?.error });
-      const snapStr = JSON.stringify(snap || {}).substring(0, 9000);
-      if (!snap?.error && snapStr) {
-        observations.push({
-          tool: "take_snapshot",
-          params: { maxDepth: 4 },
-          result: snapStr,
-        });
-        skipBootstrapDomState = true;
-      }
+      passLoop: for (let pass = 0; pass < MAX_PASSES; pass++) {
+        if (_isAborted(requestId)) throw new AiAbortError(requestId);
+        const snap = await callExtensionTool("take_snapshot", { maxDepth: 4 });
+        toolCalls.push({ tool: "take_snapshot", via: "vision_plan", ok: !snap?.error });
+        const snapStr = JSON.stringify(snap || {}).substring(0, 9000);
+        if (!snap?.error && snapStr && pass === 0) {
+          observations.push({
+            tool: "take_snapshot",
+            params: { maxDepth: 4 },
+            result: snapStr,
+          });
+          skipBootstrapDomState = true;
+        }
 
-      const planPrompt =
-        `You are AutoDOM's one-shot browser automation planner.\n` +
-        `Output ONLY a single JSON object (no prose, no markdown fences) of shape:\n` +
-        `{"steps":[{"tool":"<name>","args":{...}}]}\n\n` +
-        `Allowed tools: click_by_index, type_by_index, navigate, scroll, wait_for_element, select_option, press_key.\n` +
-        `Use snapshot indices (e.g. CB0, IC0) for click_by_index/type_by_index.\n` +
-        `Keep steps minimal and deterministic. Do not include get_dom_state — you already have the snapshot.\n\n` +
-        `Page: ${context?.title || ""} (${context?.url || ""})\n` +
-        `User task: ${text}\n\n` +
-        `Snapshot:\n${snapStr}\n`;
+        const completedStr = completedHistory.length
+          ? completedHistory
+              .map((s, i) => `${i + 1}. ${s.tool}(${JSON.stringify(s.args)}) -> ${s.ok ? "ok" : "FAIL: " + (s.error || "?")}`)
+              .join("\n")
+          : "(none yet)";
 
-      if (_isAborted(requestId)) throw new AiAbortError(requestId);
-      const cliResult = await runCliPrompt({
-        prompt: planPrompt,
-        providerConfig,
-        requestId,
-      });
-      lastCliMeta = cliResult;
+        const planPrompt =
+          `You are AutoDOM's browser automation planner. Plan the NEXT batch of steps to advance the task. The browser will execute them, then call you again with a fresh snapshot until the task is complete.\n` +
+          `Output ONLY a single JSON object (no prose, no markdown fences) of shape:\n` +
+          `{"done":<bool>,"steps":[{"tool":"<name>","args":{...}}]}\n\n` +
+          `Set "done":true (and "steps":[]) when the user's task is fully accomplished based on the current snapshot. Otherwise list the next concrete steps.\n` +
+          `Allowed tools: click_by_index, type_by_index, navigate, scroll, wait_for_element, select_option, press_key.\n` +
+          `Use snapshot indices (e.g. CB0, IC0) for click_by_index/type_by_index.\n` +
+          `Keep steps minimal and deterministic. Do not include get_dom_state — you already have the snapshot.\n` +
+          `Do NOT repeat steps that have already been executed successfully.\n\n` +
+          `Page: ${context?.title || ""} (${context?.url || ""})\n` +
+          `User task: ${text}\n` +
+          `Pass: ${pass + 1}/${MAX_PASSES}\n` +
+          `Already executed:\n${completedStr}\n\n` +
+          `Snapshot:\n${snapStr}\n`;
 
-      // Tolerate optional ```json fences from the CLI.
-      const raw = String(cliResult.response || "")
-        .trim()
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/\s*```$/, "");
-      let plan = null;
-      try { plan = JSON.parse(raw); } catch (_) { plan = null; }
-      const steps = Array.isArray(plan?.steps) ? plan.steps : [];
+        if (_isAborted(requestId)) throw new AiAbortError(requestId);
+        let cliResult;
+        try {
+          cliResult = await runCliPrompt({
+            prompt: planPrompt,
+            providerConfig: plannerProviderConfig,
+            requestId,
+          });
+        } catch (e) {
+          observations.push({
+            tool: "_vision_plan",
+            params: {},
+            result: `Planner threw on pass ${pass + 1}: ${e.message}`,
+          });
+          visionPlanFell = true;
+          break passLoop;
+        }
+        lastCliMeta = cliResult;
+        lastPlanCli = cliResult;
 
-      if (!steps.length) {
-        observations.push({
-          tool: "_vision_plan",
-          params: {},
-          result: `Vision plan produced no steps; falling back to chatty loop. Raw CLI response head: ${raw.substring(0, 400)}`,
-        });
-        visionPlanFell = true;
-      } else {
-        const MAX_REPAIRS = 2;
-        let repairs = 0;
-        let executed = 0;
+        const raw = String(cliResult.response || "")
+          .trim()
+          .replace(/^```(?:json)?\s*/i, "")
+          .replace(/\s*```$/, "");
+        let plan = null;
+        try { plan = JSON.parse(raw); } catch (_) { plan = null; }
+        const steps = Array.isArray(plan?.steps) ? plan.steps : [];
+        const explicitlyDone = plan?.done === true;
+
+        if (explicitlyDone || (!steps.length && pass > 0)) {
+          // Planner declared task complete (or stopped emitting steps after
+          // making progress) — return what we have.
+          return {
+            response:
+              totalRepairs > 0
+                ? `Done — executed ${totalExecuted} step(s) via vision plan (repaired ${totalRepairs}x, ${pass + 1} pass${pass ? "es" : ""}).`
+                : `Done — executed ${totalExecuted} step(s) via vision plan (${pass + 1} pass${pass ? "es" : ""}).`,
+            toolCalls,
+            model: lastCliMeta.model,
+          };
+        }
+
+        if (!steps.length) {
+          observations.push({
+            tool: "_vision_plan",
+            params: {},
+            result: `Vision plan produced no steps on pass ${pass + 1}; falling back to chatty loop. Raw CLI response head: ${raw.substring(0, 400)}`,
+          });
+          visionPlanFell = true;
+          break passLoop;
+        }
+
+        let repairsThisPass = 0;
         for (let i = 0; i < steps.length; i++) {
           if (_isAborted(requestId)) throw new AiAbortError(requestId);
           const step = steps[i] || {};
@@ -3480,10 +3528,10 @@ async function callCliBrowserAgent({
             observations.push({
               tool: "_vision_plan",
               params: {},
-              result: `Step ${i + 1} used disallowed tool '${step.tool}'; falling back to chatty loop.`,
+              result: `Pass ${pass + 1} step ${i + 1} used disallowed tool '${step.tool}'; falling back to chatty loop.`,
             });
             visionPlanFell = true;
-            break;
+            break passLoop;
           }
           const args = step.args && typeof step.args === "object" ? step.args : {};
           skipBootstrapDomState = false;
@@ -3495,18 +3543,23 @@ async function callCliBrowserAgent({
             params: args,
             result: truncateCliAgentResult(r),
           });
+          completedHistory.push({
+            tool: step.tool,
+            args,
+            ok,
+            error: ok ? null : (r?.error || r?.blocked || "unknown"),
+          });
           if (ok) {
-            executed++;
+            totalExecuted++;
             continue;
           }
-          // Per-step repair: re-snapshot and ask planner to fix only the
-          // remaining tail. Keeps replay deterministic when the page is
-          // stable and recovers cheaply when indices shift mid-flow.
-          if (repairs >= MAX_REPAIRS) {
-            visionPlanFell = true;
+          if (repairsThisPass >= MAX_REPAIRS_PER_PASS) {
+            // Repair budget exhausted on this pass — let the outer loop
+            // re-plan from the current page state on the next pass.
             break;
           }
-          repairs++;
+          repairsThisPass++;
+          totalRepairs++;
           let repairSnap = null;
           try {
             repairSnap = await callExtensionTool("take_snapshot", { maxDepth: 4 });
@@ -3519,7 +3572,7 @@ async function callCliBrowserAgent({
             `You are AutoDOM's plan-repair agent. The previous step failed; the page may have shifted (new modal, re-rendered list, changed indices).\n` +
             `Output ONLY a JSON object: {"steps":[{"tool":"<name>","args":{...}}]}\n` +
             `Allowed tools: click_by_index, type_by_index, navigate, scroll, wait_for_element, select_option, press_key.\n` +
-            `Use indices from the NEW snapshot below. Return the steps needed to recover and finish the task (do not repeat already-completed steps).\n\n` +
+            `Use indices from the NEW snapshot below. Return the steps needed to recover and finish this batch (do not repeat already-completed steps).\n\n` +
             `Original task: ${text}\n` +
             `Failed step: ${failedStepStr}\n` +
             `Failure: ${failureStr}\n` +
@@ -3528,14 +3581,18 @@ async function callCliBrowserAgent({
           if (_isAborted(requestId)) throw new AiAbortError(requestId);
           let repairResult;
           try {
-            repairResult = await runCliPrompt({ prompt: repairPrompt, providerConfig, requestId });
+            repairResult = await runCliPrompt({
+              prompt: repairPrompt,
+              providerConfig: plannerProviderConfig,
+              requestId,
+            });
           } catch (e) {
             observations.push({
               tool: "_vision_plan_repair",
               params: {},
               result: `Repair planner threw: ${e.message}`,
             });
-            visionPlanFell = true;
+            // Let outer loop re-plan from scratch.
             break;
           }
           lastCliMeta = repairResult;
@@ -3552,23 +3609,23 @@ async function callCliBrowserAgent({
               params: {},
               result: `Repair produced no steps. Raw head: ${repairRaw.substring(0, 400)}`,
             });
-            visionPlanFell = true;
+            // Outer loop will re-plan from current state.
             break;
           }
-          // Splice repair steps in and continue from the same index.
           steps.splice(i, steps.length - i, ...repairSteps);
           i--; // retry at this index with the first repair step
         }
-        if (!visionPlanFell) {
-          return {
-            response:
-              repairs > 0
-                ? `Done — executed ${executed} step(s) via vision plan (repaired ${repairs}x).`
-                : `Done — executed ${executed} step(s) via vision plan.`,
-            toolCalls,
-            model: lastCliMeta.model || cliResult.model,
-          };
-        }
+        // End of pass — outer loop continues with a fresh snapshot.
+      }
+
+      // Hit MAX_PASSES without explicit done; return progress as-is.
+      if (!visionPlanFell) {
+        return {
+          response:
+            `Done — executed ${totalExecuted} step(s) via vision plan (${MAX_PASSES} passes, planner did not signal completion).`,
+          toolCalls,
+          model: lastCliMeta.model || lastPlanCli?.model,
+        };
       }
     } catch (err) {
       if (err instanceof AiAbortError) throw err;
@@ -4197,14 +4254,35 @@ async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta }) 
     );
   }
 
+  // Vision-plan/planner-only callers ask for a single-shot LLM reply with
+  // no tool/agent loop. CLI-bridges otherwise drag in their own
+  // copilot-style agent (slow, multi-turn) which defeats the point.
+  const plannerOnly = !!providerConfig.cliPlannerOnly;
+  const userPickedJsonCodex =
+    /\s--json(\s|$)/.test(userArgsJoined) ||
+    /\s--output-format(\s|=)/.test(userArgsJoined);
+  const wantCodexJson = kind === "codex" && !userPickedJsonCodex;
+  const codexJsonArgs = wantCodexJson ? ["--json"] : [];
+
   let args;
   let writePromptToStdin = true;
   if (kind === "claude") {
     args = ["-p", ...claudeJsonArgs, ...modelArgs, ...extraArgs];
   } else if (kind === "codex") {
-    args = ["exec", "--skip-git-repo-check", ...modelArgs, "-", ...extraArgs];
+    // Newer codex CLI accepts the prompt as a positional arg. Stdin mode
+    // (`-`) silently truncated long prompts on 0.125+, so prefer arg form.
+    args = [
+      "exec",
+      "--skip-git-repo-check",
+      ...codexJsonArgs,
+      ...modelArgs,
+      ...extraArgs,
+      prompt,
+    ];
+    writePromptToStdin = false;
   } else if (kind === "copilot") {
-    args = ["--allow-all-tools", ...modelArgs, "-p", prompt, ...extraArgs];
+    const copilotToolArgs = plannerOnly ? [] : ["--allow-all-tools"];
+    args = [...copilotToolArgs, ...modelArgs, "-p", prompt, ...extraArgs];
     writePromptToStdin = false;
   } else {
     args = [...modelArgs, ...extraArgs];
