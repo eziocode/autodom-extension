@@ -1533,6 +1533,14 @@ function _processWsMessage(socket, message) {
           process.stderr.write(
             `[AutoDOM] ✓ Routing to direct provider: ${effectiveProvider}\n`,
           );
+          // Stream user-visible text deltas back to the extension so the
+          // chat panel can paint tokens as they arrive instead of waiting
+          // for the full provider response. Only enabled for the CLI path
+          // today (other direct-provider branches in this file still buffer
+          // their full response before returning) — runCliPrompt detects
+          // the absence of the callback and falls back to silent buffering
+          // for non-CLI providers.
+          const _chatStreamEmitter = makeChatDeltaEmitter(socket, id);
           const providerResult = await routeDirectProviderChat({
             provider: effectiveProvider,
             text,
@@ -1541,7 +1549,9 @@ function _processWsMessage(socket, message) {
             providerConfig: mergedProviderConfig,
             requestId: id,
             mode: mode || null,
+            onTextDelta: (chunk) => _chatStreamEmitter.push(chunk),
           });
+          _chatStreamEmitter.flush();
 
           process.stderr.write(
             `[AutoDOM] ✓ Direct provider responded: ${(providerResult?.response || "").substring(0, 100)}...\n`,
@@ -2816,7 +2826,38 @@ function formatBrowserSnapshotForPrompt(snapshot) {
   return parts.join("\n\n").substring(0, 18000);
 }
 
-function buildProviderSystemPrompt(context) {
+// Reply-style instructions threaded through every system prompt and
+// CLI planner prompt. Mirrors extension/background/providers.js so
+// both the direct-provider path and the bridge/CLI path produce the
+// same shape of reply for the user's selected style.
+const RESPONSE_STYLE_INSTRUCTIONS = {
+  concise:
+    "Reply style — concise summarizer (DEFAULT, like Comet/Copilot quick answer):\n" +
+    "- Open with a single one-line answer that resolves the user's question. No preamble, no restating the question.\n" +
+    "- Then at most 3 short bullet points of supporting detail. Skip bullets entirely if the one-liner is sufficient.\n" +
+    "- No headings. No closing summary. No 'I hope this helps'.\n",
+  jetbrains:
+    "Reply style — JetBrains AI Chat (structured assistant):\n" +
+    "- Format using exactly these bold sections in this order, omitting any that don't apply:\n" +
+    "  **Summary** — one short paragraph (≤2 lines).\n" +
+    "  **Details** — focused bullets, each ≤1 sentence.\n" +
+    "  **Next steps** — numbered list, only when the user can take a follow-up action.\n" +
+    "- No filler outside those sections.\n",
+  chatbar:
+    "Reply style — GPT chatbar (conversational markdown):\n" +
+    "- Friendly, second-person tone. Use **bold** for key terms and `code` for identifiers.\n" +
+    "- Short paragraphs. Use bullets or numbered lists when listing >2 items.\n" +
+    "- Headings (`###`) only when the reply runs longer than ~150 words.\n",
+};
+function _resolveResponseStyle(value) {
+  const raw = String(value || "concise").toLowerCase();
+  return RESPONSE_STYLE_INSTRUCTIONS[raw] ? raw : "concise";
+}
+function _responseStyleSuffix(value) {
+  return RESPONSE_STYLE_INSTRUCTIONS[_resolveResponseStyle(value)];
+}
+
+function buildProviderSystemPrompt(context, opts) {
   let prompt =
     "You are AutoDOM's browser agent. Help the user interact with the current web page.\n";
   prompt +=
@@ -2844,6 +2885,7 @@ function buildProviderSystemPrompt(context) {
         "Use this active-page data to answer page extraction questions directly; do not ask the user to run /dom, console snippets, developer tools, or provide DOM output. If the requested value scan says no matches were found, say AutoDOM checked the active page and found none.\n";
     }
   }
+  prompt += "\n" + _responseStyleSuffix(opts && opts.responseStyle);
   return prompt;
 }
 
@@ -2895,7 +2937,7 @@ async function callOpenAIProvider({
   const model = providerConfig.openaiModel || "gpt-4.1-mini";
 
   const messages = [
-    { role: "system", content: buildProviderSystemPrompt(context) },
+    { role: "system", content: buildProviderSystemPrompt(context, { responseStyle: providerConfig?.responseStyle }) },
   ];
 
   const historyText = conversationToProviderText(conversationHistory);
@@ -2985,7 +3027,7 @@ async function callAnthropicProvider({
     body: JSON.stringify({
       model: anthropicModel,
       max_tokens: 2048,
-      system: buildProviderSystemPrompt(context),
+      system: buildProviderSystemPrompt(context, { responseStyle: providerConfig?.responseStyle }),
       messages,
     }),
   });
@@ -3030,7 +3072,7 @@ async function callOllamaProvider({
   const model = providerConfig.ollamaModel || "llama3.2";
 
   const messages = [
-    { role: "system", content: buildProviderSystemPrompt(context) },
+    { role: "system", content: buildProviderSystemPrompt(context, { responseStyle: providerConfig?.responseStyle }) },
   ];
 
   const historyText = conversationToProviderText(conversationHistory);
@@ -3300,6 +3342,7 @@ function buildCliAgentPrompt({
   conversationHistory,
   observations,
   invalidResponse,
+  responseStyle,
 }) {
   const historyText = conversationToProviderText(conversationHistory).substring(
     0,
@@ -3338,6 +3381,7 @@ function buildCliAgentPrompt({
     `- For "create a lead", open/navigate to Leads and the create form if possible. If required lead values are missing, stop and ask for those values; do not invent data or save/submit a record with missing user-provided details.\n` +
     `- If a tool fails, replan using the result instead of repeating the same failed call.\n\n` +
     `Tool observations:\n${observationText}\n` +
+    `\nWhen you choose action:"final", the "response" string MUST follow this format:\n${_responseStyleSuffix(responseStyle)}\n` +
     (invalidResponse
       ? `\nYour previous response was rejected because it was not an executable AutoDOM JSON decision:\n${invalidResponse.substring(0, 1200)}\n`
       : "")
@@ -3561,6 +3605,7 @@ async function callCliBrowserAgent({
       conversationHistory,
       observations,
       invalidResponse,
+      responseStyle: providerConfig?.responseStyle,
     });
     const cliResult = await runCliPrompt({ prompt, providerConfig, requestId });
     lastCliMeta = cliResult;
@@ -3655,6 +3700,7 @@ async function routeDirectProviderChat({
   providerConfig: incomingConfig,
   requestId,
   mode,
+  onTextDelta,
 }) {
   const providerConfig = mergeProviderConfig(incomingConfig || { provider });
 
@@ -3706,6 +3752,7 @@ async function routeDirectProviderChat({
       conversationHistory,
       providerConfig,
       requestId,
+      onTextDelta,
     });
   }
 
@@ -3924,7 +3971,205 @@ function extractCliFinalResponse(stdout) {
 //   claude  → spawn `<binary> -p` and write prompt to stdin
 //   codex   → spawn `<binary> exec -` and write prompt to stdin
 //   custom  → spawn `<binary> <extraArgs...>` and write prompt to stdin
-async function runCliPrompt({ prompt, providerConfig, requestId }) {
+// Streaming text extractor for CLI stdout. Parses NDJSON / JSON-array
+// stream-json events as they arrive on stdout and emits incremental
+// assistant text via onText(chunk). Handles the same shapes as
+// extractCliFinalResponse but online — for plain-text CLIs (codex
+// default, copilot default) it forwards chunks verbatim. Designed to
+// stay tolerant of partial frames; anything unparseable is buffered
+// until the next \n.
+function makeCliStreamExtractor(kind, onText) {
+  let buf = "";
+  let mode = null; // "json-lines" | "plain-text" — decided on first non-whitespace byte
+  let plainEmitted = 0;
+
+  const TEXT_KEYS = [
+    "delta", "text", "content", "result", "response", "output_text",
+    "final_output", "final_message", "answer", "output", "message",
+  ];
+
+  const pickStringFromKeys = (rec, keys) => {
+    for (const k of keys) {
+      const v = rec[k];
+      if (typeof v === "string" && v.length) return v;
+    }
+    return null;
+  };
+
+  // Best-effort: pull one delta-like text from a single JSON record.
+  // Returns "" when nothing is found (not all events carry text).
+  const pickStreamText = (rec) => {
+    if (!rec || typeof rec !== "object") return "";
+    // Anthropic stream-json text deltas: {type:"content_block_delta", delta:{type:"text_delta", text:"..."}}
+    if (rec.delta && typeof rec.delta === "object") {
+      if (typeof rec.delta.text === "string") return rec.delta.text;
+      if (typeof rec.delta.content === "string") return rec.delta.content;
+    }
+    // OpenAI/Codex chat-completion delta chunks
+    if (Array.isArray(rec.choices)) {
+      const out = rec.choices
+        .map((c) => {
+          const m = c?.delta || c?.message;
+          if (m) {
+            if (typeof m.content === "string") return m.content;
+            if (Array.isArray(m.content)) {
+              return m.content
+                .map((p) => (typeof p?.text === "string" ? p.text : null))
+                .filter(Boolean)
+                .join("");
+            }
+          }
+          if (typeof c?.text === "string") return c.text;
+          return null;
+        })
+        .filter(Boolean)
+        .join("");
+      if (out) return out;
+    }
+    // Codex agent_message frames: {type:"agent_message", message:"..."}
+    // Generic {message: "...string..."} or {message: {content:[...]}}
+    const msg = rec.message;
+    if (typeof msg === "string") return msg;
+    if (msg && typeof msg === "object") {
+      const direct = pickStringFromKeys(msg, TEXT_KEYS);
+      if (direct) return direct;
+      if (Array.isArray(msg.content)) {
+        const out = msg.content
+          .map((c) => {
+            if (typeof c === "string") return c;
+            if (typeof c?.text === "string") return c.text;
+            if (c?.text && typeof c.text.value === "string") return c.text.value;
+            return null;
+          })
+          .filter(Boolean)
+          .join("");
+        if (out) return out;
+      }
+    }
+    // Direct top-level text fields (Claude {result}, generic {text|content|output})
+    return pickStringFromKeys(rec, TEXT_KEYS) || "";
+  };
+
+  // Track per-event running totals so we only emit the *new* portion of
+  // a text field that grows monotonically across frames (some CLIs send
+  // cumulative content rather than deltas).
+  const cumulativeByKey = new Map();
+  const emitCumulative = (key, full) => {
+    const prev = cumulativeByKey.get(key) || "";
+    if (typeof full !== "string" || full.length <= prev.length) return;
+    const newPart = full.slice(prev.length);
+    cumulativeByKey.set(key, full);
+    if (newPart) onText(newPart);
+  };
+
+  return {
+    push(chunkStr) {
+      if (!chunkStr) return;
+      buf += chunkStr;
+
+      if (mode === null) {
+        const trimmed = buf.replace(/^\s+/, "");
+        if (!trimmed) return;
+        mode = trimmed.startsWith("{") || trimmed.startsWith("[")
+          ? "json-lines"
+          : "plain-text";
+      }
+
+      if (mode === "plain-text") {
+        // Forward verbatim; keep what we've already emitted in plainEmitted
+        // so a full re-extract on close doesn't duplicate.
+        const slice = buf.slice(plainEmitted);
+        if (slice) {
+          plainEmitted += slice.length;
+          onText(slice);
+        }
+        return;
+      }
+
+      // json-lines mode — parse line by line.
+      let idx;
+      while ((idx = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line) continue;
+        let evt;
+        try { evt = JSON.parse(line); } catch (_) { continue; }
+        // Some CLIs (claude --output-format json) emit ONE big object
+        // rather than a stream — we may only see the full object on close.
+        if (Array.isArray(evt)) {
+          for (const sub of evt) {
+            const txt = pickStreamText(sub);
+            if (txt) emitCumulative(sub?.type || "_", txt);
+          }
+        } else {
+          // For "result" type, emit the full result as a fresh chunk
+          // (cumulative-by-type dedupes within a single stream).
+          const txt = pickStreamText(evt);
+          if (txt) emitCumulative(evt?.type || "_", txt);
+        }
+      }
+    },
+    end() {
+      if (mode === "plain-text") return;
+      // Flush any remaining buffered line (might be a single object).
+      const tail = buf.trim();
+      if (tail) {
+        try {
+          const evt = JSON.parse(tail);
+          if (Array.isArray(evt)) {
+            for (const sub of evt) {
+              const txt = pickStreamText(sub);
+              if (txt) emitCumulative(sub?.type || "_", txt);
+            }
+          } else {
+            const txt = pickStreamText(evt);
+            if (txt) emitCumulative(evt?.type || "_", txt);
+          }
+        } catch (_) {}
+      }
+      buf = "";
+    },
+  };
+}
+
+// Build a 40 ms-batched delta emitter that turns a stream of small
+// text fragments into AI_CHAT_DELTA WebSocket frames. Coalescing
+// avoids spamming the socket (and downstream chrome.tabs.sendMessage)
+// with one frame per token — the UI only needs ~25 fps to look smooth.
+function makeChatDeltaEmitter(socket, requestId) {
+  let pending = "";
+  let timer = null;
+  const FLUSH_MS = 40;
+  const send = () => {
+    if (!pending) return;
+    const chunk = pending;
+    pending = "";
+    timer = null;
+    if (!socket || socket.readyState !== 1) return;
+    try {
+      socket.send(
+        JSON.stringify({
+          type: "AI_CHAT_DELTA",
+          id: requestId,
+          chunk,
+        }),
+      );
+    } catch (_) {}
+  };
+  return {
+    push(text) {
+      if (!text) return;
+      pending += text;
+      if (!timer) timer = setTimeout(send, FLUSH_MS);
+    },
+    flush() {
+      if (timer) { clearTimeout(timer); timer = null; }
+      send();
+    },
+  };
+}
+
+async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta }) {
   if (_isAborted(requestId)) throw new AiAbortError(requestId);
   const binary = (providerConfig.cliBinary || "claude").trim();
   const kind = (providerConfig.cliKind || "claude").trim().toLowerCase();
@@ -4032,7 +4277,15 @@ async function runCliPrompt({ prompt, providerConfig, requestId }) {
       : null;
     timer?.unref?.();
 
-    proc.stdout.on("data", (d) => stdoutChunks.push(d));
+    const streamExtractor = typeof onTextDelta === "function"
+      ? makeCliStreamExtractor(kind, onTextDelta)
+      : null;
+    proc.stdout.on("data", (d) => {
+      stdoutChunks.push(d);
+      if (streamExtractor) {
+        try { streamExtractor.push(d.toString("utf8")); } catch (_) {}
+      }
+    });
     proc.stderr.on("data", (d) => stderrChunks.push(d));
 
     proc.on("error", (err) => {
@@ -4047,6 +4300,9 @@ async function runCliPrompt({ prompt, providerConfig, requestId }) {
     });
 
     proc.on("close", (code) => {
+      if (streamExtractor) {
+        try { streamExtractor.end(); } catch (_) {}
+      }
       if (_isAborted(requestId)) {
         finish(reject, new AiAbortError(requestId));
         return;
@@ -4096,6 +4352,7 @@ async function callCliProvider({
   conversationHistory,
   providerConfig,
   requestId,
+  onTextDelta,
 }) {
   if (_isAborted(requestId)) throw new AiAbortError(requestId);
   const binary = (providerConfig.cliBinary || "claude").trim();
@@ -4108,7 +4365,7 @@ async function callCliProvider({
   }
 
   // Compose the prompt: system context + conversation + new user turn
-  const systemPreamble = buildProviderSystemPrompt(context);
+  const systemPreamble = buildProviderSystemPrompt(context, { responseStyle: providerConfig?.responseStyle });
   const historyText = conversationToProviderText(conversationHistory);
   const composedPrompt =
     `${systemPreamble}\n\n` +
@@ -4119,6 +4376,7 @@ async function callCliProvider({
     prompt: composedPrompt,
     providerConfig,
     requestId,
+    onTextDelta,
   });
   return {
     response: cliResult.response || "(CLI returned no output)",

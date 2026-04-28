@@ -15,6 +15,32 @@ scripts, or use MCP tools from an IDE to run local Playwright scripts. See
 
 ---
 
+## What's new in 2.1
+
+- **Streaming responses everywhere.** The chat panel now paints tokens as they
+  arrive instead of waiting for the full reply. Time-to-first-token on the
+  built-in CLI agent path (Claude Code / Codex / Copilot CLI) drops from
+  several seconds to ~500ms — on par with Comet, JetBrains AI, and the GPT
+  chat bar.
+  - Bridge server (`server/index.js`) parses CLI subprocess `stdout`
+    incrementally and forwards `AI_CHAT_DELTA` WebSocket frames to the
+    extension.
+  - Direct providers (`extension/background/providers.js`) stream OpenAI and
+    Anthropic via SSE and Ollama via NDJSON.
+- **Selectable response style.** A new "Reply style" dropdown in the popup
+  Chat tab lets you pick how the assistant should format answers:
+  - `concise` — one-line answer plus up to 3 short bullets (default).
+  - `jetbrains` — **Summary / Details / Next steps** structure, like the
+    JetBrains AI tool window.
+  - `chatbar` — conversational markdown, friendly tone, headings only when
+    the reply gets long. Mimics the GPT chat bar.
+  The selection is plumbed end-to-end (chat panel → service worker →
+  providers / bridge → CLI agent prompt) so every code path honours it.
+- **Bumped extension and bridge server to `2.1.0`** (`extension/manifest.json`,
+  `extension/manifest.firefox.json`, `server/package.json`).
+
+---
+
 ## How it works
 
 ```

@@ -1188,6 +1188,7 @@ async function runAgentLoop({
   modelOverride,
   attachments,
   mode,
+  responseStyle,
 }) {
   const ProvidersApi = globalThis.AutoDOMProviders;
   const AgentApi = globalThis.AutoDOMAgent;
@@ -2213,6 +2214,30 @@ function connectWebSocket(port) {
           if (pending) {
             pendingAutomationValidations.delete(message.id);
             pending.resolve(message.result || { ok: false, error: "Empty validation result" });
+          }
+          return;
+        }
+
+        // Streaming text deltas from the bridge server (CLI provider).
+        // Forward to the chat panel so it can paint tokens incrementally
+        // into a transient assistant bubble keyed by runId. The eventual
+        // AI_CHAT_RESPONSE arrives later and the panel skips a duplicate
+        // render via its rendered-runId set.
+        if (message.type === "AI_CHAT_DELTA") {
+          const pending = pendingAiRequests.get(message.id);
+          if (pending) {
+            if (!pending._runStarted) {
+              pending._runStarted = true;
+              _streamAgentToolEvent(pending.panelTabId, {
+                phase: "run-start",
+                runId: pending.runId,
+              });
+            }
+            _streamAgentToolEvent(pending.panelTabId, {
+              phase: "answer-delta",
+              runId: pending.runId,
+              chunk: typeof message.chunk === "string" ? message.chunk : "",
+            });
           }
           return;
         }
@@ -3283,7 +3308,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "CHAT_AI_MESSAGE") {
-    const { text, context, conversationHistory, provider, attachments, mode } = message;
+    const { text, context, conversationHistory, provider, attachments, mode, responseStyle } = message;
     _debugLog(
       "[AutoDOM SW] CHAT_AI_MESSAGE received, text:",
       (text || "").substring(0, 80),
@@ -3382,6 +3407,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             modelOverride: effectiveModel,
             attachments: Array.isArray(attachments) ? attachments : [],
             mode: mode || null,
+            responseStyle: responseStyle || "concise",
           });
           _debugLog(
             "[AutoDOM SW] Agent loop finished, length:",
@@ -3476,6 +3502,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           (message.model || "").trim() ||
           (aiProviderSettings.model || "").trim() ||
           "",
+        // Reply-style selection from the chat panel (concise|jetbrains|chatbar).
+        // The bridge appends the matching instruction to its system prompt.
+        responseStyle: responseStyle || "concise",
       },
     };
 
