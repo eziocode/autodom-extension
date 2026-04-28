@@ -3717,6 +3717,207 @@ async function routeDirectProviderChat({
 // prompt to it, and returns stdout. The user's existing CLI auth
 // (Anthropic OAuth token, OpenAI key, etc.) is reused — no API
 // key needed in the extension. Best for users who already use
+// Extract the final assistant text + model from a CLI's stdout, regardless
+// of which AI/CLI produced it. Handles every shape we've seen in the wild:
+//
+//   • Plain text (codex default, copilot default, custom binaries)
+//   • Single JSON object: { result | response | output_text | text | content,
+//                           model | model_id | model_usage }
+//       (claude --output-format json, openai-style replies)
+//   • JSON array of stream events:
+//       [{type:"system",...}, {type:"assistant", message:{content:[{type:"text",text}]}},
+//        {type:"result", result:"...final..."}]
+//       (claude stream-json wrapped, copilot CLI session dumps, etc.)
+//   • NDJSON (one JSON event per line), terminating with a result/message/
+//     assistant_message/agent_message/task_complete record.
+//       (codex exec --json, gemini-cli, generic agent loops)
+//
+// Returns { text, model } where either may be null when nothing extractable
+// was found. Callers should fall back to the raw stdout if text is null.
+function extractCliFinalResponse(stdout) {
+  const empty = { text: null, model: null };
+  if (!stdout || typeof stdout !== "string") return empty;
+  const trimmed = stdout.trim();
+  if (!trimmed) return empty;
+
+  const TEXT_KEYS = [
+    "result",
+    "response",
+    "output_text",
+    "final_output",
+    "final_message",
+    "answer",
+    "text",
+    "content",
+    "output",
+    "message",
+  ];
+  const MODEL_KEYS = ["model", "model_id", "modelId", "model_name"];
+  // Event-record `type` values that carry the final assistant text.
+  const RESULT_TYPES = new Set([
+    "result",
+    "final",
+    "final_result",
+    "task_complete",
+    "task_completed",
+    "completion",
+    "agent_message",
+    "agent_message_final",
+    "assistant_message",
+    "message",
+  ]);
+  const ASSISTANT_TYPES = new Set([
+    "assistant",
+    "assistant_message",
+    "message",
+    "agent_message",
+  ]);
+
+  const pickStringFromKeys = (rec, keys) => {
+    for (const k of keys) {
+      const v = rec[k];
+      if (typeof v === "string" && v.length) return v;
+    }
+    return null;
+  };
+
+  // Extract text from a single record using known shapes.
+  const pickText = (rec) => {
+    if (!rec || typeof rec !== "object") return null;
+
+    // Direct string fields (covers Claude {result}, OpenAI {output_text},
+    // Codex {agent_message.message}, generic {text|content|output}).
+    const direct = pickStringFromKeys(rec, TEXT_KEYS);
+    if (direct) return direct;
+
+    // Nested message.content[] (Anthropic stream-json assistant frames,
+    // OpenAI assistants API).
+    const msg = rec.message || rec.delta || rec.response;
+    if (msg && typeof msg === "object") {
+      if (typeof msg === "string") return msg;
+      const nestedDirect = pickStringFromKeys(msg, TEXT_KEYS);
+      if (nestedDirect) return nestedDirect;
+      if (Array.isArray(msg.content)) {
+        const texts = msg.content
+          .map((c) => {
+            if (!c) return null;
+            if (typeof c === "string") return c;
+            if (typeof c.text === "string") return c.text;
+            if (c.text && typeof c.text.value === "string") return c.text.value;
+            if (typeof c.content === "string") return c.content;
+            return null;
+          })
+          .filter(Boolean);
+        if (texts.length) return texts.join("");
+      }
+    }
+
+    // Choices[] (OpenAI chat/completion shape).
+    if (Array.isArray(rec.choices)) {
+      const texts = rec.choices
+        .map((c) => {
+          if (!c) return null;
+          if (typeof c.text === "string") return c.text;
+          const m = c.message || c.delta;
+          if (m) {
+            if (typeof m.content === "string") return m.content;
+            if (Array.isArray(m.content)) {
+              return m.content
+                .map((p) => (typeof p?.text === "string" ? p.text : null))
+                .filter(Boolean)
+                .join("");
+            }
+          }
+          return null;
+        })
+        .filter(Boolean);
+      if (texts.length) return texts.join("");
+    }
+
+    return null;
+  };
+
+  const pickModel = (rec) => {
+    if (!rec || typeof rec !== "object") return null;
+    const direct = pickStringFromKeys(rec, MODEL_KEYS);
+    if (direct) return direct;
+    if (rec.message && typeof rec.message === "object") {
+      const m = pickStringFromKeys(rec.message, MODEL_KEYS);
+      if (m) return m;
+    }
+    for (const key of ["modelUsage", "model_usage", "models"]) {
+      const v = rec[key];
+      if (v && typeof v === "object") {
+        const k = Object.keys(v)[0];
+        if (typeof k === "string" && k) return k;
+      }
+    }
+    return null;
+  };
+
+  const extractFromRecords = (records) => {
+    let text = null;
+    let model = null;
+    // Prefer explicit "result"-class records first, then assistant frames,
+    // walking in reverse so we land on the final message.
+    for (let i = records.length - 1; i >= 0 && !text; i--) {
+      const rec = records[i];
+      if (!rec || typeof rec !== "object") continue;
+      if (RESULT_TYPES.has(rec.type)) text = pickText(rec);
+      if (!model) model = pickModel(rec);
+    }
+    if (!text) {
+      for (let i = records.length - 1; i >= 0 && !text; i--) {
+        const rec = records[i];
+        if (!rec || typeof rec !== "object") continue;
+        if (ASSISTANT_TYPES.has(rec.type)) text = pickText(rec);
+        if (!model) model = pickModel(rec);
+      }
+    }
+    if (!text) {
+      // Last-resort: take the last record that yields any text at all.
+      for (let i = records.length - 1; i >= 0 && !text; i--) {
+        text = pickText(records[i]);
+        if (!model) model = pickModel(records[i]);
+      }
+    }
+    return { text, model };
+  };
+
+  // 1) Try whole-string JSON (object or array).
+  try {
+    const data = JSON.parse(trimmed);
+    if (Array.isArray(data)) {
+      return extractFromRecords(data);
+    }
+    if (data && typeof data === "object") {
+      const text = pickText(data);
+      const model = pickModel(data);
+      if (text || model) return { text, model };
+    }
+  } catch (_) {
+    // not whole-string JSON — fall through to NDJSON
+  }
+
+  // 2) Try NDJSON / stream-json (one JSON value per line). Tolerate
+  //    interleaved log lines by ignoring parse failures.
+  const records = [];
+  for (const line of trimmed.split(/\r?\n/)) {
+    const piece = line.trim();
+    if (!piece || (piece[0] !== "{" && piece[0] !== "[")) continue;
+    try {
+      const v = JSON.parse(piece);
+      if (Array.isArray(v)) records.push(...v);
+      else records.push(v);
+    } catch (_) {
+      // ignore
+    }
+  }
+  if (records.length) return extractFromRecords(records);
+
+  return empty;
+}
+
 // `claude` or `codex` daily.
 //
 // Supported kinds:
@@ -3862,106 +4063,9 @@ async function runCliPrompt({ prompt, providerConfig, requestId }) {
         return;
       }
 
-      let parsedResponse = null;
-      let actualModel = pickedModel || "";
-      if (wantClaudeJson && stdout) {
-        // Claude CLI emits one of:
-        //   1. A single JSON object: { result, model, ... }
-        //   2. A JSON array of stream events (stream-json mode, or when the
-        //      CLI is wrapped by another agent that aggregates output):
-        //      [{type:"system",...}, {type:"assistant",...},
-        //       {type:"result", result:"...final text...", ...}]
-        //   3. NDJSON: one JSON object per line, terminating with a
-        //      {type:"result", ...} record.
-        // Extract the final assistant text from whichever shape we receive
-        // so the chat panel doesn't render the raw session dump.
-        const pickFromResultRecord = (rec) => {
-          if (!rec || typeof rec !== "object") return null;
-          if (typeof rec.result === "string") return rec.result;
-          if (typeof rec.response === "string") return rec.response;
-          return null;
-        };
-        const pickFromAssistantRecord = (rec) => {
-          if (!rec || typeof rec !== "object") return null;
-          const msg = rec.message;
-          if (msg && Array.isArray(msg.content)) {
-            const texts = msg.content
-              .filter((c) => c && c.type === "text" && typeof c.text === "string")
-              .map((c) => c.text);
-            if (texts.length) return texts.join("");
-          }
-          return null;
-        };
-        const pickModelFromRecord = (rec) => {
-          if (!rec || typeof rec !== "object") return null;
-          const m =
-            rec.model ||
-            rec.model_id ||
-            (rec.message && rec.message.model) ||
-            (rec.modelUsage && typeof rec.modelUsage === "object"
-              ? Object.keys(rec.modelUsage)[0]
-              : null) ||
-            (rec.model_usage && typeof rec.model_usage === "object"
-              ? Object.keys(rec.model_usage)[0]
-              : null);
-          return typeof m === "string" ? m : null;
-        };
-
-        const extractFromRecords = (records) => {
-          let text = null;
-          let model = null;
-          // Walk in reverse so we prefer the final result/assistant message.
-          for (let i = records.length - 1; i >= 0; i--) {
-            const rec = records[i];
-            if (!rec || typeof rec !== "object") continue;
-            if (!text && rec.type === "result") text = pickFromResultRecord(rec);
-            if (!text && rec.type === "assistant") {
-              text = pickFromAssistantRecord(rec);
-            }
-            if (!model) model = pickModelFromRecord(rec);
-            if (text && model) break;
-          }
-          return { text, model };
-        };
-
-        let handled = false;
-        try {
-          const data = JSON.parse(stdout);
-          if (Array.isArray(data)) {
-            const { text, model } = extractFromRecords(data);
-            if (text) parsedResponse = text;
-            if (model) actualModel = model;
-            handled = true;
-          } else if (data && typeof data === "object") {
-            const text =
-              pickFromResultRecord(data) || pickFromAssistantRecord(data);
-            if (text) parsedResponse = text;
-            const model = pickModelFromRecord(data);
-            if (model) actualModel = model;
-            handled = true;
-          }
-        } catch (_) {
-          // Fall through to NDJSON parsing below.
-        }
-
-        if (!handled) {
-          const records = [];
-          for (const line of stdout.split(/\r?\n/)) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            try {
-              records.push(JSON.parse(trimmed));
-            } catch (_) {
-              // Ignore non-JSON lines (logs etc.).
-            }
-          }
-          if (records.length) {
-            const { text, model } = extractFromRecords(records);
-            if (text) parsedResponse = text;
-            if (model) actualModel = model;
-          }
-        }
-      }
+      const extracted = extractCliFinalResponse(stdout);
+      const parsedResponse = extracted.text;
+      const actualModel = extracted.model || pickedModel || "";
 
       finish(resolve, {
         response: parsedResponse || stdout || "(CLI returned no output)",
