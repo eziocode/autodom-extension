@@ -2435,14 +2435,16 @@
       overflow: hidden;
       font-size: 12px;
     }
-    /* Honour the "Verbose automation logs" setting — when off, hide every
-       per-step tool card (live or restored) and every persisted tool-result
-       <details> message so the chat shows only the user's prompts and the
-       AI's final replies. The data stays in the messages array; toggling
-       verbose back on reveals it instantly without reloading. */
-    #${PANEL_ID}[data-verbose="false"] .ai-tool-card,
+    /* Honour the "Verbose automation logs" setting — when off, hide the
+       persisted per-step <details> tool-result blocks so the chat shows
+       only the user's prompts and the AI's final replies.
+
+       Note: live ".ai-tool-card" progress cards are NOT gated here on
+       purpose. Hiding them while a run is in flight removes the only
+       in-flow signal that the agent is actually doing something, which
+       made automations look frozen. The collapsed "Tools used:" chip
+       on the assistant message still summarizes them after the fact. */
     #${PANEL_ID}[data-verbose="false"] .autodom-chat-msg.tool-result,
-    #${INLINE_OVERLAY_ID}[data-verbose="false"] .ai-tool-card,
     #${INLINE_OVERLAY_ID}[data-verbose="false"] .autodom-chat-msg.tool-result {
       display: none !important;
     }
@@ -6840,7 +6842,14 @@
         {
           label: "Open settings",
           kind: "primary",
-          onClick: _openExtensionPopup,
+          onClick: () => {
+            // Prefer the in-panel settings overlay — same surface the
+            // gear icon opens — because chrome.action.openPopup() can't
+            // be triggered reliably from a content script (requires
+            // a user gesture on the action icon itself in MV3).
+            try { _openSettingsOverlay(); } catch (_) {}
+            _openExtensionPopup();
+          },
         },
         {
           label: "Retry",
@@ -9461,7 +9470,10 @@
             {
               label: "Open settings",
               kind: "ghost",
-              onClick: _openExtensionPopup,
+              onClick: () => {
+                try { _openSettingsOverlay(); } catch (_) {}
+                _openExtensionPopup();
+              },
             },
             {
               label: "Retry",

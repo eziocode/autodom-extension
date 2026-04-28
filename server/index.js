@@ -3241,7 +3241,21 @@ function shouldUseCliBrowserAgent(text, context, conversationHistory) {
     /\b(?:register|sign\s*up|book|order|purchase|enroll)\b/.test(lower) ||
     isAutomationIntent(lower);
 
-  return multiStep;
+  if (multiStep) return true;
+
+  // Single-action browser intents (e.g. "open settings", "click Save",
+  // "navigate to leads", "scroll to bottom"). Routing these through
+  // vision-plan is dramatically faster than letting CLI bridges spin up
+  // their own agent loop (`--allow-all-tools` on copilot, full session
+  // for codex/claude). One snapshot + one planner call handles the
+  // common cases; the chatty loop still exists as a fallback if the
+  // planner returns no/invalid steps.
+  const singleAction =
+    /^(?:please\s+)?(?:open|click|tap|press|navigate|go\s+to|goto|visit|scroll|select|choose|pick|type|enter|fill|search\s+for|find|focus|close|dismiss|cancel|toggle|switch|check|uncheck|expand|collapse)\b/.test(
+      lower,
+    );
+
+  return singleAction;
 }
 
 function containsManualBrowserGuidance(text) {
@@ -4387,17 +4401,37 @@ async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta }) 
       }
       const stdout = Buffer.concat(stdoutChunks).toString("utf8").trim();
       const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
-      if (code !== 0 && !stdout) {
+
+      // Some CLIs (notably codex 0.125+) print a long human-readable
+      // banner to stderr — workdir, model, sandbox, the full user
+      // prompt, etc. — before the actual error message at the very
+      // end. Truncating from the HEAD hides the only useful part. Show
+      // the TAIL instead, so the operator sees the real failure line.
+      const stderrTail = (() => {
+        if (!stderr) return "";
+        const max = 1500;
+        if (stderr.length <= max) return stderr;
+        return "…" + stderr.slice(-max);
+      })();
+
+      // Try to salvage a final assistant message even if the CLI
+      // exited non-zero — codex sometimes completes the turn cleanly
+      // and then dies in its post-turn rollout writer (exit 1 with
+      // valid JSONL agent_message frames in stdout).
+      const extracted = stdout
+        ? extractCliFinalResponse(stdout)
+        : { text: "", model: "" };
+
+      if (code !== 0 && !extracted.text && !stdout) {
         finish(
           reject,
           new Error(
-            `CLI provider: '${binary}' exited with code ${code}.${stderr ? " stderr: " + stderr.substring(0, 500) : ""}`,
+            `CLI provider: '${binary}' exited with code ${code}.${stderrTail ? " stderr (tail): " + stderrTail : ""}`,
           ),
         );
         return;
       }
 
-      const extracted = extractCliFinalResponse(stdout);
       const parsedResponse = extracted.text;
       const actualModel = extracted.model || pickedModel || "";
 
