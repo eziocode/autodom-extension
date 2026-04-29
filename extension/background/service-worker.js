@@ -4124,13 +4124,13 @@ async function getActiveTab() {
 }
 
 // Inject and execute a function in the active tab's content script context
-async function executeInTab(tabId, func, args = []) {
+async function executeInTab(tabId, func, args = [], world = "MAIN") {
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId },
       func,
       args,
-      world: "MAIN", // access page's JS context
+      world,
     });
     if (results && results[0]) {
       if (results[0].error) {
@@ -6253,7 +6253,7 @@ async function toolExecuteCode(params) {
   const { code, timeout } = params;
   const timeoutMs = timeout || 15000;
 
-  return await executeInTab(
+  const result = await executeInTab(
     tab.id,
     (code, timeoutMs) => {
       return new Promise((resolve) => {
@@ -6297,12 +6297,73 @@ async function toolExecuteCode(params) {
           }
         } catch (err) {
           clearTimeout(timer);
-          resolve({ error: err.message || String(err) });
+          // Surface the error name so the caller can detect CSP eval blocks
+          // (e.g. EvalError on pages whose CSP forbids 'unsafe-eval').
+          resolve({
+            error: err.message || String(err),
+            errorName: err && err.name,
+          });
         }
       });
     },
     [code, timeoutMs],
+    "ISOLATED",
   );
+
+  // If the page's CSP blocked eval (no 'unsafe-eval' in script-src), fall
+  // back to executing via the Chrome DevTools Protocol, which runs outside
+  // the page's CSP. Requires the chrome.debugger API (not in Firefox).
+  if (
+    result &&
+    result.error &&
+    !IS_FIREFOX &&
+    isCspEvalError(result.error, result.errorName)
+  ) {
+    try {
+      return await executeCodeViaCdp(tab.id, code, timeoutMs);
+    } catch (cdpErr) {
+      return {
+        error: `${result.error} (CDP fallback failed: ${cdpErr.message || cdpErr})`,
+      };
+    }
+  }
+
+  // Strip the internal errorName before returning to the agent.
+  if (result && result.errorName) delete result.errorName;
+  return result;
+}
+
+function isCspEvalError(message, name) {
+  if (name === "EvalError") return true;
+  if (!message) return false;
+  const m = String(message);
+  return (
+    m.includes("unsafe-eval") ||
+    m.includes("Content Security Policy") ||
+    m.includes("CSP")
+  );
+}
+
+async function executeCodeViaCdp(tabId, code, timeoutMs) {
+  await ensureDebugger(tabId);
+  const expression = `(async () => { ${code} })()`;
+  const res = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+    expression,
+    awaitPromise: true,
+    returnByValue: true,
+    timeout: timeoutMs,
+    userGesture: true,
+  });
+  if (res && res.exceptionDetails) {
+    const ex = res.exceptionDetails;
+    const msg =
+      (ex.exception && (ex.exception.description || ex.exception.value)) ||
+      ex.text ||
+      "Code execution failed";
+    return { error: String(msg) };
+  }
+  const value = res && res.result ? res.result.value : undefined;
+  return { success: true, result: value };
 }
 
 async function toolRunBrowserScript(params) {
@@ -6385,6 +6446,7 @@ async function toolRunBrowserScript(params) {
       });
     },
     [source, scriptParams, timeoutMs],
+    "ISOLATED",
   );
 }
 

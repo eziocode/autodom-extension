@@ -2383,12 +2383,6 @@ function shouldPreferLocalBrowserHeuristic(lowerText) {
     lower.includes("page details") ||
     lower.includes("what page") ||
     lower.includes("where am i") ||
-    lower.includes("summarize") ||
-    lower.includes("summary") ||
-    lower === "tldr" ||
-    lower === "tl;dr" ||
-    lower.includes("what's on this page") ||
-    lower.includes("what is this page") ||
     lower.includes("accessibility") ||
     lower.includes("a11y") ||
     lower.startsWith("go to ") ||
