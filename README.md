@@ -15,6 +15,15 @@ scripts, or use MCP tools from an IDE to run local Playwright scripts. See
 
 ---
 
+## What's new in 2.2.3
+
+- **Settings tab polish.** The Scripts beta badge now stays inside its tab and
+  no longer overlaps the Security tab on narrow or embedded settings views.
+- **Cleaner chat composer control.** The expand/shrink affordance uses a
+  simpler single-corner icon so it reads less cluttered beside the send button.
+
+---
+
 ## What's new in 2.2.2
 
 - **Chrome-only, signed releases.** AutoDOM now ships exclusively for

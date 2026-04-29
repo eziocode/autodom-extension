@@ -3026,9 +3026,7 @@
       height: 100% !important;
       flex: 1 1 auto !important;
     }
-    /* Expand / shrink toggle — JetBrains AI-style two-way arrow chip
-       that sits next to the send button. Stays out of the way until
-       the user wants a real editor surface. */
+    /* Expand / shrink toggle that sits next to the send button. */
     .autodom-chat-expand-btn {
       width: 28px !important;
       height: 28px !important;
@@ -4765,12 +4763,10 @@
           aria-pressed="false"
         >
           <svg class="expand-icon" viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M14 4h6v6"/><path d="M10 20H4v-6"/>
-            <path d="M20 4l-7 7"/><path d="M4 20l7-7"/>
+            <path d="M14 5h5v5"/><path d="M19 5l-7 7"/>
           </svg>
           <svg class="shrink-icon" viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M20 10h-6V4"/><path d="M4 14h6v6"/>
-            <path d="M14 10l6-6"/><path d="M10 14l-6 6"/>
+            <path d="M10 19H5v-5"/><path d="M5 19l7-7"/>
           </svg>
         </button>
         <button class="autodom-chat-send-btn" id="__autodom_send_btn" title="Send (Enter) · Shift+Enter for newline" aria-label="Send message" disabled>

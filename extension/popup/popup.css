@@ -278,11 +278,17 @@ body {
     border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: 3px;
-    overflow: hidden;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+}
+
+.tab-bar::-webkit-scrollbar {
+    display: none;
 }
 
 .tab {
-    flex: 1 1 0;
+    flex: 1 0 max-content;
     min-width: 0;
     appearance: none;
     border: none;
@@ -295,6 +301,10 @@ body {
     font-weight: 500;
     color: var(--text-muted);
     cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
     white-space: nowrap;
     transition:
         color 0.15s ease,
@@ -1358,7 +1368,7 @@ body.embedded #aiChatBtn {
 /* ─── Beta badge / notice (Scripts tab) ──────────────────── */
 .tab-beta-badge {
     display: inline-block;
-    margin-left: 5px;
+    flex: 0 0 auto;
     padding: 1px 5px;
     font-size: 8.5px;
     font-weight: 700;
