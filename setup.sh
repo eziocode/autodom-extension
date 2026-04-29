@@ -25,20 +25,31 @@ SERVER_PATH="$SERVER_DIR/index.js"
 DEFAULT_PORT=9876
 TARGET_PORT=$DEFAULT_PORT
 SERVER_NAME="autodom"
+ENABLE_AUTO_UPDATE=""    # "yes" | "no" | "" (= prompt interactively)
+EXTENSION_ID_OVERRIDE=""
 
 usage() {
     cat <<EOF
 Usage: ./setup.sh [--name <server-name>] [--port <port>]
+                  [--enable-auto-update | --no-auto-update]
+                  [--extension-id <32-char-id>]
 
 Examples:
   ./setup.sh
   ./setup.sh --name autodom-firefox --port 9877
   ./setup.sh --name autodom-brave --port 9878
+  AUTODOM_EXTENSION_ID=abcdefghijklmnopabcdefghijklmnop \\
+      ./setup.sh --enable-auto-update
 
 Options:
-  --name, -n   MCP server name to add to IDE configs (default: autodom)
-  --port, -p   WebSocket port for this browser target (default: 9876)
-  --help, -h   Show this help
+  --name, -n             MCP server name to add to IDE configs (default: autodom)
+  --port, -p             WebSocket port for this browser target (default: 9876)
+  --enable-auto-update   Enroll this machine in Chromium auto-updates (will
+                         re-invoke itself with sudo to write the policy file).
+  --no-auto-update       Skip the auto-update prompt entirely.
+  --extension-id         32-char Chromium extension ID. Falls back to the
+                         AUTODOM_EXTENSION_ID env var.
+  --help, -h             Show this help
 EOF
 }
 
@@ -58,6 +69,22 @@ while [ $# -gt 0 ]; do
                 exit 1
             fi
             TARGET_PORT="$2"
+            shift 2
+            ;;
+        --enable-auto-update)
+            ENABLE_AUTO_UPDATE="yes"
+            shift 1
+            ;;
+        --no-auto-update)
+            ENABLE_AUTO_UPDATE="no"
+            shift 1
+            ;;
+        --extension-id)
+            if [ $# -lt 2 ]; then
+                echo -e "${RED}✗ Missing value for $1${NC}"
+                exit 1
+            fi
+            EXTENSION_ID_OVERRIDE="$2"
             shift 2
             ;;
         --help|-h)
@@ -513,6 +540,86 @@ configure_gemini
 if [ "$CONFIGURED_COUNT" -eq 0 ]; then
     echo -e "${YELLOW}  ⚠ No supported IDE detected. Configure manually — see INSTALL.md${NC}"
 fi
+
+# ─── Step 7 (optional): Enroll in Chromium auto-updates ───────
+# Browsers sandbox extensions from writing to /Library/Managed Preferences/
+# (macOS) or /etc/<browser>/policies/managed/ (Linux), so the extension
+# itself cannot opt the machine in to silent auto-updates. We do it here
+# in the setup script — with the user's explicit consent — by re-invoking
+# enterprise/install.sh through sudo. This is a one-time per machine cost
+# and mirrors what the enterprise docs describe in UPDATES.md.
+
+ENTERPRISE_SCRIPT="$SCRIPT_DIR/enterprise/install.sh"
+
+maybe_enroll_auto_update() {
+    if [ ! -x "$ENTERPRISE_SCRIPT" ] && [ ! -f "$ENTERPRISE_SCRIPT" ]; then
+        return
+    fi
+
+    case "$(uname -s)" in
+        Darwin|Linux) ;;
+        *)
+            echo -e "${YELLOW}  ⚠ Auto-update enrollment via setup.sh is supported on macOS/Linux only.${NC}"
+            echo -e "    Windows users: run ${CYAN}enterprise\\install.ps1${NC} from an elevated PowerShell."
+            return
+            ;;
+    esac
+
+    local ext_id="${EXTENSION_ID_OVERRIDE:-${AUTODOM_EXTENSION_ID:-}}"
+
+    local choice="$ENABLE_AUTO_UPDATE"
+    if [ -z "$choice" ]; then
+        # Only prompt when stdin is a TTY — avoids surprising users who
+        # pipe setup.sh through curl or run it from CI.
+        if [ ! -t 0 ]; then
+            return
+        fi
+        echo ""
+        echo -e "${BOLD}Enable silent Chromium auto-updates for AutoDOM?${NC}"
+        echo -e "  Writes a managed-policy file to ${CYAN}/Library/Managed Preferences/${NC} (macOS)"
+        echo -e "  or ${CYAN}/etc/<browser>/policies/managed/${NC} (Linux). Requires ${BOLD}sudo${NC}."
+        echo -e "  After enrollment, Chrome / Edge / Brave will pull new AutoDOM"
+        echo -e "  releases from the GitHub Pages update endpoint (~5h cadence)."
+        echo ""
+        read -r -p "  Enable auto-update now? [y/N] " reply || reply=""
+        case "$reply" in
+            y|Y|yes|YES) choice="yes" ;;
+            *) choice="no" ;;
+        esac
+    fi
+
+    if [ "$choice" != "yes" ]; then
+        echo -e "${YELLOW}  ⏭  Skipping auto-update enrollment. Re-run with ${CYAN}--enable-auto-update${YELLOW} later.${NC}"
+        return
+    fi
+
+    if [ -z "$ext_id" ]; then
+        if [ -t 0 ]; then
+            echo ""
+            echo -e "  Need the 32-char Chromium extension ID (lowercase a–p)."
+            echo -e "  Find it under ${CYAN}chrome://extensions${NC} → Developer mode → AutoDOM card,"
+            echo -e "  or in ${CYAN}docs/RELEASE-SIGNING.md${NC}."
+            read -r -p "  Extension ID: " ext_id || ext_id=""
+        fi
+    fi
+
+    if ! [[ "$ext_id" =~ ^[a-p]{32}$ ]]; then
+        echo -e "${RED}  ✗ Invalid / missing extension ID — must be 32 lowercase a–p chars.${NC}"
+        echo -e "    Re-run later with: ${CYAN}AUTODOM_EXTENSION_ID=<id> ./setup.sh --enable-auto-update${NC}"
+        return
+    fi
+
+    echo ""
+    echo -e "${BLUE}[7/7]${NC} Enrolling Chromium auto-update (sudo required)..."
+    if AUTODOM_EXTENSION_ID="$ext_id" sudo -E bash "$ENTERPRISE_SCRIPT"; then
+        echo -e "${GREEN}✓${NC} Auto-update policy installed. Restart Chrome / Edge / Brave to apply."
+    else
+        echo -e "${RED}✗ enterprise/install.sh failed — see output above.${NC}"
+        echo -e "    You can re-run it manually: ${CYAN}sudo AUTODOM_EXTENSION_ID=$ext_id $ENTERPRISE_SCRIPT${NC}"
+    fi
+}
+
+maybe_enroll_auto_update
 
 MCP_CONFIG="$(print_mcp_config_json "mcpServers" "standard")"
 

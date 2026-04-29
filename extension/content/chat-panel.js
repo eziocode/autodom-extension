@@ -213,6 +213,18 @@
 
     return `
       <div class="autodom-chat-welcome">
+        <div class="autodom-chat-update-banner" id="__autodom_update_banner" role="status" aria-live="polite" hidden>
+          <div class="autodom-chat-update-banner-left">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/>
+            </svg>
+            <div class="autodom-chat-update-banner-text">
+              <strong id="__autodom_update_banner_title">Update available</strong>
+              <small id="__autodom_update_banner_sub">A newer version of AutoDOM is ready to install.</small>
+            </div>
+          </div>
+          <button type="button" class="autodom-chat-update-banner-cta" id="__autodom_update_banner_cta">Update now</button>
+        </div>
         <h3>How can I help?</h3>
         <p class="welcome-sub">${subtitle}</p>
         <div class="welcome-section-label">Try something</div>
@@ -1536,6 +1548,92 @@
     /* Hide BETA + MCP badges — keep nodes for compatibility */
     .autodom-chat-beta-badge,
     .autodom-ai-badge { display: none !important; }
+
+    /* ─── Update available pill — appears in the chat header when a
+       newer extension version has been fetched and is waiting to be
+       applied. Driven by chrome.storage.local.pendingUpdate. */
+    .autodom-chat-update-pill {
+      display: inline-flex !important;
+      align-items: center !important;
+      gap: 5px !important;
+      padding: 3px 8px 3px 7px !important;
+      margin-left: 8px !important;
+      font-size: 11px !important;
+      font-weight: 600 !important;
+      letter-spacing: 0.01em !important;
+      color: #fff !important;
+      background: var(--c-accent) !important;
+      border: none !important;
+      border-radius: 999px !important;
+      cursor: pointer !important;
+      flex-shrink: 0 !important;
+      box-shadow: 0 0 0 1px var(--c-accent-soft) inset, 0 4px 10px var(--c-accent-soft);
+      transition: background-color 0.15s ease, transform 0.15s ease;
+      animation: __autodom_update_pulse 2.6s ease-in-out infinite;
+    }
+    .autodom-chat-update-pill[hidden] { display: none !important; }
+    .autodom-chat-update-pill:hover { background: var(--c-accent-2) !important; transform: translateY(-1px); }
+    .autodom-chat-update-pill:focus-visible {
+      outline: 2px solid var(--c-accent) !important;
+      outline-offset: 2px !important;
+    }
+    .autodom-chat-update-pill svg {
+      width: 12px !important;
+      height: 12px !important;
+      fill: none !important;
+      stroke: currentColor !important;
+      stroke-width: 2.4 !important;
+      stroke-linecap: round !important;
+      stroke-linejoin: round !important;
+    }
+    @keyframes __autodom_update_pulse {
+      0%, 100% { box-shadow: 0 0 0 1px var(--c-accent-soft) inset, 0 4px 10px var(--c-accent-soft); }
+      50%      { box-shadow: 0 0 0 1px var(--c-accent-soft) inset, 0 6px 18px var(--c-accent-soft); }
+    }
+    /* Inline banner that lives at the top of the welcome / homepage
+       view so the update CTA is impossible to miss when the side
+       panel first opens. */
+    .autodom-chat-update-banner {
+      display: flex !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+      gap: 10px !important;
+      margin: 10px 14px 0 14px !important;
+      padding: 10px 12px !important;
+      background: color-mix(in oklch, var(--c-accent) 14%, var(--c-surface)) !important;
+      border: 1px solid color-mix(in oklch, var(--c-accent) 35%, var(--c-border)) !important;
+      border-radius: var(--radius-md) !important;
+      color: var(--c-text) !important;
+      font-size: 12.5px !important;
+    }
+    .autodom-chat-update-banner[hidden] { display: none !important; }
+    .autodom-chat-update-banner-left {
+      display: flex !important; align-items: center !important; gap: 8px !important; min-width: 0;
+    }
+    .autodom-chat-update-banner-left svg {
+      width: 16px !important; height: 16px !important;
+      fill: none !important; stroke: var(--c-accent) !important;
+      stroke-width: 2 !important; stroke-linecap: round !important; stroke-linejoin: round !important;
+      flex-shrink: 0 !important;
+    }
+    .autodom-chat-update-banner-text { min-width: 0; }
+    .autodom-chat-update-banner-text strong { color: var(--c-text) !important; font-weight: 600 !important; }
+    .autodom-chat-update-banner-text small {
+      display: block; color: var(--c-text-2) !important; font-size: 11px !important; margin-top: 2px;
+    }
+    .autodom-chat-update-banner-cta {
+      flex-shrink: 0 !important;
+      font: inherit !important; font-size: 12px !important; font-weight: 600 !important;
+      padding: 5px 10px !important;
+      background: var(--c-accent) !important; color: #fff !important;
+      border: none !important; border-radius: var(--radius-sm) !important;
+      cursor: pointer !important;
+      transition: background-color 0.15s ease;
+    }
+    .autodom-chat-update-banner-cta:hover { background: var(--c-accent-2) !important; }
+    .autodom-chat-update-banner-cta:focus-visible {
+      outline: 2px solid #fff !important; outline-offset: 1px !important;
+    }
 
     /* ─── Inline Settings Overlay (hosts popup.html in an iframe) ─── */
     .autodom-chat-settings-overlay {
@@ -2888,6 +2986,17 @@
       box-sizing: border-box !important;
       max-width: 100% !important;
       width: 100% !important;
+      /* JetBrains-style dynamic growth: the textarea inside autosizes
+         freely up to --composer-max-px (set from JS based on the panel
+         height). When the user clicks the expand toggle, .is-expanded
+         is added and the shell takes over the full free height of the
+         input area so the editor feels like a real prompt editor. */
+      --composer-max-px: 280px;
+    }
+    .autodom-chat-input-shell.is-expanded {
+      flex: 1 1 100% !important;
+      align-self: stretch !important;
+      align-items: stretch !important;
     }
     .autodom-chat-input-shell:focus-within {
       border-color: var(--c-accent);
@@ -2898,7 +3007,7 @@
       flex: 1 1 auto !important;
       min-width: 0 !important;
       min-height: 36px !important;
-      max-height: 160px !important;
+      max-height: var(--composer-max-px, 280px) !important;
       padding: 9px 0 !important;
       background: transparent !important;
       border: none !important;
@@ -2910,6 +3019,57 @@
       resize: none !important;
       outline: none !important;
       box-shadow: none !important;
+      overflow-y: auto !important;
+    }
+    .autodom-chat-input-shell.is-expanded .autodom-chat-input {
+      max-height: none !important;
+      height: 100% !important;
+      flex: 1 1 auto !important;
+    }
+    /* Expand / shrink toggle — JetBrains AI-style two-way arrow chip
+       that sits next to the send button. Stays out of the way until
+       the user wants a real editor surface. */
+    .autodom-chat-expand-btn {
+      width: 28px !important;
+      height: 28px !important;
+      min-width: 28px !important;
+      border-radius: 8px !important;
+      background: transparent !important;
+      border: none !important;
+      cursor: pointer !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      color: var(--c-text-3) !important;
+      transition: background-color 0.15s ease, color 0.15s ease;
+      flex-shrink: 0 !important;
+      align-self: flex-end;
+      padding: 0 !important;
+    }
+    .autodom-chat-expand-btn:hover {
+      background: var(--c-raised) !important;
+      color: var(--c-text) !important;
+    }
+    .autodom-chat-expand-btn:focus-visible {
+      outline: 2px solid var(--c-accent) !important;
+      outline-offset: 2px !important;
+    }
+    .autodom-chat-expand-btn svg {
+      width: 14px !important;
+      height: 14px !important;
+      fill: none !important;
+      stroke: currentColor !important;
+      stroke-width: 2 !important;
+      stroke-linecap: round !important;
+      stroke-linejoin: round !important;
+    }
+    .autodom-chat-input-shell.is-expanded .autodom-chat-expand-btn .expand-icon { display: none !important; }
+    .autodom-chat-input-shell:not(.is-expanded) .autodom-chat-expand-btn .shrink-icon { display: none !important; }
+    /* When the composer is expanded, the surrounding input area becomes
+       a flex column so the shell can take the full available height. */
+    .autodom-chat-input-area.is-composer-expanded {
+      flex: 1 1 auto !important;
+      min-height: 60% !important;
     }
     .autodom-chat-input::placeholder {
       color: var(--c-text-3) !important;
@@ -4490,6 +4650,19 @@
           MCP AI
         </span>
         <span class="autodom-chat-beta-badge" aria-label="Beta" hidden>BETA</span>
+        <button
+          class="autodom-chat-update-pill"
+          id="__autodom_update_pill"
+          type="button"
+          title="Apply pending update"
+          aria-label="Apply pending update"
+          hidden
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/>
+          </svg>
+          <span id="__autodom_update_pill_text">Update</span>
+        </button>
       </div>
       <div class="autodom-chat-header-actions">
         <button class="autodom-chat-header-btn" id="__autodom_collapse_btn" title="Collapse panel (Ctrl/⌘+Alt+\\)" aria-label="Collapse chat panel" aria-controls="${PANEL_ID}">
@@ -4583,6 +4756,23 @@
           rows="1"
           aria-label="Chat message input"
         ></textarea>
+        <button
+          class="autodom-chat-expand-btn"
+          id="__autodom_expand_btn"
+          type="button"
+          title="Expand editor (Ctrl/⌘+Shift+E)"
+          aria-label="Expand chat editor"
+          aria-pressed="false"
+        >
+          <svg class="expand-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M14 4h6v6"/><path d="M10 20H4v-6"/>
+            <path d="M20 4l-7 7"/><path d="M4 20l7-7"/>
+          </svg>
+          <svg class="shrink-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M20 10h-6V4"/><path d="M4 14h6v6"/>
+            <path d="M14 10l6-6"/><path d="M10 14l-6 6"/>
+          </svg>
+        </button>
         <button class="autodom-chat-send-btn" id="__autodom_send_btn" title="Send (Enter) · Shift+Enter for newline" aria-label="Send message" disabled>
           <svg class="send-icon" viewBox="0 0 24 24" aria-hidden="true"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
           <span class="stop-icon" aria-hidden="true"></span>
@@ -9787,10 +9977,181 @@
   }
 
   // ─── Input Handling ────────────────────────────────────────
-  function autoResizeInput() {
-    chatInput.style.height = "auto";
-    chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + "px";
+  // JetBrains-style autosize: the textarea grows with content up to
+  // a dynamic ceiling derived from the visible panel height (so the
+  // composer never eats the whole conversation). When the user clicks
+  // the expand toggle, the shell switches to .is-expanded and the
+  // textarea fills the remaining vertical space instead.
+  const inputShellEl = panel.querySelector(".autodom-chat-input-shell");
+  const inputAreaEl = panel.querySelector(".autodom-chat-input-area");
+  function _composerMaxPx() {
+    try {
+      const panelH = panel.getBoundingClientRect().height || 600;
+      // Cap auto-grow at ~45% of the panel height, with a sensible
+      // floor for very short windows so the textarea always shows at
+      // least a few lines before scrolling kicks in.
+      return Math.max(140, Math.floor(panelH * 0.45));
+    } catch (_) {
+      return 280;
+    }
   }
+  function autoResizeInput() {
+    if (!chatInput) return;
+    if (inputShellEl && inputShellEl.classList.contains("is-expanded")) {
+      // In expanded mode the shell controls the height — let the
+      // textarea fill its parent rather than driving height from
+      // scrollHeight. We still clear the inline height so the rule
+      // height: 100% from CSS takes over cleanly.
+      chatInput.style.height = "";
+      return;
+    }
+    const max = _composerMaxPx();
+    if (inputShellEl) {
+      inputShellEl.style.setProperty("--composer-max-px", max + "px");
+    }
+    chatInput.style.height = "auto";
+    chatInput.style.height = Math.min(chatInput.scrollHeight, max) + "px";
+  }
+
+  // Keep the autosize ceiling honest when the side panel / window
+  // resizes (Chromium side panel snaps to a few widths; the user can
+  // also drag-resize the in-page panel).
+  try {
+    if (typeof ResizeObserver !== "undefined") {
+      const _ro = new ResizeObserver(() => { try { autoResizeInput(); } catch (_) {} });
+      _ro.observe(panel);
+    } else {
+      window.addEventListener("resize", () => { try { autoResizeInput(); } catch (_) {} });
+    }
+  } catch (_) {}
+
+  // Expand / shrink toggle. Mirrors the JetBrains AI editor's
+  // two-state behaviour: a compact pill that grows with content, and a
+  // full-height editor surface for longer prompts. Persisted across
+  // sessions so a user who prefers the big editor doesn't have to
+  // re-toggle on every open.
+  const expandBtn = document.getElementById("__autodom_expand_btn");
+  function _setComposerExpanded(expanded) {
+    if (!inputShellEl || !inputAreaEl) return;
+    inputShellEl.classList.toggle("is-expanded", !!expanded);
+    inputAreaEl.classList.toggle("is-composer-expanded", !!expanded);
+    if (expandBtn) {
+      expandBtn.setAttribute("aria-pressed", expanded ? "true" : "false");
+      expandBtn.title = expanded
+        ? "Shrink editor (Ctrl/⌘+Shift+E)"
+        : "Expand editor (Ctrl/⌘+Shift+E)";
+      expandBtn.setAttribute(
+        "aria-label",
+        expanded ? "Shrink chat editor" : "Expand chat editor",
+      );
+    }
+    autoResizeInput();
+    try { chatInput && chatInput.focus(); } catch (_) {}
+  }
+  function _toggleComposerExpanded() {
+    if (!inputShellEl) return;
+    const next = !inputShellEl.classList.contains("is-expanded");
+    _setComposerExpanded(next);
+    try {
+      chrome.storage.local.set({ chatComposerExpanded: next });
+    } catch (_) {}
+  }
+  if (expandBtn && !expandBtn.dataset.bound) {
+    expandBtn.dataset.bound = "1";
+    expandBtn.addEventListener("click", _toggleComposerExpanded);
+  }
+  // Restore last known expand state.
+  try {
+    chrome.storage.local.get(["chatComposerExpanded"], (s) => {
+      if (s && s.chatComposerExpanded === true) _setComposerExpanded(true);
+    });
+  } catch (_) {}
+  // Keyboard shortcut: Ctrl/⌘+Shift+E toggles the editor expansion
+  // while focus is anywhere in the chat panel — matches the JetBrains
+  // AI chat shortcut philosophy.
+  panel.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "E" || e.key === "e")) {
+      e.preventDefault();
+      _toggleComposerExpanded();
+    }
+  });
+
+  // ─── Pending-update indicator ──────────────────────────────
+  // Subscribe to chrome.storage.local.pendingUpdate (written by the
+  // service worker when chrome.runtime.onUpdateAvailable fires, or by
+  // the popup after a manual update check). When set, we surface two
+  // affordances: a pulsing pill in the header (always visible) and a
+  // banner inside the welcome view (only on the homepage). Clicking
+  // either applies the queued CRX via chrome.runtime.reload() in the
+  // background.
+  function _applyPendingUpdate() {
+    try {
+      chrome.runtime.sendMessage({ type: "AUTODOM_APPLY_UPDATE" }, () => {});
+    } catch (_) {
+      try { chrome.runtime.reload(); } catch (__) {}
+    }
+  }
+  function _syncUpdateUI(pending) {
+    const pill = document.getElementById("__autodom_update_pill");
+    const pillText = document.getElementById("__autodom_update_pill_text");
+    const banner = document.getElementById("__autodom_update_banner");
+    const bannerTitle = document.getElementById("__autodom_update_banner_title");
+    const bannerSub = document.getElementById("__autodom_update_banner_sub");
+    const bannerCta = document.getElementById("__autodom_update_banner_cta");
+    const hasUpdate = !!(pending && pending.version);
+    const v = hasUpdate ? pending.version : null;
+    if (pill) {
+      pill.hidden = !hasUpdate;
+      if (pillText) pillText.textContent = hasUpdate ? `Update → v${v}` : "Update";
+      if (hasUpdate) {
+        pill.title = `Apply update to v${v}`;
+        pill.setAttribute("aria-label", `Apply pending update to v${v}`);
+        if (!pill.dataset.bound) {
+          pill.dataset.bound = "1";
+          pill.addEventListener("click", _applyPendingUpdate);
+        }
+      }
+    }
+    if (banner) {
+      banner.hidden = !hasUpdate;
+      if (hasUpdate) {
+        if (bannerTitle) bannerTitle.textContent = `Update to v${v} ready`;
+        if (bannerSub) {
+          bannerSub.textContent =
+            "AutoDOM downloaded a newer version. Apply it now to restart the extension and pick up the latest features.";
+        }
+        if (bannerCta && !bannerCta.dataset.bound) {
+          bannerCta.dataset.bound = "1";
+          bannerCta.addEventListener("click", _applyPendingUpdate);
+        }
+      }
+    }
+  }
+  try {
+    chrome.storage.local.get(["pendingUpdate"], (s) => {
+      _syncUpdateUI(s && s.pendingUpdate);
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local" || !changes.pendingUpdate) return;
+      _syncUpdateUI(changes.pendingUpdate.newValue);
+    });
+  } catch (_) {}
+  // Re-sync after the welcome view is re-rendered (e.g. "New chat"
+  // button) — the banner DOM gets recreated each time so we have to
+  // re-bind the CTA.
+  try {
+    const _msgsEl = document.getElementById("__autodom_messages");
+    if (_msgsEl && typeof MutationObserver !== "undefined") {
+      const _mo = new MutationObserver(() => {
+        try {
+          chrome.storage.local.get(["pendingUpdate"], (s) => {
+            _syncUpdateUI(s && s.pendingUpdate);
+          });
+        } catch (_) {}
+      });
+      _mo.observe(_msgsEl, { childList: true });
+    }
+  } catch (_) {}
 
   chatInput.addEventListener("input", autoResizeInput);
   chatInput.addEventListener("input", () => {
