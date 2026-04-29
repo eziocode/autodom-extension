@@ -997,6 +997,13 @@
     if (!_chatSettings.persistAcrossSessions) return;
     if (_blockLongLivedRestore) return;
     if (messages && messages.length > 0) return;
+    // If sessionStorage already has the messages key (set by a prior content
+    // script in this tab — including after a clear that wrote "[]"), treat
+    // sessionStorage as authoritative and skip long-lived restore. This
+    // prevents stale long-lived data from re-appearing after a clear or after
+    // an extension reload from chrome://extensions. Long-lived restore is
+    // only appropriate for a genuinely fresh tab where no prior script ran.
+    if (sessionStorage.getItem(STORAGE_KEY_MESSAGES) !== null) return;
     const restoreGeneration = _chatClearGeneration;
     try {
       chrome.storage?.local?.get?.(
