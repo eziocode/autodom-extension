@@ -1020,6 +1020,7 @@ function _agentSystemPrompt(context, providerInfo, cacheKey, opts) {
     base +
     "\nAgent mode:\n" +
     "- Plan briefly, then call tools (get_dom_state, batch_actions, click_by_index, type_by_index, navigate, list_tabs, switch_tab, wait_for_popup) to read AND act on the page yourself.\n" +
+    "- For content inside iframes (including cross-origin) or web components: use list_iframes + iframe_interact (action='extract_text' to read), list_shadow_roots + shadow_interact, or deep_query. The extension pierces cross-origin iframes via the scripting API — never tell the user the iframe is unreachable; try these tools first.\n" +
     "- Prefer batch_actions when you already know 2+ browser steps (click/type/wait/scroll). One batched call is much faster than one model round-trip per action.\n" +
     "- Don't tell the user to inspect the page — do it. Only ask follow-ups if a destructive action is ambiguous or info is genuinely missing.\n" +
     "- Don't repeat a failing tool call; change selector or approach. STOP calling tools once you have the answer (or call respond_to_user).\n" +

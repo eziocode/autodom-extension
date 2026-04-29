@@ -417,6 +417,110 @@
       danger: "write",
     },
 
+    // ── iframes ──
+    // Cross-origin iframes (e.g. mail.zoho.in inside workplace.zoho.in) are
+    // unreachable from page-world JS, but the extension can pierce them via
+    // chrome.scripting.executeScript with a frameId thanks to <all_urls>
+    // host permission. Expose these to the chat agent so it stops claiming
+    // "I can't read cross-origin iframes" — it can.
+    {
+      name: "list_iframes",
+      description:
+        "List every iframe on the active tab (including cross-origin) with its frameId, src, size, and visibility. " +
+        "Use this BEFORE saying an iframe is unreachable — the extension can pierce cross-origin iframes via frameId.",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+    },
+    {
+      name: "iframe_interact",
+      description:
+        "Execute an action inside a specific iframe (works across origins). " +
+        "Actions: 'extract_text' (read body/selector text — use this to summarize content in cross-origin iframes), " +
+        "'query', 'click', 'type', 'fill_form', 'get_dom_state'. " +
+        "Resolve the target with frameId from list_iframes (preferred) or iframeSelector.",
+      parameters: {
+        type: "object",
+        properties: {
+          frameId: { type: "integer", description: "frameId from list_iframes (preferred)" },
+          iframeSelector: { type: "string", description: "CSS selector for the <iframe> element on the parent page (fallback)" },
+          action: {
+            type: "string",
+            enum: ["extract_text", "query", "click", "type", "fill_form", "get_dom_state"],
+          },
+          selector: { type: "string", description: "CSS selector inside the iframe" },
+          text: { type: "string", description: "Text to match (for click)" },
+          value: { type: "string", description: "Value to type" },
+          fields: {
+            type: "array",
+            description: "For fill_form: array of { selector, value }",
+            items: { type: "object" },
+          },
+          clearFirst: { type: "boolean" },
+        },
+        required: ["action"],
+      },
+      danger: "write",
+    },
+
+    // ── Shadow DOM ──
+    {
+      name: "list_shadow_roots",
+      description:
+        "Enumerate open shadow roots on the page (host tag, id, child counts, suggested piercing path). " +
+        "Use before shadow_interact to discover hosts inside web components.",
+      parameters: {
+        type: "object",
+        properties: {
+          maxDepth: { type: "integer", description: "How deep to recurse (default 5)" },
+        },
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "shadow_interact",
+      description:
+        "Interact with elements inside open shadow DOMs using a piercing selector " +
+        "('host >>> inner' or nested 'host1 >>> host2 >>> target'). " +
+        "Actions: 'query' (default), 'click', 'type', 'extract_text', 'query_all', 'fill_form', 'get_dom_state'. " +
+        "Closed shadow roots are not accessible — fall back to deep_query if this fails.",
+      parameters: {
+        type: "object",
+        properties: {
+          piercingSelector: {
+            type: "string",
+            description: "e.g. 'my-component >>> .inner-button'",
+          },
+          action: {
+            type: "string",
+            enum: ["query", "click", "type", "extract_text", "query_all", "fill_form", "get_dom_state"],
+          },
+          value: { type: "string" },
+          clearFirst: { type: "boolean" },
+          fields: {
+            type: "array",
+            description: "For fill_form: array of { selector, value } resolved inside the deepest shadow root",
+            items: { type: "object" },
+          },
+        },
+        required: ["piercingSelector"],
+      },
+      danger: "write",
+    },
+    {
+      name: "deep_query",
+      description:
+        "One-shot search across the main document, every iframe (including cross-origin), and every open shadow root. " +
+        "Use when you don't know whether the target lives in the main DOM, an iframe, or a shadow root. " +
+        "Provide either a CSS selector or text to match.",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: { type: "string", description: "CSS selector to match" },
+          text: { type: "string", description: "Text substring to match" },
+          limit: { type: "integer", description: "Max results (default 30)" },
+        },
+      },
+    },
+
     // ── Final answer ──
     {
       name: "respond_to_user",
