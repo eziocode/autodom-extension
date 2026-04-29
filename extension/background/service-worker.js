@@ -360,25 +360,9 @@ async function _fetchProviderModels(p) {
     }
 
     if (source === "ide" || source === "cli") {
-      if (cliKind === "copilot") {
-        return [
-          { id: "gpt-5",             label: "GPT-5",             description: "GitHub Copilot" },
-          { id: "claude-sonnet-4.5", label: "Claude Sonnet 4.5", description: "GitHub Copilot" },
-        ];
-      }
-      if (cliKind === "claude") {
-        return [
-          { id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6", description: "Claude Code CLI" },
-          { id: "claude-opus-4-7",           label: "Claude Opus 4.7",   description: "Claude Code CLI" },
-          { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5",  description: "Claude Code CLI" },
-        ];
-      }
-      if (cliKind === "codex") {
-        return [
-          { id: "gpt-5",   label: "GPT-5",   description: "Codex CLI" },
-          { id: "o4-mini", label: "o4-mini", description: "Codex CLI" },
-        ];
-      }
+      // CLI providers: don't hardcode a list. The locally-installed CLI
+      // owns the model choice (via its own login/config). Returning []
+      // makes the server omit --model so the CLI uses its default.
       return [];
     }
 
@@ -5949,6 +5933,30 @@ chrome.storage.local.get(
       enabled: result.aiProviderEnabled === true,
       preset: result.aiProviderPreset || "custom",
     };
+
+    // One-shot migration (mirrors popup.js): older builds auto-filled a
+    // hardcoded model for CLI providers. We no longer hardcode — let the
+    // CLI use its own configured default. Drop legacy values so we omit
+    // --model at runtime.
+    const _LEGACY_CLI_MODELS = new Set([
+      "gpt-5",
+      "gpt-5-codex",
+      "claude-sonnet-4-6",
+      "claude-haiku-4-5-20251001",
+      "claude-opus-4-7",
+      "claude-sonnet-4.5",
+      "o4-mini",
+    ]);
+    if (
+      (aiProviderSettings.source === "cli" ||
+        aiProviderSettings.source === "ide") &&
+      _LEGACY_CLI_MODELS.has(aiProviderSettings.model)
+    ) {
+      aiProviderSettings.model = "";
+      try {
+        chrome.storage.local.set({ aiProviderModel: "" });
+      } catch (_) {}
+    }
 
     _debugLog(
       "[AutoDOM SW] Startup: loaded provider settings (apiKey from " +

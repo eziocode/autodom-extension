@@ -291,19 +291,12 @@
       { id: "claude-sonnet-4-6",         label: "Claude Sonnet 4.6", description: "Balanced" },
       { id: "claude-opus-4-7",           label: "Claude Opus 4.7",   description: "Most capable" },
     ],
-    "ide:copilot": [
-      { id: "gpt-5",              label: "GPT-5",             description: "GitHub Copilot" },
-      { id: "claude-sonnet-4.5",  label: "Claude Sonnet 4.5", description: "GitHub Copilot" },
-    ],
-    "ide:claude": [
-      { id: "claude-sonnet-4-6",          label: "Claude Sonnet 4.6", description: "Claude Code CLI" },
-      { id: "claude-opus-4-7",            label: "Claude Opus 4.7",   description: "Claude Code CLI" },
-      { id: "claude-haiku-4-5-20251001",  label: "Claude Haiku 4.5",  description: "Claude Code CLI" },
-    ],
-    "ide:codex": [
-      { id: "gpt-5",    label: "GPT-5",   description: "Codex CLI" },
-      { id: "o4-mini",  label: "o4-mini", description: "Codex CLI" },
-    ],
+    // CLI providers: no hardcoded model list. Whatever the locally-installed
+    // CLI is configured to use (its own default / login) is what we want —
+    // the server passes no --model flag when this is empty.
+    "ide:copilot": [],
+    "ide:claude": [],
+    "ide:codex": [],
     "ide:custom": [],
   };
 
@@ -5957,12 +5950,17 @@
       const empty = document.createElement("div");
       empty.className = "autodom-model-item";
       empty.style.color = "var(--c-text-3)";
+      const isCli =
+        _modelPickerState.providerSource === "ide" ||
+        _modelPickerState.providerSource === "cli";
       empty.textContent =
         _modelFetchState[key] === "loading"
           ? "Loading models…"
           : _modelFetchState[key] === "error"
             ? "Could not fetch models for this provider."
-            : "No models configured for this provider.";
+            : isCli
+              ? "Using the CLI's configured default model."
+              : "No models configured for this provider.";
       _modelPickerMenu.appendChild(empty);
       return;
     }

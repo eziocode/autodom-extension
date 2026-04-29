@@ -256,6 +256,30 @@ const _secretAreaName =
     preset: stored.aiProviderPreset || "custom",
   };
 
+  // One-shot migration: older builds auto-filled a hardcoded model
+  // (e.g. "gpt-5") for CLI providers. We no longer hardcode — let the
+  // CLI use its own configured default. Clear stored values that match
+  // those legacy defaults so the field shows blank and `--model` is
+  // omitted at runtime. Users who deliberately picked a different model
+  // are left untouched.
+  const _LEGACY_CLI_MODELS = new Set([
+    "gpt-5",
+    "gpt-5-codex",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+    "claude-opus-4-7",
+    "claude-sonnet-4.5",
+    "o4-mini",
+  ]);
+  const _isCliSource =
+    providerSettings.source === "cli" || providerSettings.source === "ide";
+  if (_isCliSource && _LEGACY_CLI_MODELS.has(providerSettings.model)) {
+    providerSettings.model = "";
+    try {
+      chrome.storage.local.set({ aiProviderModel: "" });
+    } catch (_) {}
+  }
+
   DOM.portInput.value = port;
   DOM.autoConnectToggle.checked = autoConnect;
   if (DOM.providerSelect) DOM.providerSelect.value = providerSettings.source;
@@ -1642,7 +1666,7 @@ function _modelLooksCompatibleWithProvider(model, source, baseUrl, cliKind = "")
   }
   if (s === "cli") {
     if (cli === "claude") return d.startsWith("claude");
-    if (cli === "codex") return /^(gpt|o\d)/.test(d);
+    if (cli === "codex") return /^(gpt|o\d)/.test(d) || d === "codex-mini-latest";
     if (cli === "copilot") return /^(gpt|claude)/.test(d);
     return false;
   }
@@ -1656,13 +1680,11 @@ function _defaultModelForProvider(source, baseUrl, cliKind = "") {
   const cli = (cliKind || "").toLowerCase();
   if (s === "anthropic") return "claude-3-7-sonnet-latest";
   if (s === "ollama") return "llama3.2";
-  if (s === "cli") {
-    if (cli === "claude") return "claude-sonnet-4-6";
-    if (cli === "codex") return "gpt-5";
-    if (cli === "copilot") return "gpt-5";
+  if (s === "cli" || s === "ide") {
+    // Don't hardcode a model for CLI providers — let the locally-installed
+    // CLI use whatever it's configured with (its own default / login).
     return "";
   }
-  if (s === "ide") return "";
   if (s !== "openai") return "";
   if (/deepseek/.test(base)) return "deepseek-chat";
   if (/bigmodel|zhipu/.test(base)) return "glm-4-plus";
@@ -1723,14 +1745,22 @@ function updateProviderUI(statusOverride) {
     const cliKind = DOM.providerCliKind?.value || providerSettings.cliKind || "";
     const currentModel = (DOM.providerModel.value || providerSettings.model || "").trim();
     const fallbackModel = _defaultModelForProvider(source, baseUrl, cliKind);
-    const nextModel =
-      !currentModel
-          ? fallbackModel
-          : _modelLooksCompatibleWithProvider(currentModel, source, baseUrl, cliKind)
-            ? currentModel
-            : fallbackModel;
+    const isCliLike = source === "cli" || source === "ide";
+    // For CLI providers we never auto-fill a model — the locally-installed
+    // CLI owns that choice. The field is only respected when the user
+    // explicitly types something to override.
+    const nextModel = isCliLike
+      ? currentModel
+      : !currentModel
+        ? fallbackModel
+        : _modelLooksCompatibleWithProvider(currentModel, source, baseUrl, cliKind)
+          ? currentModel
+          : fallbackModel;
     if (DOM.providerModel.value !== nextModel) {
       DOM.providerModel.value = nextModel;
+    }
+    if (isCliLike) {
+      DOM.providerModel.placeholder = "Leave blank to use the CLI's configured default";
     }
     providerSettings.model = nextModel;
   }
