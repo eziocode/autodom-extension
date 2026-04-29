@@ -2185,7 +2185,10 @@ function initToolLogsTab() {
 
   const clearBtn = $("#clearToolLogsBtn");
   if (clearBtn) {
-    clearBtn.addEventListener("click", () => {
+    clearBtn.addEventListener("click", async () => {
+      try {
+        await sendRuntimeMessage({ type: "CLEAR_TOOL_LOGS" });
+      } catch (_) {}
       _toolLogs = { extensionLogs: [], serverLogs: [], logFile: _toolLogs.logFile };
       renderToolLogs();
     });

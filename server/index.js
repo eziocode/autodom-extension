@@ -2010,6 +2010,20 @@ function _processWsMessage(socket, message) {
     return;
   }
 
+  if (message.type === "CLEAR_TOOL_LOGS") {
+    _toolErrorBuf.length = 0;
+    fs.writeFile(TOOL_ERROR_LOG_PATH, "").catch(() => {});
+    try {
+      socket.send(
+        JSON.stringify({
+          type: "TOOL_LOGS_CLEARED",
+          logFile: TOOL_ERROR_LOG_PATH,
+        }),
+      );
+    } catch (_) {}
+    return;
+  }
+
   if (message.type === "RUN_AUTOMATION_SCRIPT" && message.id != null) {
     (async () => {
       let result;

@@ -3371,6 +3371,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "CLEAR_TOOL_LOGS") {
+    _swToolErrorLog.length = 0;
+    let logFile = null;
+    if (isConnected && ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(JSON.stringify({ type: "CLEAR_TOOL_LOGS" }));
+      } catch (_) {}
+    }
+    sendResponse({ ok: true, logFile });
+    return false;
+  }
+
   if (message.type === "CHAT_TOOL_CALL") {
     const { tool, params, requestId } = message;
     _debugLog(
