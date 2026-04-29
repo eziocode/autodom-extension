@@ -60,5 +60,5 @@ jobs:
         working-directory: server
         run: node test/e2e.cjs
 
-      - name: web-ext lint (Chrome manifest)
-        run: npx --yes web-ext@8 lint --source-dir=extension --self-hosted
+      - name: Build Chrome zip
+        run: bash scripts/build-chrome.sh
