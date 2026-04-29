@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AutoDOM",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Local MCP server for AI-driven browser automation. Connect your IDE agent to control the browser. Includes an inline AI chat panel powered by MCP.",
   "browser_specific_settings": {
     "gecko": {
@@ -9,7 +9,9 @@
       "strict_min_version": "140.0",
       "update_url": "https://eziocode.github.io/autodom-extension/updates.json",
       "data_collection_permissions": {
-        "required": ["none"]
+        "required": [
+          "none"
+        ]
       }
     },
     "gecko_android": {
@@ -24,9 +26,15 @@
     "cookies",
     "clipboardWrite"
   ],
-  "host_permissions": ["<all_urls>"],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "background": {
-    "scripts": ["background/providers.js", "background/agent-tools.js", "background/service-worker.js"]
+    "scripts": [
+      "background/providers.js",
+      "background/agent-tools.js",
+      "background/service-worker.js"
+    ]
   },
   "action": {
     "default_popup": "popup/popup.html",
@@ -59,15 +67,24 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["common/webext-api.js", "content/session-border.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "common/webext-api.js",
+        "content/session-border.js"
+      ],
       "run_at": "document_idle"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["icons/*"],
-      "matches": ["<all_urls>"]
+      "resources": [
+        "icons/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ]
 }

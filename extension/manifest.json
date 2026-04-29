@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AutoDOM",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Local MCP server for AI-driven browser automation. Connect your IDE agent to control the browser. Includes an inline AI chat panel powered by MCP.",
   "update_url": "https://eziocode.github.io/autodom-extension/updates.xml",
   "permissions": [
@@ -15,7 +15,9 @@
     "webNavigation",
     "sidePanel"
   ],
-  "host_permissions": ["<all_urls>"],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "background": {
     "service_worker": "background/service-worker.js"
   },
@@ -25,7 +27,7 @@
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     },
-    "default_title": "AutoDOM \u2014 open chat side panel"
+    "default_title": "AutoDOM — open chat side panel"
   },
   "side_panel": {
     "default_path": "sidepanel/index.html"
@@ -53,15 +55,26 @@
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
-      "js": ["common/webext-api.js", "content/session-border.js"],
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "common/webext-api.js",
+        "content/session-border.js"
+      ],
       "run_at": "document_idle"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["icons/*", "popup/*", "sidepanel/*"],
-      "matches": ["<all_urls>"]
+      "resources": [
+        "icons/*",
+        "popup/*",
+        "sidepanel/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ]
 }
