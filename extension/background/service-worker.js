@@ -2217,6 +2217,71 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // accident. The chat panel's overlay re-appears on the new page via
 // PANEL_LOADED_RESET_RUN -> _applyAgentRunState(resp).
 
+// ─── Port-Mismatch Guardrail ─────────────────────────────────
+// The extension's saved port (chrome.storage.local.mcpPort) can drift
+// from the port the IDE-launched bridge actually binds to. When that
+// happens every WebSocket attempt fails with ERR_CONNECTION_REFUSED
+// and the user only sees the generic "Disconnected" status — no hint
+// that the real bridge is alive on a neighbouring port. This probe
+// scans a small range, and if it finds a live bridge on a different
+// port surfaces a precise actionable status. Throttled so failed
+// reconnect storms don't open many parallel probe sockets.
+const PORT_PROBE_RANGE = [9876, 9877, 9878, 9879, 9880];
+const PORT_PROBE_THROTTLE_MS = 30000;
+const PORT_PROBE_TIMEOUT_MS = 1500;
+let _lastPortProbeAt = 0;
+let _portProbeInFlight = false;
+
+async function probeBridgePortMismatch(configuredPort) {
+  if (_portProbeInFlight) return;
+  const now = Date.now();
+  if (now - _lastPortProbeAt < PORT_PROBE_THROTTLE_MS) return;
+  _portProbeInFlight = true;
+  _lastPortProbeAt = now;
+  try {
+    const candidates = PORT_PROBE_RANGE.filter((p) => p !== configuredPort);
+    for (const port of candidates) {
+      const found = await new Promise((resolve) => {
+        let settled = false;
+        let probe;
+        const done = (ok) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          try {
+            probe && probe.close();
+          } catch (_) {}
+          resolve(ok);
+        };
+        const timer = setTimeout(() => done(false), PORT_PROBE_TIMEOUT_MS);
+        try {
+          probe = new WebSocket(`ws://127.0.0.1:${port}`);
+        } catch (_) {
+          done(false);
+          return;
+        }
+        probe.onopen = () => done(true);
+        probe.onerror = () => done(false);
+        probe.onclose = () => done(false);
+      });
+      if (found) {
+        chrome.storage.local.set({ mcpDetectedPort: port });
+        broadcastStatus(
+          false,
+          `Port mismatch: extension is set to ${configuredPort}, but the AutoDOM bridge is listening on ${port}. Open the popup and update the port.`,
+          "warn",
+        );
+        return;
+      }
+    }
+    // Nothing answered in the probe range — clear any stale hint so the
+    // popup doesn't keep recommending a port that's no longer alive.
+    chrome.storage.local.remove("mcpDetectedPort");
+  } finally {
+    _portProbeInFlight = false;
+  }
+}
+
 // ─── WebSocket Management ────────────────────────────────────
 
 function connectWebSocket(port) {
@@ -2240,6 +2305,9 @@ function connectWebSocket(port) {
         serverPort: lastConnectedPort,
         mcpLastConnectedPort: lastConnectedPort,
       });
+      // We're connected — clear any stale port-mismatch hint so the
+      // popup banner disappears.
+      chrome.storage.local.remove("mcpDetectedPort");
       stopAutoConnect();
       // Send KEEPALIVE immediately so the bridge recognises us as the
       // Chrome extension right away, instead of waiting 20 s for the
@@ -2590,6 +2658,11 @@ function connectWebSocket(port) {
           startAutoConnect(lastConnectedPort, { initialDelayMs: 5000 });
         }
       }
+      // Port-mismatch guardrail: when the configured port is unreachable,
+      // probe nearby ports for a live bridge so the user gets a precise
+      // status ("extension is set to X, bridge is on Y") instead of a
+      // generic "connection refused" loop. Throttled internally.
+      probeBridgePortMismatch(getCurrentPort());
     };
   } catch (err) {
     _debugWarn("[AutoDOM] Failed to connect:", err.message || err);

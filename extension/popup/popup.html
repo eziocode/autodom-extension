@@ -76,6 +76,29 @@
                             </label>
                         </div>
                         <p class="field-hint">Default WebSocket port: 9876</p>
+                        <div
+                            id="portMismatchHint"
+                            class="field-hint"
+                            style="
+                                display: none;
+                                margin-top: 6px;
+                                padding: 6px 8px;
+                                border-radius: 4px;
+                                background: #fff4e5;
+                                color: #8a4a00;
+                                border: 1px solid #f0c789;
+                            "
+                        >
+                            <span id="portMismatchText"></span>
+                            <button
+                                type="button"
+                                id="portMismatchFixBtn"
+                                class="secondary-btn"
+                                style="margin-left: 6px; padding: 2px 8px"
+                            >
+                                Use detected port
+                            </button>
+                        </div>
                     </section>
 
                     <section class="panel">

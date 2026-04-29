@@ -12,6 +12,9 @@ const DOM = {
   actionBtn: $("#actionBtn"),
   actionBtnText: $("#actionBtnText"),
   portInput: $("#portInput"),
+  portMismatchHint: $("#portMismatchHint"),
+  portMismatchText: $("#portMismatchText"),
+  portMismatchFixBtn: $("#portMismatchFixBtn"),
   statusCard: $("#statusCard"),
   statusLabel: $("#statusLabel"),
   statusDetail: $("#statusDetail"),
@@ -340,7 +343,29 @@ const _secretAreaName =
       parseInt(DOM.portInput.value, 10) || 9876,
       s.serverPath || null,
     );
+    refreshPortMismatchHint();
   });
+
+  // Port-mismatch guardrail: surfaces the live bridge port when the
+  // configured port is unreachable. Service worker writes mcpDetectedPort
+  // after a probe; we react by showing a banner with a one-click fix.
+  refreshPortMismatchHint();
+  if (DOM.portMismatchFixBtn) {
+    DOM.portMismatchFixBtn.addEventListener("click", async () => {
+      const stored = await chrome.storage.local.get(["mcpDetectedPort"]);
+      const detected = Number(stored.mcpDetectedPort);
+      if (!Number.isFinite(detected) || detected <= 0) return;
+      DOM.portInput.value = String(detected);
+      await chrome.storage.local.set({ mcpPort: detected });
+      const s = await chrome.storage.local.get(["serverPath"]);
+      generateConfigs(detected, s.serverPath || null);
+      addLog(`Switched to detected bridge port ${detected}.`, "info");
+      try {
+        await sendRuntimeMessage({ type: "START_MCP", port: detected });
+      } catch (_) {}
+      refreshPortMismatchHint();
+    });
+  }
 
   // Update auto-connect preference
   DOM.autoConnectToggle.addEventListener("change", async (e) => {
@@ -363,6 +388,10 @@ const _secretAreaName =
         parseInt(DOM.portInput.value, 10) || 9876,
         changes.serverPath.newValue,
       );
+    }
+
+    if (areaName === "local" && (changes.mcpDetectedPort || changes.mcpPort)) {
+      refreshPortMismatchHint();
     }
 
     if (changes[ACTIVITY_LOG_KEY]) {
@@ -838,6 +867,36 @@ function activateTab(tabName) {
   }
 
   return activated;
+}
+
+// ─── Port-Mismatch Hint ──────────────────────────────────────
+// Service worker writes mcpDetectedPort after a probe finds a live
+// bridge on a port other than the one the user configured. Reflect
+// that into the popup so the user gets a one-click way to fix it
+// instead of staring at a generic "connection refused" status.
+async function refreshPortMismatchHint() {
+  if (!DOM.portMismatchHint) return;
+  try {
+    const stored = await chrome.storage.local.get([
+      "mcpPort",
+      "mcpDetectedPort",
+    ]);
+    const configured = Number(stored.mcpPort) || 9876;
+    const detected = Number(stored.mcpDetectedPort);
+    const showBanner =
+      Number.isFinite(detected) &&
+      detected > 0 &&
+      detected !== configured;
+    if (showBanner) {
+      DOM.portMismatchText.textContent =
+        `Bridge detected on port ${detected}, but extension is set to ${configured}.`;
+      DOM.portMismatchHint.style.display = "block";
+    } else {
+      DOM.portMismatchHint.style.display = "none";
+    }
+  } catch (_) {
+    DOM.portMismatchHint.style.display = "none";
+  }
 }
 
 // ─── Config Generation ───────────────────────────────────────
