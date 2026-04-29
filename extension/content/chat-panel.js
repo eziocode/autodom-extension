@@ -213,18 +213,6 @@
 
     return `
       <div class="autodom-chat-welcome">
-        <div class="autodom-chat-update-banner" id="__autodom_update_banner" role="status" aria-live="polite" hidden>
-          <div class="autodom-chat-update-banner-left">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/>
-            </svg>
-            <div class="autodom-chat-update-banner-text">
-              <strong id="__autodom_update_banner_title">Update available</strong>
-              <small id="__autodom_update_banner_sub">A newer version of AutoDOM is ready to install.</small>
-            </div>
-          </div>
-          <button type="button" class="autodom-chat-update-banner-cta" id="__autodom_update_banner_cta">Update now</button>
-        </div>
         <h3>How can I help?</h3>
         <p class="welcome-sub">${subtitle}</p>
         <div class="welcome-section-label">Try something</div>
@@ -1590,51 +1578,6 @@
       0%, 100% { box-shadow: 0 0 0 1px var(--c-accent-soft) inset, 0 4px 10px var(--c-accent-soft); }
       50%      { box-shadow: 0 0 0 1px var(--c-accent-soft) inset, 0 6px 18px var(--c-accent-soft); }
     }
-    /* Inline banner that lives at the top of the welcome / homepage
-       view so the update CTA is impossible to miss when the side
-       panel first opens. */
-    .autodom-chat-update-banner {
-      display: flex !important;
-      align-items: center !important;
-      justify-content: space-between !important;
-      gap: 10px !important;
-      margin: 10px 14px 0 14px !important;
-      padding: 10px 12px !important;
-      background: color-mix(in oklch, var(--c-accent) 14%, var(--c-surface)) !important;
-      border: 1px solid color-mix(in oklch, var(--c-accent) 35%, var(--c-border)) !important;
-      border-radius: var(--radius-md) !important;
-      color: var(--c-text) !important;
-      font-size: 12.5px !important;
-    }
-    .autodom-chat-update-banner[hidden] { display: none !important; }
-    .autodom-chat-update-banner-left {
-      display: flex !important; align-items: center !important; gap: 8px !important; min-width: 0;
-    }
-    .autodom-chat-update-banner-left svg {
-      width: 16px !important; height: 16px !important;
-      fill: none !important; stroke: var(--c-accent) !important;
-      stroke-width: 2 !important; stroke-linecap: round !important; stroke-linejoin: round !important;
-      flex-shrink: 0 !important;
-    }
-    .autodom-chat-update-banner-text { min-width: 0; }
-    .autodom-chat-update-banner-text strong { color: var(--c-text) !important; font-weight: 600 !important; }
-    .autodom-chat-update-banner-text small {
-      display: block; color: var(--c-text-2) !important; font-size: 11px !important; margin-top: 2px;
-    }
-    .autodom-chat-update-banner-cta {
-      flex-shrink: 0 !important;
-      font: inherit !important; font-size: 12px !important; font-weight: 600 !important;
-      padding: 5px 10px !important;
-      background: var(--c-accent) !important; color: #fff !important;
-      border: none !important; border-radius: var(--radius-sm) !important;
-      cursor: pointer !important;
-      transition: background-color 0.15s ease;
-    }
-    .autodom-chat-update-banner-cta:hover { background: var(--c-accent-2) !important; }
-    .autodom-chat-update-banner-cta:focus-visible {
-      outline: 2px solid #fff !important; outline-offset: 1px !important;
-    }
-
     /* ─── Inline Settings Overlay (hosts popup.html in an iframe) ─── */
     .autodom-chat-settings-overlay {
       position: absolute !important;
@@ -10075,10 +10018,9 @@
   // ─── Pending-update indicator ──────────────────────────────
   // Subscribe to chrome.storage.local.pendingUpdate (written by the
   // service worker when chrome.runtime.onUpdateAvailable fires, or by
-  // the popup after a manual update check). When set, we surface two
-  // affordances: a pulsing pill in the header (always visible) and a
-  // banner inside the welcome view (only on the homepage). Clicking
-  // either applies the queued CRX via chrome.runtime.reload() in the
+  // the popup after a manual update check). When set, we surface a
+  // single affordance: a pulsing pill in the chat header. Clicking it
+  // applies the queued CRX via chrome.runtime.reload() in the
   // background.
   function _applyPendingUpdate() {
     try {
@@ -10090,10 +10032,6 @@
   function _syncUpdateUI(pending) {
     const pill = document.getElementById("__autodom_update_pill");
     const pillText = document.getElementById("__autodom_update_pill_text");
-    const banner = document.getElementById("__autodom_update_banner");
-    const bannerTitle = document.getElementById("__autodom_update_banner_title");
-    const bannerSub = document.getElementById("__autodom_update_banner_sub");
-    const bannerCta = document.getElementById("__autodom_update_banner_cta");
     const hasUpdate = !!(pending && pending.version);
     const v = hasUpdate ? pending.version : null;
     if (pill) {
@@ -10108,20 +10046,6 @@
         }
       }
     }
-    if (banner) {
-      banner.hidden = !hasUpdate;
-      if (hasUpdate) {
-        if (bannerTitle) bannerTitle.textContent = `Update to v${v} ready`;
-        if (bannerSub) {
-          bannerSub.textContent =
-            "AutoDOM downloaded a newer version. Apply it now to restart the extension and pick up the latest features.";
-        }
-        if (bannerCta && !bannerCta.dataset.bound) {
-          bannerCta.dataset.bound = "1";
-          bannerCta.addEventListener("click", _applyPendingUpdate);
-        }
-      }
-    }
   }
   try {
     chrome.storage.local.get(["pendingUpdate"], (s) => {
@@ -10131,22 +10055,6 @@
       if (area !== "local" || !changes.pendingUpdate) return;
       _syncUpdateUI(changes.pendingUpdate.newValue);
     });
-  } catch (_) {}
-  // Re-sync after the welcome view is re-rendered (e.g. "New chat"
-  // button) — the banner DOM gets recreated each time so we have to
-  // re-bind the CTA.
-  try {
-    const _msgsEl = document.getElementById("__autodom_messages");
-    if (_msgsEl && typeof MutationObserver !== "undefined") {
-      const _mo = new MutationObserver(() => {
-        try {
-          chrome.storage.local.get(["pendingUpdate"], (s) => {
-            _syncUpdateUI(s && s.pendingUpdate);
-          });
-        } catch (_) {}
-      });
-      _mo.observe(_msgsEl, { childList: true });
-    }
   } catch (_) {}
 
   chatInput.addEventListener("input", autoResizeInput);
