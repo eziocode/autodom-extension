@@ -278,22 +278,16 @@ body {
     border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: 3px;
-    overflow-x: auto;
-    overflow-y: hidden;
-    scrollbar-width: none; /* Firefox */
-    -ms-overflow-style: none; /* IE/Edge */
-}
-.tab-bar::-webkit-scrollbar {
-    display: none; /* Chromium */
+    overflow: hidden;
 }
 
 .tab {
-    flex: 1 0 auto;
-    min-width: max-content;
+    flex: 1 1 0;
+    min-width: 0;
     appearance: none;
     border: none;
     background: transparent;
-    padding: 7px 10px;
+    padding: 7px 8px;
     min-height: 32px;
     border-radius: calc(var(--radius) - 2px);
     font: inherit;
