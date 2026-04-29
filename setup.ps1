@@ -13,10 +13,16 @@
 param(
     [string]$Name = "autodom",
     [int]$Port = 9876,
+    [switch]$NoAutoUpdate,
+    [string]$ExtensionId = "kpjdffgogiajnkajnjneiboaincnaokf",
     [switch]$Help
 )
 
 $ErrorActionPreference = "Stop"
+
+# AutoDOM's published extension ID. The default for $ExtensionId above is
+# the canonical signed-release ID, baked into extension/manifest.json.
+# Override only when running a self-signed fork.
 
 function Write-Step($msg)    { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)      { Write-Host "  [OK] $msg" -ForegroundColor Green }
@@ -246,17 +252,71 @@ if ($Configured -eq 0) {
     Write-Warn "No supported IDE detected. Configure manually — see INSTALL.md."
 }
 
+# ── 7. Silent extension install (zero-touch, default ON) ─────
+$AutoUpdateEnrolled = $false
+if ($NoAutoUpdate) {
+    Write-Warn "Skipping silent-install policy enrollment (-NoAutoUpdate)."
+} else {
+    $entInstaller = Join-Path $ScriptDir "enterprise\install.ps1"
+    if (-not (Test-Path $entInstaller)) {
+        Write-Warn "enterprise\install.ps1 not found — skipping silent extension install."
+    } elseif ($ExtensionId -notmatch '^[a-p]{32}$') {
+        Write-Fail "Invalid -ExtensionId '$ExtensionId' — must be 32 lowercase a-p chars."
+    } else {
+        Write-Step "Enrolling silent Chromium auto-install + auto-update..."
+
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+        if ($isAdmin) {
+            $env:AUTODOM_EXTENSION_ID = $ExtensionId
+            try {
+                & powershell -NoProfile -ExecutionPolicy Bypass -File $entInstaller
+                Write-Ok "Silent-install policy active. Restart Chrome / Edge / Brave to apply."
+                $AutoUpdateEnrolled = $true
+            } catch {
+                Write-Fail "enterprise\install.ps1 failed: $_"
+            }
+        } else {
+            # Auto-elevate via UAC. The user gets ONE consent dialog and the
+            # rest is unattended. We pass the extension ID as a one-shot env
+            # var inside the elevated session, then close it.
+            Write-Host "  Triggering UAC prompt to install machine-wide policy (one click)..." -ForegroundColor White
+            $cmd = "`$env:AUTODOM_EXTENSION_ID='$ExtensionId'; & '$entInstaller'"
+            try {
+                Start-Process powershell.exe `
+                    -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command',$cmd) `
+                    -Verb RunAs `
+                    -Wait `
+                    -WindowStyle Hidden
+                Write-Ok "Silent-install policy active. Restart Chrome / Edge / Brave to apply."
+                $AutoUpdateEnrolled = $true
+            } catch {
+                Write-Warn "UAC was declined or elevation failed — extension will not auto-install."
+                Write-Host "  Recover later from an elevated PowerShell:" -ForegroundColor Yellow
+                Write-Host "    `$env:AUTODOM_EXTENSION_ID='$ExtensionId'" -ForegroundColor Cyan
+                Write-Host "    powershell -ExecutionPolicy Bypass -File `"$entInstaller`"" -ForegroundColor Cyan
+            }
+        }
+    }
+}
+
 Write-Host ""
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host "  AutoDOM Setup Complete!" -ForegroundColor Green
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Load the browser extension:" -ForegroundColor White
-Write-Host "    1. Open chrome://extensions"
-Write-Host "    2. Enable 'Developer mode' (top-right)"
-Write-Host "    3. Click 'Load unpacked'"
-Write-Host "    4. Select: $ExtDir"
-Write-Host "    5. Open the AutoDOM popup and ensure port = $Port"
+
+if ($AutoUpdateEnrolled) {
+    Write-Host "  Browser extension:" -ForegroundColor White
+    Write-Host "    Silent-install policy active. Restart Chrome / Edge / Brave once -" -ForegroundColor Green
+    Write-Host "    AutoDOM installs automatically and stays up to date from now on." -ForegroundColor Green
+} else {
+    Write-Host "  Manual extension install:" -ForegroundColor White
+    Write-Host "    1. Open chrome://extensions"
+    Write-Host "    2. Enable 'Developer mode' (top-right)"
+    Write-Host "    3. Click 'Load unpacked'"
+    Write-Host "    4. Select: $ExtDir"
+}
 Write-Host ""
 Write-Host "  Manual MCP config snippet:" -ForegroundColor White
 $snippet = @{ mcpServers = @{ "$Name" = (Build-McpEntry "standard") } } | ConvertTo-Json -Depth 10

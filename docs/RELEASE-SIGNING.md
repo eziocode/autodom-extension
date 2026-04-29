@@ -15,9 +15,10 @@ identity and breaks auto-update for every existing installation.
 ## 1. Chromium CRX signing key (`CHROME_CRX_PRIVATE_KEY`)
 
 The CRX private key is what makes every release CRX resolve to the *same*
-extension ID. The matching public key is embedded into `manifest.json` as the
-`key` field at packaging time (the release workflow injects it — we do **not**
-commit it to source).
+extension ID. The matching public key is committed to `extension/manifest.json`
+as the `key` field (it's the *public* half — safe to commit) and the release
+workflow re-injects it from `CHROME_EXTENSION_KEY` at build time as a defensive
+double-check.
 
 ### Generate (once)
 
@@ -74,46 +75,10 @@ every existing user. If the key is leaked, the only safe path is:
 
 ---
 
-## 2. Mozilla AMO signing credentials (`AMO_JWT_ISSUER` / `AMO_JWT_SECRET`)
+## 2. GitHub Pages publishing token
 
-Mozilla signs self-hosted ("unlisted") XPIs without listing them on
-addons.mozilla.org. Release Firefox refuses unsigned add-ons, so this step is
-mandatory before any non-developer-edition Firefox can install AutoDOM.
-
-### Mint
-
-1. Sign in at <https://addons.mozilla.org> with the maintainer account
-   (the account whose email matches `browser_specific_settings.gecko.id` is
-   recommended but not required).
-2. Visit <https://addons.mozilla.org/developers/addon/api/key/>.
-3. Click **Generate new credentials**.
-4. Copy:
-   - **JWT issuer** → `AMO_JWT_ISSUER` Actions secret.
-   - **JWT secret** → `AMO_JWT_SECRET` Actions secret.
-
-```bash
-gh secret set AMO_JWT_ISSUER --body "user:1234567:567"
-gh secret set AMO_JWT_SECRET --body "abc123…"
-```
-
-### First submission
-
-Mozilla treats the very first upload of `aswin2kumarforme@gmail.com` (the
-gecko ID in `manifest.firefox.json`) as the registration of that add-on slug.
-After that, every release pipeline run will sign successive versions
-automatically.
-
-### Rotation
-
-Safe — issuer/secret changes do not change the add-on's identity. Generate a
-new key pair on AMO, replace the two secrets, and revoke the old pair.
-
----
-
-## 3. GitHub Pages publishing token
-
-The release workflow needs to push regenerated `updates.xml` and
-`updates.json` to the `gh-pages` branch.
+The release workflow needs to push a regenerated `updates.xml` to the
+`gh-pages` branch.
 
 Easiest path (no extra secret):
 
@@ -135,10 +100,10 @@ present.
 
 ---
 
-## 4. Bootstrapping the public update URLs
+## 3. Bootstrapping the public update URL
 
 Before the first release runs, create the empty `gh-pages` branch with a
-placeholder `updates.xml` and `updates.json` so the URLs resolve `200`:
+placeholder `updates.xml` so the URL resolves `200`:
 
 ```bash
 git checkout --orphan gh-pages
@@ -147,11 +112,8 @@ cat > updates.xml <<'EOF'
 <?xml version='1.0' encoding='UTF-8'?>
 <gupdate xmlns='http://www.google.com/update2/response' protocol='2.0'/>
 EOF
-cat > updates.json <<'EOF'
-{ "addons": {} }
-EOF
-git add updates.xml updates.json
-git commit -m "Bootstrap auto-update endpoints"
+git add updates.xml
+git commit -m "Bootstrap auto-update endpoint"
 git push origin gh-pages
 git checkout main
 ```
@@ -160,25 +122,22 @@ Then enable Pages on the `gh-pages` branch (Settings → Pages). Confirm:
 
 - <https://eziocode.github.io/autodom-extension/updates.xml> → returns the
   empty `<gupdate>` document.
-- <https://eziocode.github.io/autodom-extension/updates.json> → returns
-  `{ "addons": {} }`.
 
-The first tagged release will overwrite both files with real entries.
+The first tagged release will overwrite the file with the real entry.
 
 ---
 
-## 5. Sanity checklist before tagging the first release
+## 4. Sanity checklist before tagging the first release
 
-- [ ] `CHROME_CRX_PRIVATE_KEY`, `CHROME_EXTENSION_KEY`, `AMO_JWT_ISSUER`,
-      `AMO_JWT_SECRET` all set in repo secrets.
+- [ ] `CHROME_CRX_PRIVATE_KEY`, `CHROME_EXTENSION_KEY` set in repo secrets.
+- [ ] `CHROME_EXTENSION_ID` set in repo variables.
 - [ ] Recorded 32-char Chrome extension ID and pasted into
-      `enterprise/*` policy templates and the `updates.xml` template.
-- [ ] `gh-pages` branch exists with placeholder `updates.xml` /
-      `updates.json` and Pages is serving them.
+      `enterprise/*` policy templates.
+- [ ] `gh-pages` branch exists with placeholder `updates.xml` and Pages is
+      serving it.
 - [ ] `extension/manifest.json` `update_url` resolves to the Pages URL.
-- [ ] `extension/manifest.firefox.json` `gecko.update_url` resolves to the
-      Pages URL.
+- [ ] `extension/manifest.json` `key` field matches `CHROME_EXTENSION_KEY`.
 - [ ] Release workflow has `permissions: contents: write, pages: write`.
 
-Once all six are checked, tag `v2.2.0` (or next) and push — the workflow
-will produce the first signed CRX + XPI and publish the update manifests.
+Once all are checked, tag `vX.Y.Z` and push — the workflow will produce the
+first signed CRX and publish the update manifest.

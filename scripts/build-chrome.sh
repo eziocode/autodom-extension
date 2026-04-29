@@ -13,10 +13,9 @@ echo "[*] Building Chrome zip v${VERSION}..."
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR" "$ROOT/dist"
 
-# Mirror extension/ but exclude Firefox-only manifest + dev junk.
+# Mirror extension/ but exclude dev junk.
 rsync -a \
     --exclude '.DS_Store' \
-    --exclude 'manifest.firefox.json' \
     --exclude '*.swp' \
     "$SRC/" "$OUT_DIR/"
 

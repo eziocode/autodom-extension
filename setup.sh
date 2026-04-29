@@ -25,30 +25,37 @@ SERVER_PATH="$SERVER_DIR/index.js"
 DEFAULT_PORT=9876
 TARGET_PORT=$DEFAULT_PORT
 SERVER_NAME="autodom"
-ENABLE_AUTO_UPDATE=""    # "yes" | "no" | "" (= prompt interactively)
+
+# ─── Zero-touch install defaults ───────────────────────────────
+# AutoDOM's published Chromium extension ID. Baked into the signed
+# manifest (extension/manifest.json `key` field) — every official
+# release resolves to exactly this ID. Hardcoding it here means
+# setup.sh never has to ask the user.
+DEFAULT_EXTENSION_ID="kpjdffgogiajnkajnjneiboaincnaokf"
+ENABLE_AUTO_UPDATE="yes"        # default ON — flip to "no" with --no-auto-update
 EXTENSION_ID_OVERRIDE=""
 
 usage() {
     cat <<EOF
 Usage: ./setup.sh [--name <server-name>] [--port <port>]
-                  [--enable-auto-update | --no-auto-update]
-                  [--extension-id <32-char-id>]
+                  [--no-auto-update] [--extension-id <32-char-id>]
 
 Examples:
-  ./setup.sh
-  ./setup.sh --name autodom-firefox --port 9877
+  ./setup.sh                              # zero-touch: server + IDE configs +
+                                          # silent extension auto-install
   ./setup.sh --name autodom-brave --port 9878
-  AUTODOM_EXTENSION_ID=abcdefghijklmnopabcdefghijklmnop \\
-      ./setup.sh --enable-auto-update
+  ./setup.sh --no-auto-update             # skip the policy install (server only)
 
 Options:
   --name, -n             MCP server name to add to IDE configs (default: autodom)
   --port, -p             WebSocket port for this browser target (default: 9876)
-  --enable-auto-update   Enroll this machine in Chromium auto-updates (will
-                         re-invoke itself with sudo to write the policy file).
-  --no-auto-update       Skip the auto-update prompt entirely.
-  --extension-id         32-char Chromium extension ID. Falls back to the
-                         AUTODOM_EXTENSION_ID env var.
+  --no-auto-update       Skip the silent-install policy enrollment.
+                         (Default behaviour enrolls automatically — sudo prompt
+                         once, then no further interaction.)
+  --enable-auto-update   No-op (kept for back-compat — auto-update is the default).
+  --extension-id         32-char Chromium extension ID. Defaults to AutoDOM's
+                         official published ID. Override only if you've forked
+                         and re-signed the extension yourself.
   --help, -h             Show this help
 EOF
 }
@@ -552,70 +559,74 @@ fi
 ENTERPRISE_SCRIPT="$SCRIPT_DIR/enterprise/install.sh"
 
 maybe_enroll_auto_update() {
+    if [ "$ENABLE_AUTO_UPDATE" = "no" ]; then
+        echo ""
+        echo -e "${YELLOW}  ⏭  Skipping silent-install policy enrollment (--no-auto-update).${NC}"
+        echo -e "    Re-run later with: ${CYAN}./setup.sh${NC}  (auto-update is the default)"
+        return
+    fi
+
     if [ ! -x "$ENTERPRISE_SCRIPT" ] && [ ! -f "$ENTERPRISE_SCRIPT" ]; then
+        echo ""
+        echo -e "${YELLOW}  ⚠ enterprise/install.sh not found — skipping silent-install enrollment.${NC}"
         return
     fi
 
     case "$(uname -s)" in
         Darwin|Linux) ;;
         *)
-            echo -e "${YELLOW}  ⚠ Auto-update enrollment via setup.sh is supported on macOS/Linux only.${NC}"
+            echo ""
+            echo -e "${YELLOW}  ⚠ Silent install via setup.sh is supported on macOS/Linux only.${NC}"
             echo -e "    Windows users: run ${CYAN}enterprise\\install.ps1${NC} from an elevated PowerShell."
             return
             ;;
     esac
 
-    local ext_id="${EXTENSION_ID_OVERRIDE:-${AUTODOM_EXTENSION_ID:-}}"
+    # Resolve the extension ID with a 3-tier fallback chain so that the
+    # default flow is fully zero-touch (no prompts, no env vars, no flags):
+    #   1. --extension-id CLI arg  (forks / private re-signs)
+    #   2. AUTODOM_EXTENSION_ID env var
+    #   3. DEFAULT_EXTENSION_ID hardcoded above (the canonical published ID)
+    local ext_id="${EXTENSION_ID_OVERRIDE:-${AUTODOM_EXTENSION_ID:-$DEFAULT_EXTENSION_ID}}"
 
-    local choice="$ENABLE_AUTO_UPDATE"
-    if [ -z "$choice" ]; then
-        # Only prompt when stdin is a TTY — avoids surprising users who
-        # pipe setup.sh through curl or run it from CI.
-        if [ ! -t 0 ]; then
-            return
-        fi
+    if ! [[ "$ext_id" =~ ^[a-p]{32}$ ]]; then
         echo ""
-        echo -e "${BOLD}Enable silent Chromium auto-updates for AutoDOM?${NC}"
-        echo -e "  Writes a managed-policy file to ${CYAN}/Library/Managed Preferences/${NC} (macOS)"
-        echo -e "  or ${CYAN}/etc/<browser>/policies/managed/${NC} (Linux). Requires ${BOLD}sudo${NC}."
-        echo -e "  After enrollment, Chrome / Edge / Brave will pull new AutoDOM"
-        echo -e "  releases from the GitHub Pages update endpoint (~5h cadence)."
-        echo ""
-        read -r -p "  Enable auto-update now? [y/N] " reply || reply=""
-        case "$reply" in
-            y|Y|yes|YES) choice="yes" ;;
-            *) choice="no" ;;
-        esac
-    fi
-
-    if [ "$choice" != "yes" ]; then
-        echo -e "${YELLOW}  ⏭  Skipping auto-update enrollment. Re-run with ${CYAN}--enable-auto-update${YELLOW} later.${NC}"
+        echo -e "${RED}  ✗ Invalid extension ID '$ext_id' — must be 32 lowercase a–p chars.${NC}"
+        echo -e "    Skipping silent-install enrollment."
         return
     fi
 
-    if [ -z "$ext_id" ]; then
-        if [ -t 0 ]; then
-            echo ""
-            echo -e "  Need the 32-char Chromium extension ID (lowercase a–p)."
-            echo -e "  Find it under ${CYAN}chrome://extensions${NC} → Developer mode → AutoDOM card,"
-            echo -e "  or in ${CYAN}docs/RELEASE-SIGNING.md${NC}."
-            read -r -p "  Extension ID: " ext_id || ext_id=""
-        fi
-    fi
-
-    if ! [[ "$ext_id" =~ ^[a-p]{32}$ ]]; then
-        echo -e "${RED}  ✗ Invalid / missing extension ID — must be 32 lowercase a–p chars.${NC}"
-        echo -e "    Re-run later with: ${CYAN}AUTODOM_EXTENSION_ID=<id> ./setup.sh --enable-auto-update${NC}"
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo ""
+        echo -e "${YELLOW}  ⚠ sudo not available — cannot write managed-policy file.${NC}"
+        echo -e "    Run as root manually: ${CYAN}AUTODOM_EXTENSION_ID=$ext_id $ENTERPRISE_SCRIPT${NC}"
         return
     fi
 
     echo ""
-    echo -e "${BLUE}[7/7]${NC} Enrolling Chromium auto-update (sudo required)..."
-    if AUTODOM_EXTENSION_ID="$ext_id" sudo -E bash "$ENTERPRISE_SCRIPT"; then
-        echo -e "${GREEN}✓${NC} Auto-update policy installed. Restart Chrome / Edge / Brave to apply."
+    echo -e "${BLUE}[7/7]${NC} Enrolling silent Chromium auto-install + auto-update..."
+    echo -e "        Writing managed-policy file (sudo prompts ${BOLD}once${NC}, then proceeds unattended)."
+
+    # Pre-acquire sudo so the user sees a single password prompt up front
+    # rather than mid-script. -v just refreshes the cached credentials —
+    # ideal when the user already has a valid sudo timestamp.
+    if ! sudo -p "  [sudo] password for AutoDOM silent-install: " -v 2>/dev/null; then
+        echo ""
+        echo -e "${YELLOW}  ⚠ Could not acquire sudo (no TTY, denied, or no permission).${NC}"
+        echo -e "    Run later as root: ${CYAN}sudo AUTODOM_EXTENSION_ID=$ext_id $ENTERPRISE_SCRIPT${NC}"
+        return
+    fi
+
+    # -n: never prompt again. The credentials are guaranteed cached now.
+    if AUTODOM_EXTENSION_ID="$ext_id" sudo -n -E bash "$ENTERPRISE_SCRIPT" >/dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC} Silent-install policy active."
+        echo -e "  ${BOLD}Restart Chrome / Edge / Brave${NC} — AutoDOM installs in the background"
+        echo -e "  on next launch and updates itself automatically from then on."
     else
-        echo -e "${RED}✗ enterprise/install.sh failed — see output above.${NC}"
-        echo -e "    You can re-run it manually: ${CYAN}sudo AUTODOM_EXTENSION_ID=$ext_id $ENTERPRISE_SCRIPT${NC}"
+        # Re-run with output visible so the user can see what failed.
+        echo -e "${RED}✗${NC} enterprise/install.sh failed. Re-running with full output:"
+        AUTODOM_EXTENSION_ID="$ext_id" sudo -n -E bash "$ENTERPRISE_SCRIPT" || true
+        echo -e "    Recover with: ${CYAN}sudo AUTODOM_EXTENSION_ID=$ext_id $ENTERPRISE_SCRIPT${NC}"
     fi
 }
 
@@ -632,14 +643,22 @@ echo -e "  ${BOLD}Configured target:${NC}"
 echo -e "  • Name: ${CYAN}$SERVER_NAME${NC}"
 echo -e "  • Port: ${CYAN}$TARGET_PORT${NC}"
 echo ""
-echo -e "  ${BOLD}Load the browser extension:${NC}"
-echo ""
-echo -e "  1. Open your browser → ${CYAN}chrome://extensions${NC}"
-echo -e "  2. Enable ${BOLD}Developer mode${NC} (top-right toggle)"
-echo -e "  3. Click ${BOLD}Load unpacked${NC}"
-echo -e "  4. Select: ${CYAN}$EXTENSION_DIR${NC}"
-echo -e "  5. Open the AutoDOM popup and set port ${CYAN}$TARGET_PORT${NC}"
-echo ""
+
+if [ "$ENABLE_AUTO_UPDATE" = "no" ]; then
+    echo -e "  ${BOLD}Manual extension install (auto-update was skipped):${NC}"
+    echo ""
+    echo -e "  1. Open ${CYAN}chrome://extensions${NC}"
+    echo -e "  2. Enable ${BOLD}Developer mode${NC} (top-right)"
+    echo -e "  3. Click ${BOLD}Load unpacked${NC} → select ${CYAN}$EXTENSION_DIR${NC}"
+    echo ""
+else
+    echo -e "  ${BOLD}Browser extension:${NC}"
+    echo -e "  ${GREEN}✓ Silent-install policy active.${NC} ${BOLD}Restart your browser${NC} once —"
+    echo -e "    Chrome / Edge / Brave will install AutoDOM automatically and"
+    echo -e "    keep it up to date from now on. No manual steps required."
+    echo ""
+fi
+
 echo -e "  ${BOLD}Server path (for manual IDE config):${NC}"
 echo -e "  ${CYAN}$SERVER_PATH${NC}"
 echo ""
@@ -649,7 +668,6 @@ echo ""
 echo -e "  ${BOLD}Then:${NC}"
 echo -e "  • ${BOLD}Restart your IDE${NC} so it picks up the new MCP config"
 echo -e "  • In the browser popup, click ${BOLD}Connect${NC} or enable ${BOLD}Auto-connect${NC}"
-echo -e "  • Repeat with another ${BOLD}name + port${NC} for Chrome, Firefox, Brave, or Edge"
 echo ""
 echo -e "  ${YELLOW}Troubleshooting?${NC} See ${CYAN}INSTALL.md${NC} or ${CYAN}README.md${NC}"
 echo ""

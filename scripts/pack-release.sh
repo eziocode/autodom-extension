@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Packs a shareable bundle: chrome zip + firefox xpi + server source +
-# setup scripts + docs. Output: dist/autodom-<version>-share.tar.gz / .zip
+# Packs a shareable bundle: chrome zip + server source + setup scripts +
+# docs. Output: dist/autodom-<version>-share.tar.gz / .zip
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,17 +13,15 @@ ZIPBALL="dist/autodom-${VERSION}-share.zip"
 
 echo "[*] Packing AutoDOM v${VERSION} for sharing..."
 
-# 1. Build per-browser bundles
+# 1. Build Chrome bundle
 bash scripts/build-chrome.sh
-bash scripts/build-firefox.sh
 
 # 2. Stage everything end-users need
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 
-# Pre-built browser bundles
+# Pre-built Chrome bundle
 cp "dist/autodom-chrome-${VERSION}.zip"   "$STAGE/"
-cp "dist/autodom-firefox-${VERSION}.xpi"  "$STAGE/"
 
 # Source needed for setup.sh / setup.ps1 to install MCP server locally
 mkdir -p "$STAGE/server"
@@ -34,7 +32,6 @@ rsync -a --exclude '.DS_Store' extension/ "$STAGE/extension/"
 
 mkdir -p "$STAGE/scripts"
 cp scripts/build-chrome.sh   "$STAGE/scripts/"
-cp scripts/build-firefox.sh  "$STAGE/scripts/"
 
 cp setup.sh setup.ps1 "$STAGE/"
 chmod +x "$STAGE/setup.sh" "$STAGE/scripts/"*.sh
@@ -49,12 +46,10 @@ macOS / Linux / WSL / Git Bash:
 Windows (PowerShell):
     powershell -ExecutionPolicy Bypass -File .\\setup.ps1
 
-Then load the extension into your browser:
-  - Chrome / Edge / Brave: chrome://extensions  →  Developer mode  →
-    Load unpacked  →  select the "extension/" folder
-    (or drag-and-drop autodom-chrome-${VERSION}.zip after unzipping)
-  - Firefox: about:debugging#/runtime/this-firefox  →
-    Load Temporary Add-on  →  pick autodom-firefox-${VERSION}.xpi
+Then load the extension into Chrome / Edge / Brave:
+  chrome://extensions  →  Developer mode  →
+  Load unpacked  →  select the "extension/" folder
+  (or drag-and-drop autodom-chrome-${VERSION}.zip after unzipping)
 
 Restart your IDE.  Open the AutoDOM popup.  Status should say "Connected".
 
