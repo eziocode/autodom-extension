@@ -2,7 +2,7 @@
 
 > **Turn your AI coding assistant into a browser automation powerhouse.**
 
-AutoDOM is a [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server + browser extension that lets your IDE's AI agent — GitHub Copilot, JetBrains AI Assistant, Claude Desktop, Cursor, Gemini CLI, and others — drive a real Chromium or Firefox browser.
+AutoDOM is a [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server + Chromium browser extension that lets your IDE's AI agent — GitHub Copilot, JetBrains AI Assistant, Claude Desktop, Cursor, Gemini CLI, and others — drive a real Chrome / Edge / Brave / Arc / Ulaa browser.
 
 It exposes **70 browser-automation tools** (click, type, navigate, screenshot, evaluate JS, intercept network requests, inspect the DOM, manage cookies and tabs, run local scripts, and more) over a local WebSocket bridge between a Node.js MCP server and a Manifest V3 browser extension.
 
@@ -12,6 +12,31 @@ AutoDOM also supports **local user-provided automation scripts** without AI or
 external cloud services. Use the popup Scripts tab to upload/paste browser
 scripts, or use MCP tools from an IDE to run local Playwright scripts. See
 **[AUTOMATION.md](AUTOMATION.md)**.
+
+---
+
+## What's new in 2.2.2
+
+- **Chrome-only, signed releases.** AutoDOM now ships exclusively for
+  Chromium (Chrome / Edge / Brave / Arc / Ulaa). Every release is a CRX
+  signed with a stable key — the canonical extension ID is
+  `kpjdffgogiajnkajnjneiboaincnaokf` and is now embedded in
+  `extension/manifest.json`, so unpacked loads also resolve to the same ID.
+- **Zero-touch installer.** `setup.sh` / `setup.ps1` enroll the silent
+  enterprise force-install policy by default — one sudo / UAC prompt and
+  AutoDOM installs (and auto-updates) on the next browser launch. No
+  manual `Load unpacked`, no Developer-mode toggle, no Web-Store prompt.
+  Opt out with `--no-auto-update` if you'd rather wire it up by hand.
+- **Self-hosted update channel.** The browser polls
+  `https://eziocode.github.io/autodom-extension/updates.xml` (~5h cadence)
+  so new releases roll out silently — no Chrome Web Store listing required.
+- **Firefox / AMO removed.** The Gecko manifest, XPI build, and
+  `web-ext sign` workflow steps were dropped. The runtime
+  `extension/common/webext-api.js` polyfill stays in place but is now
+  Chromium-only scaffolding.
+
+> Older highlights (streaming chat, reply-style dropdown) from 2.1 are still
+> in place — see git history for the full timeline.
 
 ---
 
@@ -36,8 +61,6 @@ scripts, or use MCP tools from an IDE to run local Playwright scripts. See
     the reply gets long. Mimics the GPT chat bar.
   The selection is plumbed end-to-end (chat panel → service worker →
   providers / bridge → CLI agent prompt) so every code path honours it.
-- **Bumped extension and bridge server to `2.1.0`** (`extension/manifest.json`,
-  `extension/manifest.firefox.json`, `server/package.json`).
 
 ---
 
@@ -46,7 +69,7 @@ scripts, or use MCP tools from an IDE to run local Playwright scripts. See
 ```
 ┌──────────────┐   stdio MCP    ┌──────────────────┐   ws://127.0.0.1:9876   ┌──────────────────┐
 │  IDE / Agent │ ◀────────────▶ │ AutoDOM server   │ ◀─────────────────────▶ │ Browser extension│
-│ (Copilot,    │                │ (Node, fastmcp)  │                         │ (Chrome/Firefox) │
+│ (Copilot,    │                │ (Node, fastmcp)  │                         │ (Chromium MV3)   │
 │  Claude…)    │                │  server/index.js │                         │  extension/      │
 └──────────────┘                └──────────────────┘                         └──────────────────┘
 ```
@@ -54,9 +77,9 @@ scripts, or use MCP tools from an IDE to run local Playwright scripts. See
 - **`server/`** — Node.js MCP server (`fastmcp` + `ws`). Speaks MCP over stdio to the IDE and proxies tool calls to the browser over a local WebSocket on port `9876`.
 - **`server/automation/`** — Local automation backend registry. Includes
   Playwright and Node script runners and can be extended with more backends.
-- **`extension/`** — Manifest V3 extension (Chromium + Firefox-flavored manifest). Service worker connects to the bridge, content scripts host the chat panel and session indicator, popup shows connection status.
-- **`scripts/build-firefox.sh`** — Repackages the extension with a Gecko-compatible manifest and produces an unpacked build plus an `.xpi`.
-- **`setup.sh`** — One-shot installer that installs server deps and writes MCP config for every IDE it can detect.
+- **`extension/`** — Manifest V3 Chromium extension. Service worker connects to the bridge, content scripts host the chat panel and session indicator, popup shows connection status. The signed CRX is published to GitHub Releases and installs via `update_url` (no Web Store).
+- **`enterprise/`** — Force-install policy templates per OS. `setup.sh` / `setup.ps1` invokes the matching `install.{sh,ps1}` to enroll the policy in one shot.
+- **`setup.sh` / `setup.ps1`** — Zero-touch installer: installs server deps, writes MCP config for every detected IDE, and enrolls the silent extension-install policy.
 
 ---
 
@@ -67,9 +90,9 @@ scripts, or use MCP tools from an IDE to run local Playwright scripts. See
 | Node.js | v18+ | `node -v` |
 | npm | bundled with Node | `npm -v` |
 | Chromium browser | Manifest V3 capable (Chrome, Edge, Brave, Arc, Ulaa…) | — |
-| Firefox (optional) | Developer Edition / Nightly / ESR for unsigned `.xpi` | — |
 | IDE with MCP support | IntelliJ family, VS Code, Cursor, Claude Desktop, Gemini CLI | — |
 | Free TCP port | `9876` on `127.0.0.1` (configurable) | `lsof -ti:9876` |
+| Admin rights for the silent install | sudo (macOS / Linux) or UAC (Windows) — only for the one-time policy enrollment | — |
 
 ---
 
@@ -89,30 +112,33 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 - ✅ `npm install` inside `server/`
 - ✅ Auto-detect installed IDEs and write their MCP config
 - ✅ Enable AutoDOM for both **GitHub Copilot** and **JetBrains AI Assistant**
-- ✅ Print next steps for loading the browser extension
+- ✅ **Enroll the silent-install policy** for every Chromium-family browser on
+  the machine (single `sudo` / UAC prompt). Skip with `--no-auto-update`
+  (Bash) or `-NoAutoUpdate` (PowerShell).
 
-To register a second browser target on a different port:
+To register a second MCP server entry on a different port (e.g. for a second profile):
 
 ```bash
-./setup.sh --name autodom-firefox --port 9877      # macOS / Linux
-.\setup.ps1 -Name autodom-firefox -Port 9877       # Windows
+./setup.sh --name autodom-edge --port 9877       # macOS / Linux
+.\setup.ps1 -Name autodom-edge -Port 9877        # Windows
 ```
 
-Then:
+After the script finishes:
 
-1. **Load the extension**
-   - **Chromium** — `chrome://extensions` → enable *Developer mode* → *Load unpacked* → select the `extension/` folder.
-   - **Firefox** — `./scripts/build-firefox.sh`, then `about:debugging#/runtime/this-firefox` → *Load Temporary Add-on…* → pick `dist/firefox/manifest.json`.
-2. Pin AutoDOM to the toolbar.
-3. **Restart your IDE** so it picks up the new MCP config.
-4. Open the AutoDOM popup → confirm it says **Connected**.
-5. Your AI agent now has 70 browser-automation tools.
+1. **Restart Chrome / Edge / Brave once** — AutoDOM installs automatically and
+   stays up to date from the GitHub Pages update channel (~5h cadence).
+2. **Restart your IDE** so it picks up the new MCP config.
+3. Open the AutoDOM popup → confirm it says **Connected**.
+4. Your AI agent now has 70 browser-automation tools.
+
+If you used `--no-auto-update`, install the extension manually:
+`chrome://extensions` → enable **Developer mode** → **Load unpacked** → pick the
+`extension/` folder.
 
 For per-IDE setup, manual install, ports, and uninstall, see **[INSTALL.md](INSTALL.md)**.
 
-For auto-update across many machines without using the Chrome Web Store
-(enterprise force-install on Chromium, signed XPI on Firefox), see
-**[UPDATES.md](UPDATES.md)**.
+For the underlying enterprise-policy mechanics and how releases flow end-to-end,
+see **[UPDATES.md](UPDATES.md)**.
 
 ---
 
@@ -204,24 +230,29 @@ Common issues (full table in [INSTALL.md](INSTALL.md#troubleshooting)):
 
 ```
 autodom-extension/
-├── extension/              # MV3 browser extension
+├── extension/              # MV3 Chromium extension
 │   ├── background/         # service worker (bridge client, tool runner)
 │   ├── content/            # session border + AI chat panel injected into pages
 │   ├── popup/              # toolbar popup (connection status, port, controls)
-│   ├── common/             # webext-api shim (Chrome/Firefox compat)
+│   ├── common/             # webext-api shim
 │   ├── icons/
-│   ├── manifest.json       # Chromium MV3
-│   └── manifest.firefox.json # Gecko MV3 (event-page background)
+│   └── manifest.json       # Chromium MV3 (with embedded `key` → stable ID)
 ├── server/                 # Node.js MCP bridge
 │   ├── index.js            # MCP server + WebSocket bridge
 │   ├── cli.js              # CLI entry / lifecycle helpers
 │   ├── wrapper.js          # process supervision
 │   └── package.json
+├── enterprise/             # silent force-install policy templates per OS
+│   ├── install.sh          # macOS + Linux enrollment
+│   └── install.ps1         # Windows enrollment
 ├── scripts/
-│   └── build-firefox.sh    # builds dist/firefox/ + .xpi
-├── dist/                   # prebuilt artifacts (Chrome zip, Firefox xpi)
-├── setup.sh                # one-shot installer
+│   ├── build-chrome.sh     # builds dist/autodom-chrome-X.Y.Z.zip
+│   ├── pack-release.sh     # signs CRX + bundles release artefacts
+│   └── build-update-manifests.mjs  # writes updates.xml for gh-pages
+├── dist/                   # prebuilt Chrome zip + signed CRX
+├── setup.sh / setup.ps1    # zero-touch installer (server + IDE + policy)
 ├── INSTALL.md              # detailed install + per-IDE setup
+├── UPDATES.md              # update channel + enterprise rollout
 └── SECURITY.md             # auth model, secret storage, permissions
 ```
 

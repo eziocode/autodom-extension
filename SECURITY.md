@@ -11,11 +11,10 @@ incoming connection:
 
 1. **Origin allowlist.** Browser-attached clients always include an
    `Origin` header. The AutoDOM extension's service worker sends
-   `chrome-extension://<id>` (or `moz-extension://<id>` on Firefox) and
-   is accepted. A malicious web page would send its own origin
-   (`https://example.com`) and is rejected. This blocks **page-based
-   attacks** — a hostile page that tries to drive the browser via
-   `new WebSocket("ws://127.0.0.1:9876")`.
+   `chrome-extension://<id>` and is accepted. A malicious web page would
+   send its own origin (`https://example.com`) and is rejected. This
+   blocks **page-based attacks** — a hostile page that tries to drive
+   the browser via `new WebSocket("ws://127.0.0.1:9876")`.
 
 2. **Bearer token.** Non-browser local clients (the proxy-client mode,
    the `server/test/e2e.cjs` smoke test, and any future CLI) must

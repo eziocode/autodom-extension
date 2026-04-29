@@ -37,8 +37,11 @@ AutoDOM uses **TCP port 9876** on localhost for the WebSocket bridge between the
 cd autodom-extension
 ./setup.sh
 
-# Add a second browser target on another port
-./setup.sh --name autodom-firefox --port 9877
+# Skip the silent-install policy enrollment (manual `Load unpacked` flow):
+./setup.sh --no-auto-update
+
+# Add a second MCP server entry on another port:
+./setup.sh --name autodom-edge --port 9877
 ```
 
 ### Windows (PowerShell)
@@ -47,8 +50,11 @@ cd autodom-extension
 cd autodom-extension
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
 
-# Add a second browser target on another port
-.\setup.ps1 -Name autodom-firefox -Port 9877
+# Skip the silent-install policy enrollment:
+.\setup.ps1 -NoAutoUpdate
+
+# Add a second MCP server entry on another port:
+.\setup.ps1 -Name autodom-edge -Port 9877
 ```
 
 > **Windows alternative:** if you have **Git Bash** or **WSL**, you can run the same `./setup.sh` script — it works identically there.
@@ -59,23 +65,27 @@ Both scripts will:
 - ✅ Install server dependencies (`npm install`)
 - ✅ Auto-configure all detected IDEs (JetBrains, VS Code, Cursor, Claude Desktop, Gemini CLI)
 - ✅ On macOS/Linux: enable AutoDOM for both **GitHub Copilot** and **JetBrains AI Assistant**
-- ✅ Print instructions for loading the browser extension
-
-For multiple browsers at the same time, run the setup script once per browser with a unique MCP server name and port.
+- ✅ **Enroll the Chromium force-install policy** for every browser detected
+  (Chrome, Edge, Brave). Single sudo / UAC prompt — no further interaction.
 
 After the script finishes:
 
-1. Load the extension into your browser:
-   - **Chromium** (Chrome / Edge / Brave / Arc / Ulaa): open `chrome://extensions` → enable **Developer mode** → **Load unpacked** → select the `extension/` folder
-   - **Firefox**: run `./scripts/build-firefox.sh` (macOS/Linux) and use `dist/firefox/` or the prebuilt `dist/autodom-firefox-<version>.xpi` (see [Firefox install](#firefox-install)). On Windows, use the prebuilt `.xpi` from a release.
-2. Pin AutoDOM to the toolbar
-3. **Restart your IDE** so it picks up the new MCP config
-4. Open the AutoDOM popup in the browser → confirm it says **Connected**
-5. Your AI agent now has access to 70 browser-automation tools
+1. **Restart Chrome / Edge / Brave once.** AutoDOM installs automatically and
+   stays up to date from the GitHub Pages update channel (~5h cadence) — no
+   `Load unpacked`, no Developer-mode toggle, no Web-Store prompt.
+2. **Restart your IDE** so it picks up the new MCP config.
+3. Open the AutoDOM popup in the browser → confirm it says **Connected**.
+4. Your AI agent now has access to 70 browser-automation tools.
 
-> **Need to roll this out to many machines, or want auto-updates without the
-> Chrome Web Store?** See **[UPDATES.md](UPDATES.md)** for the
-> enterprise-policy install path (Chromium) and the signed-XPI path (Firefox).
+If you ran with `--no-auto-update` / `-NoAutoUpdate`, install the extension
+manually:
+
+- Open `chrome://extensions` (or `edge://extensions`, `brave://extensions`).
+- Enable **Developer mode** (top-right toggle).
+- Click **Load unpacked** → select the `extension/` folder.
+
+> **Need to roll this out to many machines?** See **[UPDATES.md](UPDATES.md)**
+> for fleet-management notes (Group Policy / Intune / MDM / Ansible).
 
 ---
 
@@ -90,36 +100,16 @@ npm install
 
 ### Step 2 — Load the Browser Extension
 
-#### Chromium (Chrome / Edge / Brave / Arc / Ulaa)
-
-1. Go to `chrome://extensions` (or your browser's extensions page)
+1. Go to `chrome://extensions` (or `edge://extensions`, `brave://extensions`)
 2. Enable **Developer mode** (top-right toggle)
 3. Click **Load unpacked**
 4. Select the `extension/` folder inside `autodom-extension`
 5. Pin AutoDOM to the toolbar
 
-#### Firefox install
-
-Firefox needs a Gecko-flavored manifest (event-page background instead of `service_worker`) and only loads a file literally named `manifest.json`. Build it with:
-
-```bash
-./scripts/build-firefox.sh
-```
-
-Outputs:
-
-- `dist/firefox/` — unpacked, ready for *Load Temporary Add-on*
-- `dist/autodom-firefox-<version>.xpi` and `dist/autodom-firefox-latest.xpi`
-
-Install options:
-
-| Goal | Steps |
-|---|---|
-| **Temporary load (any Firefox edition)** | `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** → pick `dist/firefox/manifest.json`. Stays loaded until Firefox is closed. |
-| **Permanent on Developer Edition / Nightly / ESR** | `about:config` → set `xpinstall.signatures.required` to `false` → drag `dist/autodom-firefox-latest.xpi` onto `about:addons`. |
-| **Release Firefox** | Submit the XPI to [addons.mozilla.org](https://addons.mozilla.org/developers/) for signing first — release Firefox refuses unsigned add-ons. |
-
-> ⚠ Don't pick `extension/manifest.json` directly in Firefox — it declares a Chromium `service_worker` and will fail with a "background service" error. Always load via the build output.
+> The source `extension/manifest.json` ships with the canonical signing
+> `key`, so an unpacked load resolves to the same extension ID
+> (`kpjdffgogiajnkajnjneiboaincnaokf`) as the signed CRX from a GitHub
+> Release. Updates from the self-hosted channel work either way.
 
 ### Step 3 — Configure Your IDE
 

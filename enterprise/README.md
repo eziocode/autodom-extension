@@ -20,11 +20,9 @@ Both installers:
 - write the right policy file in the right location for each one,
 - print the post-install verification steps.
 
-> ℹ This only works for **Chromium**. Firefox uses a different mechanism — for
-> Firefox, distribute the signed `.xpi` from the GitHub Release; once
-> installed it will auto-update from the JSON manifest at
-> `https://eziocode.github.io/autodom-extension/updates.json`. See
-> [`UPDATES.md`](../UPDATES.md).
+> ℹ AutoDOM is **Chromium-only** (Chrome, Edge, Brave, Arc, Ulaa, etc.).
+> Firefox is no longer supported. See [`UPDATES.md`](../UPDATES.md) for the
+> end-to-end update flow.
 
 ## What gets installed
 

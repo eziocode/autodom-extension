@@ -49,10 +49,8 @@ jobs:
             node --check "$f"
           done
 
-      - name: Validate manifests
-        run: |
-          python3 -c "import json; json.load(open('extension/manifest.json'))"
-          python3 -c "import json; json.load(open('extension/manifest.firefox.json'))"
+      - name: Validate manifest
+        run: python3 -c "import json; json.load(open('extension/manifest.json'))"
 
       - name: WebSocket auth test
         working-directory: server
@@ -64,13 +62,3 @@ jobs:
 
       - name: web-ext lint (Chrome manifest)
         run: npx --yes web-ext@8 lint --source-dir=extension --self-hosted
-
-      - name: Build firefox artefact
-        run: bash scripts/build-firefox.sh
-
-      - name: Upload firefox xpi
-        uses: actions/upload-artifact@v4
-        with:
-          name: autodom-firefox
-          path: dist/*.xpi
-          if-no-files-found: warn
