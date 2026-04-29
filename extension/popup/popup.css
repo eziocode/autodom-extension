@@ -237,6 +237,34 @@ body {
     animation: version-spin 0.9s linear infinite;
 }
 
+/* "Update available" state — replaces the ↻ refresh glyph with an "Update"
+   pill and paints the button in the theme's "needs-attention" colour so it
+   reads as a CTA rather than a passive control. The state persists across
+   popup re-opens (driven by storage.local.pendingUpdate) and is cleared
+   once the user clicks to apply the update. */
+.version-update-btn.has-update {
+    color: #fff;
+    background: var(--warn);
+    border-color: var(--warn);
+    width: auto;
+    padding: 0 8px;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    animation: version-update-pulse 2s ease-in-out infinite;
+}
+
+.version-update-btn.has-update:hover:not(:disabled) {
+    filter: brightness(1.08);
+    color: #fff;
+}
+
+@keyframes version-update-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--warn) 60%, transparent); }
+    50%      { box-shadow: 0 0 0 4px transparent; }
+}
+
 @keyframes version-spin {
     to { transform: rotate(360deg); }
 }

@@ -63,6 +63,63 @@ const DOM = {
 let isRunning = false;
 let isConnected = false;
 
+const REFRESH_GLYPH = "↻";
+const UPDATE_LABEL = "Update";
+
+// Render the ↻ button in either its idle (refresh) state or its
+// "update available" CTA state. Driven by chrome.storage.local.pendingUpdate
+// which the service worker writes when chrome.runtime.onUpdateAvailable
+// fires (or when the popup itself surfaces an update_available result).
+function paintUpdateButton(pending) {
+  const btn = DOM.checkUpdateBtn;
+  const versionEl = DOM.appVersion;
+  if (!btn) return;
+  if (pending && pending.version) {
+    btn.classList.add("has-update");
+    btn.textContent = UPDATE_LABEL;
+    btn.title = `Update to v${pending.version} ready — click to apply`;
+    btn.setAttribute("aria-label", `Update to v${pending.version}`);
+    if (versionEl) {
+      versionEl.textContent = `v${chrome.runtime.getManifest().version} → v${pending.version}`;
+    }
+  } else {
+    btn.classList.remove("has-update");
+    btn.textContent = REFRESH_GLYPH;
+    btn.title = "Check for updates";
+    btn.setAttribute("aria-label", "Check for updates");
+    if (versionEl) {
+      versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
+    }
+  }
+}
+
+async function readPendingUpdate() {
+  try {
+    const { pendingUpdate } = await chrome.storage.local.get("pendingUpdate");
+    return pendingUpdate || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function applyPendingUpdate() {
+  const btn = DOM.checkUpdateBtn;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "updating…";
+  }
+  try {
+    // Asks the service worker to call chrome.runtime.reload(), which unloads
+    // the SW and applies the pre-downloaded CRX. The popup will then close
+    // automatically as the extension reloads.
+    await chrome.runtime.sendMessage({ type: "AUTODOM_APPLY_UPDATE" });
+  } catch (err) {
+    // sendMessage can throw if the SW just woke up; fall back to direct
+    // reload from the popup context.
+    try { chrome.runtime.reload(); } catch (_) {}
+  }
+}
+
 // Runs Chromium / Firefox's built-in extension update check against the
 // configured `update_url`. Browsers throttle this to a few times per hour,
 // so failures with status="throttled" are normal and surfaced to the user.
@@ -71,12 +128,20 @@ async function runUpdateCheck() {
   const versionEl = DOM.appVersion;
   if (!btn || !versionEl) return;
 
-  const restoreText = versionEl.textContent;
+  // If an update is already pending, this click means "apply it now".
+  if (btn.classList.contains("has-update")) {
+    await applyPendingUpdate();
+    return;
+  }
+
   const setLabel = (text, ttl = 4000) => {
     versionEl.textContent = text;
     if (ttl > 0) {
-      setTimeout(() => {
-        versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
+      setTimeout(async () => {
+        // Re-read pending so the label reverts to the right state if an
+        // update was discovered mid-check.
+        const pending = await readPendingUpdate();
+        paintUpdateButton(pending);
       }, ttl);
     }
   };
@@ -119,8 +184,19 @@ async function runUpdateCheck() {
 
     const status = (result && result.status) || "unknown";
     if (status === "update_available") {
-      const v = result.details && result.details.version;
-      setLabel(v ? `update → v${v}` : "update available", 8000);
+      const v = (result.details && result.details.version) || null;
+      // Tell the SW so it persists the flag and badges the toolbar icon —
+      // no-op if the SW already heard onUpdateAvailable independently.
+      try {
+        await chrome.runtime.sendMessage({
+          type: "AUTODOM_UPDATE_AVAILABLE",
+          version: v,
+        });
+      } catch (_) {}
+      btn.classList.remove("spin");
+      btn.disabled = false;
+      paintUpdateButton({ version: v || "?" });
+      return;
     } else if (status === "no_update") {
       setLabel("up to date");
     } else if (status === "throttled") {
@@ -131,9 +207,8 @@ async function runUpdateCheck() {
   } catch (err) {
     setLabel(`error: ${(err && err.message) || err}`.slice(0, 40));
   } finally {
-    btn.disabled = false;
     btn.classList.remove("spin");
-    void restoreText;
+    btn.disabled = false;
   }
 }
 
@@ -280,6 +355,19 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   if (DOM.checkUpdateBtn) {
     DOM.checkUpdateBtn.addEventListener("click", () => runUpdateCheck());
+    // Initial paint: if the service worker has already detected a pending
+    // update on a previous popup-less browser session, show the CTA state
+    // immediately.
+    readPendingUpdate().then((pending) => paintUpdateButton(pending));
+    // Live updates: react to onUpdateAvailable arriving while the popup
+    // is open (e.g. the user opens it just before the browser's scheduled
+    // check fires).
+    try {
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== "local" || !changes.pendingUpdate) return;
+        paintUpdateButton(changes.pendingUpdate.newValue || null);
+      });
+    } catch (_) {}
   }
 
 // API keys live in chrome.storage.session (RAM-only). Falls back to local

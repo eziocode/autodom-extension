@@ -5994,6 +5994,16 @@ chrome.storage.local.get(
 
 // Also auto-connect on extension install/update
 chrome.runtime.onInstalled.addListener(() => {
+  // A fresh install or successful update arrival clears any pending-update
+  // marker. The new manifest version is already running, so the popup
+  // should drop back to its idle state.
+  try {
+    chrome.storage.local.remove("pendingUpdate");
+    if (chrome.action && chrome.action.setBadgeText) {
+      chrome.action.setBadgeText({ text: "" });
+    }
+  } catch (_) {}
+
   chrome.storage.local.get(
     ["mcpPort", "autoConnect", "mcpRunning"],
     (result) => {
@@ -6022,6 +6032,65 @@ chrome.runtime.onInstalled.addListener(() => {
       }
     },
   );
+});
+
+// ─── Pending-update indicator ──────────────────────────────────
+// Chromium fires `onUpdateAvailable` once it has fetched a newer CRX from our
+// self-hosted update_url and verified its signature, but the new version
+// only takes effect after the service worker is reloaded. We persist that
+// fact so the popup can flip the ↻ button into an "Update" affordance, and
+// we paint a small accent badge on the toolbar icon so the user notices
+// without opening the popup.
+function _setPendingUpdate(version) {
+  try {
+    chrome.storage.local.set({
+      pendingUpdate: {
+        version: version || null,
+        detectedAt: Date.now(),
+      },
+    });
+    if (chrome.action && chrome.action.setBadgeText) {
+      chrome.action.setBadgeText({ text: "•" });
+    }
+    if (chrome.action && chrome.action.setBadgeBackgroundColor) {
+      // Match the accent (--accent: #f97316 in popup.css).
+      chrome.action.setBadgeBackgroundColor({ color: "#f97316" });
+    }
+    if (chrome.action && chrome.action.setTitle) {
+      chrome.action.setTitle({
+        title: version
+          ? `AutoDOM — update to v${version} ready (click)`
+          : "AutoDOM — update ready (click)",
+      });
+    }
+  } catch (_) {}
+}
+
+if (chrome.runtime && chrome.runtime.onUpdateAvailable) {
+  chrome.runtime.onUpdateAvailable.addListener((details) => {
+    _setPendingUpdate(details && details.version);
+  });
+}
+
+// Popup → service worker: forward a manual `update_available` result so the
+// badge appears even when the user triggered the check rather than the
+// browser's own scheduler.
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg && msg.type === "AUTODOM_UPDATE_AVAILABLE") {
+    _setPendingUpdate(msg.version);
+    sendResponse({ ok: true });
+    return false;
+  }
+  if (msg && msg.type === "AUTODOM_APPLY_UPDATE") {
+    // chrome.runtime.reload() unloads the service worker and applies the
+    // pending CRX. The new version's onInstalled handler will clear the
+    // pendingUpdate flag and the badge.
+    sendResponse({ ok: true });
+    setTimeout(() => {
+      try { chrome.runtime.reload(); } catch (_) {}
+    }, 50);
+    return false;
+  }
 });
 // ─── Emulation & Performance Tools (Advanced) ────────────────
 
