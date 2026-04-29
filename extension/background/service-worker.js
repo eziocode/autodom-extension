@@ -62,6 +62,24 @@ const _secretStorageIsSession =
   chrome.storage.session &&
   secretStorage === chrome.storage.session;
 
+function _storageResult(result, context) {
+  let runtimeError = "";
+  try {
+    runtimeError = chrome.runtime.lastError?.message || "";
+  } catch (_) {
+    runtimeError = "";
+  }
+  if (runtimeError) {
+    _debugWarn(`[AutoDOM SW] ${context} storage read failed: ${runtimeError}`);
+    return {};
+  }
+  if (result && typeof result === "object") return result;
+  _debugWarn(
+    `[AutoDOM SW] ${context} storage read returned no data; using defaults.`,
+  );
+  return {};
+}
+
 function _readApiKey() {
   return new Promise((resolve) => {
     try {
@@ -409,6 +427,7 @@ const IS_FIREFOX = (() => {
 })();
 
 let _pendingToolLogResolve = null; // Resolve callback for GET_TOOL_LOGS roundtrip to server
+let _pendingToolLogClearResolve = null; // Resolve callback for CLEAR_TOOL_LOGS roundtrip to server
 
 // ─── Tool Error Log ───────────────────────────────────────────
 // Ring buffer for tool errors visible in the extension Logs tab.
@@ -1794,8 +1813,9 @@ const domainCallLog = new Map();
 
 // Load rate limit config from storage on startup
 chrome.storage.local.get(["rateLimitConfig"], (stored) => {
-  if (stored.rateLimitConfig) {
-    rateLimitConfig = { ...rateLimitConfig, ...stored.rateLimitConfig };
+  const result = _storageResult(stored, "rateLimitConfig");
+  if (result.rateLimitConfig) {
+    rateLimitConfig = { ...rateLimitConfig, ...result.rateLimitConfig };
   }
 });
 
@@ -1936,10 +1956,11 @@ let confirmBeforeSubmitConfig = {
 
 // Load confirm-before-submit config from storage
 chrome.storage.local.get(["confirmBeforeSubmitConfig"], (stored) => {
-  if (stored.confirmBeforeSubmitConfig) {
+  const result = _storageResult(stored, "confirmBeforeSubmitConfig");
+  if (result.confirmBeforeSubmitConfig) {
     // Only merge the `enabled` flag — patterns stay hardcoded for safety
     confirmBeforeSubmitConfig.enabled =
-      !!stored.confirmBeforeSubmitConfig.enabled;
+      !!result.confirmBeforeSubmitConfig.enabled;
   }
 });
 
@@ -2414,6 +2435,19 @@ function connectWebSocket(port) {
             const resolve = _pendingToolLogResolve;
             _pendingToolLogResolve = null;
             resolve({ serverLogs: message.logs || [], logFile: message.logFile });
+          }
+          return;
+        }
+
+        // Confirmation that the server cleared its in-memory ring buffer
+        // and truncated the on-disk log file. The popup waits for this
+        // before claiming "cleared" — without it, a fast Refresh after
+        // Clear races ahead of the WS CLEAR and old logs reappear.
+        if (message.type === "TOOL_LOGS_CLEARED") {
+          if (_pendingToolLogClearResolve) {
+            const resolve = _pendingToolLogClearResolve;
+            _pendingToolLogClearResolve = null;
+            resolve({ logFile: message.logFile || null });
           }
           return;
         }
@@ -3373,14 +3407,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "CLEAR_TOOL_LOGS") {
     _swToolErrorLog.length = 0;
-    let logFile = null;
-    if (isConnected && ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(JSON.stringify({ type: "CLEAR_TOOL_LOGS" }));
-      } catch (_) {}
-    }
-    sendResponse({ ok: true, logFile });
-    return false;
+    (async () => {
+      let logFile = null;
+      if (isConnected && ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          const ack = await new Promise((resolve) => {
+            _pendingToolLogClearResolve = resolve;
+            try {
+              ws.send(JSON.stringify({ type: "CLEAR_TOOL_LOGS" }));
+            } catch (sendErr) {
+              if (_pendingToolLogClearResolve === resolve) {
+                _pendingToolLogClearResolve = null;
+              }
+              resolve({ logFile: null });
+              return;
+            }
+            setTimeout(() => {
+              if (_pendingToolLogClearResolve === resolve) {
+                _pendingToolLogClearResolve = null;
+                resolve({ logFile: null });
+              }
+            }, 3000);
+          });
+          logFile = ack?.logFile || null;
+        } catch (_) {}
+      }
+      sendResponse({ ok: true, logFile });
+    })();
+    return true;
   }
 
   if (message.type === "CHAT_TOOL_CALL") {
@@ -5054,6 +5108,10 @@ async function toolHandleDialog(params) {
     return { success: true, action };
   } catch (err) {
     return { error: `Dialog handling failed: ${err.message}` };
+  } finally {
+    // One-shot CDP op — drop the debugger attachment so Chrome's
+    // "started debugging" banner doesn't linger over the MCP overlay.
+    detachDebuggerSafe(tab.id).catch(() => {});
   }
 }
 
@@ -5912,21 +5970,22 @@ chrome.storage.local.get(
     "aiProviderPreset",
   ],
   async (result) => {
-    const port = result.mcpPort || 9876;
-    const autoConnect = result.autoConnect === true;
+    const stored = _storageResult(result, "startup settings");
+    const port = stored.mcpPort || 9876;
+    const autoConnect = stored.autoConnect === true;
     autoConnectEnabled = autoConnect;
     autoConnectFallbackTried = false;
     wsPort = port;
     _requestedPort = port;
     lastConnectedPort =
-      Number(result.mcpLastConnectedPort || result.serverPort || port) || port;
+      Number(stored.mcpLastConnectedPort || stored.serverPort || port) || port;
     shouldRunMcp = autoConnect;
     _startupRestoreOnly = autoConnect;
 
     // Migrate legacy plaintext key (chrome.storage.local) → session storage.
     let apiKey = await _readApiKey();
-    if (!apiKey && result.aiProviderApiKey) {
-      apiKey = result.aiProviderApiKey;
+    if (!apiKey && stored.aiProviderApiKey) {
+      apiKey = stored.aiProviderApiKey;
       _writeApiKey(apiKey);
       try {
         chrome.storage.local.remove("aiProviderApiKey");
@@ -5937,15 +5996,15 @@ chrome.storage.local.get(
     }
 
     aiProviderSettings = {
-      source: result.aiProviderSource || "ide",
+      source: stored.aiProviderSource || "ide",
       apiKey,
-      model: result.aiProviderModel || "",
-      baseUrl: result.aiProviderBaseUrl || "",
-      cliBinary: result.aiProviderCliBinary || "",
-      cliKind: result.aiProviderCliKind || "",
-      cliExtraArgs: result.aiProviderCliExtraArgs || "",
-      enabled: result.aiProviderEnabled === true,
-      preset: result.aiProviderPreset || "custom",
+      model: stored.aiProviderModel || "",
+      baseUrl: stored.aiProviderBaseUrl || "",
+      cliBinary: stored.aiProviderCliBinary || "",
+      cliKind: stored.aiProviderCliKind || "",
+      cliExtraArgs: stored.aiProviderCliExtraArgs || "",
+      enabled: stored.aiProviderEnabled === true,
+      preset: stored.aiProviderPreset || "custom",
     };
 
     // One-shot migration (mirrors popup.js): older builds auto-filled a
@@ -6021,9 +6080,10 @@ chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.get(
     ["mcpPort", "autoConnect", "mcpRunning"],
     (result) => {
-      const port = result.mcpPort || 9876;
+      const stored = _storageResult(result, "installed settings");
+      const port = stored.mcpPort || 9876;
       const autoConnect =
-        typeof result.autoConnect === "boolean" ? result.autoConnect : false;
+        typeof stored.autoConnect === "boolean" ? stored.autoConnect : false;
       const initialRunning = autoConnect;
 
       shouldRunMcp = initialRunning;
@@ -6032,7 +6092,7 @@ chrome.runtime.onInstalled.addListener(() => {
       wsPort = port;
       _requestedPort = port;
       lastConnectedPort =
-        Number(result.mcpLastConnectedPort || result.serverPort || port) ||
+        Number(stored.mcpLastConnectedPort || stored.serverPort || port) ||
         port;
       chrome.storage.local.set({
         mcpPort: port,
@@ -6111,6 +6171,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // Track which tabs have an active debugger session to avoid double-attach
 const _debuggerAttached = new Set();
 
+// Detach the debugger from a tab if we are the ones holding it. Best
+// effort — never throws. Called after one-shot CDP operations
+// (execute_code CSP fallback, file upload) so Chrome's permanent
+// "AutoDOM started debugging this browser" banner doesn't linger on
+// top of our session-border MCP overlay.
+async function detachDebuggerSafe(tabId) {
+  if (IS_FIREFOX) return;
+  if (!_debuggerAttached.has(tabId)) return;
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch (_) {
+    // Already detached (manually closed, tab gone, etc.) — fine.
+  } finally {
+    _debuggerAttached.delete(tabId);
+  }
+}
+
 async function ensureDebugger(tabId) {
   if (IS_FIREFOX) {
     throw new Error(
@@ -6180,28 +6257,34 @@ async function toolUploadFile({ uid, filePath }) {
   const tab = await getActiveTab();
   const tabId = tab.id;
   await ensureDebugger(tabId);
-  const res = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
-    expression: `document.querySelector('${uid.replace(/'/g, "\\'")}') || document.querySelector('[__bmcp_uid="${uid.replace(/"/g, '\\"')}"]');`,
-  });
+  try {
+    const res = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+      expression: `document.querySelector('${uid.replace(/'/g, "\\'")}') || document.querySelector('[__bmcp_uid="${uid.replace(/"/g, '\\"')}"]');`,
+    });
 
-  if (
-    !res.result ||
-    res.result.type === "undefined" ||
-    res.result.subtype === "null"
-  ) {
-    throw new Error(`File input element not found for selector/uid: ${uid}`);
+    if (
+      !res.result ||
+      res.result.type === "undefined" ||
+      res.result.subtype === "null"
+    ) {
+      throw new Error(`File input element not found for selector/uid: ${uid}`);
+    }
+
+    const nodeRes = await chrome.debugger.sendCommand(
+      { tabId },
+      "DOM.requestNode",
+      { objectId: res.result.objectId },
+    );
+    await chrome.debugger.sendCommand({ tabId }, "DOM.setFileInputFiles", {
+      files: [filePath],
+      backendNodeId: nodeRes.nodeId,
+    });
+    return { success: true, note: `File uploaded to element ${uid}` };
+  } finally {
+    // One-shot CDP op — drop the debugger attachment so Chrome's
+    // "started debugging" banner doesn't linger.
+    detachDebuggerSafe(tabId).catch(() => {});
   }
-
-  const nodeRes = await chrome.debugger.sendCommand(
-    { tabId },
-    "DOM.requestNode",
-    { objectId: res.result.objectId },
-  );
-  await chrome.debugger.sendCommand({ tabId }, "DOM.setFileInputFiles", {
-    files: [filePath],
-    backendNodeId: nodeRes.nodeId,
-  });
-  return { success: true, note: `File uploaded to element ${uid}` };
 }
 
 // 44. Start Trace
@@ -6361,23 +6444,34 @@ function isCspEvalError(message, name) {
 async function executeCodeViaCdp(tabId, code, timeoutMs) {
   await ensureDebugger(tabId);
   const expression = `(async () => { ${code} })()`;
-  const res = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
-    expression,
-    awaitPromise: true,
-    returnByValue: true,
-    timeout: timeoutMs,
-    userGesture: true,
-  });
-  if (res && res.exceptionDetails) {
-    const ex = res.exceptionDetails;
-    const msg =
-      (ex.exception && (ex.exception.description || ex.exception.value)) ||
-      ex.text ||
-      "Code execution failed";
-    return { error: String(msg) };
+  let detachAfter = false;
+  try {
+    const res = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+      timeout: timeoutMs,
+      userGesture: true,
+    });
+    detachAfter = true;
+    if (res && res.exceptionDetails) {
+      const ex = res.exceptionDetails;
+      const msg =
+        (ex.exception && (ex.exception.description || ex.exception.value)) ||
+        ex.text ||
+        "Code execution failed";
+      return { error: String(msg) };
+    }
+    const value = res && res.result ? res.result.value : undefined;
+    return { success: true, result: value };
+  } finally {
+    // Detach so Chrome's "started debugging this browser" banner clears
+    // — execute_code is a one-shot operation and we don't need to keep
+    // the debugger attached between calls.
+    if (detachAfter) {
+      detachDebuggerSafe(tabId).catch(() => {});
+    }
   }
-  const value = res && res.result ? res.result.value : undefined;
-  return { success: true, result: value };
 }
 
 async function toolRunBrowserScript(params) {

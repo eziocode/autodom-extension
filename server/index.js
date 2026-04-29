@@ -1576,6 +1576,37 @@ function _processWsMessage(socket, message) {
         // ── Heuristic AI routing ──────────────────────────────
         // Map natural language intents to tool calls and compose
         // a helpful response from the results.
+        //
+        // When an IDE AI agent is connected via MCP sampling, "rich text"
+        // intents (summarize, list interactive elements, accessibility
+        // audit, what-can-I-do) should be answered by the real AI rather
+        // than the local heuristic — otherwise the user gets a generic
+        // page-stats dump or a raw DOM listing instead of an AI summary.
+        // Deterministic intents (click, scroll, navigate, screenshot,
+        // page info, extract text) stay on the heuristic path because
+        // they don't benefit from AI and need to remain instant.
+        const _preferIdeAiForRichIntent =
+          !!activeMcpSession &&
+          (
+            lower.includes("summarize") ||
+            lower.includes("summary") ||
+            lower === "tldr" ||
+            lower === "tl;dr" ||
+            lower.includes("what's on this page") ||
+            lower.includes("what is this page") ||
+            lower.includes("interactive") ||
+            lower.includes("dom state") ||
+            lower.includes("what can i click") ||
+            lower.includes("elements") ||
+            lower.includes("accessibility") ||
+            lower.includes("a11y")
+          );
+
+        if (_preferIdeAiForRichIntent) {
+          process.stderr.write(
+            `[AutoDOM] Rich intent detected; skipping heuristic and routing to IDE AI agent: "${(text || "").substring(0, 80)}"\n`,
+          );
+        }
 
         if (
           lower.includes("screenshot") ||
@@ -1591,10 +1622,13 @@ function _processWsMessage(socket, message) {
             responseText = `Screenshot result: ${JSON.stringify(result)}`;
           }
         } else if (
-          lower.includes("dom state") ||
-          lower.includes("interactive") ||
-          lower.includes("what can i click") ||
-          lower.includes("elements")
+          !_preferIdeAiForRichIntent &&
+          (
+            lower.includes("dom state") ||
+            lower.includes("interactive") ||
+            lower.includes("what can i click") ||
+            lower.includes("elements")
+          )
         ) {
           const result = await callExtensionTool("get_dom_state", {});
           toolCalls.push({ tool: "get_dom_state" });
@@ -1625,12 +1659,15 @@ function _processWsMessage(socket, message) {
           if (result?.links) responseText += `Links: ${result.links}\n`;
           if (result?.images) responseText += `Images: ${result.images}\n`;
         } else if (
-          lower.includes("summarize") ||
-          lower.includes("summary") ||
-          lower === "tldr" ||
-          lower === "tl;dr" ||
-          lower.includes("what's on this page") ||
-          lower.includes("what is this page")
+          !_preferIdeAiForRichIntent &&
+          (
+            lower.includes("summarize") ||
+            lower.includes("summary") ||
+            lower === "tldr" ||
+            lower === "tl;dr" ||
+            lower.includes("what's on this page") ||
+            lower.includes("what is this page")
+          )
         ) {
           const result = await callExtensionTool("execute_code", {
             code: "return { title: document.title, url: location.href, text: document.body.innerText.substring(0, 4000), h1: [...document.querySelectorAll('h1')].map(h => h.textContent.trim()).filter(Boolean).slice(0, 5), h2: [...document.querySelectorAll('h2')].map(h => h.textContent.trim()).filter(Boolean).slice(0, 10), counts: { links: document.querySelectorAll('a[href]').length, buttons: document.querySelectorAll('button, [role=\"button\"]').length, inputs: document.querySelectorAll('input, textarea, select').length, forms: document.querySelectorAll('form').length } };",
@@ -1675,7 +1712,10 @@ function _processWsMessage(socket, message) {
           responseText +=
             "_For a smarter summary, configure a direct AI provider " +
             "(GPT, Claude, or Ollama) in the extension popup._";
-        } else if (lower.includes("accessibility") || lower.includes("a11y")) {
+        } else if (
+          !_preferIdeAiForRichIntent &&
+          (lower.includes("accessibility") || lower.includes("a11y"))
+        ) {
           const result = await callExtensionTool("execute_code", {
             code: `
               const issues = [];

@@ -48,25 +48,36 @@
 
   // Declared early so _log/_err closures can reference it without TDZ issues
   let _contextInvalidated = false;
+  function _swallowRuntimeLastError() {
+    try {
+      void chrome.runtime.lastError;
+    } catch (_) {
+      _contextInvalidated = true;
+    }
+  }
+
   function _pushActivityLog(level, args) {
     try {
-      chrome.runtime.sendMessage({
-        type: "ACTIVITY_LOG_APPEND",
-        level: level || "info",
-        source: "chat-panel",
-        text: args
-          .map((arg) => {
-            if (typeof arg === "string") return arg;
-            if (arg && typeof arg.message === "string") return arg.message;
-            try {
-              return String(arg);
-            } catch (_) {
-              return "";
-            }
-          })
-          .filter(Boolean)
-          .join(" "),
-      });
+      chrome.runtime.sendMessage(
+        {
+          type: "ACTIVITY_LOG_APPEND",
+          level: level || "info",
+          source: "chat-panel",
+          text: args
+            .map((arg) => {
+              if (typeof arg === "string") return arg;
+              if (arg && typeof arg.message === "string") return arg.message;
+              try {
+                return String(arg);
+              } catch (_) {
+                return "";
+              }
+            })
+            .filter(Boolean)
+            .join(" "),
+        },
+        _swallowRuntimeLastError,
+      );
     } catch (_) {}
   }
 
@@ -5750,11 +5761,10 @@
     _userAborted = true;
     try {
       if (chrome?.runtime?.id) {
-        chrome.runtime.sendMessage({ type: "ABORT_AI_CHAT" }, () => {
-          // Swallow lastError — the SW may not be alive (context
-          // invalidated). The local UI reset below is what matters.
-          void chrome.runtime.lastError;
-        });
+        chrome.runtime.sendMessage(
+          { type: "ABORT_AI_CHAT" },
+          _swallowRuntimeLastError,
+        );
       }
     } catch (_) {}
     hideTyping();
@@ -7121,11 +7131,14 @@
         : "Denied";
       card.appendChild(status);
       try {
-        chrome.runtime.sendMessage({
-          type: "ACTION_GATE_DECISION",
-          requestId: req.requestId,
-          decision,
-        });
+        chrome.runtime.sendMessage(
+          {
+            type: "ACTION_GATE_DECISION",
+            requestId: req.requestId,
+            decision,
+          },
+          _swallowRuntimeLastError,
+        );
       } catch (_) {}
     };
 
@@ -7632,7 +7645,7 @@
       try {
         chrome.runtime.sendMessage(
           { type: "STOP_AGENT_RUN", runId: _activeRunId, reason: "stopped_by_user" },
-          () => { try { void chrome.runtime.lastError; } catch (_) {} },
+          _swallowRuntimeLastError,
         );
       } catch (_) {}
       // Also flag any in-chat tool cards as cancelled for immediate feedback
@@ -7753,6 +7766,7 @@
         chrome.runtime.sendMessage(
           { type: "STOP_AGENT_RUN", runId: _activeRunId },
           () => {
+            _swallowRuntimeLastError();
             try {
               document
                 .querySelectorAll(".ai-tool-card.running")
@@ -9917,7 +9931,7 @@
           cancelBtn.disabled = true;
           chrome.runtime.sendMessage(
             { type: "CANCEL_SUBMIT_ACTION", confirmId: result.confirmId },
-            () => {},
+            _swallowRuntimeLastError,
           );
           btnRow.remove();
           addMessage("system", `Action "${command.tool}" cancelled.`);
@@ -10118,7 +10132,10 @@
   // background.
   function _applyPendingUpdate() {
     try {
-      chrome.runtime.sendMessage({ type: "AUTODOM_APPLY_UPDATE" }, () => {});
+      chrome.runtime.sendMessage(
+        { type: "AUTODOM_APPLY_UPDATE" },
+        _swallowRuntimeLastError,
+      );
     } catch (_) {
       try { chrome.runtime.reload(); } catch (__) {}
     }
@@ -10543,11 +10560,14 @@
         renderActionGateCard(message);
       } catch (err) {
         try {
-          chrome.runtime.sendMessage({
-            type: "ACTION_GATE_DECISION",
-            requestId: message.requestId,
-            decision: { allowed: false, reason: err?.message || String(err) },
-          });
+          chrome.runtime.sendMessage(
+            {
+              type: "ACTION_GATE_DECISION",
+              requestId: message.requestId,
+              decision: { allowed: false, reason: err?.message || String(err) },
+            },
+            _swallowRuntimeLastError,
+          );
         } catch (_) {}
       }
       return;

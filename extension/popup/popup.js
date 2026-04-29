@@ -93,9 +93,29 @@ function paintUpdateButton(pending) {
   }
 }
 
+async function readLocalStorage(keys, context) {
+  try {
+    const result = await chrome.storage.local.get(keys);
+    if (result && typeof result === "object") return result;
+    console.warn(
+      `[AutoDOM Popup] ${context} storage read returned no data; using defaults.`,
+    );
+    return {};
+  } catch (err) {
+    console.warn(
+      `[AutoDOM Popup] ${context} storage read failed:`,
+      err?.message || err,
+    );
+    return {};
+  }
+}
+
 async function readPendingUpdate() {
   try {
-    const { pendingUpdate } = await chrome.storage.local.get("pendingUpdate");
+    const { pendingUpdate } = await readLocalStorage(
+      "pendingUpdate",
+      "pending update",
+    );
     return pendingUpdate || null;
   } catch (_) {
     return null;
@@ -379,7 +399,7 @@ const _secretAreaName =
     : "local";
 
   // Load saved port, server path, auto-connect preference, and provider settings
-  const stored = await chrome.storage.local.get([
+  const stored = await readLocalStorage([
     "mcpPort",
     "serverPath",
     "autoConnect",
@@ -392,7 +412,7 @@ const _secretAreaName =
     "aiProviderCliExtraArgs",
     "aiProviderEnabled",
     "aiProviderPreset",
-  ]);
+  ], "startup settings");
   const secretStored = await new Promise((resolve) => {
     try {
       _secretArea.get(["aiProviderApiKey"], (r) => resolve(r || {}));
@@ -471,16 +491,19 @@ const _secretAreaName =
     ? storedActivity[ACTIVITY_LOG_KEY]
     : [];
 
-  const storedUiState = await chrome.storage.local.get([ACTIVITY_FILTER_KEY]);
+  const storedUiState = await readLocalStorage(
+    [ACTIVITY_FILTER_KEY],
+    "activity filter",
+  );
   activityFilter = storedUiState[ACTIVITY_FILTER_KEY] || "all";
   if (DOM.logFilter) DOM.logFilter.value = activityFilter;
   renderActivityLogs(activityLogs);
 
   // Load guardrails settings
-  const guardrails = await chrome.storage.local.get([
+  const guardrails = await readLocalStorage([
     "rateLimitConfig",
     "confirmBeforeSubmitConfig",
-  ]);
+  ], "guardrails");
   if (guardrails.rateLimitConfig) {
     if (DOM.rateLimitToggle)
       DOM.rateLimitToggle.checked = !!guardrails.rateLimitConfig.enabled;
@@ -530,7 +553,7 @@ const _secretAreaName =
 
   // Update config when port changes
   DOM.portInput.addEventListener("change", async () => {
-    const s = await chrome.storage.local.get(["serverPath"]);
+    const s = await readLocalStorage(["serverPath"], "server path");
     generateConfigs(
       parseInt(DOM.portInput.value, 10) || 9876,
       s.serverPath || null,
@@ -544,12 +567,15 @@ const _secretAreaName =
   refreshPortMismatchHint();
   if (DOM.portMismatchFixBtn) {
     DOM.portMismatchFixBtn.addEventListener("click", async () => {
-      const stored = await chrome.storage.local.get(["mcpDetectedPort"]);
+      const stored = await readLocalStorage(
+        ["mcpDetectedPort"],
+        "detected port",
+      );
       const detected = Number(stored.mcpDetectedPort);
       if (!Number.isFinite(detected) || detected <= 0) return;
       DOM.portInput.value = String(detected);
       await chrome.storage.local.set({ mcpPort: detected });
-      const s = await chrome.storage.local.get(["serverPath"]);
+      const s = await readLocalStorage(["serverPath"], "server path");
       generateConfigs(detected, s.serverPath || null);
       addLog(`Switched to detected bridge port ${detected}.`, "info");
       try {
@@ -1069,10 +1095,10 @@ function activateTab(tabName) {
 async function refreshPortMismatchHint() {
   if (!DOM.portMismatchHint) return;
   try {
-    const stored = await chrome.storage.local.get([
+    const stored = await readLocalStorage([
       "mcpPort",
       "mcpDetectedPort",
-    ]);
+    ], "port mismatch");
     const configured = Number(stored.mcpPort) || 9876;
     const detected = Number(stored.mcpDetectedPort);
     const showBanner =
@@ -1142,6 +1168,13 @@ const AI_CHAT_NEW_VERSION = "2.0.0";
   if (!badge) return;
   try {
     chrome.storage.local.get(["aiChatNewSeenVersion"], (items) => {
+      if (chrome.runtime.lastError) {
+        console.warn(
+          "[AutoDOM Popup] AI chat badge storage read failed:",
+          chrome.runtime.lastError.message,
+        );
+        return;
+      }
       const seen = items && items.aiChatNewSeenVersion;
       if (seen === AI_CHAT_NEW_VERSION) {
         badge.setAttribute("hidden", "");
@@ -1449,7 +1482,7 @@ DOM.connectBtn.addEventListener("click", async () => {
   }
 
   await chrome.storage.local.set({ mcpPort: port });
-  const stored = await chrome.storage.local.get(["serverPath"]);
+  const stored = await readLocalStorage(["serverPath"], "server path");
   generateConfigs(port, stored.serverPath || null);
 
   if (!isRunning) {
@@ -2186,9 +2219,15 @@ function initToolLogsTab() {
   const clearBtn = $("#clearToolLogsBtn");
   if (clearBtn) {
     clearBtn.addEventListener("click", async () => {
+      // Optimistic local clear so the UI feels instant.
+      _toolLogs = { extensionLogs: [], serverLogs: [], logFile: _toolLogs.logFile };
+      renderToolLogs();
       try {
         await sendRuntimeMessage({ type: "CLEAR_TOOL_LOGS" });
       } catch (_) {}
+      // Re-render in case the server ack updated logFile, and to mask
+      // any in-flight response that arrived between optimistic clear and
+      // server ack.
       _toolLogs = { extensionLogs: [], serverLogs: [], logFile: _toolLogs.logFile };
       renderToolLogs();
     });
