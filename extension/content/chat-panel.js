@@ -2982,7 +2982,7 @@
       align-items: center !important;
       justify-content: center !important;
       color: var(--c-text-3) !important;
-      transition: background-color 0.15s ease, color 0.15s ease;
+      transition: background-color 0.15s ease, color 0.15s ease, transform 0.15s ease;
       flex-shrink: 0 !important;
       align-self: flex-end;
       padding: 0 !important;
@@ -2991,21 +2991,30 @@
       background: var(--c-raised) !important;
       color: var(--c-text) !important;
     }
+    .autodom-chat-input-shell.is-expanded .autodom-chat-expand-btn {
+      background: var(--c-surface-2) !important;
+      color: var(--c-text) !important;
+    }
+    .autodom-chat-input-shell.is-expanded .autodom-chat-expand-btn:hover {
+      background: var(--c-raised) !important;
+    }
     .autodom-chat-expand-btn:focus-visible {
       outline: 2px solid var(--c-accent) !important;
       outline-offset: 2px !important;
     }
     .autodom-chat-expand-btn svg {
-      width: 14px !important;
-      height: 14px !important;
+      width: 15px !important;
+      height: 15px !important;
       fill: none !important;
       stroke: currentColor !important;
-      stroke-width: 2 !important;
+      stroke-width: 1.85 !important;
       stroke-linecap: round !important;
       stroke-linejoin: round !important;
+      transition: transform 0.18s ease;
     }
-    .autodom-chat-input-shell.is-expanded .autodom-chat-expand-btn .expand-icon { display: none !important; }
-    .autodom-chat-input-shell:not(.is-expanded) .autodom-chat-expand-btn .shrink-icon { display: none !important; }
+    .autodom-chat-input-shell.is-expanded .autodom-chat-expand-btn svg {
+      transform: rotate(180deg);
+    }
     /* When the composer is expanded, the surrounding input area becomes
        a flex column so the shell can take the full available height. */
     .autodom-chat-input-area.is-composer-expanded {
@@ -4705,11 +4714,8 @@
           aria-label="Expand chat editor"
           aria-pressed="false"
         >
-          <svg class="expand-icon" viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M14 5h5v5"/><path d="M19 5l-7 7"/>
-          </svg>
-          <svg class="shrink-icon" viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M10 19H5v-5"/><path d="M5 19l7-7"/>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M14 4h6v6M10 20H4v-6"/>
           </svg>
         </button>
         <button class="autodom-chat-send-btn" id="__autodom_send_btn" title="Send (Enter) · Shift+Enter for newline" aria-label="Send message" disabled>
@@ -4878,14 +4884,17 @@
         gap: 4px !important;
         border-radius: 12px !important;
       }
-      /* Attachment paperclip: vertically center against a single-line
-         textarea (was align-self: flex-end which drifted down). Tighter
-         hit target reads as more minimalist at side-panel widths. */
+      /* Anchor attach / send / expand to the bottom of the shell in
+         BOTH compact and expanded states so toggling the expand
+         button never shifts the send key. In single-line mode the
+         shell is roughly button-height so flex-end reads the same as
+         center; in expanded mode the controls sit cleanly along the
+         bottom edge instead of floating in the middle. */
       #${PANEL_ID} .autodom-chat-attach-btn {
         width: 26px !important;
         height: 26px !important;
         min-width: 26px !important;
-        align-self: center !important;
+        align-self: flex-end !important;
         margin-right: 0 !important;
       }
       #${PANEL_ID} .autodom-chat-attach-btn svg {
@@ -4901,7 +4910,10 @@
         width: 30px !important;
         height: 30px !important;
         min-width: 30px !important;
-        align-self: center !important;
+        align-self: flex-end !important;
+      }
+      #${PANEL_ID} .autodom-chat-expand-btn {
+        align-self: flex-end !important;
       }
       /* Attachment chips: smaller previews so the composer stays
          compact when an image is queued. */
