@@ -75,12 +75,12 @@ function main() {
 
   const version = args.version || process.env.RELEASE_VERSION || chromeManifest.version;
   const extensionId = args["extension-id"] || process.env.EXTENSION_ID || process.env.CHROME_EXTENSION_ID;
-  const geckoId =
-    args["gecko-id"] ||
-    process.env.GECKO_ID ||
-    (firefoxManifest.browser_specific_settings &&
-      firefoxManifest.browser_specific_settings.gecko &&
-      firefoxManifest.browser_specific_settings.gecko.id);
+  // Firefox is opt-in: only pick up the gecko id when the caller
+  // explicitly passes --gecko-id or sets GECKO_ID. We deliberately do
+  // NOT fall back to manifest.firefox.json here, because the manifest
+  // always has a gecko id baked in — relying on it would force every
+  // release to be Firefox-enabled and break Chrome-only releases.
+  const geckoId = args["gecko-id"] || process.env.GECKO_ID || "";
   const crxUrl = args["crx-url"] || process.env.CRX_URL;
   const xpiUrl = args["xpi-url"] || process.env.XPI_URL;
   const outDir = resolve(ROOT, args["out-dir"] || "dist/update-manifests");
