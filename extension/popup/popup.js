@@ -9,6 +9,7 @@ const $$ = (sel) => document.querySelectorAll(sel);
 
 const DOM = {
   appVersion: $("#appVersion"),
+  checkUpdateBtn: $("#checkUpdateBtn"),
   actionBtn: $("#actionBtn"),
   actionBtnText: $("#actionBtnText"),
   portInput: $("#portInput"),
@@ -61,6 +62,81 @@ const DOM = {
 
 let isRunning = false;
 let isConnected = false;
+
+// Runs Chromium / Firefox's built-in extension update check against the
+// configured `update_url`. Browsers throttle this to a few times per hour,
+// so failures with status="throttled" are normal and surfaced to the user.
+async function runUpdateCheck() {
+  const btn = DOM.checkUpdateBtn;
+  const versionEl = DOM.appVersion;
+  if (!btn || !versionEl) return;
+
+  const restoreText = versionEl.textContent;
+  const setLabel = (text, ttl = 4000) => {
+    versionEl.textContent = text;
+    if (ttl > 0) {
+      setTimeout(() => {
+        versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
+      }, ttl);
+    }
+  };
+
+  btn.disabled = true;
+  btn.classList.add("spin");
+  versionEl.textContent = "checking…";
+
+  try {
+    const api =
+      (typeof browser !== "undefined" && browser.runtime && browser.runtime.requestUpdateCheck)
+        ? browser.runtime
+        : chrome.runtime;
+
+    if (!api || typeof api.requestUpdateCheck !== "function") {
+      setLabel("not supported");
+      return;
+    }
+
+    const result = await new Promise((resolve, reject) => {
+      try {
+        const ret = api.requestUpdateCheck((status, details) => {
+          if (chrome.runtime.lastError) {
+            reject(chrome.runtime.lastError);
+          } else {
+            resolve({ status, details });
+          }
+        });
+        // Firefox returns a Promise instead of using a callback.
+        if (ret && typeof ret.then === "function") {
+          ret.then(
+            (r) => resolve(Array.isArray(r) ? { status: r[0], details: r[1] } : r),
+            reject
+          );
+        }
+      } catch (err) {
+        reject(err);
+      }
+    });
+
+    const status = (result && result.status) || "unknown";
+    if (status === "update_available") {
+      const v = result.details && result.details.version;
+      setLabel(v ? `update → v${v}` : "update available", 8000);
+    } else if (status === "no_update") {
+      setLabel("up to date");
+    } else if (status === "throttled") {
+      setLabel("rate-limited");
+    } else {
+      setLabel(String(status));
+    }
+  } catch (err) {
+    setLabel(`error: ${(err && err.message) || err}`.slice(0, 40));
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove("spin");
+    void restoreText;
+  }
+}
+
 const ACTIVITY_LOG_KEY = "autodomActivityLogs";
 const ACTIVITY_FILTER_KEY = "autodomActivityLogFilter";
 const activityStorage = (() => {
@@ -200,6 +276,10 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   if (DOM.appVersion) {
     DOM.appVersion.textContent = `v${chrome.runtime.getManifest().version}`;
+  }
+
+  if (DOM.checkUpdateBtn) {
+    DOM.checkUpdateBtn.addEventListener("click", () => runUpdateCheck());
   }
 
 // API keys live in chrome.storage.session (RAM-only). Falls back to local

@@ -199,6 +199,48 @@ body {
     line-height: 1.6;
 }
 
+.version-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
+.version-update-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    font-size: 12px;
+    line-height: 1;
+    color: var(--text-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    cursor: pointer;
+    transition: color 0.15s, background 0.15s;
+}
+
+.version-update-btn:hover:not(:disabled) {
+    color: var(--text);
+    background: var(--bg-hover, var(--bg-raised));
+}
+
+.version-update-btn:disabled {
+    opacity: 0.6;
+    cursor: progress;
+}
+
+.version-update-btn.spin {
+    animation: version-spin 0.9s linear infinite;
+}
+
+@keyframes version-spin {
+    to { transform: rotate(360deg); }
+}
+
 /* ─── Tab Bar ───────────────────────────── */
 
 .tab-bar {

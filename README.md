@@ -110,6 +110,10 @@ Then:
 
 For per-IDE setup, manual install, ports, and uninstall, see **[INSTALL.md](INSTALL.md)**.
 
+For auto-update across many machines without using the Chrome Web Store
+(enterprise force-install on Chromium, signed XPI on Firefox), see
+**[UPDATES.md](UPDATES.md)**.
+
 ---
 
 ## MCP configuration (manual)

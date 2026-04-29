@@ -1,0 +1,198 @@
+name: Release
+
+# Triggers on a semver tag like v2.2.0. The tag's name (minus the leading "v")
+# is treated as the canonical release version and stamped into both manifests
+# before any artifact is built. Manual dispatch is supported for dry-runs.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 2.2.0). Defaults to the tag."
+        required: false
+        type: string
+
+permissions:
+  contents: write   # create the GitHub Release + push to gh-pages
+  pages: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  AUTODOM_REPO_SLUG: eziocode/autodom-extension
+  CHROME_EXTENSION_ID: ${{ vars.CHROME_EXTENSION_ID }}
+  GECKO_ID: ${{ vars.GECKO_ID }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release version
+        id: ver
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "✘ resolved version '$VERSION' is not semver" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing v$VERSION"
+
+      - name: Validate required secrets / vars
+        run: |
+          missing=()
+          [[ -z "${{ secrets.CHROME_CRX_PRIVATE_KEY }}" ]] && missing+=("secret CHROME_CRX_PRIVATE_KEY")
+          [[ -z "${{ secrets.CHROME_EXTENSION_KEY }}"  ]] && missing+=("secret CHROME_EXTENSION_KEY")
+          [[ -z "${{ secrets.AMO_JWT_ISSUER }}"        ]] && missing+=("secret AMO_JWT_ISSUER")
+          [[ -z "${{ secrets.AMO_JWT_SECRET }}"        ]] && missing+=("secret AMO_JWT_SECRET")
+          [[ -z "${{ env.CHROME_EXTENSION_ID }}"       ]] && missing+=("var CHROME_EXTENSION_ID")
+          [[ -z "${{ env.GECKO_ID }}"                  ]] && missing+=("var GECKO_ID")
+          if (( ${#missing[@]} )); then
+            printf '✘ missing required release inputs:\n' >&2
+            printf '  - %s\n' "${missing[@]}" >&2
+            echo 'See docs/RELEASE-SIGNING.md for how to mint these.' >&2
+            exit 1
+          fi
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install server dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Stamp version into manifests + server package
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const v = process.env.V;
+            for (const p of ["extension/manifest.json", "extension/manifest.firefox.json", "server/package.json"]) {
+              const j = JSON.parse(fs.readFileSync(p, "utf8"));
+              j.version = v;
+              fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+              console.log("stamped", p, "->", v);
+            }
+          '
+
+      - name: Inject Chrome `key` into manifest.json
+        env:
+          KEY_B64: ${{ secrets.CHROME_EXTENSION_KEY }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const path = "extension/manifest.json";
+            const j = JSON.parse(fs.readFileSync(path, "utf8"));
+            j.key = process.env.KEY_B64.trim();
+            fs.writeFileSync(path, JSON.stringify(j, null, 2) + "\n");
+            console.log("injected key (",j.key.length,"chars) into", path);
+          '
+
+      - name: Build Chrome zip (Web Store-ready)
+        run: bash scripts/build-chrome.sh
+
+      - name: Pack signed CRX
+        env:
+          PEM: ${{ secrets.CHROME_CRX_PRIVATE_KEY }}
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          echo "$PEM" > /tmp/autodom.pem
+          chmod 600 /tmp/autodom.pem
+          npx --yes crx3@1 \
+            --keyPath=/tmp/autodom.pem \
+            --crxPath="dist/autodom-${V}.crx" \
+            "dist/chrome"
+          shred -u /tmp/autodom.pem
+          ls -lh "dist/autodom-${V}.crx"
+
+      - name: Build Firefox folder + unsigned XPI
+        run: bash scripts/build-firefox.sh
+
+      - name: Sign Firefox XPI via AMO (unlisted channel)
+        env:
+          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          rm -f dist/*.xpi
+          npx --yes web-ext@8 sign \
+            --source-dir=dist/firefox \
+            --artifacts-dir=dist \
+            --channel=unlisted \
+            --api-key="$AMO_JWT_ISSUER" \
+            --api-secret="$AMO_JWT_SECRET"
+          # web-ext writes a versioned name; normalise it for the release URL.
+          signed=$(ls dist/*.xpi | head -1)
+          target="dist/autodom-firefox-${V}.xpi"
+          if [[ "$signed" != "$target" ]]; then
+            mv "$signed" "$target"
+          fi
+          ls -lh "$target"
+
+      - name: Generate updates.xml + updates.json
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir -p gh-pages-publish
+          node scripts/build-update-manifests.mjs \
+            --version "$V" \
+            --extension-id "$CHROME_EXTENSION_ID" \
+            --gecko-id "$GECKO_ID" \
+            --crx-url "https://github.com/${AUTODOM_REPO_SLUG}/releases/download/v${V}/autodom-${V}.crx" \
+            --xpi-url "https://github.com/${AUTODOM_REPO_SLUG}/releases/download/v${V}/autodom-firefox-${V}.xpi" \
+            --out-dir gh-pages-publish
+
+      - name: Publish update manifests to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: gh-pages-publish
+          keep_files: true
+          commit_message: "release: publish update manifests for v${{ steps.ver.outputs.version }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: AutoDOM v${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/autodom-${{ steps.ver.outputs.version }}.crx
+            dist/autodom-chrome-${{ steps.ver.outputs.version }}.zip
+            dist/autodom-firefox-${{ steps.ver.outputs.version }}.xpi
+
+      - name: Summary
+        run: |
+          {
+            echo "## AutoDOM v${{ steps.ver.outputs.version }} released"
+            echo
+            echo "- CRX: \`dist/autodom-${{ steps.ver.outputs.version }}.crx\`"
+            echo "- Chrome zip: \`dist/autodom-chrome-${{ steps.ver.outputs.version }}.zip\`"
+            echo "- Signed XPI: \`dist/autodom-firefox-${{ steps.ver.outputs.version }}.xpi\`"
+            echo "- updates.xml + updates.json published to \`gh-pages\`."
+            echo
+            echo "Existing installs will pick up this version on their next scheduled update check."
+          } >> "$GITHUB_STEP_SUMMARY"

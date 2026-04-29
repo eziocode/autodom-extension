@@ -73,6 +73,10 @@ After the script finishes:
 4. Open the AutoDOM popup in the browser → confirm it says **Connected**
 5. Your AI agent now has access to 70 browser-automation tools
 
+> **Need to roll this out to many machines, or want auto-updates without the
+> Chrome Web Store?** See **[UPDATES.md](UPDATES.md)** for the
+> enterprise-policy install path (Chromium) and the signed-XPI path (Firefox).
+
 ---
 
 ## Manual Setup

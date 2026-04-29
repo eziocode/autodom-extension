@@ -1,0 +1,18 @@
+Windows Registry Editor Version 5.00
+
+; AutoDOM auto-install + auto-update policy.
+; Generated from enterprise/windows/autodom-policy.reg.tmpl by install.ps1.
+; Replace __AUTODOM_EXTENSION_ID__ with the 32-char ID from
+; docs/RELEASE-SIGNING.md before importing manually.
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome\ExtensionSettings\__AUTODOM_EXTENSION_ID__]
+"installation_mode"="force_installed"
+"update_url"="https://eziocode.github.io/autodom-extension/updates.xml"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge\ExtensionSettings\__AUTODOM_EXTENSION_ID__]
+"installation_mode"="force_installed"
+"update_url"="https://eziocode.github.io/autodom-extension/updates.xml"
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Policies\BraveSoftware\Brave\ExtensionSettings\__AUTODOM_EXTENSION_ID__]
+"installation_mode"="force_installed"
+"update_url"="https://eziocode.github.io/autodom-extension/updates.xml"

@@ -3,6 +3,7 @@
   "name": "AutoDOM",
   "version": "2.1.0",
   "description": "Local MCP server for AI-driven browser automation. Connect your IDE agent to control the browser. Includes an inline AI chat panel powered by MCP.",
+  "update_url": "https://eziocode.github.io/autodom-extension/updates.xml",
   "permissions": [
     "activeTab",
     "scripting",
