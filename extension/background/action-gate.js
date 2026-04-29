@@ -55,6 +55,7 @@
     "get_recording",
     "get_tool_tiers",
     "deep_query",
+    "wait_for_network_idle",
     "get_pending_chat_requests",
     "list_automation_backends",
     "validate_automation_script",

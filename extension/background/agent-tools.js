@@ -102,6 +102,29 @@
         "Capture a PNG screenshot of the current viewport. Returns a small reference id; the bytes are not fed back to you.",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
+    {
+      name: "take_snapshot",
+      description:
+        "Capture a structured DOM/accessibility snapshot of the page (tag, role, aria-label, key attributes, text). " +
+        "More structural than get_dom_state; better for navigation/aria-driven layouts (Playwright-style snapshot).",
+      parameters: {
+        type: "object",
+        properties: {
+          maxDepth: { type: "integer", description: "Max recursion depth (default 10)" },
+        },
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "check_element_state",
+      description:
+        "Report exists/visible/inViewport/disabled/checked/value for a single element. Use to verify state before/after an action.",
+      parameters: {
+        type: "object",
+        properties: { selector: { type: "string" } },
+        required: ["selector"],
+      },
+    },
 
     // ── Actions ──
     {
@@ -275,18 +298,110 @@
         required: ["selector"],
       },
     },
+    {
+      name: "right_click",
+      description: "Right-click an element by selector (dispatches a contextmenu event).",
+      parameters: {
+        type: "object",
+        properties: { selector: { type: "string" } },
+        required: ["selector"],
+      },
+      danger: "write",
+    },
+    {
+      name: "drag_and_drop",
+      description:
+        "Drag a source element onto a target element using HTML5 drag events plus pointer events. " +
+        "Works for kanban boards, sliders, file reorder, etc.",
+      parameters: {
+        type: "object",
+        properties: {
+          sourceSelector: { type: "string" },
+          targetSelector: { type: "string" },
+        },
+        required: ["sourceSelector", "targetSelector"],
+      },
+      danger: "write",
+    },
+    {
+      name: "set_attribute",
+      description:
+        "Set or remove an attribute on the first element matching selector. Pass value=null to remove. " +
+        "Use to toggle aria-expanded, hidden, disabled, data-*, etc.",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: { type: "string" },
+          attribute: { type: "string" },
+          value: { type: ["string", "null"], description: "null removes the attribute" },
+        },
+        required: ["selector", "attribute"],
+      },
+      danger: "write",
+    },
+    {
+      name: "upload_file",
+      description:
+        "Attach a local file to an <input type=\"file\">. uid is a CSS selector for the input. " +
+        "filePath must be an absolute path on the user's machine (ask the user if you don't have it). " +
+        "Uses CDP DOM.setFileInputFiles — the only reliable way to drive file inputs.",
+      parameters: {
+        type: "object",
+        properties: {
+          uid: { type: "string", description: "CSS selector for the file input" },
+          filePath: { type: "string", description: "Absolute local file path" },
+        },
+        required: ["uid", "filePath"],
+      },
+      danger: "write",
+    },
+    {
+      name: "handle_dialog",
+      description:
+        "Accept or dismiss a JS dialog (alert/confirm/prompt/beforeunload). Call this proactively when " +
+        "an action might trigger a confirm/alert — otherwise the page hangs.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["accept", "dismiss"] },
+          promptText: { type: "string", description: "For prompt() — text to type before accept" },
+        },
+        required: ["action"],
+      },
+      danger: "write",
+    },
 
     // ── Nav / waits ──
     {
       name: "navigate",
       description:
-        "Navigate the current tab to a URL. Use absolute URLs only.",
+        "Navigate the current tab. Provide either url (absolute) OR action (back/forward/reload).",
       parameters: {
         type: "object",
-        properties: { url: { type: "string" } },
-        required: ["url"],
+        properties: {
+          url: { type: "string", description: "Absolute URL to load" },
+          action: {
+            type: "string",
+            enum: ["back", "forward", "reload"],
+            description: "History navigation instead of url",
+          },
+        },
       },
       danger: "write",
+    },
+    {
+      name: "wait_for_network_idle",
+      description:
+        "Wait until no new XHR/fetch resources have started for `idleTime` ms (default 500ms, max wait `timeout` default 10s). " +
+        "Use this for SPA readiness instead of fixed sleeps.",
+      parameters: {
+        type: "object",
+        properties: {
+          timeout: { type: "integer", description: "Max wait in ms (default 10000)" },
+          idleTime: { type: "integer", description: "Quiescence window in ms (default 500)" },
+        },
+        additionalProperties: false,
+      },
     },
     {
       name: "wait_for_element",
