@@ -39,6 +39,18 @@ if [[ "$ACTION" == "install" && -z "$EXTENSION_ID" ]]; then
   exit 2
 fi
 
+# Strict format check before we ever interpolate $EXTENSION_ID into a sed
+# command or a registry-style path. A Chromium extension ID is exactly
+# 32 lowercase letters in the range a–p (sha256 of the public key, mangled).
+# Refusing anything else closes the door on sed delimiter / metacharacter
+# injection (e.g. ids containing '/', '&', '\') even though the installer
+# is intended to run as root from a trusted source.
+if [[ "$ACTION" == "install" && ! "$EXTENSION_ID" =~ ^[a-p]{32}$ ]]; then
+  echo "✘ AUTODOM_EXTENSION_ID must be exactly 32 lowercase a–p characters." >&2
+  echo "  Got: '$EXTENSION_ID'" >&2
+  exit 2
+fi
+
 if [[ $EUID -ne 0 ]]; then
   echo "✘ this script must be run as root (use sudo)." >&2
   exit 2
@@ -46,8 +58,11 @@ fi
 
 substitute() {
   # $1 = template path, $2 = output path
+  # The strict [a-p]{32} validation above guarantees $EXTENSION_ID contains
+  # no sed metacharacters, but we use '|' as the delimiter anyway as a
+  # belt-and-braces measure.
   if [[ "$ACTION" == "install" ]]; then
-    sed "s/${ID_PLACEHOLDER}/${EXTENSION_ID}/g" "$1" > "$2"
+    sed "s|${ID_PLACEHOLDER}|${EXTENSION_ID}|g" "$1" > "$2"
     chmod 0644 "$2"
     echo "  ✓ wrote $2"
   fi

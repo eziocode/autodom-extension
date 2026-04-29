@@ -56,9 +56,12 @@ Record three values:
 gh secret set CHROME_CRX_PRIVATE_KEY < autodom.pem
 gh secret set CHROME_EXTENSION_KEY   < autodom.key.b64
 
-# Then shred the local copies — only the secrets and the runbook should ever
-# hold them.
-shred -u autodom.pem autodom.key.b64
+# Then securely delete the local copies — only the secrets and the runbook
+# should ever hold them.
+#   • Linux:  shred -u autodom.pem autodom.key.b64
+#   • macOS:  rm -P autodom.pem autodom.key.b64   (or `gshred -u …` if coreutils installed)
+#   • Either: srm -m autodom.pem autodom.key.b64  (if `secure-delete` is installed)
+rm -P autodom.pem autodom.key.b64 2>/dev/null || rm -f autodom.pem autodom.key.b64
 ```
 
 ### Rotation

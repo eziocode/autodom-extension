@@ -40,6 +40,15 @@ Set the 32-char extension ID from docs/RELEASE-SIGNING.md, then re-run:
   exit 2
 }
 
+# Strict format check before $ExtensionId is interpolated into any registry
+# path. A Chromium extension id is exactly 32 lowercase a–p characters; any
+# other input is refused so attacker-controlled values cannot construct
+# unexpected registry keys.
+if (-not $Remove -and ($ExtensionId -notmatch '^[a-p]{32}$')) {
+  Write-Error "AUTODOM_EXTENSION_ID must be exactly 32 lowercase a-p characters. Got: '$ExtensionId'"
+  exit 2
+}
+
 $UpdateUrl = 'https://eziocode.github.io/autodom-extension/updates.xml'
 
 # (display name, registry root for ExtensionSettings)

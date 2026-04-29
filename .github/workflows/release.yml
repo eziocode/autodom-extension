@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
@@ -71,7 +71,7 @@ jobs:
           fi
 
       - name: Use Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.x
           cache: npm
@@ -104,9 +104,19 @@ jobs:
             const fs = require("fs");
             const path = "extension/manifest.json";
             const j = JSON.parse(fs.readFileSync(path, "utf8"));
-            j.key = process.env.KEY_B64.trim();
+            const key = (process.env.KEY_B64 || "").trim();
+            // 2048-bit RSA SPKI in base64 is ~392 chars; allow 256+ to cover
+            // both 2048 and 4096-bit keys, and refuse anything that does not
+            // look like clean base64 (prevents a tampered secret from
+            // shipping a junk `key` field that would silently re-randomise
+            // the extension ID).
+            if (!/^[A-Za-z0-9+/]+={0,2}$/.test(key) || key.length < 256 || key.length > 1024) {
+              console.error("✘ CHROME_EXTENSION_KEY is not valid base64 SPKI (got " + key.length + " chars)");
+              process.exit(1);
+            }
+            j.key = key;
             fs.writeFileSync(path, JSON.stringify(j, null, 2) + "\n");
-            console.log("injected key (",j.key.length,"chars) into", path);
+            console.log("injected key (", key.length, "chars) into", path);
           '
 
       - name: Build Chrome zip (Web Store-ready)
@@ -164,7 +174,7 @@ jobs:
             --out-dir gh-pages-publish
 
       - name: Publish update manifests to gh-pages
-        uses: peaceiris/actions-gh-pages@v4
+        uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_branch: gh-pages
@@ -173,7 +183,7 @@ jobs:
           commit_message: "release: publish update manifests for v${{ steps.ver.outputs.version }}"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           name: AutoDOM v${{ steps.ver.outputs.version }}
