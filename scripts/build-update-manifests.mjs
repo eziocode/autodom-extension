@@ -88,9 +88,17 @@ function main() {
   const errors = [];
   if (!version) errors.push("missing --version (or RELEASE_VERSION env)");
   if (!extensionId) errors.push("missing --extension-id (or EXTENSION_ID env)");
-  if (!geckoId) errors.push("missing gecko id (set browser_specific_settings.gecko.id or pass --gecko-id)");
   if (!crxUrl) errors.push("missing --crx-url (or CRX_URL env)");
-  if (!xpiUrl) errors.push("missing --xpi-url (or XPI_URL env)");
+  // Firefox is OPTIONAL — if any of geckoId/xpiUrl is missing, we treat
+  // this as a Chrome-only release and skip writing updates.json. This
+  // lets the project ship Chromium auto-updates before AMO signing is
+  // configured (or for releases that intentionally exclude Firefox).
+  const firefoxEnabled = Boolean(geckoId && xpiUrl);
+  if ((geckoId && !xpiUrl) || (!geckoId && xpiUrl)) {
+    errors.push(
+      "Firefox is partially configured — provide BOTH --gecko-id and --xpi-url, or NEITHER."
+    );
+  }
   if (errors.length) {
     console.error("[build-update-manifests] aborting:");
     for (const e of errors) console.error("  - " + e);
@@ -116,31 +124,36 @@ function main() {
     `  </app>\n` +
     `</gupdate>\n`;
 
-  const json = {
-    addons: {
-      [geckoId]: {
-        updates: [
-          {
-            version,
-            update_link: xpiUrl,
-          },
-        ],
-      },
-    },
-  };
-
   const xmlPath = join(outDir, "updates.xml");
-  const jsonPath = join(outDir, "updates.json");
   writeFileSync(xmlPath, xml, "utf8");
-  writeFileSync(jsonPath, JSON.stringify(json, null, 2) + "\n", "utf8");
-
   console.log(`[build-update-manifests] wrote ${xmlPath}`);
-  console.log(`[build-update-manifests] wrote ${jsonPath}`);
+
+  if (firefoxEnabled) {
+    const json = {
+      addons: {
+        [geckoId]: {
+          updates: [
+            {
+              version,
+              update_link: xpiUrl,
+            },
+          ],
+        },
+      },
+    };
+    const jsonPath = join(outDir, "updates.json");
+    writeFileSync(jsonPath, JSON.stringify(json, null, 2) + "\n", "utf8");
+    console.log(`[build-update-manifests] wrote ${jsonPath}`);
+  } else {
+    console.log(
+      `[build-update-manifests] Firefox manifest skipped (gecko-id / xpi-url not provided — Chrome-only release).`
+    );
+  }
   console.log(`[build-update-manifests]   version       = ${version}`);
   console.log(`[build-update-manifests]   chrome ext id = ${extensionId}`);
-  console.log(`[build-update-manifests]   gecko id      = ${geckoId}`);
+  console.log(`[build-update-manifests]   gecko id      = ${geckoId || "(skipped)"}`);
   console.log(`[build-update-manifests]   crx url       = ${crxUrl}`);
-  console.log(`[build-update-manifests]   xpi url       = ${xpiUrl}`);
+  console.log(`[build-update-manifests]   xpi url       = ${xpiUrl || "(skipped)"}`);
 }
 
 main();

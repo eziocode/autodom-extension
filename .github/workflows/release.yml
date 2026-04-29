@@ -57,17 +57,34 @@ jobs:
       - name: Validate required secrets / vars
         run: |
           missing=()
+          # ─── Chromium signing (always required) ────────────
           [[ -z "${{ secrets.CHROME_CRX_PRIVATE_KEY }}" ]] && missing+=("secret CHROME_CRX_PRIVATE_KEY")
           [[ -z "${{ secrets.CHROME_EXTENSION_KEY }}"  ]] && missing+=("secret CHROME_EXTENSION_KEY")
-          [[ -z "${{ secrets.AMO_JWT_ISSUER }}"        ]] && missing+=("secret AMO_JWT_ISSUER")
-          [[ -z "${{ secrets.AMO_JWT_SECRET }}"        ]] && missing+=("secret AMO_JWT_SECRET")
           [[ -z "${{ env.CHROME_EXTENSION_ID }}"       ]] && missing+=("var CHROME_EXTENSION_ID")
-          [[ -z "${{ env.GECKO_ID }}"                  ]] && missing+=("var GECKO_ID")
+          # ─── Firefox / AMO signing (optional) ──────────────
+          # If ALL three Firefox inputs are unset, skip the Firefox build
+          # and ship Chrome-only. If only SOME are set, that's a partial
+          # config — surface it as missing so the user fixes it.
+          ff_set=0
+          [[ -n "${{ secrets.AMO_JWT_ISSUER }}" ]] && ff_set=$((ff_set+1))
+          [[ -n "${{ secrets.AMO_JWT_SECRET }}" ]] && ff_set=$((ff_set+1))
+          [[ -n "${{ env.GECKO_ID }}"           ]] && ff_set=$((ff_set+1))
+          if (( ff_set > 0 && ff_set < 3 )); then
+            [[ -z "${{ secrets.AMO_JWT_ISSUER }}" ]] && missing+=("secret AMO_JWT_ISSUER (Firefox is partially configured)")
+            [[ -z "${{ secrets.AMO_JWT_SECRET }}" ]] && missing+=("secret AMO_JWT_SECRET (Firefox is partially configured)")
+            [[ -z "${{ env.GECKO_ID }}"           ]] && missing+=("var GECKO_ID (Firefox is partially configured)")
+          fi
           if (( ${#missing[@]} )); then
             printf '✘ missing required release inputs:\n' >&2
             printf '  - %s\n' "${missing[@]}" >&2
             echo 'See docs/RELEASE-SIGNING.md for how to mint these.' >&2
             exit 1
+          fi
+          if (( ff_set == 0 )); then
+            echo "ℹ Firefox / AMO secrets not configured — skipping XPI build for this release."
+            echo "FIREFOX_ENABLED=false" >> "$GITHUB_ENV"
+          else
+            echo "FIREFOX_ENABLED=true" >> "$GITHUB_ENV"
           fi
 
       - name: Use Node.js 22
@@ -137,9 +154,11 @@ jobs:
           ls -lh "dist/autodom-${V}.crx"
 
       - name: Build Firefox folder + unsigned XPI
+        if: env.FIREFOX_ENABLED == 'true'
         run: bash scripts/build-firefox.sh
 
       - name: Sign Firefox XPI via AMO (unlisted channel)
+        if: env.FIREFOX_ENABLED == 'true'
         env:
           AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
           AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
@@ -165,13 +184,19 @@ jobs:
           V: ${{ steps.ver.outputs.version }}
         run: |
           mkdir -p gh-pages-publish
-          node scripts/build-update-manifests.mjs \
-            --version "$V" \
-            --extension-id "$CHROME_EXTENSION_ID" \
-            --gecko-id "$GECKO_ID" \
-            --crx-url "https://github.com/${AUTODOM_REPO_SLUG}/releases/download/v${V}/autodom-${V}.crx" \
-            --xpi-url "https://github.com/${AUTODOM_REPO_SLUG}/releases/download/v${V}/autodom-firefox-${V}.xpi" \
+          ARGS=(
+            --version "$V"
+            --extension-id "$CHROME_EXTENSION_ID"
+            --crx-url "https://github.com/${AUTODOM_REPO_SLUG}/releases/download/v${V}/autodom-${V}.crx"
             --out-dir gh-pages-publish
+          )
+          if [[ "${FIREFOX_ENABLED:-false}" == "true" ]]; then
+            ARGS+=(
+              --gecko-id "$GECKO_ID"
+              --xpi-url "https://github.com/${AUTODOM_REPO_SLUG}/releases/download/v${V}/autodom-firefox-${V}.xpi"
+            )
+          fi
+          node scripts/build-update-manifests.mjs "${ARGS[@]}"
 
       - name: Publish update manifests to gh-pages
         uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e # v4
@@ -182,6 +207,28 @@ jobs:
           keep_files: true
           commit_message: "release: publish update manifests for v${{ steps.ver.outputs.version }}"
 
+      - name: Stage release assets
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          # Build a newline-separated asset list that includes the XPI only
+          # when Firefox signing was performed. Avoids action-gh-release's
+          # fail_on_unmatched_files trap when the XPI doesn't exist.
+          {
+            echo "dist/autodom-${V}.crx"
+            echo "dist/autodom-chrome-${V}.zip"
+            if [[ "${FIREFOX_ENABLED:-false}" == "true" ]]; then
+              echo "dist/autodom-firefox-${V}.xpi"
+            fi
+          } > /tmp/release-assets.txt
+          echo "── Release assets ──"
+          cat /tmp/release-assets.txt
+          {
+            echo "RELEASE_FILES<<__EOF__"
+            cat /tmp/release-assets.txt
+            echo "__EOF__"
+          } >> "$GITHUB_ENV"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -189,10 +236,7 @@ jobs:
           name: AutoDOM v${{ steps.ver.outputs.version }}
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: |
-            dist/autodom-${{ steps.ver.outputs.version }}.crx
-            dist/autodom-chrome-${{ steps.ver.outputs.version }}.zip
-            dist/autodom-firefox-${{ steps.ver.outputs.version }}.xpi
+          files: ${{ env.RELEASE_FILES }}
 
       - name: Summary
         run: |
@@ -201,8 +245,13 @@ jobs:
             echo
             echo "- CRX: \`dist/autodom-${{ steps.ver.outputs.version }}.crx\`"
             echo "- Chrome zip: \`dist/autodom-chrome-${{ steps.ver.outputs.version }}.zip\`"
-            echo "- Signed XPI: \`dist/autodom-firefox-${{ steps.ver.outputs.version }}.xpi\`"
-            echo "- updates.xml + updates.json published to \`gh-pages\`."
+            if [[ "${FIREFOX_ENABLED:-false}" == "true" ]]; then
+              echo "- Signed XPI: \`dist/autodom-firefox-${{ steps.ver.outputs.version }}.xpi\`"
+              echo "- updates.xml + updates.json published to \`gh-pages\`."
+            else
+              echo "- _Firefox XPI skipped — AMO secrets not configured._"
+              echo "- updates.xml published to \`gh-pages\` (Chrome only)."
+            fi
             echo
             echo "Existing installs will pick up this version on their next scheduled update check."
           } >> "$GITHUB_STEP_SUMMARY"
