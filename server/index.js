@@ -24,10 +24,11 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { promisify } from "util";
 import { randomBytes, timingSafeEqual } from "crypto";
-import {
-  runAutomationScript,
-  validateAutomationScript,
-} from "./automation/backends.js";
+
+// Local Playwright/Node automation backends were intentionally removed: AutoDOM
+// is a Playwright alternative, not a wrapper, and any server-spawned automation
+// runners interfered with normal MCP tool calls. Scripts now run only in the
+// extension popup against the active tab (browser-extension backend).
 
 const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
 const DEFAULT_CLI_INSTALLS = Object.freeze({
@@ -2344,38 +2345,37 @@ function _processWsMessage(socket, message) {
   }
 
   if (message.type === "RUN_AUTOMATION_SCRIPT" && message.id != null) {
-    (async () => {
-      let result;
-      try {
-        result = await runAutomationScript(message.params || {});
-      } catch (err) {
-        result = {
-          ok: false,
-          status: "error",
-          error: err?.message || String(err),
-        };
-      }
-      try {
-        socket.send(
-          JSON.stringify({
-            type: "AUTOMATION_SCRIPT_RESULT",
-            id: message.id,
-            result,
-          }),
-        );
-      } catch (_) {}
-    })();
+    // Server-side Playwright/Node script runners were removed. The extension
+    // popup runs scripts directly in the active tab via the browser-extension
+    // backend, so the bridge should never receive this message anymore.
+    try {
+      socket.send(
+        JSON.stringify({
+          type: "AUTOMATION_SCRIPT_RESULT",
+          id: message.id,
+          result: {
+            ok: false,
+            status: "unsupported",
+            error:
+              "Server-side automation backends were removed. Use the popup Scripts tab (Browser extension backend) to run scripts manually in the active tab.",
+          },
+        }),
+      );
+    } catch (_) {}
     return;
   }
 
   if (message.type === "VALIDATE_AUTOMATION_SCRIPT" && message.id != null) {
-    const result = validateAutomationScript(message.params || {});
     try {
       socket.send(
         JSON.stringify({
           type: "AUTOMATION_SCRIPT_VALIDATION",
           id: message.id,
-          result,
+          result: {
+            ok: false,
+            error:
+              "Server-side automation backends were removed. Use the popup Scripts tab (Browser extension backend) for validation.",
+          },
         }),
       );
     } catch (_) {}
@@ -4876,10 +4876,11 @@ const server = new FastMCP({
 });
 
 // ─── Script Runner Scope ─────────────────────────────────────
-// Playwright/Node/browser-extension script runners are intentionally not
-// registered as MCP tools. The popup Script tab reaches them through
-// RUN_AUTOMATION_SCRIPT / VALIDATE_AUTOMATION_SCRIPT over WebSocket, keeping
-// IDE clients focused on interactive browser tools instead of local scripts.
+// AutoDOM scripts run only in the active browser tab (browser-extension
+// backend) via the popup Scripts tab — manual run only. The server does not
+// register script-runner MCP tools and does not spawn Playwright/Node child
+// processes; that keeps IDE clients focused on interactive browser tools and
+// prevents background script execution from interfering with MCP traffic.
 
 // ─── Token-Efficient Tools (inspired by OpenBrowser-AI) ──────
 // These tools reduce token usage by 3-6x compared to individual tool calls.

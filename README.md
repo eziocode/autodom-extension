@@ -21,7 +21,7 @@ that lets GitHub Copilot, JetBrains AI, Claude, Cursor, Gemini CLI and friends
 - 🤖 **Bring-your-own provider** — OpenAI, Anthropic, local Ollama, or your IDE's existing CLI agent (Copilot, Claude Code, Codex).
 - 🔒 **Local-first.** All traffic stays on `127.0.0.1`. Secrets live in session-only browser storage.
 - ⚡ **Zero-touch installer.** One command sets up the server, registers MCP for every detected IDE, and silently installs the signed CRX into your Chromium browsers.
-- 📜 **Local automation scripts.** Run your own Playwright / Node scripts via the popup or MCP — no AI required (see [AUTOMATION.md](AUTOMATION.md)).
+- 📜 **Manual scripts in the active tab.** Paste or upload JS in the popup Scripts tab and run it on demand against the current page — no AI, no server-side runners, no Playwright dependency (see [AUTOMATION.md](AUTOMATION.md)).
 
 ---
 
@@ -38,8 +38,7 @@ that lets GitHub Copilot, JetBrains AI, Claude, Cursor, Gemini CLI and friends
 | Component | Role |
 |---|---|
 | **`server/`** | Node.js MCP server (`fastmcp` + `ws`). Speaks MCP to the IDE over stdio and proxies tool calls to the browser over a local WebSocket. |
-| **`extension/`** | Manifest V3 Chromium extension. Service worker connects to the bridge; content scripts host the chat panel and session indicator. |
-| **`server/automation/`** | Pluggable backend registry for local Playwright / Node script runners. |
+| **`extension/`** | Manifest V3 Chromium extension. Service worker connects to the bridge; content scripts host the chat panel and session indicator. The popup Scripts tab runs user scripts in the active tab on manual click. |
 | **`enterprise/`** | Per-OS force-install policy templates that the installer enrolls in one shot. |
 | **`setup.sh` / `setup.ps1`** | Zero-touch installer — server deps, MCP config for every IDE, and the silent extension-install policy. |
 
@@ -203,7 +202,6 @@ pkill -f "autodom.*index.js"     # force kill
 autodom-extension/
 ├── extension/          MV3 Chromium extension (service worker, content, popup)
 ├── server/             Node MCP bridge (fastmcp + WebSocket)
-│   └── automation/     Local Playwright / Node script runners
 ├── enterprise/         Silent force-install policy templates per OS
 ├── scripts/            Build, sign, and update-manifest tooling
 ├── dist/               Prebuilt Chrome zip + signed CRX

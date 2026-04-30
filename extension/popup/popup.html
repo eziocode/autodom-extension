@@ -357,8 +357,6 @@
 	                            <label class="field-label" for="scriptBackend">Backend</label>
 	                            <select id="scriptBackend" class="config-input">
 	                                <option value="browser-extension">Browser extension</option>
-	                                <option value="playwright">Playwright via MCP</option>
-	                                <option value="node">Node via MCP</option>
 	                            </select>
 	                            <label class="field-label" for="scriptFile">Local script file</label>
 	                            <input id="scriptFile" class="config-input file-input" type="file" accept=".js,.mjs,.cjs,.txt" />
@@ -385,7 +383,7 @@ return { title: document.title, url: location.href };"
 	                                <button class="secondary-btn" id="validateScriptBtn">Validate</button>
 	                                <button class="action-btn" id="runScriptBtn">Run</button>
 	                            </div>
-	                            <p class="field-hint" id="scriptStatus">Browser extension scripts run in the active tab. Playwright/Node scripts run locally through MCP.</p>
+	                            <p class="field-hint" id="scriptStatus">Scripts run manually in the active tab via the browser extension. Click Run to execute.</p>
 	                        </div>
 	                    </section>
 	

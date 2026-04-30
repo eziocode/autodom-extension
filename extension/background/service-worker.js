@@ -2388,23 +2388,9 @@ function connectWebSocket(port) {
           return;
         }
 
-        if (message.type === "AUTOMATION_SCRIPT_RESULT") {
-          const pending = pendingAutomationRuns.get(message.id);
-          if (pending) {
-            pendingAutomationRuns.delete(message.id);
-            pending.resolve(message.result || { ok: false, error: "Empty automation result" });
-          }
-          return;
-        }
-
-        if (message.type === "AUTOMATION_SCRIPT_VALIDATION") {
-          const pending = pendingAutomationValidations.get(message.id);
-          if (pending) {
-            pendingAutomationValidations.delete(message.id);
-            pending.resolve(message.result || { ok: false, error: "Empty validation result" });
-          }
-          return;
-        }
+        // AUTOMATION_SCRIPT_RESULT / AUTOMATION_SCRIPT_VALIDATION used to be
+        // emitted by server-side Playwright/Node runners. Those backends were
+        // removed; scripts now run only in the active tab via the popup.
 
         // Streaming text deltas from the bridge server (CLI provider).
         // Forward to the chat panel so it can paint tokens incrementally
@@ -3054,122 +3040,77 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "RUN_AUTOMATION_SCRIPT") {
-    const params = message.params || {};
-    if ((params.backend || "browser-extension") === "browser-extension") {
-      (async () => {
-        try {
-          const result = await toolRunBrowserScript({
-            source: params.source || "",
-            params: params.params || {},
-            timeoutMs: params.timeoutMs || 15000,
-          });
-          sendResponse(result);
-        } catch (err) {
-          sendResponse({ ok: false, status: "error", error: err?.message || String(err) });
-        }
-      })();
-      return true;
+    // Manual run only: scripts may only be invoked from the extension popup
+    // Scripts tab. Reject calls from content scripts, chat panels, or other
+    // extension surfaces so background/MCP traffic cannot trigger script
+    // execution.
+    if (!isPopupSender(sender)) {
+      sendResponse({
+        ok: false,
+        status: "error",
+        error: "Automation scripts can only be run manually from the popup Scripts tab.",
+      });
+      return false;
     }
-
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
+    const params = message.params || {};
+    const backend = params.backend || "browser-extension";
+    if (backend !== "browser-extension") {
       sendResponse({
         ok: false,
         status: "error",
         error:
-          "MCP bridge not connected. Connect MCP first to run Playwright/Node automation scripts locally.",
+          "Server-side Playwright/Node automation backends were removed. Use the Browser extension backend.",
       });
       return false;
     }
-
-    const id = ++automationRunIdCounter;
-    const timeoutMs = params.timeoutMs || 60000;
-    const timer = setTimeout(() => {
-      if (pendingAutomationRuns.has(id)) {
-        pendingAutomationRuns.delete(id);
-        sendResponse({
-          ok: false,
-          status: "timeout",
-          error: `Automation did not respond within ${timeoutMs}ms`,
+    (async () => {
+      try {
+        const result = await toolRunBrowserScript({
+          source: params.source || "",
+          params: params.params || {},
+          timeoutMs: params.timeoutMs || 15000,
         });
-      }
-    }, timeoutMs + 3000);
-    pendingAutomationRuns.set(id, {
-      resolve: (result) => {
-        clearTimeout(timer);
         sendResponse(result);
-      },
-    });
-    try {
-      ws.send(
-        JSON.stringify({
-          type: "RUN_AUTOMATION_SCRIPT",
-          id,
-          params,
-        }),
-      );
-    } catch (err) {
-      pendingAutomationRuns.delete(id);
-      clearTimeout(timer);
-      sendResponse({ ok: false, status: "error", error: err.message });
-    }
+      } catch (err) {
+        sendResponse({ ok: false, status: "error", error: err?.message || String(err) });
+      }
+    })();
     return true;
   }
 
   if (message.type === "VALIDATE_AUTOMATION_SCRIPT") {
-    const params = message.params || {};
-    if ((params.backend || "browser-extension") === "browser-extension") {
-      // MV3 service-worker CSP blocks `new Function` / eval, so parse-by-compile
-      // isn't available here. Match the server's approach for Playwright/Node
-      // (see server/automation/backends.js: validateAutomationScript) and defer
-      // real syntax checking to run time, where the script is compiled in the
-      // page's main world via executeInTab.
-      const src = String(params.source || "").trim();
-      if (!src) {
-        sendResponse({
-          ok: false,
-          backend: "browser-extension",
-          error: "Script source is empty",
-        });
-      } else {
-        sendResponse({ ok: true, backend: "browser-extension" });
-      }
-      return false;
-    }
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (!isPopupSender(sender)) {
       sendResponse({
         ok: false,
-        error:
-          "MCP bridge not connected. Connect MCP first to validate Playwright/Node scripts.",
+        error: "Automation script validation is only available from the popup Scripts tab.",
       });
       return false;
     }
-    const id = ++automationValidationIdCounter;
-    const timer = setTimeout(() => {
-      if (pendingAutomationValidations.has(id)) {
-        pendingAutomationValidations.delete(id);
-        sendResponse({ ok: false, error: "Validation did not respond in time" });
-      }
-    }, 8000);
-    pendingAutomationValidations.set(id, {
-      resolve: (result) => {
-        clearTimeout(timer);
-        sendResponse(result);
-      },
-    });
-    try {
-      ws.send(
-        JSON.stringify({
-          type: "VALIDATE_AUTOMATION_SCRIPT",
-          id,
-          params,
-        }),
-      );
-    } catch (err) {
-      pendingAutomationValidations.delete(id);
-      clearTimeout(timer);
-      sendResponse({ ok: false, error: err.message });
+    const params = message.params || {};
+    const backend = params.backend || "browser-extension";
+    if (backend !== "browser-extension") {
+      sendResponse({
+        ok: false,
+        backend,
+        error:
+          "Server-side Playwright/Node automation backends were removed. Use the Browser extension backend.",
+      });
+      return false;
     }
-    return true;
+    // MV3 service-worker CSP blocks `new Function` / eval, so parse-by-compile
+    // isn't available here. Defer real syntax checking to run time, where the
+    // script is compiled in the page's main world via executeInTab.
+    const src = String(params.source || "").trim();
+    if (!src) {
+      sendResponse({
+        ok: false,
+        backend: "browser-extension",
+        error: "Script source is empty",
+      });
+    } else {
+      sendResponse({ ok: true, backend: "browser-extension" });
+    }
+    return false;
   }
 
   if (message.type === "ACTIVITY_LOG_APPEND") {
@@ -4055,10 +3996,22 @@ const pendingCliChecks = new Map();
 let cliCheckIdCounter = 0;
 const pendingCliInstalls = new Map();
 let cliInstallIdCounter = 0;
-const pendingAutomationRuns = new Map();
-let automationRunIdCounter = 0;
-const pendingAutomationValidations = new Map();
-let automationValidationIdCounter = 0;
+
+// Restrict RUN_AUTOMATION_SCRIPT / VALIDATE_AUTOMATION_SCRIPT to messages
+// originating from the extension popup. Manual run only — chat panels and
+// content scripts cannot drive script execution.
+function isPopupSender(sender) {
+  if (!sender) return false;
+  if (sender.id && sender.id !== chrome.runtime.id) return false;
+  const url = sender.url || "";
+  if (!url) return false;
+  try {
+    const popupUrl = chrome.runtime.getURL("popup/popup.html");
+    return url === popupUrl || url.startsWith(popupUrl + "?") || url.startsWith(popupUrl + "#");
+  } catch (_) {
+    return false;
+  }
+}
 
 function resolvePendingAiRequests(error) {
   for (const [id, pending] of pendingAiRequests.entries()) {
