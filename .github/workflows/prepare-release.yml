@@ -1,0 +1,122 @@
+name: Prepare Release
+
+# Manually bumps the committed version files, commits the bump to main, and
+# pushes the matching semver tag. The Release workflow then publishes from that
+# tag so the released source and artifacts agree on the same version.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Explicit version to release (e.g. 3.0.5). Leave empty to use bump type."
+        required: false
+        type: string
+      bump:
+        description: "Bump type when version is empty."
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prepare-release-main
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22.x
+
+      - name: Resolve target version
+        id: target
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUMP: ${{ inputs.bump }}
+        run: |
+          REQUESTED="${INPUT_VERSION:-$INPUT_BUMP}"
+          CURRENT="$(node -p "require('./extension/manifest.json').version")"
+
+          case "$REQUESTED" in
+            major|minor|patch)
+              VERSION="$(node -e "
+                const [maj,min,pat] = '$CURRENT'.split('.').map(Number);
+                const t = '$REQUESTED';
+                const v = t === 'major' ? [maj + 1, 0, 0]
+                        : t === 'minor' ? [maj, min + 1, 0]
+                        : [maj, min, pat + 1];
+                console.log(v.join('.'));
+              ")"
+              ;;
+            [0-9]*.[0-9]*.[0-9]*)
+              VERSION="$REQUESTED"
+              ;;
+            *)
+              echo "✘ '$REQUESTED' is not semver or one of patch|minor|major" >&2
+              exit 2
+              ;;
+          esac
+
+          if git show-ref --verify --quiet "refs/tags/v${VERSION}" ||
+             git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "✘ tag v${VERSION} already exists" >&2
+            exit 1
+          fi
+
+          echo "requested=$REQUESTED" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "Preparing v$VERSION from $CURRENT"
+
+      - name: Bump version, commit, and tag
+        env:
+          REQUESTED: ${{ steps.target.outputs.requested }}
+          VERSION: ${{ steps.target.outputs.version }}
+          CURRENT: ${{ steps.target.outputs.current }}
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+          if [[ "$CURRENT" == "$VERSION" ]]; then
+            echo "[=] Version files already at v${VERSION}; creating tag only."
+            git tag "v${VERSION}"
+          else
+            scripts/bump-version.sh "$REQUESTED" --commit --tag
+          fi
+
+      - name: Push release commit and tag
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          git push origin HEAD:main
+          git push origin "v${VERSION}"
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          {
+            echo "## AutoDOM v${VERSION} prepared"
+            echo
+            echo "- Version files were committed to \`main\`."
+            echo "- Tag \`v${VERSION}\` was pushed."
+            echo "- The Release workflow will publish artifacts from that tag."
+          } >> "$GITHUB_STEP_SUMMARY"

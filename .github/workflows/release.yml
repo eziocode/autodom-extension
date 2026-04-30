@@ -1,8 +1,8 @@
 name: Release
 
 # Triggers on a semver tag like v2.2.0. The tag's name (minus the leading "v")
-# is treated as the canonical release version and stamped into both manifests
-# before any artifact is built. Manual dispatch is supported for dry-runs.
+# is treated as the canonical release version. Use the Prepare Release workflow
+# to bump committed version files and push the matching tag automatically.
 
 on:
   push:
@@ -50,6 +50,43 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Releasing v$VERSION"
+
+      - name: Validate committed versions match release tag
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          node - <<'NODE'
+          const fs = require("fs");
+          const expected = process.env.V;
+          const files = [
+            {
+              label: "extension/manifest.json",
+              version: JSON.parse(fs.readFileSync("extension/manifest.json", "utf8")).version,
+            },
+            {
+              label: "server/package.json",
+              version: JSON.parse(fs.readFileSync("server/package.json", "utf8")).version,
+            },
+          ];
+          const lock = JSON.parse(fs.readFileSync("server/package-lock.json", "utf8"));
+          files.push(
+            { label: "server/package-lock.json", version: lock.version },
+            { label: 'server/package-lock.json packages[""]', version: lock.packages?.[""]?.version },
+          );
+
+          const mismatches = files.filter(({ version }) => version !== expected);
+          if (mismatches.length) {
+            console.error("✘ release tag version does not match committed version files:");
+            for (const { label, version } of mismatches) {
+              console.error(`  - ${label}: ${version ?? "(missing)"} != ${expected}`);
+            }
+            console.error("");
+            console.error(`Use the Prepare Release workflow, or run: scripts/bump-version.sh ${expected} --commit --tag`);
+            process.exit(1);
+          }
+
+          console.log(`✓ committed version files match v${expected}`);
+          NODE
 
       - name: Validate required secrets / vars
         run: |
