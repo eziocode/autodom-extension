@@ -83,8 +83,42 @@
       : "concise";
   }
 
+  const BROWSER_AGENT_PROTOCOL =
+    "Browser-agent protocol:\n" +
+    "- Observe first: use page context, then get_dom_state for interactables, take_snapshot for role/accessibility structure, and deep_query/list_iframes/list_shadow_roots when a target is hidden.\n" +
+    "- Identify targets by stable evidence (visible text, role/name, index, selector, frame/shadow context, state) before acting; avoid brittle selectors when an index or role-backed target is available.\n" +
+    "- Act in short verified batches: click/type/navigate, wait for navigation or network idle, then verify with check_element_state, page text, URL/title, or a fresh snapshot.\n" +
+    "- Handle real browser surfaces before giving up: dialogs, popups/windows, tabs, cross-origin iframes, shadow DOM, downloads, file inputs, and canvas each have dedicated tools.\n" +
+    "- For destructive, payment, account, credential, or irreversible actions, ask for confirmation unless the user has already clearly authorized the exact action.\n";
+
+  // Detect the host OS platform and return a short label.
+  function _detectPlatform() {
+    try {
+      // navigator.userAgentData is available in Chrome/Edge MV3 workers.
+      const uad = navigator.userAgentData;
+      if (uad && uad.platform) {
+        const p = uad.platform.toLowerCase();
+        if (p.includes("mac")) return "macOS";
+        if (p.includes("win")) return "Windows";
+        if (p.includes("linux") || p.includes("chromeos")) return "Linux";
+        return uad.platform;
+      }
+    } catch (_) {}
+    try {
+      const ua = (navigator.userAgent || "").toLowerCase();
+      if (ua.includes("macintosh") || ua.includes("mac os x")) return "macOS";
+      if (ua.includes("windows")) return "Windows";
+      if (ua.includes("linux") || ua.includes("cros")) return "Linux";
+    } catch (_) {}
+    return "unknown";
+  }
+
   function buildSystemPrompt(context, providerInfo, opts) {
     let p = "You are AutoDOM, an in-page browser assistant.\n";
+    // Platform info — helps the model give OS-appropriate keyboard shortcuts
+    // and paths (e.g. Cmd vs Ctrl, / vs \\ path separators).
+    const platform = _detectPlatform();
+    p += `Platform: ${platform}.\n`;
     if (providerInfo && (providerInfo.model || providerInfo.provider)) {
       const m = String(providerInfo.model || "unknown").trim();
       const prov = String(providerInfo.provider || "unknown").trim();
@@ -93,13 +127,20 @@
       p += `Identity: provider=${prov}, model=${m}. When asked, answer truthfully with this exact pair; don't invent another model.\n`;
     }
     if (context) {
-      if (context.title) p += `Page: ${scrubContextIdentifiers(context.title)}\n`;
-      if (context.url) p += `URL: ${scrubContextIdentifiers(context.url)}\n`;
+      p += "Page context report:\n";
+      if (context.title) p += `- Title: ${scrubContextIdentifiers(context.title)}\n`;
+      if (context.url) p += `- URL: ${scrubContextIdentifiers(context.url)}\n`;
+      if (context.viewportWidth || context.viewportHeight) {
+        p += `- Viewport: ${context.viewportWidth || 0}x${context.viewportHeight || 0}\n`;
+      }
+      if (context.scrollX != null || context.scrollY != null) {
+        p += `- Scroll: x=${context.scrollX || 0}, y=${context.scrollY || 0}\n`;
+      }
       // Outline is dense and cheap (~150 tokens). Send it on every turn,
       // including unchanged ones, so the model has structural anchors
       // even after we drop the visible-text body for dedup.
       if (context.outline) {
-        p += `Outline:\n${scrubContextIdentifiers(context.outline).substring(0, 800)}\n`;
+        p += `- Outline:\n${scrubContextIdentifiers(context.outline).substring(0, 800)}\n`;
       }
       if (context._pageUnchanged) {
         // Page-context dedup: SW detected this page is identical to the
@@ -107,10 +148,10 @@
         // (saves ~1k tokens/turn). The model already saw it earlier in
         // this same conversation and can call get_dom_state for fresh
         // detail if it needs more than headings.
-        p += `[Page state unchanged from previous turn — visible text omitted to save tokens. Call get_dom_state if you need fresh content.]\n`;
+        p += `- State: unchanged from previous turn; visible text omitted to save tokens. Call get_dom_state if you need fresh content.\n`;
         if (context.interactiveElements) {
           const ie = context.interactiveElements;
-          p += `Interactive: ${ie.links || 0}L ${ie.buttons || 0}B ${ie.inputs || 0}I ${ie.forms || 0}F\n`;
+          p += `- Interactive: ${ie.links || 0}L ${ie.buttons || 0}B ${ie.inputs || 0}I ${ie.forms || 0}F\n`;
         }
       } else {
         // Page-context truncation — heaviest per-turn cost. With the
@@ -118,18 +159,19 @@
         // can be tighter still: 600/800 chars. Model can call
         // get_dom_state for full content when it needs detail.
         if (context.visibleOverlayText) {
-          p += `Popup text:\n${scrubContextIdentifiers(context.visibleOverlayText).substring(0, 600)}\n`;
+          p += `- Popup/dialog text:\n${scrubContextIdentifiers(context.visibleOverlayText).substring(0, 600)}\n`;
         }
         if (context.visibleTextPreview) {
-          p += `Page text:\n${scrubContextIdentifiers(context.visibleTextPreview).substring(0, 800)}\n`;
+          p += `- Page text:\n${scrubContextIdentifiers(context.visibleTextPreview).substring(0, 800)}\n`;
         }
         if (context.interactiveElements) {
           const ie = context.interactiveElements;
-          p += `Interactive: ${ie.links || 0}L ${ie.buttons || 0}B ${ie.inputs || 0}I ${ie.forms || 0}F\n`;
+          p += `- Interactive: ${ie.links || 0}L ${ie.buttons || 0}B ${ie.inputs || 0}I ${ie.forms || 0}F\n`;
         }
       }
     }
     p +=
+      BROWSER_AGENT_PROTOCOL +
       "Be concise. For browser actions, use slash commands (/dom /click /screenshot /nav) or call tools directly. Never show internal shorthand such as IC0 or CB0; describe the practical action in plain English.\n" +
       RESPONSE_STYLE_INSTRUCTIONS[_resolveResponseStyle(opts)];
     return p;
@@ -319,7 +361,7 @@
       buildMessages(text, context, conversationHistory, providerInfo || { model: m, provider: "openai" }, { responseStyle });
     const wantStream = typeof onDelta === "function";
     debug && debug("[AutoDOM SW] Calling OpenAI:", cleanBase + "/chat/completions", "model:", m, "tools:", tools ? tools.length : 0, "stream:", wantStream);
-    const body = { model: m, messages, max_tokens: 4096 };
+    const body = { model: m, messages, max_tokens: 10000 };
     if (Array.isArray(tools) && tools.length > 0) {
       body.tools = tools;
       body.tool_choice = "auto";
@@ -423,7 +465,7 @@
     debug && debug("[AutoDOM SW] Calling Anthropic, model:", m, "tools:", tools ? tools.length : 0, "stream:", wantStream);
     const body = {
       model: m,
-      max_tokens: 4096,
+      max_tokens: 10000,
       system: systemPrompt,
       messages: msgs,
     };

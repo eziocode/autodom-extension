@@ -661,6 +661,50 @@ function _debugError(...args) {
 //     assistant note so the model knows context exists beyond the window
 //     (otherwise long sessions feel amnesic — JetBrains AI does the same
 //     "summary of earlier conversation" thing).
+// Strip base64 image data from messages older than the last IMAGE_KEEP_RECENT
+// turns when the total history is longer than IMAGE_COMPACT_THRESHOLD.
+// This mirrors Claude for Chrome's "image compaction" strategy: recent
+// screenshots stay intact so the model can reason about the current page
+// state; older ones are replaced with a compact placeholder that still
+// tells the model an image was present.
+const IMAGE_COMPACT_THRESHOLD = 30; // conversations longer than this get compacted
+const IMAGE_KEEP_RECENT = 10;       // how many recent messages to leave untouched
+
+function _stripBase64Images(content) {
+  if (typeof content === "string") {
+    // Inline data-URL image references in text messages
+    return content.replace(
+      /data:image\/[a-zA-Z+]+;base64,[A-Za-z0-9+/=]{20,}/g,
+      "[image data stripped for context efficiency]",
+    );
+  }
+  if (Array.isArray(content)) {
+    // Anthropic-style content blocks: [{type:"image", source:{type:"base64", data:"..."}}]
+    return content.map((block) => {
+      if (!block || typeof block !== "object") return block;
+      if (block.type === "image" && block.source?.type === "base64") {
+        return {
+          type: "text",
+          text: "[image data stripped for context efficiency]",
+        };
+      }
+      // OpenAI-style image_url blocks
+      if (block.type === "image_url" && block.image_url?.url?.startsWith("data:")) {
+        return {
+          type: "text",
+          text: "[image data stripped for context efficiency]",
+        };
+      }
+      if (block.type === "text" && typeof block.text === "string") {
+        const stripped = _stripBase64Images(block.text);
+        return stripped !== block.text ? { ...block, text: stripped } : block;
+      }
+      return block;
+    });
+  }
+  return content;
+}
+
 function _compactHistoryForOutbound(history, opts) {
   const sliceN = Math.max(2, opts?.sliceN ?? 8);
   const stripAttachmentBinaries = !!opts?.stripAttachmentBinaries;
@@ -721,6 +765,21 @@ function _compactHistoryForOutbound(history, opts) {
       role: "assistant",
       content: `[earlier conversation: ${droppedCount} prior turn(s) elided to keep context manageable. Ask the user if you need details from before this point.]`,
     });
+  }
+
+  // Image compaction: for long sessions, strip base64 image data from
+  // messages older than the last IMAGE_KEEP_RECENT entries. This prevents
+  // huge base64 blobs from re-filling the context window every turn.
+  if (arr.length > IMAGE_COMPACT_THRESHOLD) {
+    const compactBoundary = Math.max(0, sanitized.length - IMAGE_KEEP_RECENT);
+    for (let i = 0; i < compactBoundary; i++) {
+      if (sanitized[i] && sanitized[i].content != null) {
+        const stripped = _stripBase64Images(sanitized[i].content);
+        if (stripped !== sanitized[i].content) {
+          sanitized[i] = { ...sanitized[i], content: stripped };
+        }
+      }
+    }
   }
 
   return sanitized;
@@ -1067,10 +1126,12 @@ function _agentSystemPrompt(context, providerInfo, cacheKey, opts) {
   return (
     base +
     "\nAgent mode:\n" +
-    "- Plan briefly, then call tools (get_dom_state, batch_actions, click_by_index, type_by_index, navigate, list_tabs, switch_tab, wait_for_popup) to read AND act on the page yourself.\n" +
-    "- For content inside iframes (including cross-origin) or web components: use list_iframes + iframe_interact (action='extract_text' to read), list_shadow_roots + shadow_interact, or deep_query. The extension pierces cross-origin iframes via the scripting API — never tell the user the iframe is unreachable; try these tools first.\n" +
+    "- Use the perception stack before acting: page context -> get_dom_state for indexed interactables -> take_snapshot for role/accessibility structure -> deep_query/list_iframes/list_shadow_roots/list_popups/list_tabs for hidden or external surfaces.\n" +
+    "- For content inside iframes (including cross-origin) or web components: use list_iframes + iframe_interact (action='extract_text' or 'get_dom_state'), list_shadow_roots + shadow_interact, or deep_query. The extension pierces cross-origin iframes via the scripting API — never call an iframe unreachable until these tools fail.\n" +
+    "- Identify the target with stable evidence (visible text, role/name, index, selector, frame/shadow context, current state) before clicking or typing. If the target is ambiguous, inspect more instead of guessing.\n" +
     "- Modern interactions are available: drag_and_drop, right_click, handle_dialog (accept/dismiss alerts before they hang the page), upload_file (needs absolute local path), set_attribute (toggle aria-*/hidden/disabled), check_element_state (verify before/after), take_snapshot (a11y/role tree), wait_for_network_idle (SPA readiness), and navigate {action:'back'|'forward'|'reload'}.\n" +
-    "- Prefer batch_actions when you already know 2+ browser steps (click/type/wait/scroll). One batched call is much faster than one model round-trip per action.\n" +
+    "- Prefer batch_actions when you already know 2+ safe browser steps (click/type/wait/scroll); include waits/verification when the page is likely to re-render.\n" +
+    "- After actions, verify with URL/title, wait_for_text, wait_for_network_idle, check_element_state, get_dom_state, or take_snapshot before claiming success.\n" +
     "- Don't tell the user to inspect the page — do it. Only ask follow-ups if a destructive action is ambiguous or info is genuinely missing.\n" +
     "- Don't repeat a failing tool call; change selector or approach. STOP calling tools once you have the answer (or call respond_to_user).\n" +
     "Reply rules (HARD):\n" +
@@ -1213,6 +1274,120 @@ function _buildUserMessageForProvider(text, attachments, providerType) {
   return { content: String(text || "") };
 }
 
+// ─── Tab context injection helper ─────────────────────────────
+// After navigation/tab-switch tool calls, inject a fresh <system-reminder>
+// block into the messages array so the model knows the current tab state
+// without burning a full page-context re-render. Matches Claude for Chrome's
+// "inject tab context as system-reminder after navigation" strategy.
+//
+// NAVIGATION_TOOLS: tool names whose execution changes the active tab or URL.
+const NAVIGATION_TOOLS = new Set([
+  "navigate",
+  "switch_tab",
+  "open_new_tab",
+  "wait_for_navigation",
+  "wait_for_network_idle",
+]);
+
+async function _buildTabContextReminder() {
+  try {
+    const tab = await getActiveTab();
+    // List all open tabs briefly (id, title, url) so the model can switch
+    // if needed.
+    const allTabs = await chrome.tabs.query({}).catch(() => []);
+    const tabList = (allTabs || [])
+      .slice(0, 20)
+      .map((t) => `[${t.id}] ${String(t.title || "").substring(0, 60)} — ${String(t.url || "").substring(0, 120)}`)
+      .join("\n");
+    return (
+      `<system-reminder>Updated tab context after navigation:\n` +
+      `Current tab: [${tab.id}] ${tab.title || ""} — ${tab.url || ""}\n` +
+      `Open tabs:\n${tabList}\n</system-reminder>`
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+// ─── update_plan tool definition (dynamic — not in TOOL_CATALOG) ──────────
+// Presents a structured plan with domains and approach to the user for
+// approval before the agent proceeds. Domains listed in an approved plan
+// are considered pre-authorized for navigation.
+const UPDATE_PLAN_TOOL_ANTHROPIC = {
+  name: "update_plan",
+  description:
+    "Present a structured plan to the user before performing a multi-step automation. " +
+    "The plan includes the domains to visit and the approach. Wait for user approval before proceeding. " +
+    "Use this when you are about to perform actions across multiple sites or execute a sequence of steps that affect real data.",
+  input_schema: {
+    type: "object",
+    properties: {
+      domains: {
+        type: "array",
+        items: { type: "string" },
+        description: "List of domains (e.g. ['github.com', 'google.com']) the plan will visit.",
+      },
+      approach: {
+        type: "string",
+        description: "Step-by-step description of what the agent will do, in plain English.",
+      },
+      title: {
+        type: "string",
+        description: "Short title for the plan (≤60 chars).",
+      },
+    },
+    required: ["domains", "approach"],
+  },
+};
+const UPDATE_PLAN_TOOL_OPENAI = {
+  type: "function",
+  function: {
+    name: "update_plan",
+    description: UPDATE_PLAN_TOOL_ANTHROPIC.description,
+    parameters: UPDATE_PLAN_TOOL_ANTHROPIC.input_schema,
+  },
+};
+
+// Pending plan-approval requests. Maps a unique requestId to a
+// { resolve, reject } pair so the agent loop can await user approval.
+const _pendingPlanApprovals = new Map();
+let _planApprovalIdCounter = 0;
+
+// Called from the agent loop when the model invokes update_plan.
+// Streams a PLAN_APPROVAL_REQUEST event to the chat panel and returns a
+// Promise that resolves to { approved: boolean } when the user responds.
+async function _requestPlanApproval(panelTabId, planArgs) {
+  const requestId = `plan_${Date.now()}_${++_planApprovalIdCounter}`;
+  return new Promise((resolve) => {
+    _pendingPlanApprovals.set(requestId, resolve);
+    try {
+      chrome.tabs
+        .sendMessage(panelTabId, {
+          type: "PLAN_APPROVAL_REQUEST",
+          requestId,
+          domains: planArgs.domains || [],
+          approach: planArgs.approach || "",
+          title: planArgs.title || "Agent Plan",
+        })
+        .catch(() => {
+          // Panel unreachable — auto-approve so the run doesn't hang.
+          _pendingPlanApprovals.delete(requestId);
+          resolve({ approved: true, auto: true });
+        });
+    } catch (_) {
+      _pendingPlanApprovals.delete(requestId);
+      resolve({ approved: true, auto: true });
+    }
+    // Safety timeout: auto-approve after 60s if user doesn't respond.
+    setTimeout(() => {
+      if (_pendingPlanApprovals.has(requestId)) {
+        _pendingPlanApprovals.delete(requestId);
+        resolve({ approved: true, auto: true, reason: "timeout" });
+      }
+    }, 60000);
+  });
+}
+
 async function runAgentLoop({
   providerType,
   text,
@@ -1236,10 +1411,15 @@ async function runAgentLoop({
     aiProviderSettings,
     modelOverride,
   );
-  const tools = _toolsForProvider(providerType);
-  if (!tools) {
+  const _baseTools = _toolsForProvider(providerType);
+  if (!_baseTools) {
     throw new Error(`Agent loop not supported for provider: ${providerType}`);
   }
+  // Append update_plan tool (not in TOOL_CATALOG; handled specially in the loop)
+  const tools = [
+    ..._baseTools,
+    providerType === "anthropic" ? UPDATE_PLAN_TOOL_ANTHROPIC : UPDATE_PLAN_TOOL_OPENAI,
+  ];
 
   // Pin the tab where the chat originated so user focus changes don't hijack the run
   const startTab = await _resolveAgentTab(initialTabId);
@@ -1354,21 +1534,26 @@ async function runAgentLoop({
     // 1 vision call → JSON action script → local replay. On any failure we
     // surface a clear error and stop — caller can retry without /auto.
     visionPlanFastPath: if (mode === "vision-plan") {
+      const PLAN_ALLOWED_TOOLS_TEXT =
+        "click_by_index, type_by_index, navigate, scroll, wait_for_element, wait_for_text, wait_for_network_idle, select_option, press_key, handle_dialog";
       const ALLOWED_PLAN_TOOLS = new Set([
         "click_by_index",
         "type_by_index",
         "navigate",
         "scroll",
         "wait_for_element",
+        "wait_for_text",
+        "wait_for_network_idle",
         "select_option",
         "press_key",
+        "handle_dialog",
       ]);
       const PLAN_PROMPT =
         "You are a browser automation planner. Output ONLY a single JSON object " +
         '(no prose, no code fences) with shape: {"steps":[{"tool":"<name>","args":{...}}]}. ' +
-        "Allowed tools: click_by_index, type_by_index, navigate, scroll, wait_for_element, " +
-        "select_option, press_key. Use snapshot indices (e.g. CB0, IC0) for click_by_index/type_by_index. " +
-        "Keep steps minimal and deterministic.";
+        `Allowed tools: ${PLAN_ALLOWED_TOOLS_TEXT}. ` +
+        "Use snapshot indices (e.g. CB0, IC0) for click_by_index/type_by_index. " +
+        "Keep steps minimal and deterministic; include waits or dialog handling when the next page state depends on them.";
 
       let snap, shot;
       try {
@@ -1475,6 +1660,286 @@ async function runAgentLoop({
       ? `${text}\n\n[Fast-plan fallback: ${fastPlanFallbackMessages.join(" ")}]`
       : text;
 
+    // ── Quick Mode: compact command language, no tool schema ───────────────
+    // Triggered via /quick. Sends tools:[] + stop_sequences=["\n<<END>>"] so
+    // the model responds with single-letter commands that are parsed and
+    // replayed locally — no round-trips for JSON tool schemas. After each
+    // batch of commands, takes a screenshot and feeds it back as a user
+    // message. Loops until the model outputs no commands.
+    //
+    // Command format (one per line, "<<END>>" terminates the batch):
+    //   C x y           — left click
+    //   RC x y          — right click
+    //   DC x y          — double click
+    //   TC x y          — triple click
+    //   H x y           — hover
+    //   T text          — type text
+    //   K keys          — press keys (space-separated)
+    //   S dir amt x y   — scroll (dir=up|down|left|right)
+    //   D x1 y1 x2 y2  — drag
+    //   Z x1 y1 x2 y2  — zoom screenshot region (just takes screenshot)
+    //   N url           — navigate (or "back"/"forward")
+    //   J code          — execute JavaScript
+    //   W               — wait for network idle
+    //   ST tabId        — switch tab
+    //   NT url          — open new tab
+    //   LT              — list tabs
+    //   PL json         — present plan (emits update_plan event, awaits approval)
+    quickModeFastPath: if (mode === "quick") {
+      const QUICK_SYSTEM_PROMPT =
+        "You are AutoDOM in Quick Mode. Respond ONLY with compact browser commands, one per line, then <<END>>.\n" +
+        "Commands:\n" +
+        "  C x y           — left click at viewport coords\n" +
+        "  RC x y          — right click\n" +
+        "  DC x y          — double click\n" +
+        "  TC x y          — triple click\n" +
+        "  H x y           — hover\n" +
+        "  T text          — type text (everything after T<space> until next command)\n" +
+        "  K key1 key2     — press keys (Enter, Tab, Escape, ArrowDown, etc.)\n" +
+        "  S dir amt x y  — scroll (dir=up|down|left|right, amt=pixels, x/y=coords)\n" +
+        "  D x1 y1 x2 y2 — drag from (x1,y1) to (x2,y2)\n" +
+        "  Z x1 y1 x2 y2 — screenshot region (for inspection only)\n" +
+        "  N url           — navigate (or N back / N forward)\n" +
+        "  J code          — execute JavaScript (one line)\n" +
+        "  W               — wait for network idle\n" +
+        "  ST tabId        — switch to tab\n" +
+        "  NT url          — open new tab\n" +
+        "  LT              — list all tabs\n" +
+        "  PL json         — present plan for approval before proceeding\n" +
+        "Terminate every response with <<END>> on its own line.\n" +
+        "Output nothing else — no prose, no explanation, no code fences.\n" +
+        "If the task is done or you need more info, output only <<END>> with no commands.";
+
+      // Parse a block of quick-mode command text into an array of command objects.
+      function _parseQuickCommands(text) {
+        const commands = [];
+        const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+        for (const line of lines) {
+          if (line === "<<END>>") break;
+          const parts = line.split(/\s+/);
+          const cmd = parts[0].toUpperCase();
+          const rest = parts.slice(1);
+          switch (cmd) {
+            case "C":   commands.push({ cmd: "click", x: +rest[0], y: +rest[1] }); break;
+            case "RC":  commands.push({ cmd: "right_click", x: +rest[0], y: +rest[1] }); break;
+            case "DC":  commands.push({ cmd: "dbl_click", x: +rest[0], y: +rest[1] }); break;
+            case "TC":  commands.push({ cmd: "triple_click", x: +rest[0], y: +rest[1] }); break;
+            case "H":   commands.push({ cmd: "hover", x: +rest[0], y: +rest[1] }); break;
+            case "T":   commands.push({ cmd: "type", text: line.slice(2) }); break;
+            case "K":   commands.push({ cmd: "press_key", keys: rest }); break;
+            case "S":   commands.push({ cmd: "scroll", direction: rest[0], amount: +rest[1], x: +rest[2], y: +rest[3] }); break;
+            case "D":   commands.push({ cmd: "drag", x1: +rest[0], y1: +rest[1], x2: +rest[2], y2: +rest[3] }); break;
+            case "Z":   commands.push({ cmd: "screenshot_region", x1: +rest[0], y1: +rest[1], x2: +rest[2], y2: +rest[3] }); break;
+            case "N":   commands.push({ cmd: "navigate", url: rest.join(" ") }); break;
+            case "J":   commands.push({ cmd: "js", code: line.slice(2) }); break;
+            case "W":   commands.push({ cmd: "wait" }); break;
+            case "ST":  commands.push({ cmd: "switch_tab", tabId: +rest[0] }); break;
+            case "NT":  commands.push({ cmd: "open_new_tab", url: rest.join(" ") }); break;
+            case "LT":  commands.push({ cmd: "list_tabs" }); break;
+            case "PL":  {
+              let planData = {};
+              try { planData = JSON.parse(line.slice(3).trim()); } catch (_) {}
+              commands.push({ cmd: "present_plan", plan: planData });
+              break;
+            }
+            default: break; // skip unknown commands
+          }
+        }
+        return commands;
+      }
+
+      // Execute a single parsed quick command and return the raw result.
+      async function _execQuickCommand(qcmd) {
+        switch (qcmd.cmd) {
+          case "click":
+            return executeAgentTool("click", { x: qcmd.x, y: qcmd.y });
+          case "right_click":
+            return executeAgentTool("right_click", { x: qcmd.x, y: qcmd.y });
+          case "dbl_click":
+            // Double-click via evaluate_script as there's no native double_click tool
+            return executeAgentTool("evaluate_script", { script: `(function(){const e=document.elementFromPoint(${qcmd.x},${qcmd.y});if(e){e.dispatchEvent(new MouseEvent('dblclick',{bubbles:true,cancelable:true,clientX:${qcmd.x},clientY:${qcmd.y}}));}})()` });
+          case "triple_click":
+            return executeAgentTool("evaluate_script", { script: `(function(){const e=document.elementFromPoint(${qcmd.x},${qcmd.y});if(e){e.click();e.click();e.click();}})()` });
+          case "hover":
+            return executeAgentTool("hover", { x: qcmd.x, y: qcmd.y });
+          case "type":
+            return executeAgentTool("type_text", { text: qcmd.text });
+          case "press_key":
+            return executeAgentTool("press_key", { key: qcmd.keys.join("+") });
+          case "scroll":
+            return executeAgentTool("scroll", { direction: qcmd.direction, amount: qcmd.amount, x: qcmd.x, y: qcmd.y });
+          case "drag":
+            return executeAgentTool("drag_and_drop", { sourceX: qcmd.x1, sourceY: qcmd.y1, targetX: qcmd.x2, targetY: qcmd.y2 });
+          case "screenshot_region":
+            return executeAgentTool("take_screenshot", {});
+          case "navigate": {
+            const url = qcmd.url;
+            if (url === "back") return executeAgentTool("navigate", { action: "back" });
+            if (url === "forward") return executeAgentTool("navigate", { action: "forward" });
+            return executeAgentTool("navigate", { url });
+          }
+          case "js":
+            return executeAgentTool("evaluate_script", { script: qcmd.code });
+          case "wait":
+            return executeAgentTool("wait_for_network_idle", {});
+          case "switch_tab":
+            return executeAgentTool("switch_tab", { tabId: qcmd.tabId });
+          case "open_new_tab":
+            return executeAgentTool("open_new_tab", { url: qcmd.url });
+          case "list_tabs":
+            return executeAgentTool("list_tabs", {});
+          case "present_plan": {
+            const decision = await _requestPlanApproval(panelTabId, {
+              domains: qcmd.plan.domains || [],
+              approach: qcmd.plan.approach || JSON.stringify(qcmd.plan),
+              title: qcmd.plan.title || "Agent Plan",
+            });
+            return { ok: true, approved: decision.approved };
+          }
+          default:
+            return { ok: false, error: `Unknown quick command: ${qcmd.cmd}` };
+        }
+      }
+
+      // Take the initial screenshot to ground the model
+      let shotResult;
+      try {
+        shotResult = await executeAgentTool("take_screenshot", {});
+      } catch (_) { shotResult = null; }
+      const initialScreenshot = shotResult?.screenshot || shotResult?.dataUrl || null;
+
+      // Build the initial message list
+      const qMessages = [];
+      if (providerType === "anthropic") {
+        const userContent = [];
+        userContent.push({ type: "text", text: activeText });
+        if (initialScreenshot) {
+          userContent.push({
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data: initialScreenshot.replace(/^data:image\/[a-z]+;base64,/, "") },
+          });
+        }
+        qMessages.push({ role: "user", content: userContent });
+      } else {
+        const userContent = [{ type: "text", text: activeText }];
+        if (initialScreenshot) {
+          userContent.push({ type: "image_url", image_url: { url: initialScreenshot } });
+        }
+        qMessages.push({ role: "user", content: userContent });
+      }
+
+      for (let qTurn = 0; qTurn < AGENT_MAX_TURNS; qTurn++) {
+        if (isAborted()) return finish(abortedReply());
+        if (Date.now() - startedAt > AGENT_WALL_CLOCK_MS) {
+          return finish({ response: "⚠️ Quick mode timed out.", toolCalls: accumulatedToolCalls });
+        }
+
+        let qResp;
+        resetTurnBuffer();
+        try {
+          if (providerType === "anthropic") {
+            qResp = await ProvidersApi.callAnthropic({
+              apiKey,
+              baseUrl: aiProviderSettings.baseUrl,
+              model: _model,
+              messagesOverride: qMessages,
+              systemPromptOverride: QUICK_SYSTEM_PROMPT,
+              providerInfo: { model: _model, provider: "anthropic" },
+              tools: [], // quick mode: no tool schema
+              signal,
+              onDelta,
+              stop_sequences: ["\n<<END>>"],
+            });
+          } else {
+            const callFn = providerType === "openai" ? ProvidersApi.callOpenAI : ProvidersApi.callOllama;
+            qResp = await callFn({
+              apiKey,
+              baseUrl: aiProviderSettings.baseUrl,
+              model: _model,
+              messagesOverride: [
+                { role: "system", content: QUICK_SYSTEM_PROMPT },
+                ...qMessages,
+              ],
+              tools: [],
+              debug: _debugLog,
+              signal,
+              onDelta,
+            });
+          }
+        } catch (err) {
+          discardTurnBuffer();
+          if (isAborted() || err?.name === "AbortError") return finish(abortedReply());
+          break quickModeFastPath;
+        }
+
+        const rawText = qResp?.response || "";
+        const qCommands = _parseQuickCommands(rawText);
+
+        // Append assistant turn
+        if (providerType === "anthropic") {
+          qMessages.push({ role: "assistant", content: rawText || "(no commands)" });
+        } else {
+          qMessages.push({ role: "assistant", content: rawText || "(no commands)" });
+        }
+
+        if (qCommands.length === 0) {
+          // No commands — model is done or needs user input
+          finalizeStream();
+          return finish({
+            response: rawText.replace(/<<END>>/g, "").trim() || "✅ Quick mode: task complete.",
+            toolCalls: accumulatedToolCalls,
+          });
+        }
+
+        discardTurnBuffer();
+
+        // Execute commands sequentially
+        for (const qcmd of qCommands) {
+          if (isAborted()) return finish(abortedReply());
+          _streamAgentToolEvent(panelTabId, {
+            phase: "start", runId: runHandle.runId, tool: `quick:${qcmd.cmd}`, args: qcmd,
+          });
+          const qResult = await _execQuickCommand(qcmd);
+          accumulatedToolCalls.push({ tool: `quick:${qcmd.cmd}`, args: qcmd, ok: !!qResult?.ok });
+          _streamAgentToolEvent(panelTabId, {
+            phase: "end", runId: runHandle.runId, tool: `quick:${qcmd.cmd}`,
+            ok: !!qResult?.ok, error: qResult?.error,
+          });
+          // If a plan was rejected, stop the run
+          if (qcmd.cmd === "present_plan" && !qResult?.approved) {
+            return finish({ response: "❌ Plan rejected by user.", toolCalls: accumulatedToolCalls });
+          }
+        }
+
+        // Take a new screenshot and feed back to model
+        let nextShot;
+        try { nextShot = await executeAgentTool("take_screenshot", {}); } catch (_) { nextShot = null; }
+        const nextScreenshotUrl = nextShot?.screenshot || nextShot?.dataUrl || null;
+
+        if (providerType === "anthropic") {
+          const feedback = nextScreenshotUrl
+            ? [
+                { type: "text", text: "Here is the updated page after the commands:" },
+                { type: "image", source: { type: "base64", media_type: "image/png", data: nextScreenshotUrl.replace(/^data:image\/[a-z]+;base64,/, "") } },
+              ]
+            : [{ type: "text", text: "Commands executed. No screenshot available." }];
+          qMessages.push({ role: "user", content: feedback });
+        } else {
+          const feedback = nextScreenshotUrl
+            ? [
+                { type: "text", text: "Here is the updated page after the commands:" },
+                { type: "image_url", image_url: { url: nextScreenshotUrl } },
+              ]
+            : [{ type: "text", text: "Commands executed. No screenshot available." }];
+          qMessages.push({ role: "user", content: feedback });
+        }
+      }
+      return finish({
+        response: "⚠️ Quick mode reached max turns.",
+        toolCalls: accumulatedToolCalls,
+      });
+    }
+
     // ── OpenAI / Ollama style: messages = [{role, content/tool_calls/...}] ──
     if (providerType === "openai" || providerType === "ollama") {
       const providerInfo = { model: _model, provider: providerType };
@@ -1561,6 +2026,7 @@ async function runAgentLoop({
         discardTurnBuffer();
 
         // Execute each tool call sequentially (parallel disabled in OpenAI body)
+        let _needsTabContextInjection = false;
         for (const tc of resp.toolCalls) {
           if (isAborted()) return finish(abortedReply());
           const args = _safeJsonParse(tc.arguments);
@@ -1570,6 +2036,29 @@ async function runAgentLoop({
               response: args.markdown || resp.response || "(no response)",
               toolCalls: accumulatedToolCalls,
             });
+          }
+          // update_plan: pause for user approval before continuing
+          if (tc.name === "update_plan") {
+            _streamAgentToolEvent(panelTabId, {
+              phase: "start", runId: runHandle.runId, tool: "update_plan", args,
+            });
+            const decision = await _requestPlanApproval(panelTabId, args);
+            const planResultContent = decision.approved
+              ? JSON.stringify({ ok: true, approved: true, message: "Plan approved by user. Proceed." })
+              : JSON.stringify({ ok: false, approved: false, message: "Plan rejected by user. Stop or revise." });
+            accumulatedToolCalls.push({ tool: "update_plan", args, ok: !!decision.approved });
+            _streamAgentToolEvent(panelTabId, {
+              phase: "end", runId: runHandle.runId, tool: "update_plan", ok: !!decision.approved,
+            });
+            messages.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: planResultContent,
+            });
+            if (!decision.approved) {
+              return finish({ response: "❌ Plan rejected by user.", toolCalls: accumulatedToolCalls });
+            }
+            continue;
           }
           if (_isRepeatLoop(callHistory, tc.name, args)) {
             const stuckMsg = `Aborting: tool '${tc.name}' called 3 times in a row with same args. Likely a loop on a flaky selector.`;
@@ -1597,6 +2086,8 @@ async function runAgentLoop({
           const result = AgentApi.truncateToolResult(tc.name, rawResult);
           // Re-pin the agent run to a new tab when the AI explicitly asked to.
           _maybeRepinAgentTab(tc.name, rawResult);
+          // Track if any navigation tool ran — we'll inject tab context after.
+          if (NAVIGATION_TOOLS.has(tc.name)) _needsTabContextInjection = true;
           accumulatedToolCalls.push({
             tool: tc.name,
             args,
@@ -1615,6 +2106,13 @@ async function runAgentLoop({
             tool_call_id: tc.id,
             content: deduper.process(tc.name, JSON.stringify(result)),
           });
+        }
+        // Inject fresh tab context as a system-reminder after navigation
+        if (_needsTabContextInjection) {
+          const reminder = await _buildTabContextReminder();
+          if (reminder) {
+            messages.push({ role: "user", content: reminder });
+          }
         }
       }
       return finish({
@@ -1712,12 +2210,37 @@ async function runAgentLoop({
         // Build a single user message containing all tool_result blocks
         const toolResultBlocks = [];
         let earlyReturn = null;
+        let _anthropicNeedsTabContext = false;
         for (const tc of resp.toolCalls) {
           if (isAborted()) return finish(abortedReply());
           const args = _safeJsonParse(tc.arguments);
           if (tc.name === "respond_to_user") {
             earlyReturn = args.markdown || resp.response || "(no response)";
             break;
+          }
+          // update_plan: pause for user approval before continuing
+          if (tc.name === "update_plan") {
+            _streamAgentToolEvent(panelTabId, {
+              phase: "start", runId: runHandle.runId, tool: "update_plan", args,
+            });
+            const decision = await _requestPlanApproval(panelTabId, args);
+            accumulatedToolCalls.push({ tool: "update_plan", args, ok: !!decision.approved });
+            _streamAgentToolEvent(panelTabId, {
+              phase: "end", runId: runHandle.runId, tool: "update_plan", ok: !!decision.approved,
+            });
+            toolResultBlocks.push({
+              type: "tool_result",
+              tool_use_id: tc.id,
+              content: decision.approved
+                ? "Plan approved by user. Proceed."
+                : "Plan rejected by user. Stop or revise.",
+              is_error: !decision.approved,
+            });
+            if (!decision.approved) {
+              earlyReturn = "❌ Plan rejected by user.";
+              break;
+            }
+            continue;
           }
           if (_isRepeatLoop(callHistory, tc.name, args)) {
             earlyReturn =
@@ -1735,6 +2258,8 @@ async function runAgentLoop({
           const rawResult = await executeAgentTool(tc.name, args);
           const result = AgentApi.truncateToolResult(tc.name, rawResult);
           _maybeRepinAgentTab(tc.name, rawResult);
+          // Track navigation for tab context injection
+          if (NAVIGATION_TOOLS.has(tc.name)) _anthropicNeedsTabContext = true;
           accumulatedToolCalls.push({
             tool: tc.name,
             args,
@@ -1760,6 +2285,17 @@ async function runAgentLoop({
             response: earlyReturn,
             toolCalls: accumulatedToolCalls,
           });
+        }
+        // Inject fresh tab context as a system-reminder after navigation
+        if (_anthropicNeedsTabContext) {
+          const reminder = await _buildTabContextReminder();
+          if (reminder) {
+            // Append the reminder as an extra text block in the tool-results message
+            toolResultBlocks.push({
+              type: "text",
+              text: reminder,
+            });
+          }
         }
         messages.push({ role: "user", content: toolResultBlocks });
       }
@@ -3011,6 +3547,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ ok: !!delivered });
     return false;
   }
+  // ── Plan approval response from the chat panel ──────────────
+  if (message.type === "PLAN_APPROVAL_RESPONSE") {
+    const resolver = _pendingPlanApprovals.get(message.requestId);
+    if (resolver) {
+      _pendingPlanApprovals.delete(message.requestId);
+      resolver({ approved: !!message.approved });
+    }
+    sendResponse({ ok: true });
+    return false;
+  }
   if (message.type === "ACTION_GATE_GET_STATE") {
     (async () => {
       const Gate = globalThis.AutoDOMActionGate;
@@ -3799,6 +4345,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           "[AutoDOM SW] Active tab:",
           tab ? tab.id + " - " + (tab.url || "").substring(0, 60) : "none",
         );
+        if (tab) {
+          // Prefer native side panel whenever available; only fall back to
+          // the injected in-page panel on non-sidepanel environments.
+          try {
+            if (await _toggleNativeSidePanelForWindow(tab.windowId)) {
+              sendResponse({ success: true, mcpActive: isConnected });
+              return;
+            }
+          } catch (e) {
+            _debugWarn?.("[AutoDOM] sidePanel.open failed, falling back:", e);
+          }
+        }
         if (tab && isInjectableTab(tab)) {
           // Try sending the toggle message to the content script
           try {
@@ -5880,6 +6438,30 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 // `window.close()` itself over that port.
 const sidePanelPorts = new Map(); // windowId -> Port
 
+function _canUseNativeSidePanel() {
+  try {
+    return !!(chrome.sidePanel && typeof chrome.sidePanel.open === "function");
+  } catch (_) {
+    return false;
+  }
+}
+
+async function _toggleNativeSidePanelForWindow(windowId) {
+  if (!_canUseNativeSidePanel()) return false;
+  const existing = sidePanelPorts.get(windowId);
+  if (existing) {
+    try {
+      existing.postMessage({ type: "AUTODOM_SIDEPANEL_CLOSE" });
+    } catch (_) {
+      // Port already torn down — drop it and fall through to open.
+      sidePanelPorts.delete(windowId);
+    }
+    if (sidePanelPorts.has(windowId)) return true;
+  }
+  await chrome.sidePanel.open({ windowId });
+  return true;
+}
+
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "autodom-sidepanel") return;
   // The side panel page has no associated tab in port.sender, so the
@@ -5914,24 +6496,8 @@ chrome.commands.onCommand.addListener(async (command) => {
       // injected panel only when sidePanel API is unavailable (older
       // Chrome, Firefox via manifest.firefox.json, restricted pages
       // where the side panel can't be opened).
-      //
-      // Toggle behavior: if the side panel is already open in this
-      // window (we have a live port), tell it to close itself.
-      const existing = sidePanelPorts.get(tab.windowId);
-      if (existing) {
-        try {
-          existing.postMessage({ type: "AUTODOM_SIDEPANEL_CLOSE" });
-        } catch (_) {
-          // Port already torn down — drop it and fall through to open.
-          sidePanelPorts.delete(tab.windowId);
-        }
-        if (sidePanelPorts.has(tab.windowId)) return;
-      }
       try {
-        if (chrome.sidePanel && typeof chrome.sidePanel.open === "function") {
-          await chrome.sidePanel.open({ windowId: tab.windowId });
-          return;
-        }
+        if (await _toggleNativeSidePanelForWindow(tab.windowId)) return;
       } catch (e) {
         _debugWarn?.("[AutoDOM] sidePanel.open failed, falling back:", e);
       }

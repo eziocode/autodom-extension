@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AutoDOM Chat</title>
     <link rel="stylesheet" href="sidepanel.css" />
+    <!-- Pre-load the chat panel CSS so it's parsed in parallel with
+         chat-panel.js and applied before first paint of the panel DOM.
+         Performance: avoids re-parsing a 3.5K-line JS template literal
+         on every panel mount. -->
+    <link rel="stylesheet" href="../content/chat-panel.css" />
   </head>
   <body>
     <!--

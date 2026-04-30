@@ -1075,3515 +1075,51 @@
   }
 
   // ─── Inject Styles ─────────────────────────────────────────
-  const style = document.createElement("style");
-  style.id = STYLE_ID;
-  style.textContent = `
-    /* ─── Tokens — aligned with AutoDOM popup palette ────────── */
-    /* Same oklch warm-neutral system as extension/popup/popup.css.
-       Single warm-amber accent (--warn family) is used for primary
-       chat surfaces (user bubble, AI avatar, send button) so the
-       panel reads as part of the AutoDOM tool, not a separate app. */
-    #${PANEL_ID},
-    #${INLINE_OVERLAY_ID} {
-      color-scheme: dark;
-      --c-bg:        oklch(13% 0.008 70);
-      --c-surface:   oklch(17% 0.008 70);
-      --c-surface-2: oklch(21% 0.008 70);
-      --c-raised:    oklch(24% 0.008 70);
-      --c-border:    oklch(25% 0.006 70);
-      --c-border-s:  oklch(34% 0.006 70);
-      --c-text:      oklch(91% 0.006 70);
-      --c-text-2:    oklch(70% 0.006 70);
-      --c-text-3:    oklch(52% 0.006 70);
-      --c-accent:       oklch(58% 0.16 25);
-      --c-accent-2:     oklch(66% 0.16 25);
-      --c-accent-soft:  oklch(58% 0.16 25 / 0.14);
-      --c-accent-ring:  oklch(58% 0.16 25 / 0.26);
-      --c-success:   oklch(65% 0.16 155);
-      --c-danger:    oklch(65% 0.18 25);
-      --c-warn:      oklch(70% 0.14 85);
-      --c-info:      oklch(70% 0.14 260);
-      --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-      --font: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-      --radius: 8px;
-      --radius-lg: 12px;
-      --radius-xl: 18px;
-    }
+  // Performance: the ~3.5K-line CSS that used to live as a JS template
+  // literal is now in extension/content/chat-panel.css so the browser
+  // parses it from a cached file instead of re-evaluating a 100KB
+  // string on every panel mount (sidepanel open AND every content-
+  // script injection). Side-panel mode loads the link directly via
+  // sidepanel/index.html. Content-script mode injects the link itself
+  // here, fronted by a tiny critical-CSS guard that hides the panel /
+  // inline overlay until the stylesheet finishes loading — no FOUC
+  // even when the panel mounts in the host page's DOM (no Shadow DOM).
+  // The avatar SVG-data URL is provided to CSS via a custom property
+  // (--autodom-avatar) set on the panel/overlay roots a few lines below
+  // (the ID-scoped selector in panel.style is enough; CSS uses var()).
+  if (!SIDE_PANEL_MODE && !document.getElementById(STYLE_ID + "_link")) {
+    const guard = document.createElement("style");
+    guard.id = STYLE_ID + "_critical";
+    // Hide the panel + overlay roots until the real CSS loads. Use
+    // visibility (not display:none) so layout still settles correctly
+    // and onload remove is a one-property update.
+    guard.textContent =
+      "#" + PANEL_ID + ",#" + INLINE_OVERLAY_ID +
+      "{visibility:hidden!important;}";
+    document.documentElement.appendChild(guard);
 
-    #${PANEL_ID}.theme-light,
-    #${INLINE_OVERLAY_ID}.theme-light {
-      color-scheme: light;
-      --c-bg:        oklch(98% 0.004 70);
-      --c-surface:   oklch(95% 0.005 70);
-      --c-surface-2: oklch(92% 0.006 70);
-      --c-raised:    oklch(90% 0.006 70);
-      --c-border:    oklch(86% 0.006 70);
-      --c-border-s:  oklch(76% 0.008 70);
-      --c-text:      oklch(20% 0.008 70);
-      --c-text-2:    oklch(38% 0.008 70);
-      --c-text-3:    oklch(54% 0.008 70);
-      --c-accent:       oklch(50% 0.15 25);
-      --c-accent-2:     oklch(44% 0.15 25);
-      --c-accent-soft:  oklch(50% 0.15 25 / 0.10);
-      --c-accent-ring:  oklch(50% 0.15 25 / 0.18);
-      --c-success:   oklch(48% 0.14 155);
-      --c-danger:    oklch(48% 0.18 25);
-      --c-warn:      oklch(50% 0.14 85);
-      --c-info:      oklch(48% 0.14 260);
+    const link = document.createElement("link");
+    link.id = STYLE_ID + "_link";
+    link.rel = "stylesheet";
+    try {
+      link.href = chrome.runtime.getURL("content/chat-panel.css");
+    } catch (_) {
+      // Extension context invalidated mid-injection. Fall back to
+      // doing nothing — the next reload will recover.
+      link.remove();
+      guard.remove();
     }
+    const reveal = () => {
+      try { guard.remove(); } catch (_) {}
+    };
+    link.addEventListener("load", reveal, { once: true });
+    // If the stylesheet 404s for any reason (file missing in a partial
+    // install) reveal anyway so the panel is at least usable in plain
+    // form rather than permanently invisible.
+    link.addEventListener("error", reveal, { once: true });
+    document.documentElement.appendChild(link);
+  }
 
-    @media (prefers-color-scheme: light) {
-      #${PANEL_ID}.theme-system,
-      #${INLINE_OVERLAY_ID}.theme-system {
-        color-scheme: light;
-        --c-bg:        oklch(98% 0.004 70);
-        --c-surface:   oklch(95% 0.005 70);
-        --c-surface-2: oklch(92% 0.006 70);
-        --c-raised:    oklch(90% 0.006 70);
-        --c-border:    oklch(86% 0.006 70);
-        --c-border-s:  oklch(76% 0.008 70);
-        --c-text:      oklch(20% 0.008 70);
-        --c-text-2:    oklch(38% 0.008 70);
-        --c-text-3:    oklch(54% 0.008 70);
-        --c-accent:       oklch(50% 0.15 25);
-        --c-accent-2:     oklch(44% 0.15 25);
-        --c-accent-soft:  oklch(50% 0.15 25 / 0.10);
-        --c-accent-ring:  oklch(50% 0.15 25 / 0.18);
-        --c-success:   oklch(48% 0.14 155);
-        --c-danger:    oklch(48% 0.18 25);
-        --c-warn:      oklch(50% 0.14 85);
-        --c-info:      oklch(48% 0.14 260);
-      }
-    }
-
-    /* ─── Keyframes (minimal, purposeful) ─────────────────────── */
-    @keyframes __autodom_slide_in {
-      from { opacity: 0; transform: translateY(8px); }
-      to   { opacity: 1; transform: translateY(0); }
-    }
-    @keyframes __autodom_typing {
-      0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
-      30% { opacity: 1; transform: translateY(-2px); }
-    }
-    @keyframes __autodom_dot_pulse {
-      0%, 100% { opacity: 1; transform: scale(1); }
-      50% { opacity: 0.4; transform: scale(0.9); }
-    }
-    @keyframes __autodom_shimmer {
-      0% { background-position: -200% 0; }
-      100% { background-position: 200% 0; }
-    }
-    @media (prefers-reduced-motion: reduce) {
-      #${PANEL_ID} *,
-      #${INLINE_OVERLAY_ID} * {
-        animation-duration: 0.01ms !important;
-        transition-duration: 0.01ms !important;
-      }
-    }
-
-    /* ─── Chat Panel (Sidebar) ────────────────────────────────── */
-    /* Page push: when the panel is open, shift the host page's <html>
-       over by the panel width so the panel never obscures content.
-       Closing the panel removes the class and the page reflows back.
-       overflow-x clip prevents host pages with width: 100vw elements
-       from spawning a horizontal scrollbar after the margin shrinks
-       the visible width — affects Windows Chrome/Edge most visibly. */
-    html.__autodom_panel_open {
-      margin-right: var(--autodom-panel-w, 440px) !important;
-      overflow-x: hidden !important;
-      transition: margin-right 0.32s var(--ease-out, cubic-bezier(0.22, 1, 0.36, 1));
-    }
-    #${PANEL_ID} {
-      position: fixed !important;
-      top: 0 !important;
-      right: 0 !important;
-      bottom: 0 !important;
-      left: auto !important;
-      width: var(--autodom-panel-w, 440px) !important;
-      max-width: 100vw !important;
-      height: 100vh !important;
-      max-height: 100vh !important;
-      background: var(--c-bg) !important;
-      border-left: 1px solid var(--c-border);
-      z-index: 2147483646 !important;
-      display: flex !important;
-      flex-direction: column !important;
-      overflow: hidden !important;
-      font-family: var(--font) !important;
-      font-size: 14px !important;
-      line-height: 1.55 !important;
-      color: var(--c-text) !important;
-      transform: translateX(100%);
-      transition: transform 0.32s var(--ease-out);
-      box-shadow: -8px 0 40px rgba(0, 0, 0, 0.5);
-      pointer-events: auto;
-      -webkit-font-smoothing: antialiased;
-      -moz-osx-font-smoothing: grayscale;
-      /* Defensive containment: keeps the panel's own paint isolated from
-         host-page reflows during the drag, smoother on Windows + Linux. */
-      contain: layout paint style;
-    }
-    #${PANEL_ID}.open {
-      transform: translateX(0) !important;
-    }
-    /* Resize handle on the left edge.
-       - 8px hit target straddles the panel's left border so the cursor
-         catches it consistently across Mac (Retina), Windows (DPI scaling
-         150%/175%), and Linux/Wayland (fractional scaling).
-       - The visible 2px line sits flush over the existing 1px border and
-         lights up on hover / focus / active.
-       - touch-action: none is required so iPadOS / Windows touchscreens /
-         Chromebooks don't hijack the gesture for page scroll. */
-    #${PANEL_ID} .autodom-chat-resize-handle {
-      position: absolute !important;
-      top: 0 !important;
-      left: -4px !important;
-      width: 8px !important;
-      height: 100% !important;
-      cursor: ew-resize !important;
-      z-index: 2 !important;
-      background: transparent !important;
-      touch-action: none !important;
-      -webkit-user-select: none !important;
-      user-select: none !important;
-      outline: none !important;
-    }
-    #${PANEL_ID} .autodom-chat-resize-handle::after {
-      content: "" !important;
-      position: absolute !important;
-      top: 0 !important;
-      left: 3px !important;
-      width: 2px !important;
-      height: 100% !important;
-      background: transparent !important;
-      transition: background-color 0.15s ease !important;
-      pointer-events: none !important;
-    }
-    #${PANEL_ID} .autodom-chat-resize-handle:hover::after,
-    #${PANEL_ID} .autodom-chat-resize-handle:focus-visible::after,
-    #${PANEL_ID}.is-resizing .autodom-chat-resize-handle::after {
-      background: var(--c-accent, #6aa4ff) !important;
-    }
-    /* Disable transitions while dragging so the panel + page reflow track
-       the cursor 1:1 (otherwise the 0.32s margin-right ease lags behind
-       and you get a rubber-band feel, especially on Windows trackpads). */
-    #${PANEL_ID}.is-resizing,
-    html.__autodom_panel_resizing,
-    html.__autodom_panel_resizing.__autodom_panel_open {
-      transition: none !important;
-    }
-    html.__autodom_panel_resizing,
-    html.__autodom_panel_resizing * {
-      cursor: ew-resize !important;
-      user-select: none !important;
-    }
-    /* ─── Collapsed (rail) state ──────────────────────────────
-       When the user collapses the panel it shrinks to a 44px vertical
-       rail showing just the AutoDOM logo + an expand affordance. The
-       full chat surface stays mounted (preserves scroll position,
-       composer draft, in-flight requests) but is visually hidden;
-       clicking the rail or hitting the keyboard shortcut restores
-       the previous width. Per-host preference, persisted. */
-    #${PANEL_ID}.is-collapsed {
-      cursor: pointer !important;
-    }
-    #${PANEL_ID}.is-collapsed > *:not(.autodom-chat-resize-handle):not(.autodom-chat-rail) {
-      visibility: hidden !important;
-      pointer-events: none !important;
-    }
-    #${PANEL_ID}.is-collapsed .autodom-chat-resize-handle {
-      pointer-events: none !important;
-    }
-    .autodom-chat-rail {
-      display: none !important;
-      position: absolute !important;
-      inset: 0 !important;
-      flex-direction: column !important;
-      align-items: center !important;
-      justify-content: flex-start !important;
-      padding: 14px 0 !important;
-      gap: 12px !important;
-      background: transparent !important;
-      pointer-events: auto !important;
-      z-index: 3 !important;
-    }
-    #${PANEL_ID}.is-collapsed .autodom-chat-rail {
-      display: flex !important;
-    }
-    /* Rail logo: reuse the AutoDOM brand mark from the header so the
-       collapsed state is recognisably AutoDOM (not a generic gradient
-       block). Same radial gradient + accent colors + inset star glyph. */
-    .autodom-chat-rail-logo {
-      width: 28px !important;
-      height: 28px !important;
-      border-radius: 8px !important;
-      background:
-        radial-gradient(120% 120% at 0% 0%, var(--c-accent-2) 0%, var(--c-accent) 55%, oklch(48% 0.18 25) 100%) !important;
-      display: flex !important;
-      align-items: center !important;
-      justify-content: center !important;
-      flex-shrink: 0 !important;
-      box-shadow:
-        0 0 0 1px rgba(255, 255, 255, 0.06) inset,
-        0 4px 14px var(--c-accent-soft) !important;
-    }
-    .autodom-chat-rail-logo svg {
-      width: 14px !important;
-      height: 14px !important;
-      fill: #fff !important;
-      stroke: none !important;
-    }
-    .autodom-chat-rail-icon {
-      width: 16px !important;
-      height: 16px !important;
-      color: var(--c-text-muted, #a0a0a8) !important;
-      transition: color 0.15s ease !important;
-    }
-    #${PANEL_ID}.is-collapsed:hover .autodom-chat-rail-icon {
-      color: var(--c-text, #e8e8ec) !important;
-    }
-    /* Header collapse toggle — chevron flips when collapsed. */
-    #__autodom_collapse_btn svg {
-      transition: transform 0.2s ease !important;
-    }
-    #${PANEL_ID}.is-collapsed #__autodom_collapse_btn svg {
-      transform: rotate(180deg) !important;
-    }
-    #${PANEL_ID} * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-    }
-    /* ─── Defensive reset (page CSS isolation) ─────────────────
-       The panel is injected into the host page, so site stylesheets
-       (e.g. Zoho CRM, GitHub, docs sites) can bleed in and override
-       our sizes / typography / surfaces. Reset descendants to a clean
-       baseline; explicit class rules below re-apply our intended
-       values (and win on specificity). Container itself keeps its
-       background/border/box-shadow defined above. */
-    #${PANEL_ID} * {
-      box-sizing: border-box !important;
-      font-family: var(--font) !important;
-      font-weight: 400;
-      font-style: normal;
-      font-size: inherit;
-      line-height: inherit;
-      letter-spacing: normal;
-      text-transform: none;
-      text-shadow: none;
-      text-decoration: none;
-      vertical-align: baseline;
-      float: none;
-      color: inherit;
-      background: transparent;
-      border: 0;
-      box-shadow: none;
-    }
-    #${PANEL_ID} svg {
-      display: inline-block !important;
-      vertical-align: middle !important;
-      max-width: none !important;
-      max-height: none !important;
-      width: auto;
-      height: auto;
-      flex-shrink: 0 !important;
-    }
-    #${PANEL_ID} button {
-      font: inherit !important;
-      background: transparent;
-      border: none;
-      cursor: pointer;
-      text-transform: none !important;
-      letter-spacing: normal !important;
-      box-shadow: none;
-      min-width: 0;
-      min-height: 0;
-    }
-    #${PANEL_ID} textarea,
-    #${PANEL_ID} select {
-      font: inherit !important;
-      color: inherit;
-      background: transparent;
-      border: none;
-      text-transform: none !important;
-      letter-spacing: normal !important;
-      box-shadow: none;
-    }
-    #${PANEL_ID} kbd {
-      text-transform: none !important;
-    }
-
-    /* ─── Header ──────────────────────────────────────────────── */
-    .autodom-chat-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 12px 14px;
-      background: var(--c-bg);
-      border-bottom: 1px solid var(--c-border);
-      flex-shrink: 0;
-      gap: 8px;
-      position: relative;
-      overflow: visible;
-      min-height: 52px;
-    }
-    .autodom-chat-header-left {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex: 1;
-      min-width: 0;
-    }
-
-    /* Close Button — sits inside the header, top-right side */
-    .autodom-chat-close-btn {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      width: 30px !important;
-      height: 30px !important;
-      padding: 0 !important;
-      background: transparent;
-      border: none;
-      color: var(--c-text-3);
-      cursor: pointer;
-      border-radius: 8px;
-      transition: color 0.15s ease, background-color 0.15s ease;
-      font-family: inherit;
-      flex-shrink: 0 !important;
-    }
-    .autodom-chat-close-btn:hover {
-      background: var(--c-surface);
-      color: var(--c-text);
-    }
-    .autodom-chat-close-btn:focus-visible {
-      outline: 2px solid var(--c-accent);
-      outline-offset: 2px;
-    }
-    .autodom-chat-close-btn svg {
-      width: 14px !important;
-      height: 14px !important;
-      fill: none !important;
-      stroke: currentColor !important;
-      stroke-width: 2.5;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-    }
-
-    /* Logo — subtle gradient mark */
-    .autodom-chat-header-logo {
-      width: 30px !important;
-      height: 30px !important;
-      border-radius: 9px;
-      background:
-        radial-gradient(120% 120% at 0% 0%, var(--c-accent-2) 0%, var(--c-accent) 55%, oklch(48% 0.18 25) 100%);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      flex-shrink: 0 !important;
-      box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset, 0 4px 14px var(--c-accent-soft);
-    }
-    .autodom-chat-header-logo svg {
-      width: 15px !important;
-      height: 15px !important;
-      fill: #fff;
-      stroke: none;
-    }
-    .autodom-chat-header-titlebox {
-      display: flex;
-      flex-direction: column;
-      gap: 1px;
-      min-width: 0;
-      flex: 1 1 auto;
-      overflow: hidden;
-    }
-    .autodom-chat-header-title {
-      font-size: 14px;
-      font-weight: 600;
-      color: var(--c-text);
-      letter-spacing: -0.01em;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      line-height: 1.2;
-      max-width: 100%;
-    }
-
-    /* Status: now a tiny dot + label living UNDER the title */
-    .autodom-chat-header-status {
-      font-size: 11px;
-      padding: 0;
-      border-radius: 0;
-      border: none;
-      background: transparent !important;
-      font-weight: 500;
-      letter-spacing: 0;
-      text-transform: none;
-      transition: color 0.15s ease;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      flex-shrink: 1;
-      max-width: 100%;
-      line-height: 1.2;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      color: var(--c-text-3);
-    }
-    .autodom-chat-header-status::before {
-      content: "";
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--c-text-3);
-      flex-shrink: 0;
-      box-shadow: 0 0 0 0 transparent;
-    }
-    .autodom-chat-header-status.connected::before {
-      background: var(--c-success);
-      box-shadow: 0 0 0 3px oklch(65% 0.16 155 / 0.22);
-      animation: __autodom_dot_pulse 2.4s ease-in-out infinite;
-    }
-    .autodom-chat-header-status.connected { color: var(--c-text-2); }
-    .autodom-chat-header-status.direct::before {
-      background: var(--c-accent);
-      box-shadow: 0 0 0 3px var(--c-accent-soft);
-      animation: __autodom_dot_pulse 2.4s ease-in-out infinite;
-    }
-    .autodom-chat-header-status.direct { color: var(--c-text-2); }
-    .autodom-chat-header-status.disconnected::before { background: var(--c-text-3); }
-    .autodom-chat-header-status.disconnected { color: var(--c-text-3); }
-
-    /* Hide BETA + MCP badges — keep nodes for compatibility */
-    .autodom-chat-beta-badge,
-    .autodom-ai-badge { display: none !important; }
-
-    /* ─── Update available pill — appears in the chat header when a
-       newer extension version has been fetched and is waiting to be
-       applied. Driven by chrome.storage.local.pendingUpdate. */
-    .autodom-chat-update-pill {
-      display: inline-flex !important;
-      align-items: center !important;
-      gap: 5px !important;
-      padding: 3px 8px 3px 7px !important;
-      margin-left: 8px !important;
-      font-size: 11px !important;
-      font-weight: 600 !important;
-      letter-spacing: 0.01em !important;
-      color: #fff !important;
-      background: var(--c-accent) !important;
-      border: none !important;
-      border-radius: 999px !important;
-      cursor: pointer !important;
-      flex-shrink: 0 !important;
-      box-shadow: 0 0 0 1px var(--c-accent-soft) inset, 0 4px 10px var(--c-accent-soft);
-      transition: background-color 0.15s ease, transform 0.15s ease;
-      animation: __autodom_update_pulse 2.6s ease-in-out infinite;
-    }
-    .autodom-chat-update-pill[hidden] { display: none !important; }
-    .autodom-chat-update-pill:hover { background: var(--c-accent-2) !important; transform: translateY(-1px); }
-    .autodom-chat-update-pill:focus-visible {
-      outline: 2px solid var(--c-accent) !important;
-      outline-offset: 2px !important;
-    }
-    .autodom-chat-update-pill svg {
-      width: 12px !important;
-      height: 12px !important;
-      fill: none !important;
-      stroke: currentColor !important;
-      stroke-width: 2.4 !important;
-      stroke-linecap: round !important;
-      stroke-linejoin: round !important;
-    }
-    @keyframes __autodom_update_pulse {
-      0%, 100% { box-shadow: 0 0 0 1px var(--c-accent-soft) inset, 0 4px 10px var(--c-accent-soft); }
-      50%      { box-shadow: 0 0 0 1px var(--c-accent-soft) inset, 0 6px 18px var(--c-accent-soft); }
-    }
-    /* ─── Inline Settings Overlay (hosts popup.html in an iframe) ─── */
-    .autodom-chat-settings-overlay {
-      position: absolute !important;
-      inset: 0 !important;
-      z-index: 30 !important;
-      display: flex !important;
-      flex-direction: column !important;
-      background: var(--c-bg) !important;
-      animation: __autodom_slide_in 0.18s var(--ease-out);
-    }
-    .autodom-chat-settings-overlay[hidden] { display: none !important; }
-    .autodom-chat-settings-overlay-header {
-      flex: 0 0 auto !important;
-      display: flex !important;
-      align-items: center !important;
-      gap: 10px !important;
-      padding: 8px 10px !important;
-      background: var(--c-raised) !important;
-      border-bottom: 1px solid var(--c-border) !important;
-    }
-    .autodom-chat-settings-overlay-back {
-      display: inline-flex !important;
-      align-items: center !important;
-      gap: 4px !important;
-      font: inherit !important;
-      font-size: 12px !important;
-      color: var(--c-text-1) !important;
-      background: transparent !important;
-      border: 1px solid var(--c-border) !important;
-      border-radius: 6px !important;
-      padding: 4px 8px 4px 6px !important;
-      cursor: pointer !important;
-      transition: background-color 0.15s ease, border-color 0.15s ease !important;
-    }
-    .autodom-chat-settings-overlay-back svg {
-      width: 14px !important;
-      height: 14px !important;
-    }
-    .autodom-chat-settings-overlay-back:hover {
-      background: color-mix(in oklch, var(--c-accent) 12%, transparent) !important;
-      border-color: var(--c-accent) !important;
-    }
-    .autodom-chat-settings-overlay-back:focus-visible {
-      outline: 2px solid var(--c-accent) !important;
-      outline-offset: 2px !important;
-    }
-    .autodom-chat-settings-overlay-title {
-      font-size: 12.5px !important;
-      font-weight: 600 !important;
-      color: var(--c-text) !important;
-    }
-    .autodom-chat-settings-overlay-mount {
-      flex: 1 1 auto !important;
-      min-height: 0 !important;
-      display: flex !important;
-    }
-    .autodom-chat-settings-overlay-frame {
-      flex: 1 1 auto !important;
-      width: 100% !important;
-      border: 0 !important;
-      background: var(--c-bg) !important;
-      color-scheme: light dark;
-    }
-
-    /* Settings button active state */
-    .autodom-chat-header-btn.active {
-      background: color-mix(in oklch, var(--c-accent) 14%, transparent) !important;
-      color: var(--c-accent) !important;
-    }
-
-    .autodom-chat-header-actions {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      flex-shrink: 0;
-      flex-wrap: nowrap;
-      position: relative;
-    }
-    .autodom-chat-header-btn {
-      background: none;
-      border: none;
-      color: var(--c-text-3);
-      cursor: pointer;
-      padding: 7px;
-      border-radius: 8px;
-      transition: color 0.15s ease, background-color 0.15s ease;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      width: 30px !important;
-      height: 30px !important;
-      flex-shrink: 0;
-    }
-    .autodom-chat-header-btn svg {
-      width: 14px !important;
-      height: 14px !important;
-      fill: none;
-      stroke: currentColor;
-      stroke-width: 2;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-    }
-    .autodom-chat-header-btn:hover {
-      color: var(--c-text);
-      background: var(--c-surface);
-    }
-    .autodom-chat-header-btn:focus-visible {
-      outline: 2px solid var(--c-accent);
-      outline-offset: 2px;
-    }
-    .autodom-chat-header-btn:disabled,
-    .autodom-chat-header-btn[aria-disabled="true"] {
-      opacity: 0.32;
-      cursor: not-allowed;
-      pointer-events: none;
-    }
-    #${PANEL_ID} .autodom-past-chat-menu {
-      position: fixed !important;
-      overflow: auto !important;
-      z-index: 2147483647 !important;
-      box-sizing: border-box !important;
-      padding: 8px !important;
-      border: 1px solid var(--c-border) !important;
-      border-radius: 14px !important;
-      background: var(--c-raised, #0d0d0f) !important;
-      color: var(--c-text, #f4f4f5) !important;
-      box-shadow: 0 18px 42px rgba(0, 0, 0, 0.42) !important;
-    }
-    #${PANEL_ID} .autodom-past-chat-menu[hidden] {
-      display: none !important;
-    }
-    #${PANEL_ID} .autodom-past-chat-menu-title {
-      padding: 4px 6px 8px !important;
-      font-size: 11px !important;
-      font-weight: 700 !important;
-      letter-spacing: 0.03em !important;
-      text-transform: uppercase !important;
-      color: var(--c-text-3) !important;
-      line-height: 1.2 !important;
-    }
-    #${PANEL_ID} .autodom-past-chat-empty {
-      padding: 12px 10px !important;
-      border-radius: 10px !important;
-      color: var(--c-text-2) !important;
-      background: var(--c-surface) !important;
-      font-size: 12px !important;
-      line-height: 1.45 !important;
-    }
-    #${PANEL_ID} .autodom-past-chat-item {
-      display: block !important;
-      width: 100% !important;
-      text-align: left !important;
-      padding: 9px 10px !important;
-      border: 0 !important;
-      border-radius: 10px !important;
-      background: transparent !important;
-      color: var(--c-text) !important;
-      cursor: pointer !important;
-      box-sizing: border-box !important;
-    }
-    #${PANEL_ID} .autodom-past-chat-item:hover,
-    #${PANEL_ID} .autodom-past-chat-item:focus-visible {
-      background: var(--c-surface) !important;
-      outline: none !important;
-    }
-    #${PANEL_ID} .autodom-past-chat-item.is-active {
-      background: color-mix(in oklch, var(--c-accent) 14%, transparent) !important;
-    }
-    #${PANEL_ID} .autodom-past-chat-item-title {
-      display: block !important;
-      overflow: hidden !important;
-      text-overflow: ellipsis !important;
-      white-space: nowrap !important;
-      font-size: 12.5px !important;
-      font-weight: 600 !important;
-      line-height: 1.3 !important;
-    }
-    #${PANEL_ID} .autodom-past-chat-item-meta {
-      display: block !important;
-      margin-top: 3px !important;
-      overflow: hidden !important;
-      text-overflow: ellipsis !important;
-      white-space: nowrap !important;
-      font-size: 11px !important;
-      color: var(--c-text-3) !important;
-      line-height: 1.25 !important;
-    }
-    /* Armed (confirmation) state for the Clear button — first click
-       turns it red so the user sees the second click really wipes. */
-    #${PANEL_ID} .autodom-chat-header-btn.is-armed {
-      background: rgba(239, 68, 68, 0.18);
-      border-color: rgba(239, 68, 68, 0.55);
-      color: #fca5a5;
-      animation: autodom-clear-pulse 0.9s ease-in-out infinite;
-    }
-    #${PANEL_ID} .autodom-chat-header-btn.is-armed:hover {
-      background: rgba(239, 68, 68, 0.28);
-      border-color: rgba(239, 68, 68, 0.75);
-      color: #fee2e2;
-    }
-    #${PANEL_ID} .autodom-chat-header-btn.is-armed svg {
-      stroke: currentColor;
-    }
-    @keyframes autodom-clear-pulse {
-      0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.45); }
-      50%      { box-shadow: 0 0 0 4px rgba(239, 68, 68, 0); }
-    }
-
-    /* Hidden helper kept for AI Badge */
-    .autodom-ai-badge {
-      display: none;
-    }
-    .autodom-ai-badge svg {
-      width: 9px;
-      height: 9px;
-      fill: none;
-      stroke: currentColor;
-      stroke-width: 2;
-    }
-
-    /* ─── Context Bar (page context chip) ────────────────────── */
-    #${PANEL_ID} .autodom-chat-context {
-      display: flex !important;
-      align-items: center !important;
-      gap: 8px !important;
-      margin: 0 16px 4px !important;
-      padding: 8px 10px !important;
-      background: color-mix(in oklch, var(--c-surface) 88%, transparent) !important;
-      border: 1px solid color-mix(in oklch, var(--c-border) 88%, transparent) !important;
-      border-radius: 12px !important;
-      font-size: 11.5px !important;
-      color: var(--c-text-3) !important;
-      flex-shrink: 0 !important;
-      overflow: hidden !important;
-      min-height: 34px !important;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
-    }
-    #${PANEL_ID} .autodom-chat-context-icon {
-      flex-shrink: 0 !important;
-      opacity: 0.65 !important;
-      display: flex !important;
-      align-items: center !important;
-    }
-    #${PANEL_ID} .autodom-chat-context-icon svg {
-      width: 11px !important;
-      height: 11px !important;
-      fill: none !important;
-      stroke: currentColor !important;
-      stroke-width: 2 !important;
-      display: block !important;
-    }
-    #${PANEL_ID} .autodom-chat-context-text {
-      white-space: nowrap !important;
-      overflow: hidden !important;
-      text-overflow: ellipsis !important;
-      flex: 1 1 auto !important;
-      font-weight: 500 !important;
-      line-height: 1.35 !important;
-      color: var(--c-text-2) !important;
-      letter-spacing: 0.01em !important;
-      min-width: 0 !important;
-    }
-    /* ─── Messages ────────────────────────────────────────────── */
-    .autodom-chat-messages {
-      flex: 1 1 auto !important;
-      overflow-y: auto !important;
-      overflow-x: hidden !important;
-      /* Generous top/bottom padding so the first message clears the context
-         bar and the last message/typing row never hides behind the quick-
-         actions strip sitting underneath. */
-      padding: 18px 16px 22px !important;
-      display: flex !important;
-      flex-direction: column !important;
-      align-items: flex-start !important;
-      gap: 12px !important;
-      scroll-behavior: smooth;
-      min-width: 0;
-      min-height: 0;
-      /* Prevent host-page CSS (Zoho CRM, Gmail, etc.) from leaking
-         absolute/fixed positioning, floats, transforms, or grid layouts
-         into our chat list. Without this, messages stack on top of each
-         other because the host promotes generic divs to position:absolute. */
-      contain: layout style;
-      isolation: isolate;
-    }
-    .autodom-chat-messages,
-    .autodom-chat-messages * {
-      writing-mode: horizontal-tb !important;
-    }
-    .autodom-chat-messages > * {
-      position: relative !important;
-      display: block !important;
-      float: none !important;
-      clear: none !important;
-      transform: none !important;
-      inset: auto !important;
-      top: auto !important;
-      left: auto !important;
-      right: auto !important;
-      bottom: auto !important;
-      grid-area: auto !important;
-      flex-shrink: 0;
-    }
-    .autodom-chat-messages > * * {
-      float: none !important;
-      clear: none !important;
-    }
-    .autodom-chat-messages::-webkit-scrollbar {
-      width: 6px;
-    }
-    .autodom-chat-messages::-webkit-scrollbar-track {
-      background: transparent;
-    }
-    .autodom-chat-messages::-webkit-scrollbar-thumb {
-      background: var(--c-border);
-      border-radius: 3px;
-    }
-    .autodom-chat-messages::-webkit-scrollbar-thumb:hover {
-      background: var(--c-border-s);
-    }
-
-    .autodom-chat-msg {
-      max-width: 88% !important;
-      width: fit-content !important;
-      display: block !important;
-      padding: 10px 14px !important;
-      border-radius: var(--radius-lg);
-      line-height: 1.55 !important;
-      font-size: 14px !important;
-      word-wrap: break-word;
-      overflow-wrap: anywhere;
-      white-space: pre-wrap;
-      animation: __autodom_slide_in 0.22s var(--ease-out);
-      position: relative;
-      color: var(--c-text);
-      isolation: isolate;
-    }
-
-    /* User message — accent pill aligned right, shrinks to content */
-    .autodom-chat-msg.user {
-      align-self: flex-end !important;
-      background: var(--c-accent) !important;
-      color: #fff !important;
-      border-bottom-right-radius: 6px;
-      font-weight: 500;
-      box-shadow: 0 1px 0 rgba(0,0,0,0.18) inset, 0 0 0 1px rgba(0,0,0,0.06);
-    }
-
-    /* Assistant — borderless flowing reply with avatar gutter */
-    .autodom-chat-msg.ai-response.streaming .stream-text {
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-family: inherit;
-    }
-    .autodom-chat-msg.ai-response.streaming .stream-cursor {
-      display: inline-block;
-      margin-left: 2px;
-      animation: autodom-stream-blink 1s steps(2, start) infinite;
-      opacity: 0.6;
-    }
-    @keyframes autodom-stream-blink {
-      to { visibility: hidden; }
-    }
-    .autodom-chat-msg.assistant,
-    .autodom-chat-msg.ai-response {
-      align-self: stretch !important;
-      background: transparent !important;
-      border: none !important;
-      color: var(--c-text) !important;
-      padding: 2px 0 0 40px !important;
-      max-width: 100% !important;
-      width: auto !important;
-      border-radius: 0 !important;
-      min-height: 28px;
-      box-shadow: none !important;
-    }
-    /* Reserve a small top-right float so the absolutely-positioned
-       hover copy button never overlaps the first line of an assistant
-       reply. Invisible block; only affects text wrapping. */
-    .autodom-chat-msg.assistant > .md::before,
-    .autodom-chat-msg.ai-response > .md::before {
-      content: "";
-      float: right;
-      width: 28px;
-      height: 22px;
-      shape-outside: inset(0);
-    }
-    .autodom-chat-msg .md,
-    .autodom-chat-msg .md * {
-      position: static !important;
-      inset: auto !important;
-      float: none !important;
-      clear: none !important;
-      transform: none !important;
-      filter: none !important;
-      white-space: revert !important;
-      max-width: 100% !important;
-      min-width: 0 !important;
-      text-align: left !important;
-      text-indent: 0 !important;
-      letter-spacing: normal !important;
-      text-transform: none !important;
-    }
-    .autodom-chat-msg .md {
-      display: block !important;
-      width: 100% !important;
-      overflow: hidden;
-    }
-    .autodom-chat-msg .md > * {
-      display: block !important;
-      width: auto !important;
-      max-width: 100% !important;
-    }
-    .autodom-chat-msg .md br {
-      display: inline !important;
-    }
-    .autodom-chat-msg.assistant::before,
-    .autodom-chat-msg.ai-response::before {
-      content: "";
-      position: absolute;
-      top: 0;
-      left: 0;
-      width: 28px !important;
-      height: 28px !important;
-      border-radius: 8px;
-      box-shadow: 0 0 0 1px rgba(255,255,255,0.05) inset;
-      background-image: ${AUTODOM_AVATAR_URL};
-      background-size: cover;
-      background-position: center;
-      background-repeat: no-repeat;
-      flex-shrink: 0;
-    }
-
-    /* System message — subtle inline pill */
-    .autodom-chat-msg.system {
-      align-self: center;
-      background: var(--c-surface);
-      border: 1px solid var(--c-border);
-      color: var(--c-text-2);
-      font-size: 11.5px;
-      padding: 5px 14px;
-      border-radius: 999px;
-      text-align: center;
-      font-weight: 500;
-    }
-
-    /* Error message — readable card, not a balloon */
-    .autodom-chat-msg.error {
-      align-self: stretch;
-      max-width: 100% !important;
-      width: auto !important;
-      background: rgba(248, 113, 113, 0.06);
-      border: 1px solid rgba(248, 113, 113, 0.22);
-      color: var(--c-danger);
-      font-size: 12px;
-      padding: 10px 12px 10px 34px !important;
-      border-radius: 10px;
-      text-align: left;
-      font-weight: 500;
-      white-space: pre-wrap;
-      line-height: 1.5;
-      position: relative;
-    }
-    .autodom-chat-msg.error::before {
-      content: "!";
-      position: absolute;
-      top: 10px;
-      left: 10px;
-      width: 16px;
-      height: 16px;
-      border-radius: 50%;
-      background: rgba(248, 113, 113, 0.18);
-      color: var(--c-danger);
-      font-size: 11px;
-      font-weight: 700;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      line-height: 1;
-    }
-
-    /* ─── AI-unavailable alert ─────────────────────────────────
-       Prominent, actionable card shown when no AI provider can answer
-       the query (offline + direct provider disabled, API errors, etc.).
-       Lives inside the messages stream so it's contextual, but styled
-       as an alert so it clearly breaks the conversation flow. */
-    .autodom-chat-msg.alert {
-      align-self: stretch !important;
-      max-width: 100% !important;
-      width: 100% !important;
-      padding: 12px 14px !important;
-      border-radius: 12px !important;
-      background: color-mix(in oklch, var(--c-danger) 8%, var(--c-surface)) !important;
-      border: 1px solid color-mix(in oklch, var(--c-danger) 35%, var(--c-border)) !important;
-      color: var(--c-text) !important;
-      display: flex !important;
-      flex-direction: column !important;
-      gap: 8px !important;
-      position: relative;
-      animation: __autodom_slide_in 0.22s var(--ease-out);
-    }
-    .autodom-chat-msg.alert.warn {
-      background: color-mix(in oklch, var(--c-warn, oklch(80% 0.14 85)) 10%, var(--c-surface)) !important;
-      border-color: color-mix(in oklch, var(--c-warn, oklch(80% 0.14 85)) 40%, var(--c-border)) !important;
-    }
-    .autodom-chat-msg.alert .alert-head {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      min-height: 22px;
-    }
-    .autodom-chat-msg.alert .alert-icon {
-      flex: 0 0 22px;
-      width: 22px;
-      height: 22px;
-      border-radius: 50%;
-      background: color-mix(in oklch, var(--c-danger) 22%, transparent);
-      color: var(--c-danger);
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 700;
-      font-size: 13px;
-      font-family: var(--font);
-      line-height: 1;
-    }
-    .autodom-chat-msg.alert.warn .alert-icon {
-      background: color-mix(in oklch, var(--c-warn, oklch(80% 0.14 85)) 22%, transparent);
-      color: var(--c-warn, oklch(80% 0.14 85));
-    }
-    .autodom-chat-msg.alert .alert-title {
-      font-size: 13px;
-      font-weight: 600;
-      color: var(--c-text);
-      line-height: 1.3;
-      flex: 1 1 auto;
-      min-width: 0;
-    }
-    .autodom-chat-msg.alert .alert-dismiss {
-      flex: 0 0 22px;
-      width: 22px;
-      height: 22px;
-      padding: 0;
-      border: none;
-      background: transparent;
-      color: var(--c-text-3);
-      cursor: pointer;
-      border-radius: 5px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      font: inherit;
-      line-height: 1;
-      font-size: 14px;
-    }
-    .autodom-chat-msg.alert .alert-dismiss:hover {
-      background: var(--c-raised);
-      color: var(--c-text);
-    }
-    .autodom-chat-msg.alert .alert-body {
-      font-size: 12.5px;
-      color: var(--c-text-2);
-      line-height: 1.5;
-      white-space: pre-wrap;
-    }
-    .autodom-chat-msg.alert .alert-body strong { color: var(--c-text); }
-    .autodom-chat-msg.alert .alert-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      margin-top: 2px;
-    }
-    .autodom-chat-msg.alert .alert-btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 5px 11px;
-      border-radius: 6px;
-      font-size: 11.5px;
-      font-weight: 600;
-      cursor: pointer;
-      font-family: inherit;
-      line-height: 1.3;
-      transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-    }
-    .autodom-chat-msg.alert .alert-btn.primary {
-      background: var(--c-accent);
-      border: 1px solid var(--c-accent);
-      color: #fff;
-    }
-    .autodom-chat-msg.alert .alert-btn.primary:hover {
-      background: var(--c-accent-2, var(--c-accent));
-      border-color: var(--c-accent-2, var(--c-accent));
-    }
-    .autodom-chat-msg.alert .alert-btn.ghost {
-      background: transparent;
-      border: 1px solid var(--c-border);
-      color: var(--c-text-2);
-    }
-    .autodom-chat-msg.alert .alert-btn.ghost:hover {
-      background: var(--c-raised);
-      border-color: var(--c-border-s);
-      color: var(--c-text);
-    }
-
-    /* Tool result legacy box (overridden later by collapsible details rules) */
-    .autodom-chat-msg.tool-result {
-      align-self: flex-start;
-      background: var(--c-surface);
-      border: 1px solid var(--c-border);
-      font-family: var(--mono);
-      font-size: 11.5px;
-      color: var(--c-text-2);
-      max-height: 220px;
-      overflow-y: auto;
-      border-radius: var(--radius);
-    }
-    .autodom-chat-msg .tool-name {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      background: var(--c-raised);
-      border: 1px solid var(--c-border);
-      color: var(--c-text-2);
-      padding: 2px 8px;
-      border-radius: 5px;
-      font-size: 10px;
-      font-weight: 600;
-      margin-bottom: 6px;
-      font-family: var(--mono);
-      letter-spacing: 0.02em;
-    }
-    .autodom-chat-msg .ai-tool-calls {
-      margin-top: 10px;
-      padding: 8px 10px;
-      background: var(--c-surface);
-      border: 1px solid var(--c-border);
-      border-radius: 10px;
-      font-size: 11px;
-      color: var(--c-text-3);
-    }
-    .autodom-chat-msg .ai-tool-call-item {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      padding: 3px 0;
-      font-family: var(--mono);
-      font-size: 11px;
-      line-height: 1.5;
-      color: var(--c-text-2);
-    }
-    .autodom-chat-msg .ai-tool-call-item .tool-icon {
-      color: var(--c-success);
-      font-size: 11px;
-      display: flex;
-      align-items: center;
-      flex-shrink: 0;
-    }
-
-    /* ─── Assistant message meta footer ─────────────────────────
-       Keeps the "AI provider" badge and the "tools used" summary
-       visually de-emphasised so they don't read like part of the
-       assistant's actual answer. The full tool list is collapsed
-       by default; users open it by clicking the tools chip, and
-       it auto-expands when verbose-logs is on. */
-    .autodom-chat-msg .autodom-msg-meta {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 6px 10px;
-      margin-top: 8px;
-      padding-top: 6px;
-      border-top: 1px dashed color-mix(in oklch, var(--c-border) 60%, transparent);
-      font-size: 10px;
-      line-height: 1.3;
-      color: var(--c-text-3);
-      opacity: 0.7;
-      transition: opacity 120ms ease;
-    }
-    .autodom-chat-msg .autodom-msg-meta:hover { opacity: 1; }
-    .autodom-chat-msg .autodom-msg-meta .autodom-model-badge {
-      margin-top: 0;
-    }
-    .autodom-chat-msg .autodom-meta-tools-chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      padding: 1px 6px;
-      border-radius: 999px;
-      border: 1px solid var(--c-border);
-      background: transparent;
-      color: var(--c-text-3);
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 10px;
-      line-height: 1.4;
-      cursor: pointer;
-      user-select: none;
-    }
-    .autodom-chat-msg .autodom-meta-tools-chip:hover {
-      color: var(--c-text-1);
-      border-color: color-mix(in oklch, var(--c-border) 30%, var(--c-text-3));
-    }
-    .autodom-chat-msg .autodom-meta-tools-chip .twisty {
-      display: inline-block;
-      transition: transform 120ms ease;
-    }
-    .autodom-chat-msg .autodom-msg-meta.is-expanded .autodom-meta-tools-chip .twisty {
-      transform: rotate(180deg);
-    }
-    /* Tools-used summary visibility:
-         • verbose ON  → full list rendered inline
-         • verbose OFF → hide the chip AND the list entirely; the
-           operator chose minimal mode, so don't even tease it.
-       The model badge in the same meta footer stays visible either
-       way so the user always sees which provider answered. */
-    .autodom-chat-msg .autodom-msg-meta .ai-tool-calls {
-      display: none;
-      flex-basis: 100%;
-      margin-top: 4px;
-    }
-    #${PANEL_ID}[data-verbose="true"] .autodom-chat-msg .autodom-msg-meta .ai-tool-calls,
-    #${INLINE_OVERLAY_ID}[data-verbose="true"] .autodom-chat-msg .autodom-msg-meta .ai-tool-calls {
-      display: block;
-    }
-    /* Hide the click-to-expand chip when verbose is off — the user
-       explicitly opted into minimal mode, so don't show the chip
-       either. The chip is also redundant in verbose mode (list is
-       already open), so it's hidden in both states. */
-    .autodom-chat-msg .autodom-meta-tools-chip {
-      display: none;
-    }
-
-    /* ─── Automation Run Card (Claude-style grouped assistant turn) ─
-       No ::before tricks — host pages (Zoho CRM, Gmail) override padding
-       and positioning unpredictably. Build the header with real flex
-       children so layout is deterministic on any host. */
-    .autodom-chat-turn {
-      align-self: stretch !important;
-      width: 100% !important;
-      max-width: 100% !important;
-      display: flex !important;
-      flex-direction: column !important;
-      gap: 6px !important;
-      padding: 0 !important;
-      margin: 0 !important;
-      background: transparent !important;
-      border: none !important;
-      animation: __autodom_slide_in 0.22s var(--ease-out);
-    }
-    .autodom-chat-turn .turn-head {
-      display: flex !important;
-      flex-direction: row !important;
-      align-items: center !important;
-      gap: 10px !important;
-      width: 100% !important;
-      min-height: 30px !important;
-      padding: 2px 0 !important;
-    }
-    .autodom-chat-turn .turn-avatar {
-      flex: 0 0 28px !important;
-      width: 28px !important;
-      height: 28px !important;
-      border-radius: 8px !important;
-      display: inline-flex !important;
-      align-items: center !important;
-      justify-content: center !important;
-      background-image: ${AUTODOM_AVATAR_URL} !important;
-      background-size: cover !important;
-      background-position: center !important;
-      background-repeat: no-repeat !important;
-      box-shadow: 0 0 0 1px rgba(255,255,255,0.05) inset !important;
-      color: #fff !important;
-    }
-    .autodom-chat-turn .turn-avatar svg {
-      display: none !important;
-    }
-    .autodom-chat-turn .turn-label {
-      flex: 0 1 auto !important;
-      min-width: 0 !important;
-      font-size: 13px !important;
-      font-weight: 500 !important;
-      color: var(--c-text-2) !important;
-      line-height: 1.2 !important;
-      white-space: nowrap !important;
-      overflow: hidden !important;
-      text-overflow: ellipsis !important;
-    }
-    .autodom-chat-turn .turn-dots {
-      display: inline-flex !important;
-      align-items: center !important;
-      gap: 3px !important;
-      flex: 0 0 auto !important;
-    }
-    .autodom-chat-turn .turn-dots span {
-      width: 4px !important; height: 4px !important;
-      border-radius: 50% !important;
-      background: var(--c-text-3) !important;
-      animation: __autodom_typing 1.4s ease-in-out infinite;
-    }
-    .autodom-chat-turn .turn-dots span:nth-child(2) { animation-delay: 0.2s; }
-    .autodom-chat-turn .turn-dots span:nth-child(3) { animation-delay: 0.4s; }
-    .autodom-chat-turn .turn-spacer {
-      flex: 1 1 auto !important;
-      min-width: 0 !important;
-    }
-    .autodom-chat-turn .turn-stop {
-      flex: 0 0 auto !important;
-      display: inline-flex !important;
-      align-items: center !important;
-      gap: 6px !important;
-      padding: 4px 11px !important;
-      border-radius: 999px !important;
-      background: color-mix(in oklch, var(--c-danger) 14%, var(--c-surface)) !important;
-      border: 1px solid color-mix(in oklch, var(--c-danger) 40%, var(--c-border)) !important;
-      color: var(--c-danger) !important;
-      font-size: 11.5px !important;
-      font-weight: 600 !important;
-      cursor: pointer !important;
-      font-family: inherit !important;
-      line-height: 1.2 !important;
-      height: 26px !important;
-      min-height: 26px !important;
-      max-height: 26px !important;
-      box-sizing: border-box !important;
-      transition: background-color 0.15s ease, transform 0.1s ease;
-    }
-    .autodom-chat-turn .turn-stop:hover {
-      background: color-mix(in oklch, var(--c-danger) 22%, var(--c-surface)) !important;
-    }
-    .autodom-chat-turn .turn-stop:active { transform: translateY(1px); }
-    .autodom-chat-turn .turn-stop[disabled] {
-      opacity: 0.6 !important; cursor: not-allowed !important;
-    }
-    /* Explicit glyph so host CSS can't inflate an <svg> — use a square
-       Unicode char for the Stop icon. */
-    .autodom-chat-turn .turn-stop .stop-glyph {
-      display: inline-block !important;
-      width: 9px !important; height: 9px !important;
-      background: currentColor !important;
-      border-radius: 1.5px !important;
-      flex: 0 0 9px !important;
-    }
-    .autodom-chat-turn .turn-body {
-      display: flex !important;
-      flex-direction: column !important;
-      gap: 6px !important;
-      padding-left: 38px !important;  /* align with content, clear of avatar */
-    }
-    /* Backwards-compat alias — old code paths still reference this class */
-    .autodom-chat-typing {
-      align-self: stretch !important;
-      display: block !important;
-      width: 100% !important;
-      max-width: 100% !important;
-    }
-    .autodom-chat-typing .ai-run-stop-btn {
-      margin-left: auto;
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 3px 10px;
-      border-radius: 999px;
-      background: color-mix(in oklch, var(--c-danger) 14%, var(--c-surface));
-      border: 1px solid color-mix(in oklch, var(--c-danger) 40%, var(--c-border));
-      color: var(--c-danger);
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-      font-family: inherit;
-      line-height: 1.2;
-      transition: background-color 0.15s ease, transform 0.1s ease;
-    }
-    .autodom-chat-typing .ai-run-stop-btn:hover {
-      background: color-mix(in oklch, var(--c-danger) 22%, var(--c-surface));
-    }
-    .autodom-chat-typing .ai-run-stop-btn:active { transform: translateY(1px); }
-    .autodom-chat-typing .ai-run-stop-btn svg {
-      width: 10px; height: 10px;
-      fill: currentColor;
-    }
-    /* Finalized turn: the header (avatar + label + Stop) is stripped by
-       hideTyping(); keep the indented tool-card cluster so it still visually
-       belongs to the assistant reply rendered below it. */
-    .autodom-chat-turn.finalized {
-      margin-bottom: -2px !important;
-    }
-    .autodom-chat-turn.finalized .turn-body {
-      padding-left: 38px !important;
-    }
-
-    /* ─── Live tool cards (Claude/Playwright look) ─── */
-    .ai-tool-card {
-      margin-top: 8px;
-      background: var(--c-surface);
-      border: 1px solid var(--c-border);
-      border-radius: 10px;
-      overflow: hidden;
-      font-size: 12px;
-    }
-    /* Honour the "Verbose automation logs" setting — when off, hide the
-       persisted per-step <details> tool-result blocks so the chat shows
-       only the user's prompts and the AI's final replies.
-
-       Note: live ".ai-tool-card" progress cards are NOT gated here on
-       purpose. Hiding them while a run is in flight removes the only
-       in-flow signal that the agent is actually doing something, which
-       made automations look frozen. The collapsed "Tools used:" chip
-       on the assistant message still summarizes them after the fact. */
-    #${PANEL_ID}[data-verbose="false"] .autodom-chat-msg.tool-result,
-    #${INLINE_OVERLAY_ID}[data-verbose="false"] .autodom-chat-msg.tool-result {
-      display: none !important;
-    }
-    .ai-tool-card-head {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 10px;
-      background: var(--c-raised);
-      cursor: pointer;
-      user-select: none;
-      line-height: 1.3;
-    }
-    .ai-tool-card-head[aria-expanded="true"] { border-bottom: 1px solid var(--c-border); }
-    .ai-tool-card .twisty {
-      font-size: 9px;
-      color: var(--c-text-3);
-      transition: transform 0.15s ease;
-      width: 8px; text-align: center;
-    }
-    .ai-tool-card-head[aria-expanded="true"] .twisty { transform: rotate(90deg); }
-    .ai-tool-card .tc-spinner {
-      width: 12px; height: 12px;
-      border-radius: 50%;
-      border: 1.5px solid var(--c-border-s);
-      border-top-color: var(--c-accent);
-      animation: __autodom_spin 0.7s linear infinite;
-      flex-shrink: 0;
-    }
-    .ai-tool-card.ok .tc-spinner {
-      border: none; color: var(--c-success);
-      display: inline-flex; align-items: center; justify-content: center;
-      animation: none;
-    }
-    .ai-tool-card.ok .tc-spinner::before { content: "✓"; font-weight: 700; font-size: 11px; }
-    .ai-tool-card.fail .tc-spinner {
-      border: none; color: var(--c-danger);
-      display: inline-flex; align-items: center; justify-content: center;
-      animation: none;
-    }
-    .ai-tool-card.fail .tc-spinner::before { content: "✕"; font-weight: 700; font-size: 11px; }
-    .ai-tool-card .tc-name {
-      font-family: var(--mono);
-      font-weight: 600;
-      color: var(--c-text);
-      font-size: 11.5px;
-      max-width: 160px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .ai-tool-card .tc-args-inline {
-      color: var(--c-text-3);
-      font-family: var(--mono);
-      font-size: 11px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      flex: 1;
-      min-width: 0;
-    }
-    .ai-tool-card .tc-elapsed {
-      margin-left: auto;
-      color: var(--c-text-3);
-      font-size: 10.5px;
-      font-family: var(--mono);
-      flex-shrink: 0;
-    }
-    .ai-tool-card-body {
-      display: none;
-      padding: 8px 10px;
-      background: var(--c-bg);
-    }
-    .ai-tool-card-head[aria-expanded="true"] + .ai-tool-card-body { display: block; }
-    .ai-tool-card-body .tc-label {
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--c-text-3);
-      margin: 4px 0 3px;
-      font-weight: 600;
-    }
-    .ai-tool-card-body pre {
-      margin: 0;
-      padding: 6px 8px;
-      font-family: var(--mono);
-      font-size: 11px;
-      line-height: 1.5;
-      color: var(--c-text-2);
-      background: var(--c-surface);
-      border: 1px solid var(--c-border);
-      border-radius: 6px;
-      white-space: pre-wrap;
-      word-break: break-word;
-      max-height: 220px;
-      overflow: auto;
-    }
-    .ai-tool-card-body pre.is-error {
-      color: var(--c-danger);
-      background: rgba(248, 113, 113, 0.06);
-      border-color: rgba(248, 113, 113, 0.25);
-    }
-    .autodom-chat-typing .ai-thinking-label {
-      font-size: 13px;
-      color: var(--c-text-2);
-      font-weight: 500;
-      line-height: 1;
-      background: linear-gradient(90deg, var(--c-text-3) 0%, var(--c-text) 50%, var(--c-text-3) 100%);
-      background-size: 200% 100%;
-      -webkit-background-clip: text;
-      background-clip: text;
-      -webkit-text-fill-color: transparent;
-      animation: __autodom_shimmer 2.2s linear infinite;
-    }
-    .autodom-chat-typing .dots {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-    }
-    .autodom-chat-typing .dots span {
-      width: 5px;
-      height: 5px;
-      border-radius: 50%;
-      background: var(--c-text-3);
-      animation: __autodom_typing 1.4s ease-in-out infinite;
-    }
-    .autodom-chat-typing .dots span:nth-child(2) { animation-delay: 0.2s; }
-    .autodom-chat-typing .dots span:nth-child(3) { animation-delay: 0.4s; }
-
-    /* ─── Agent activity chips (live tool execution) ─────── */
-    .autodom-chat-typing .ai-thinking-row {
-      display: flex; align-items: center; gap: 8px;
-    }
-    .ai-agent-activity {
-      display: flex; flex-wrap: wrap; gap: 6px;
-      margin-top: 8px;
-      padding-left: 28px;
-    }
-    .ai-agent-activity:empty { display: none; }
-    .agent-chip {
-      display: inline-flex; align-items: center; gap: 6px;
-      padding: 3px 10px 3px 8px;
-      border-radius: 999px;
-      background: var(--c-surface);
-      border: 1px solid var(--c-border);
-      font-size: 11.5px;
-      font-family: var(--mono);
-      color: var(--c-text-2);
-      line-height: 1.3;
-      max-width: 240px;
-    }
-    .agent-chip-name {
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    }
-    .agent-chip-spinner {
-      display: inline-block;
-      width: 12px; height: 12px;
-      border-radius: 50%;
-      font-size: 10px; line-height: 12px; text-align: center;
-      flex-shrink: 0;
-      color: var(--c-text-3);
-    }
-    .agent-chip.running .agent-chip-spinner {
-      border: 1.5px solid var(--c-border-s);
-      border-top-color: var(--c-accent);
-      animation: __autodom_spin 0.7s linear infinite;
-    }
-    .agent-chip.ok {
-      background: color-mix(in oklch, var(--c-success) 8%, var(--c-surface));
-      border-color: color-mix(in oklch, var(--c-success) 30%, var(--c-border));
-      color: var(--c-text);
-    }
-    .agent-chip.ok .agent-chip-spinner { color: var(--c-success); }
-    .agent-chip.fail {
-      background: color-mix(in oklch, var(--c-danger) 8%, var(--c-surface));
-      border-color: color-mix(in oklch, var(--c-danger) 30%, var(--c-border));
-      color: var(--c-text);
-    }
-    .agent-chip.fail .agent-chip-spinner { color: var(--c-danger); }
-    @keyframes __autodom_spin { to { transform: rotate(360deg); } }
-
-    /* ─── Quick Actions Strip (above composer) ─────────────── */
-    .autodom-chat-quick-actions {
-      display: flex !important;
-      align-items: center !important;
-      gap: 5px !important;
-      padding: 6px 12px 4px !important;
-      background: linear-gradient(
-        180deg,
-        transparent 0%,
-        color-mix(in oklch, var(--c-bg) 92%, transparent) 100%
-      ) !important;
-      overflow-x: auto !important;
-      flex-shrink: 0 !important;
-      border-top: 1px solid color-mix(in oklch, var(--c-border) 75%, transparent) !important;
-      scrollbar-width: none !important;
-    }
-    .autodom-chat-quick-actions::-webkit-scrollbar {
-      height: 0 !important;
-    }
-    .autodom-chat-quick-btn {
-      flex-shrink: 0 !important;
-      padding: 4px 9px 4px 8px !important;
-      border-radius: 999px !important;
-      background: color-mix(in oklch, var(--c-surface) 84%, transparent) !important;
-      border: 1px solid color-mix(in oklch, var(--c-border) 85%, transparent) !important;
-      color: var(--c-text-3) !important;
-      font-size: 10px !important;
-      font-weight: 500 !important;
-      cursor: pointer !important;
-      transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease !important;
-      font-family: inherit !important;
-      white-space: nowrap !important;
-      line-height: 1 !important;
-      letter-spacing: 0.01em !important;
-      display: inline-flex !important;
-      align-items: center !important;
-      gap: 4px !important;
-      min-height: 24px !important;
-      box-shadow: none !important;
-      text-transform: none !important;
-    }
-    .autodom-chat-quick-btn:hover {
-      background: color-mix(in oklch, var(--c-surface-2) 90%, transparent) !important;
-      border-color: color-mix(in oklch, var(--c-border-s) 85%, transparent) !important;
-      color: var(--c-text) !important;
-      transform: none !important;
-    }
-    .autodom-chat-quick-btn:focus-visible {
-      outline: 2px solid var(--c-accent) !important;
-      outline-offset: 2px !important;
-    }
-    .autodom-chat-quick-btn:active {
-      transform: none !important;
-      opacity: 0.85 !important;
-    }
-    .autodom-chat-quick-btn:disabled {
-      opacity: 0.3 !important;
-      cursor: not-allowed !important;
-    }
-    .autodom-chat-quick-btn .prompt-spark {
-      font-size: 9px !important;
-      line-height: 1 !important;
-      opacity: 0.7 !important;
-      filter: saturate(1.2) !important;
-    }
-    .autodom-chat-quick-btn:hover .prompt-spark {
-      opacity: 1 !important;
-    }
-    .autodom-chat-icon-btn {
-      flex-shrink: 0 !important;
-      width: 26px !important;
-      height: 24px !important;
-      padding: 0 !important;
-      border-radius: 8px !important;
-      background: transparent !important;
-      border: 1px solid transparent !important;
-      color: var(--c-text-2) !important;
-      cursor: pointer !important;
-      display: inline-flex !important;
-      align-items: center !important;
-      justify-content: center !important;
-      transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease !important;
-      box-shadow: none !important;
-    }
-    /* Hover backdrop uses a text-color mix so the contrast works in both
-       dark (dim-on-dark) and light (subtle-dark-on-light) themes. The
-       previous rule mixed against --c-surface-2 which in light mode is
-       nearly white, leaving no visible hover state. */
-    .autodom-chat-icon-btn:hover {
-      background: color-mix(in oklch, var(--c-text) 10%, transparent) !important;
-      border-color: color-mix(in oklch, var(--c-text) 14%, transparent) !important;
-      color: var(--c-text) !important;
-    }
-    .autodom-chat-icon-btn:focus-visible {
-      outline: 2px solid var(--c-accent) !important;
-      outline-offset: 2px !important;
-    }
-    .autodom-chat-icon-btn:disabled {
-      opacity: 0.3 !important;
-      cursor: not-allowed !important;
-    }
-    .autodom-chat-icon-btn svg {
-      width: 14px !important;
-      height: 14px !important;
-      stroke: currentColor !important;
-      fill: none !important;
-      stroke-width: 1.6 !important;
-      stroke-linecap: round !important;
-      stroke-linejoin: round !important;
-    }
-    .autodom-chat-quick-divider {
-      flex-shrink: 0 !important;
-      width: 1px !important;
-      align-self: stretch !important;
-      margin: 4px 4px !important;
-      background: color-mix(in oklch, var(--c-border) 70%, transparent) !important;
-    }
-    .autodom-chat-force-stop {
-      color: oklch(70% 0.13 25) !important;
-    }
-    .autodom-chat-force-stop:hover {
-      color: oklch(82% 0.18 25) !important;
-      background: color-mix(in oklch, oklch(60% 0.18 25) 14%, transparent) !important;
-      border-color: color-mix(in oklch, oklch(60% 0.18 25) 50%, transparent) !important;
-    }
-    .autodom-chat-force-stop.is-armed {
-      color: oklch(85% 0.2 25) !important;
-      background: color-mix(in oklch, oklch(60% 0.2 25) 22%, transparent) !important;
-      border-color: color-mix(in oklch, oklch(60% 0.2 25) 70%, transparent) !important;
-      animation: autodom-force-stop-pulse 1.4s ease-in-out infinite;
-    }
-    @keyframes autodom-force-stop-pulse {
-      0%, 100% { box-shadow: 0 0 0 0 color-mix(in oklch, oklch(60% 0.2 25) 35%, transparent); }
-      50%      { box-shadow: 0 0 0 4px color-mix(in oklch, oklch(60% 0.2 25) 0%, transparent); }
-    }
-    .autodom-chat-force-stop svg rect {
-      fill: currentColor !important;
-      stroke: none !important;
-    }
-    .autodom-chat-force-stop.just-pressed {
-      transform: scale(0.92) !important;
-      transition: transform 0.12s ease !important;
-    }
-    .autodom-chat-toast {
-      position: absolute !important;
-      left: 50% !important;
-      bottom: 100% !important;
-      transform: translate(-50%, -6px) !important;
-      margin-bottom: 8px !important;
-      padding: 6px 12px !important;
-      max-width: 80% !important;
-      background: oklch(20% 0.01 70 / 95%) !important;
-      color: #fff !important;
-      font-size: 11px !important;
-      font-weight: 500 !important;
-      letter-spacing: 0.01em !important;
-      border-radius: 999px !important;
-      box-shadow: 0 4px 14px oklch(0% 0 0 / 35%) !important;
-      pointer-events: none !important;
-      opacity: 0 !important;
-      transition: opacity 0.18s ease, transform 0.18s ease !important;
-      z-index: 5 !important;
-      white-space: nowrap !important;
-    }
-    .autodom-chat-toast.is-visible {
-      opacity: 1 !important;
-      transform: translate(-50%, -10px) !important;
-    }
-    .autodom-chat-input-area {
-      position: relative !important;
-    }
-
-    /* ─── Input Area — modern pill composer ──────────────────── */
-    .autodom-chat-input-area {
-      display: flex !important;
-      flex-direction: column !important;
-      align-items: stretch !important;
-      gap: 8px !important;
-      padding: 12px 14px 14px !important;
-      background: var(--c-bg);
-      border-top: 1px solid var(--c-border);
-      flex-shrink: 0 !important;
-      position: relative;
-      width: 100% !important;
-      max-width: 100% !important;
-      box-sizing: border-box !important;
-      z-index: 2;
-      isolation: isolate;
-      box-shadow: none;
-    }
-    .autodom-slash-menu {
-      position: absolute !important;
-      left: 14px !important;
-      right: 14px !important;
-      bottom: calc(100% - 6px) !important;
-      z-index: 2147483647 !important;
-      max-height: min(320px, 42vh) !important;
-      overflow-y: auto !important;
-      padding: 8px !important;
-      border: 1px solid var(--c-border) !important;
-      border-radius: 14px !important;
-      background: var(--c-raised, #0d0d0f) !important;
-      color: var(--c-text, #f4f4f5) !important;
-      box-shadow: 0 18px 42px rgba(0, 0, 0, 0.42) !important;
-      box-sizing: border-box !important;
-    }
-    .autodom-slash-menu[hidden] {
-      display: none !important;
-    }
-    .autodom-slash-menu-title {
-      padding: 4px 6px 8px !important;
-      font-size: 11px !important;
-      font-weight: 700 !important;
-      letter-spacing: 0.03em !important;
-      text-transform: uppercase !important;
-      color: var(--c-text-3) !important;
-    }
-    .autodom-slash-menu-item {
-      display: flex !important;
-      align-items: baseline !important;
-      gap: 10px !important;
-      width: 100% !important;
-      padding: 8px 10px !important;
-      border: 0 !important;
-      border-radius: 10px !important;
-      background: transparent !important;
-      color: var(--c-text) !important;
-      text-align: left !important;
-      cursor: pointer !important;
-      box-sizing: border-box !important;
-    }
-    .autodom-slash-menu-item:hover,
-    .autodom-slash-menu-item.is-active,
-    .autodom-slash-menu-item:focus-visible {
-      background: var(--c-surface) !important;
-      outline: none !important;
-    }
-    .autodom-slash-menu-command {
-      flex: 0 0 auto !important;
-      min-width: 104px !important;
-      color: var(--c-accent-2) !important;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
-      font-size: 12px !important;
-      font-weight: 700 !important;
-    }
-    .autodom-slash-menu-desc {
-      flex: 1 1 auto !important;
-      min-width: 0 !important;
-      color: var(--c-text-2) !important;
-      font-size: 12px !important;
-      line-height: 1.35 !important;
-    }
-    .autodom-chat-input-shell {
-      flex: 1 1 auto !important;
-      min-width: 0 !important;
-      display: flex !important;
-      align-items: flex-end !important;
-      gap: 6px;
-      background: var(--c-surface) !important;
-      border: 1px solid var(--c-border) !important;
-      border-radius: var(--radius-xl) !important;
-      padding: 6px 6px 6px 14px !important;
-      transition: border-color 0.18s ease, box-shadow 0.18s ease, background-color 0.18s ease;
-      box-sizing: border-box !important;
-      max-width: 100% !important;
-      width: 100% !important;
-      /* JetBrains-style dynamic growth: the textarea inside autosizes
-         freely up to --composer-max-px (set from JS based on the panel
-         height). When the user clicks the expand toggle, .is-expanded
-         is added and the shell takes over the full free height of the
-         input area so the editor feels like a real prompt editor. */
-      --composer-max-px: 280px;
-    }
-    .autodom-chat-input-shell.is-expanded {
-      flex: 1 1 100% !important;
-      align-self: stretch !important;
-      align-items: stretch !important;
-    }
-    .autodom-chat-input-shell:focus-within {
-      border-color: var(--c-accent);
-      background: var(--c-surface-2);
-      box-shadow: 0 0 0 3px var(--c-accent-soft);
-    }
-    .autodom-chat-input {
-      flex: 1 1 auto !important;
-      min-width: 0 !important;
-      min-height: 36px !important;
-      max-height: var(--composer-max-px, 280px) !important;
-      padding: 9px 0 !important;
-      background: transparent !important;
-      border: none !important;
-      border-radius: 0 !important;
-      color: var(--c-text) !important;
-      font-family: var(--font) !important;
-      font-size: 14px !important;
-      line-height: 1.5 !important;
-      resize: none !important;
-      outline: none !important;
-      box-shadow: none !important;
-      overflow-y: auto !important;
-    }
-    .autodom-chat-input-shell.is-expanded .autodom-chat-input {
-      max-height: none !important;
-      height: 100% !important;
-      flex: 1 1 auto !important;
-    }
-    /* Expand / shrink toggle that sits next to the send button. */
-    .autodom-chat-expand-btn {
-      width: 28px !important;
-      height: 28px !important;
-      min-width: 28px !important;
-      border-radius: 8px !important;
-      background: transparent !important;
-      border: none !important;
-      cursor: pointer !important;
-      display: flex !important;
-      align-items: center !important;
-      justify-content: center !important;
-      color: var(--c-text-3) !important;
-      transition: background-color 0.15s ease, color 0.15s ease, transform 0.15s ease;
-      flex-shrink: 0 !important;
-      align-self: flex-end;
-      padding: 0 !important;
-    }
-    .autodom-chat-expand-btn:hover {
-      background: var(--c-raised) !important;
-      color: var(--c-text) !important;
-    }
-    .autodom-chat-input-shell.is-expanded .autodom-chat-expand-btn {
-      background: var(--c-surface-2) !important;
-      color: var(--c-text) !important;
-    }
-    .autodom-chat-input-shell.is-expanded .autodom-chat-expand-btn:hover {
-      background: var(--c-raised) !important;
-    }
-    .autodom-chat-expand-btn:focus-visible {
-      outline: 2px solid var(--c-accent) !important;
-      outline-offset: 2px !important;
-    }
-    .autodom-chat-expand-btn svg {
-      width: 15px !important;
-      height: 15px !important;
-      fill: none !important;
-      stroke: currentColor !important;
-      stroke-width: 1.85 !important;
-      stroke-linecap: round !important;
-      stroke-linejoin: round !important;
-      transition: transform 0.18s ease;
-    }
-    .autodom-chat-input-shell.is-expanded .autodom-chat-expand-btn svg {
-      transform: rotate(180deg);
-    }
-    /* When the composer is expanded, the surrounding input area becomes
-       a flex column so the shell can take the full available height. */
-    .autodom-chat-input-area.is-composer-expanded {
-      flex: 1 1 auto !important;
-      min-height: 60% !important;
-    }
-    .autodom-chat-input::placeholder {
-      color: var(--c-text-3) !important;
-    }
-    .autodom-chat-send-btn {
-      width: 36px !important;
-      height: 36px !important;
-      min-width: 36px !important;
-      border-radius: 50% !important;
-      background: var(--c-text-3);
-      border: none;
-      cursor: pointer;
-      display: flex !important;
-      align-items: center !important;
-      justify-content: center !important;
-      transition: background-color 0.15s ease, transform 0.15s ease, opacity 0.15s ease;
-      flex-shrink: 0 !important;
-      align-self: flex-end;
-      padding: 0 !important;
-    }
-    .autodom-chat-input-shell:focus-within .autodom-chat-send-btn,
-    .autodom-chat-send-btn:not(:disabled) {
-      background: var(--c-accent);
-    }
-    .autodom-chat-send-btn:hover:not(:disabled) {
-      background: var(--c-accent-2);
-      transform: scale(1.05);
-    }
-    .autodom-chat-send-btn:active:not(:disabled) {
-      transform: scale(0.96);
-    }
-    .autodom-chat-send-btn:disabled {
-      background: var(--c-raised);
-      cursor: not-allowed;
-    }
-    .autodom-chat-send-btn:focus-visible {
-      outline: 2px solid var(--c-accent);
-      outline-offset: 2px;
-    }
-    .autodom-chat-send-btn svg {
-      width: 16px !important;
-      height: 16px !important;
-      fill: none !important;
-      stroke: #fff !important;
-      stroke-width: 2.2 !important;
-      stroke-linecap: round !important;
-      stroke-linejoin: round !important;
-    }
-    /* When a chat request is in flight, the button morphs into a stop
-       control (matching ChatGPT / Claude.ai). The .stop-icon child is
-       only shown in this state; the .send-icon is hidden.
-
-       Important: these rules MUST out-specify the panel-wide reset rule
-       that sets every SVG to display: inline-block — otherwise the
-       up-arrow keeps rendering on top of the stop square and the user
-       just sees the arrow during loading. We do that by prefixing with
-       the panel ID below. */
-    #${PANEL_ID} .autodom-chat-send-btn .stop-icon { display: none !important; }
-    .autodom-chat-send-btn.is-stop {
-      background: var(--c-danger) !important;
-      cursor: pointer !important;
-      opacity: 1 !important;
-    }
-    .autodom-chat-send-btn.is-stop:hover {
-      background: oklch(58% 0.20 25) !important;
-      transform: scale(1.05);
-    }
-    .autodom-chat-send-btn.is-stop:disabled {
-      background: var(--c-danger) !important;
-      cursor: pointer !important;
-    }
-    #${PANEL_ID} .autodom-chat-send-btn.is-stop .send-icon { display: none !important; }
-    #${PANEL_ID} .autodom-chat-send-btn.is-stop .stop-icon {
-      display: block !important;
-      width: 14px !important;
-      height: 14px !important;
-      background: #fff !important;
-      border-radius: 3px !important;
-      /* Subtle inner shadow on the white square so it reads as a button
-         glyph rather than a flat sticker on the red disc — important on
-         OLED / high-contrast Windows themes where pure white on red can
-         look like a render artefact. */
-      box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.06) inset !important;
-    }
-    .autodom-chat-input-hint {
-      position: static !important;
-      align-self: flex-end !important;
-      font-size: 9.5px !important;
-      color: var(--c-text-3) !important;
-      pointer-events: none !important;
-      opacity: 0.45 !important;
-      line-height: 1 !important;
-      letter-spacing: 0.01em !important;
-      transition: opacity 0.18s ease, color 0.18s ease !important;
-      font-weight: 400 !important;
-    }
-    /* Inline <kbd> chips inside the hint — keep them subtle so the
-       footer reads as a whisper, not a banner. Without these, host-page
-       <kbd> styles or the user agent default can render them at almost
-       a full chip-button size, which is what the user was seeing. */
-    .autodom-chat-input-hint kbd {
-      font: inherit !important;
-      font-size: 9.5px !important;
-      background: transparent !important;
-      border: none !important;
-      box-shadow: none !important;
-      padding: 0 1px !important;
-      margin: 0 !important;
-      color: inherit !important;
-      opacity: 1 !important;
-    }
-    .autodom-chat-input-shell:focus-within ~ .autodom-chat-input-hint {
-      opacity: 0.7 !important;
-      color: var(--c-text-2) !important;
-    }
-
-    /* ─── Image Attachment Composer ──────────────────────────── */
-    .autodom-chat-attach-btn {
-      width: 32px !important;
-      height: 32px !important;
-      min-width: 32px !important;
-      border-radius: 50% !important;
-      background: transparent !important;
-      border: none !important;
-      cursor: pointer !important;
-      display: flex !important;
-      align-items: center !important;
-      justify-content: center !important;
-      color: var(--c-text-3) !important;
-      transition: background-color 0.15s ease, color 0.15s ease;
-      flex-shrink: 0 !important;
-      align-self: flex-end !important;
-      padding: 0 !important;
-      margin-right: 2px;
-    }
-    .autodom-chat-attach-btn:hover {
-      background: var(--c-surface-2) !important;
-      color: var(--c-accent) !important;
-    }
-    .autodom-chat-attach-btn:focus-visible {
-      outline: 2px solid var(--c-accent) !important;
-      outline-offset: 2px !important;
-    }
-    .autodom-chat-attach-btn svg {
-      width: 18px !important;
-      height: 18px !important;
-      fill: none !important;
-      stroke: currentColor !important;
-      stroke-width: 2 !important;
-      stroke-linecap: round !important;
-      stroke-linejoin: round !important;
-    }
-    .autodom-chat-attachments {
-      display: flex !important;
-      gap: 8px !important;
-      flex-wrap: wrap !important;
-      padding: 0 2px !important;
-    }
-    .autodom-chat-attachments[hidden] { display: none !important; }
-    .autodom-chat-attachment-chip {
-      position: relative;
-      width: 56px;
-      height: 56px;
-      border-radius: 8px;
-      overflow: hidden;
-      border: 1px solid var(--c-border);
-      background: var(--c-surface-2);
-      box-shadow: 0 1px 2px rgba(0,0,0,0.08);
-    }
-    .autodom-chat-attachment-chip img {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-      display: block;
-    }
-    .autodom-chat-attachment-chip .autodom-attach-remove {
-      position: absolute;
-      top: 2px;
-      right: 2px;
-      width: 18px;
-      height: 18px;
-      border: none;
-      border-radius: 50%;
-      background: rgba(0,0,0,0.65);
-      color: #fff;
-      cursor: pointer;
-      font-size: 13px;
-      line-height: 1;
-      padding: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .autodom-chat-attachment-chip .autodom-attach-remove:hover {
-      background: rgba(220, 38, 38, 0.9);
-    }
-    .autodom-chat-input-shell.is-drag-over {
-      outline: 2px dashed var(--c-accent) !important;
-      outline-offset: -3px !important;
-      background: var(--c-accent-soft) !important;
-    }
-    .autodom-chat-input-shell.is-drag-over .autodom-chat-input::placeholder {
-      color: var(--c-accent) !important;
-    }
-    .autodom-msg-attachments {
-      display: flex;
-      gap: 6px;
-      flex-wrap: wrap;
-      margin-top: 8px;
-    }
-    .autodom-msg-attachments img {
-      max-width: 220px;
-      max-height: 220px;
-      border-radius: 8px;
-      border: 1px solid var(--c-border);
-      cursor: zoom-in;
-      display: block;
-    }
-
-    /* ─── Model Picker (composer footer) ───────────────────── */
-    #${PANEL_ID} .autodom-model-row {
-      position: relative !important;
-      display: flex !important;
-      align-items: center !important;
-      gap: 8px !important;
-      padding: 4px 4px 0 4px !important;
-      width: max-content !important;
-      max-width: 100% !important;
-      overflow: visible !important;
-      z-index: 6 !important;
-    }
-    #${PANEL_ID} .autodom-model-picker {
-      position: relative !important;
-      display: inline-flex !important;
-      align-items: center !important;
-      justify-content: space-between !important;
-      gap: 8px !important;
-      min-height: 30px !important;
-      max-width: min(240px, calc(100vw - 72px)) !important;
-      padding: 5px 11px !important;
-      border: 1px solid var(--c-border) !important;
-      border-radius: 999px !important;
-      background: var(--c-surface) !important;
-      color: var(--c-text-2) !important;
-      font-size: 11.5px !important;
-      font-weight: 600 !important;
-      line-height: 1.3 !important;
-      cursor: pointer !important;
-      user-select: none !important;
-      white-space: nowrap !important;
-      transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease !important;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03) !important;
-      overflow: hidden !important;
-      pointer-events: auto !important;
-    }
-    #${PANEL_ID} #__autodom_model_picker_label {
-      display: inline-block !important;
-      overflow: hidden !important;
-      text-overflow: ellipsis !important;
-      white-space: nowrap !important;
-      min-width: 0 !important;
-      max-width: 180px !important;
-    }
-    #${PANEL_ID} .autodom-model-picker:hover,
-    #${PANEL_ID} .autodom-model-picker:focus-visible {
-      border-color: var(--c-accent) !important;
-      background: var(--c-surface-2) !important;
-      color: var(--c-text-1) !important;
-      outline: none !important;
-      box-shadow: 0 0 0 3px var(--c-accent-soft) !important;
-    }
-    #${PANEL_ID} .autodom-model-picker[hidden] { display: none !important; }
-    #${PANEL_ID} .autodom-model-picker::after {
-      content: "" !important;
-      width: 6px !important;
-      height: 6px !important;
-      border-right: 1.5px solid currentColor !important;
-      border-bottom: 1.5px solid currentColor !important;
-      transform: rotate(45deg) translateY(-1px) !important;
-      margin-left: 2px !important;
-      opacity: 0.78 !important;
-      flex-shrink: 0 !important;
-    }
-    #${PANEL_ID} .autodom-model-menu {
-      position: absolute !important;
-      bottom: calc(100% + 8px) !important;
-      left: 0 !important;
-      min-width: max(220px, 100%) !important;
-      max-width: min(280px, calc(100vw - 48px)) !important;
-      max-height: 240px !important;
-      overflow-y: auto !important;
-      background: var(--c-surface-2, #1c1c1e) !important;
-      border: 1px solid var(--c-border) !important;
-      border-radius: 12px !important;
-      padding: 4px !important;
-      box-shadow: 0 14px 32px rgba(0, 0, 0, 0.36) !important;
-      z-index: 30 !important;
-      pointer-events: auto !important;
-    }
-    #${PANEL_ID} .autodom-model-menu[hidden] { display: none !important; }
-    #${PANEL_ID} .autodom-model-item {
-      display: block !important;
-      width: 100% !important;
-      text-align: left !important;
-      padding: 8px 10px !important;
-      border: 0 !important;
-      background: transparent !important;
-      color: var(--c-text-1) !important;
-      border-radius: 8px !important;
-      font-size: 12px !important;
-      line-height: 1.35 !important;
-      cursor: pointer !important;
-      pointer-events: auto !important;
-    }
-    #${PANEL_ID} .autodom-model-item:hover,
-    #${PANEL_ID} .autodom-model-item:focus-visible {
-      background: rgba(255, 255, 255, 0.06) !important;
-      outline: none !important;
-    }
-    #${PANEL_ID} .autodom-model-item .mi-desc {
-      display: block !important;
-      font-size: 10px !important;
-      color: var(--c-text-3) !important;
-      margin-top: 2px !important;
-      white-space: normal !important;
-    }
-    #${PANEL_ID} .autodom-model-item.is-active {
-      background: var(--c-accent-soft, rgba(37, 99, 235, 0.15)) !important;
-      color: var(--c-text-1) !important;
-    }
-    .autodom-model-badge {
-      display: inline-block;
-      margin-top: 6px;
-      font-size: 10px;
-      color: var(--c-text-3);
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      opacity: 0.75;
-    }
-
-    /* ─── Welcome Screen ──────────────────────────────────────
-       Give the empty state a proper hero card so the panel feels like
-       a designed landing view instead of loose text floating in a dark
-       column. Scoped to the panel ID so these rules beat the defensive
-       reset above. */
-    #${PANEL_ID} .autodom-chat-welcome {
-      width: 100% !important;
-      max-width: none !important;
-      align-self: stretch !important;
-      position: relative !important;
-      overflow: hidden !important;
-      display: flex !important;
-      flex-direction: column !important;
-      align-items: stretch !important;
-      justify-content: flex-start !important;
-      gap: 16px !important;
-      padding: 20px 18px 18px !important;
-      border-radius: 18px !important;
-      border: 1px solid color-mix(in oklch, var(--c-border) 92%, transparent) !important;
-      background:
-        linear-gradient(180deg,
-          color-mix(in oklch, var(--c-surface) 92%, transparent) 0%,
-          color-mix(in oklch, var(--c-bg) 94%, transparent) 100%) !important;
-      box-shadow:
-        0 12px 30px rgba(0, 0, 0, 0.18),
-        inset 0 1px 0 rgba(255, 255, 255, 0.04) !important;
-      text-align: left !important;
-      isolation: isolate !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome::before {
-      content: "" !important;
-      position: absolute !important;
-      top: -42px !important;
-      left: -18px !important;
-      width: 180px !important;
-      height: 180px !important;
-      border-radius: 50% !important;
-      background: radial-gradient(circle, var(--c-accent-soft) 0%, transparent 72%) !important;
-      pointer-events: none !important;
-      opacity: 0.95 !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome > * {
-      position: relative !important;
-      z-index: 1 !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome h3 {
-      font-size: 28px !important;
-      font-weight: 700 !important;
-      color: var(--c-text) !important;
-      letter-spacing: -0.03em !important;
-      margin: 0 !important;
-      line-height: 1.08 !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome p.welcome-sub {
-      font-size: 14px !important;
-      color: var(--c-text-2) !important;
-      line-height: 1.6 !important;
-      max-width: none !important;
-      margin: 0 !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome p.welcome-sub code,
-    #${PANEL_ID} .autodom-chat-welcome .welcome-tips code {
-      font-family: var(--mono) !important;
-      font-size: 10.5px !important;
-      color: var(--c-text) !important;
-      background: color-mix(in oklch, var(--c-bg) 92%, transparent) !important;
-      padding: 2px 7px !important;
-      border-radius: 6px !important;
-      border: 1px solid color-mix(in oklch, var(--c-border) 88%, transparent) !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome .welcome-section-label {
-      font-size: 10.5px !important;
-      font-weight: 700 !important;
-      letter-spacing: 0.1em !important;
-      text-transform: uppercase !important;
-      color: var(--c-text-3) !important;
-      margin: 2px 0 -4px !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome .welcome-bullets {
-      margin: 0 !important;
-      padding: 0 !important;
-      list-style: none !important;
-      display: flex !important;
-      flex-direction: column !important;
-      gap: 10px !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome .welcome-bullets li {
-      display: flex !important;
-      gap: 10px !important;
-      align-items: flex-start !important;
-      padding: 12px 14px !important;
-      border-radius: 14px !important;
-      border: 1px solid color-mix(in oklch, var(--c-border) 86%, transparent) !important;
-      background: color-mix(in oklch, var(--c-bg) 70%, transparent) !important;
-      font-size: 13px !important;
-      color: var(--c-text-2) !important;
-      line-height: 1.55 !important;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02) !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome .welcome-bullets li::before {
-      content: "" !important;
-      flex: 0 0 7px !important;
-      width: 7px !important;
-      height: 7px !important;
-      margin-top: 7px !important;
-      border-radius: 50% !important;
-      background: var(--c-accent) !important;
-      box-shadow: 0 0 0 4px var(--c-accent-soft) !important;
-      opacity: 1 !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome .welcome-bullets li b {
-      color: var(--c-text) !important;
-      font-weight: 700 !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome .welcome-tips {
-      margin: 0 !important;
-      padding: 12px 14px !important;
-      border: 1px solid color-mix(in oklch, var(--c-border) 88%, transparent) !important;
-      border-radius: 14px !important;
-      background: color-mix(in oklch, var(--c-surface) 88%, transparent) !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome .welcome-tips summary {
-      font-size: 12px !important;
-      font-weight: 600 !important;
-      color: var(--c-text-2) !important;
-      cursor: pointer !important;
-      list-style: none !important;
-      display: flex !important;
-      align-items: center !important;
-      gap: 8px !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome .welcome-tips summary::-webkit-details-marker { display: none !important; }
-    #${PANEL_ID} .autodom-chat-welcome .welcome-tips summary::before {
-      content: "▸" !important;
-      font-size: 10px !important;
-      color: var(--c-text-3) !important;
-      transition: transform 0.15s ease !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome .welcome-tips[open] summary::before { transform: rotate(90deg) !important; }
-    #${PANEL_ID} .autodom-chat-welcome .welcome-tips-body {
-      margin-top: 10px !important;
-      display: flex !important;
-      flex-direction: column !important;
-      gap: 9px !important;
-      font-size: 11.5px !important;
-      color: var(--c-text-3) !important;
-      line-height: 1.55 !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome .welcome-tips-row {
-      display: flex !important;
-      flex-wrap: wrap !important;
-      gap: 6px 12px !important;
-      align-items: center !important;
-    }
-    #${PANEL_ID} .autodom-chat-welcome .welcome-tips-row .tip-label {
-      color: var(--c-text-2) !important;
-      font-weight: 600 !important;
-      min-width: 78px !important;
-    }
-
-    /* Footer hidden — replaced by composer hint */
-    .autodom-chat-footer { display: none !important; }
-    .autodom-chat-footer .ai-powered { display: none; }
-    .autodom-chat-footer .ai-powered svg { display: none; }
-
-    /* ─── Inline Overlay (Spotlight-style) ─────────────────────── */
-    #${INLINE_OVERLAY_ID} {
-      position: fixed;
-      top: 18%;
-      left: 50%;
-      transform: translate(-50%, -8px) scale(0.98);
-      width: 560px;
-      max-width: calc(100vw - 32px);
-      background: var(--c-bg);
-      border: 1px solid var(--c-border);
-      border-radius: 14px;
-      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.2);
-      z-index: 2147483647;
-      font-family: var(--font);
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.2s ease, transform 0.2s var(--ease-out);
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-    }
-    #${INLINE_OVERLAY_ID}.visible {
-      opacity: 1;
-      pointer-events: auto;
-      transform: translate(-50%, 0) scale(1);
-    }
-    /* Hard reset to defeat host page CSS leakage onto generic class names like .title/.logo/.dot.
-       Scoped to descendants only — the overlay container itself keeps its bg/border/shadow. */
-    #${INLINE_OVERLAY_ID} * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-      font-family: var(--font);
-      font-weight: 400;
-      font-style: normal;
-      letter-spacing: normal;
-      text-transform: none;
-      text-decoration: none;
-      text-shadow: none;
-      line-height: 1.4;
-      vertical-align: baseline;
-      float: none;
-      box-shadow: none;
-      background: transparent;
-      color: inherit;
-      border: 0;
-      min-width: 0;
-    }
-    #${INLINE_OVERLAY_ID} button {
-      cursor: pointer;
-      -webkit-appearance: none;
-      appearance: none;
-    }
-    #${INLINE_OVERLAY_ID} svg {
-      display: block;
-      flex-shrink: 0;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-header {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 14px 16px 10px;
-      font-size: 13px;
-      color: var(--c-text-3);
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-header .logo {
-      width: 26px;
-      height: 26px;
-      border-radius: 8px;
-      background: var(--c-accent);
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      flex-shrink: 0;
-      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-header .logo svg {
-      width: 14px;
-      height: 14px;
-      fill: none;
-      stroke: #fff;
-      stroke-width: 2.4;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-header .title {
-      font-weight: 600;
-      font-size: 14px;
-      line-height: 1.2;
-      color: var(--c-text);
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-header .autodom-chat-beta-badge {
-      font-size: 9px;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      padding: 2px 6px;
-      border-radius: 4px;
-      background: var(--c-accent-soft);
-      color: var(--c-accent);
-      line-height: 1;
-      text-transform: uppercase;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-header .mcp-status {
-      margin-left: auto;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 11px;
-      color: var(--c-text-3);
-      font-weight: 500;
-      line-height: 1;
-      white-space: nowrap;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-header .mcp-status .dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--c-success);
-      animation: __autodom_dot_pulse 2s ease-in-out infinite;
-      flex-shrink: 0;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-input-row {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 4px 16px 12px;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-input {
-      flex: 1 1 auto;
-      min-width: 0;
-      height: 44px;
-      padding: 0 14px;
-      background: var(--c-surface);
-      border: 1px solid var(--c-border);
-      border-radius: 10px;
-      color: var(--c-text);
-      font-family: var(--font);
-      font-size: 14px;
-      font-weight: 400;
-      line-height: 1.4;
-      outline: none;
-      transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-input:focus {
-      border-color: var(--c-accent);
-      background: var(--c-surface-2);
-      box-shadow: 0 0 0 3px var(--c-accent-soft);
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-input::placeholder {
-      color: var(--c-text-3);
-      opacity: 1;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-send {
-      width: 36px;
-      height: 36px;
-      border-radius: 50%;
-      background: var(--c-accent);
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      transition: background-color 0.15s ease, transform 0.15s ease, opacity 0.15s ease, box-shadow 0.15s ease;
-      flex-shrink: 0;
-      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-send:hover {
-      background: var(--c-accent-2);
-      transform: scale(1.06);
-      box-shadow: 0 3px 10px rgba(0, 0, 0, 0.24);
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-send:active {
-      transform: scale(0.95);
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-send:disabled {
-      opacity: 0.35;
-      cursor: not-allowed;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-send:focus-visible,
-    #${INLINE_OVERLAY_ID} .autodom-inline-hint:focus-visible {
-      outline: 2px solid var(--c-accent);
-      outline-offset: 2px;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-send svg {
-      width: 16px;
-      height: 16px;
-      fill: none;
-      stroke: #fff;
-      stroke-width: 2.4;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-response {
-      display: none;
-      padding: 0 16px 12px;
-      max-height: 260px;
-      overflow-y: auto;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-response.visible {
-      display: block;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-response-content {
-      background: var(--c-surface);
-      border: 1px solid var(--c-border);
-      border-radius: 10px;
-      padding: 12px 14px;
-      font-size: 13px;
-      color: var(--c-text);
-      line-height: 1.55;
-      white-space: pre-wrap;
-      word-wrap: break-word;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-response-content .ai-sparkle {
-      color: var(--c-text-3);
-      margin-right: 4px;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-response::-webkit-scrollbar {
-      width: 4px;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-response::-webkit-scrollbar-thumb {
-      background: var(--c-border-s);
-      border-radius: 2px;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-hints {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 6px;
-      padding: 0 16px 12px;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-hint {
-      flex-shrink: 0;
-      padding: 6px 12px;
-      border-radius: 999px;
-      background: var(--c-surface);
-      border: 1px solid var(--c-border);
-      color: var(--c-text-2);
-      font-size: 11.5px;
-      font-weight: 500;
-      font-family: var(--font);
-      white-space: nowrap;
-      line-height: 1.2;
-      display: inline-flex;
-      align-items: center;
-      height: 26px;
-      transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-hint:hover {
-      background: var(--c-surface-2);
-      border-color: var(--c-accent);
-      color: var(--c-text);
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-hint:active {
-      transform: scale(0.96);
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-footer {
-      display: flex;
-      align-items: center;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-      gap: 4px 12px;
-      padding: 10px 16px 12px;
-      margin-top: auto;
-      font-size: 11px;
-      color: var(--c-text-3);
-      border-top: 1px solid var(--c-border-s);
-      background: var(--c-surface);
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-footer span {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      white-space: nowrap;
-      line-height: 1;
-    }
-    #${INLINE_OVERLAY_ID} .autodom-inline-footer kbd {
-      font-family: var(--mono);
-      font-size: 10px;
-      font-weight: 600;
-      background: var(--c-bg);
-      padding: 2px 6px;
-      border-radius: 4px;
-      color: var(--c-text-2);
-      border: 1px solid var(--c-border-s);
-      line-height: 1.2;
-      display: inline-block;
-    }
-
-    /* Backdrop for inline overlay */
-    .autodom-inline-backdrop {
-      position: fixed;
-      inset: 0;
-      background: rgba(0, 0, 0, 0.18);
-      z-index: 2147483646;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.2s ease;
-    }
-    .autodom-inline-backdrop.visible {
-      opacity: 1;
-      pointer-events: auto;
-    }
-
-    /* ─── Confirmation Prompt (Guardrails) ─────────────────── */
-    .autodom-chat-msg.confirm-prompt {
-      align-self: flex-start;
-      background: var(--c-surface);
-      border: 1px solid rgba(251, 191, 36, 0.25);
-      color: var(--c-text);
-      border-radius: 12px;
-      border-bottom-left-radius: 3px;
-      padding: 14px 16px;
-      max-width: 92%;
-      animation: __autodom_slide_in 0.2s var(--ease-out);
-    }
-    .confirm-prompt-icon {
-      font-size: 18px;
-      margin-bottom: 6px;
-    }
-    .confirm-prompt-title {
-      font-size: 13px;
-      font-weight: 700;
-      color: var(--c-warn);
-      margin-bottom: 6px;
-    }
-    .confirm-prompt-reason {
-      font-size: 12px;
-      color: var(--c-text-2);
-      line-height: 1.55;
-      margin-bottom: 8px;
-    }
-    .confirm-prompt-details {
-      font-size: 10px;
-      font-family: var(--mono);
-      color: var(--c-text-3);
-      background: var(--c-bg);
-      border: 1px solid var(--c-border);
-      padding: 4px 8px;
-      border-radius: 4px;
-      margin-bottom: 12px;
-    }
-    .confirm-prompt-buttons {
-      display: flex;
-      gap: 8px;
-    }
-    .confirm-prompt-btn {
-      flex: 1;
-      padding: 8px 14px;
-      border-radius: 6px;
-      font-family: inherit;
-      font-size: 12px;
-      font-weight: 600;
-      cursor: pointer;
-      border: none;
-      transition: opacity 0.15s ease, background-color 0.15s ease;
-      min-height: 36px;
-    }
-    .confirm-prompt-btn.confirm {
-      background: var(--c-success);
-      color: #0d1117;
-    }
-    .confirm-prompt-btn.confirm:hover {
-      opacity: 0.85;
-    }
-    .confirm-prompt-btn.cancel {
-      background: transparent;
-      color: var(--c-danger);
-      border: 1px solid rgba(248, 113, 113, 0.25);
-    }
-    .confirm-prompt-btn.cancel:hover {
-      background: rgba(248, 113, 113, 0.08);
-    }
-    .confirm-prompt-btn:focus-visible {
-      outline: 2px solid var(--c-accent);
-      outline-offset: 2px;
-      box-shadow: 0 0 0 4px rgba(228, 228, 231, 0.15);
-    }
-    .confirm-prompt-btn:disabled {
-      opacity: 0.35;
-      cursor: not-allowed;
-    }
-    .confirm-prompt-btn:active {
-      opacity: 0.7;
-    }
-
-    /* ─── Markdown rendering (assistant / ai-response) ────── */
-    .autodom-chat-msg.assistant,
-    .autodom-chat-msg.ai-response {
-      white-space: normal;
-    }
-    .autodom-chat-msg .md p {
-      margin: 0 0 8px 0;
-    }
-    .autodom-chat-msg .md p:last-child { margin-bottom: 0; }
-    .autodom-chat-msg .md h2,
-    .autodom-chat-msg .md h3,
-    .autodom-chat-msg .md h4 {
-      font-weight: 700;
-      letter-spacing: -0.01em;
-      color: var(--c-text);
-      margin: 12px 0 6px;
-      line-height: 1.3;
-    }
-    .autodom-chat-msg .md h2 { font-size: 15px; }
-    .autodom-chat-msg .md h3 { font-size: 13.5px; }
-    .autodom-chat-msg .md h4 { font-size: 12.5px; color: var(--c-text-2); text-transform: uppercase; letter-spacing: 0.04em; }
-    .autodom-chat-msg .md ul,
-    .autodom-chat-msg .md ol {
-      margin: 4px 0 8px 0;
-      padding-left: 20px;
-    }
-    .autodom-chat-msg .md li { margin: 2px 0; }
-    .autodom-chat-msg .md blockquote {
-      margin: 6px 0;
-      padding: 4px 10px;
-      border-left: 3px solid var(--c-border-s);
-      color: var(--c-text-2);
-      background: rgba(255, 255, 255, 0.02);
-      border-radius: 0 4px 4px 0;
-    }
-    .autodom-chat-msg .md a {
-      color: #93c5fd;
-      text-decoration: underline;
-      text-underline-offset: 2px;
-    }
-    .autodom-chat-msg .md a:hover { color: #bfdbfe; }
-    .autodom-chat-msg .md code.md-inline {
-      background: var(--c-bg);
-      border: 1px solid var(--c-border);
-      border-radius: 4px;
-      padding: 1px 5px;
-      font-family: var(--mono);
-      font-size: 11.5px;
-      color: #fbbf24;
-    }
-    .autodom-chat-msg .md pre.md-code {
-      margin: 8px 0;
-      background: #0f0f10;
-      border: 1px solid var(--c-border);
-      border-radius: 8px;
-      overflow: hidden;
-      font-family: var(--mono);
-    }
-    .autodom-chat-msg .md pre.md-code .md-code-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 4px 8px 4px 10px;
-      background: var(--c-raised);
-      border-bottom: 1px solid var(--c-border);
-      font-size: 10px;
-      color: var(--c-text-3);
-    }
-    .autodom-chat-msg .md pre.md-code .md-code-lang {
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      font-weight: 600;
-    }
-    .autodom-chat-msg .md pre.md-code .md-code-copy {
-      background: transparent;
-      border: 1px solid var(--c-border-s);
-      color: var(--c-text-2);
-      cursor: pointer;
-      font-family: inherit;
-      font-size: 10px;
-      padding: 2px 8px;
-      border-radius: 4px;
-      transition: background-color 0.15s ease, color 0.15s ease;
-    }
-    .autodom-chat-msg .md pre.md-code .md-code-copy:hover {
-      background: var(--c-bg);
-      color: var(--c-text);
-    }
-    .autodom-chat-msg .md pre.md-code .md-code-copy.copied {
-      color: var(--c-success);
-      border-color: rgba(52, 211, 153, 0.3);
-    }
-    .autodom-chat-msg .md pre.md-code code {
-      display: block;
-      padding: 10px 12px;
-      font-size: 11.5px;
-      line-height: 1.55;
-      color: #e4e4e7;
-      white-space: pre;
-      overflow-x: auto;
-    }
-    .autodom-chat-msg .md hr {
-      border: none;
-      border-top: 1px solid var(--c-border);
-      margin: 10px 0;
-    }
-
-    /* Hover copy button on assistant bubbles — minimal ghost-style.
-       Borderless on idle, subtle surface tint on hover/focus. Shrinks the
-       old 26px chip down to a 20px icon so it no longer dominates the
-       bubble corner. */
-    .autodom-chat-msg .msg-copy-btn {
-      position: absolute;
-      top: 4px;
-      right: 4px;
-      background: transparent;
-      border: 0;
-      color: var(--c-text-3);
-      cursor: pointer;
-      width: 20px;
-      height: 20px;
-      border-radius: 6px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      padding: 0;
-      opacity: 0;
-      transition: opacity 0.15s ease, background-color 0.15s ease,
-        color 0.15s ease, transform 0.15s ease;
-      font-family: inherit;
-    }
-    .autodom-chat-msg.assistant:hover .msg-copy-btn,
-    .autodom-chat-msg.ai-response:hover .msg-copy-btn,
-    .autodom-chat-msg.user:hover .msg-copy-btn,
-    .autodom-chat-msg .msg-copy-btn:focus-visible { opacity: 0.72; }
-    .autodom-chat-msg .msg-copy-btn:hover {
-      background: color-mix(in oklch, var(--c-text-1) 10%, transparent);
-      color: var(--c-text-1);
-      opacity: 1;
-      transform: scale(1.06);
-    }
-    .autodom-chat-msg .msg-copy-btn:focus-visible {
-      outline: 1px solid color-mix(in oklch, var(--c-accent) 60%, transparent);
-      outline-offset: 1px;
-    }
-    .autodom-chat-msg .msg-copy-btn.copied {
-      color: var(--c-success);
-      opacity: 1;
-    }
-    .autodom-chat-msg .msg-copy-btn svg {
-      width: 11px; height: 11px;
-      fill: none; stroke: currentColor; stroke-width: 1.9;
-      stroke-linecap: round; stroke-linejoin: round;
-    }
-    /* User bubble copy button — floats just outside the pill on its left
-       so it never overlaps the message text. */
-    .autodom-chat-msg.user { position: relative; }
-    .autodom-chat-msg.user .msg-copy-btn {
-      top: 50%;
-      right: auto;
-      left: -28px;
-      transform: translateY(-50%);
-      width: 20px; height: 20px;
-      border-radius: 6px;
-    }
-    .autodom-chat-msg.user .msg-copy-btn:hover {
-      transform: translateY(-50%) scale(1.06);
-    }
-    .autodom-chat-msg.user .msg-copy-btn svg { width: 10px; height: 10px; }
-
-    /* Copy button inside a tool-result summary row (compact, inline) */
-    .autodom-chat-msg.tool-result .tr-copy-btn {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 16px;
-      height: 16px;
-      margin-left: 3px;
-      padding: 0;
-      border-radius: 999px;
-      background: transparent;
-      border: none;
-      color: var(--c-text-3);
-      cursor: pointer;
-      opacity: 0.38;
-      transition: opacity 0.15s ease, background-color 0.15s ease,
-        color 0.15s ease, transform 0.15s ease;
-      flex-shrink: 0;
-    }
-    .autodom-chat-msg.tool-result summary:hover .tr-copy-btn,
-    .autodom-chat-msg.tool-result .tr-copy-btn:focus-visible {
-      opacity: 0.88;
-      color: var(--c-text);
-    }
-    .autodom-chat-msg.tool-result .tr-copy-btn:hover {
-      background: rgba(255, 255, 255, 0.06);
-      color: var(--c-text);
-      opacity: 1;
-      transform: translateY(-1px);
-    }
-    .autodom-chat-msg.tool-result .tr-copy-btn:focus-visible {
-      outline: 1px solid rgba(255, 255, 255, 0.12);
-      outline-offset: 1px;
-    }
-    .autodom-chat-msg.tool-result .tr-copy-btn.copied {
-      color: var(--c-success);
-      opacity: 1;
-    }
-    .autodom-chat-msg.tool-result .tr-copy-btn svg {
-      width: 9px;
-      height: 9px;
-      fill: none;
-      stroke: currentColor;
-      stroke-width: 1.85;
-      stroke-linecap: round; stroke-linejoin: round;
-    }
-
-    /* Tool result as collapsible <details> */
-    .autodom-chat-msg.tool-result {
-      max-height: none;
-      overflow: visible;
-      padding: 0;
-      background: transparent;
-      border: none;
-      font-family: inherit;
-      font-size: 12px;
-      color: var(--c-text);
-      width: auto;
-      max-width: 92%;
-    }
-    .autodom-chat-msg.tool-result details {
-      background: var(--c-bg);
-      border: 1px solid var(--c-border);
-      border-radius: 8px;
-      overflow: hidden;
-    }
-    .autodom-chat-msg.tool-result summary {
-      cursor: pointer;
-      list-style: none;
-      padding: 6px 10px;
-      background: var(--c-raised);
-      border-bottom: 1px solid transparent;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 11px;
-      color: var(--c-text-2);
-      user-select: none;
-    }
-    .autodom-chat-msg.tool-result summary::-webkit-details-marker { display: none; }
-    .autodom-chat-msg.tool-result summary::before {
-      content: "▸";
-      display: inline-block;
-      transition: transform 0.15s ease;
-      color: var(--c-text-3);
-      font-size: 9px;
-    }
-    .autodom-chat-msg.tool-result details[open] summary::before { transform: rotate(90deg); }
-    .autodom-chat-msg.tool-result details[open] summary { border-bottom-color: var(--c-border); }
-    .autodom-chat-msg.tool-result summary .tr-tool {
-      font-family: inherit;
-      color: var(--c-text);
-      font-weight: 600;
-      letter-spacing: 0.01em;
-    }
-    .autodom-chat-msg.tool-result summary .tr-meta {
-      margin-left: auto;
-      color: var(--c-text-3);
-      font-size: 10px;
-    }
-    .autodom-chat-msg.tool-result pre {
-      margin: 0;
-      padding: 10px 12px;
-      font-family: var(--mono);
-      font-size: 11px;
-      line-height: 1.5;
-      color: var(--c-text-2);
-      white-space: pre-wrap;
-      word-break: break-word;
-      max-height: 320px;
-      overflow: auto;
-    }
-
-    /* Welcome suggestion cards (2x2 grid) */
-    #${PANEL_ID} .autodom-chat-welcome-suggestions {
-      display: grid !important;
-      grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
-      gap: 10px !important;
-      margin-top: 0 !important;
-      width: 100% !important;
-      max-width: none !important;
-    }
-    #${PANEL_ID} .autodom-chat-suggestion {
-      position: relative !important;
-      background: color-mix(in oklch, var(--c-bg) 74%, transparent) !important;
-      border: 1px solid color-mix(in oklch, var(--c-border) 90%, transparent) !important;
-      color: var(--c-text) !important;
-      padding: 12px 14px !important;
-      border-radius: 14px !important;
-      font-size: 13px !important;
-      font-weight: 600 !important;
-      cursor: pointer !important;
-      font-family: inherit !important;
-      text-align: left !important;
-      line-height: 1.4 !important;
-      min-height: 58px !important;
-      display: flex !important;
-      align-items: flex-start !important;
-      justify-content: space-between !important;
-      gap: 10px !important;
-      transition:
-        background-color 0.16s ease,
-        color 0.16s ease,
-        border-color 0.16s ease,
-        transform 0.16s ease,
-        box-shadow 0.16s ease !important;
-      box-shadow:
-        inset 0 1px 0 rgba(255, 255, 255, 0.03),
-        0 6px 16px rgba(0, 0, 0, 0.12) !important;
-    }
-    #${PANEL_ID} .autodom-chat-suggestion::after {
-      content: "↗" !important;
-      color: var(--c-text-3) !important;
-      font-size: 13px !important;
-      line-height: 1 !important;
-      transition: transform 0.16s ease, color 0.16s ease !important;
-      flex-shrink: 0 !important;
-    }
-    #${PANEL_ID} .autodom-chat-suggestion:hover {
-      background: color-mix(in oklch, var(--c-surface-2) 94%, transparent) !important;
-      border-color: color-mix(in oklch, var(--c-accent) 70%, var(--c-border)) !important;
-      color: var(--c-text) !important;
-      transform: translateY(-1px) !important;
-      box-shadow:
-        inset 0 1px 0 rgba(255, 255, 255, 0.04),
-        0 12px 24px rgba(0, 0, 0, 0.16) !important;
-    }
-    #${PANEL_ID} .autodom-chat-suggestion:hover::after {
-      color: var(--c-accent) !important;
-      transform: translate(1px, -1px) !important;
-    }
-    #${PANEL_ID} .autodom-chat-suggestion:focus-visible {
-      outline: 2px solid var(--c-accent) !important;
-      outline-offset: 2px !important;
-    }
-
-    /* ─── Floating Run Indicator ─────────────────────────────
-       Always-visible pill that appears while an agent run is active,
-       even if the chat panel is closed or the page was refreshed mid-
-       run. Gives the user a universal manual-stop handle. */
-    .autodom-run-indicator {
-      position: fixed !important;
-      bottom: 20px !important;
-      right: 20px !important;
-      z-index: 2147483645 !important;
-      display: none !important;
-      align-items: center !important;
-      gap: 10px !important;
-      padding: 8px 12px 8px 10px !important;
-      border-radius: 999px !important;
-      background: rgba(14, 14, 14, 0.96) !important;
-      color: #fff !important;
-      border: 1px solid rgba(255, 255, 255, 0.08) !important;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45), 0 2px 8px rgba(0, 0, 0, 0.25) !important;
-      font-family: var(--font) !important;
-      font-size: 12.5px !important;
-      line-height: 1.2 !important;
-      animation: __autodom_slide_in 0.22s var(--ease-out);
-      -webkit-font-smoothing: antialiased;
-    }
-    .autodom-run-indicator.visible { display: inline-flex !important; }
-    .autodom-run-indicator .ari-spinner {
-      flex: 0 0 14px;
-      width: 14px; height: 14px;
-      border-radius: 50%;
-      border: 2px solid rgba(255,255,255,0.18);
-      border-top-color: #fff;
-      animation: __autodom_spin 0.7s linear infinite;
-    }
-    .autodom-run-indicator .ari-text {
-      font-weight: 500;
-      letter-spacing: 0.01em;
-      white-space: nowrap;
-      max-width: 180px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .autodom-run-indicator .ari-stop {
-      appearance: none !important;
-      background: color-mix(in oklch, var(--c-danger) 40%, transparent) !important;
-      border: 1px solid color-mix(in oklch, var(--c-danger) 70%, transparent) !important;
-      color: #fff !important;
-      padding: 4px 10px !important;
-      border-radius: 999px !important;
-      font: inherit !important;
-      font-size: 11.5px !important;
-      font-weight: 600 !important;
-      cursor: pointer !important;
-      letter-spacing: 0.02em !important;
-      transition: background-color 0.15s ease, transform 0.1s ease !important;
-    }
-    .autodom-run-indicator .ari-stop:hover {
-      background: var(--c-danger) !important;
-    }
-    .autodom-run-indicator .ari-stop:active { transform: translateY(1px); }
-    .autodom-run-indicator[data-stopping="1"] .ari-stop {
-      opacity: 0.6; cursor: wait !important;
-    }
-    @keyframes __autodom_spin { to { transform: rotate(360deg); } }
-
-    /* Responsive: narrow screens */
-    @media (max-width: 480px) {
-      #${PANEL_ID} {
-        width: 100vw;
-      }
-      .autodom-chat-close-btn {
-        background: var(--c-surface);
-      }
-      #${INLINE_OVERLAY_ID} {
-        width: 95vw;
-        border-radius: 10px;
-      }
-      .autodom-chat-quick-btn {
-        min-height: 34px;
-        padding: 6px 10px;
-      }
-      .confirm-prompt-btn {
-        min-height: 44px;
-      }
-    }
-
-    /* ─── Automation Activity Overlay ─────────────────────────
-       Shown on the page while an AI request is in flight so the
-       user always knows automation is running. Pointer-events are
-       disabled on the dim layer so the agent's synthetic clicks
-       still reach the page; the floating Stop button sits above
-       it and re-enables pointer events for itself. */
-    #${AUTOMATION_OVERLAY_ID} {
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-      z-index: 2147483645;
-      background: radial-gradient(
-        ellipse at center,
-        rgba(0, 0, 0, 0) 55%,
-        rgba(0, 0, 0, 0.18) 100%
-      );
-      box-shadow: inset 0 0 0 2px rgba(245, 158, 11, 0.55),
-        inset 0 0 24px rgba(245, 158, 11, 0.18);
-      animation: __autodom_automation_pulse 2.2s ease-in-out infinite;
-    }
-    #${AUTOMATION_OVERLAY_ID}::before {
-      content: "● Automation running";
-      position: absolute;
-      top: 12px;
-      left: 50%;
-      transform: translateX(-50%);
-      pointer-events: none;
-      background: rgba(20, 20, 22, 0.78);
-      color: #f5d089;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
-        Helvetica, Arial, sans-serif;
-      font-size: 11px;
-      font-weight: 600;
-      letter-spacing: 0.05em;
-      padding: 4px 10px;
-      border-radius: 999px;
-      border: 1px solid rgba(245, 158, 11, 0.45);
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
-      backdrop-filter: blur(6px);
-      -webkit-backdrop-filter: blur(6px);
-    }
-    @keyframes __autodom_automation_pulse {
-      0%, 100% {
-        box-shadow: inset 0 0 0 2px rgba(245, 158, 11, 0.45),
-          inset 0 0 18px rgba(245, 158, 11, 0.12);
-      }
-      50% {
-        box-shadow: inset 0 0 0 2px rgba(245, 158, 11, 0.75),
-          inset 0 0 30px rgba(245, 158, 11, 0.28);
-      }
-    }
-
-    /* ─── Floating Stop Button ────────────────────────────────
-       Visible only when automation is running AND the chat panel
-       is closed, so the user can stop the agent without having to
-       reopen chat. Semi-transparent until hover. */
-    #${FLOATING_STOP_ID} {
-      position: fixed;
-      bottom: 20px;
-      right: 20px;
-      width: 52px;
-      height: 52px;
-      border-radius: 50%;
-      border: 1px solid rgba(245, 158, 11, 0.5);
-      background: rgba(20, 20, 22, 0.65);
-      color: #fbbf24;
-      cursor: pointer;
-      z-index: 2147483646;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      pointer-events: auto;
-      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35),
-        0 0 0 0 rgba(245, 158, 11, 0.4);
-      backdrop-filter: blur(8px);
-      -webkit-backdrop-filter: blur(8px);
-      opacity: 0.78;
-      transition: opacity 0.15s ease, transform 0.15s ease,
-        background 0.15s ease;
-      animation: __autodom_stop_pulse 2s ease-out infinite;
-    }
-    #${FLOATING_STOP_ID}:hover {
-      opacity: 1;
-      transform: scale(1.06);
-      background: rgba(40, 25, 20, 0.88);
-    }
-    #${FLOATING_STOP_ID}:active {
-      transform: scale(0.96);
-    }
-    #${FLOATING_STOP_ID} svg {
-      width: 20px;
-      height: 20px;
-      fill: currentColor;
-    }
-    #${FLOATING_STOP_ID}::after {
-      content: "Stop automation";
-      position: absolute;
-      right: 60px;
-      top: 50%;
-      transform: translateY(-50%);
-      background: rgba(20, 20, 22, 0.92);
-      color: #e8e8ec;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
-        Helvetica, Arial, sans-serif;
-      font-size: 11px;
-      font-weight: 500;
-      padding: 4px 8px;
-      border-radius: 4px;
-      white-space: nowrap;
-      opacity: 0;
-      pointer-events: none;
-      transition: opacity 0.15s ease;
-      border: 1px solid rgba(140, 140, 155, 0.3);
-    }
-    #${FLOATING_STOP_ID}:hover::after {
-      opacity: 1;
-    }
-    @keyframes __autodom_stop_pulse {
-      0% {
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35),
-          0 0 0 0 rgba(245, 158, 11, 0.45);
-      }
-      70% {
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35),
-          0 0 0 14px rgba(245, 158, 11, 0);
-      }
-      100% {
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35),
-          0 0 0 0 rgba(245, 158, 11, 0);
-      }
-    }
-    @media (prefers-reduced-motion: reduce) {
-      #${AUTOMATION_OVERLAY_ID},
-      #${FLOATING_STOP_ID} {
-        animation: none !important;
-      }
-    }
-    .autodom-gate-card {
-      border: 1px solid var(--c-border, #3a3a3a);
-      border-radius: 10px;
-      padding: 10px 12px;
-      background: var(--c-surface-2, #1c1c1e);
-      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
-      outline: none;
-    }
-    .autodom-gate-card:focus-visible {
-      box-shadow: 0 0 0 2px var(--c-accent, #6aa4ff);
-    }
-    .autodom-gate-card[data-gate-category="destructive"] {
-      border-color: #d14343;
-    }
-    .autodom-gate-title {
-      font-weight: 600;
-      font-size: 12px;
-      color: var(--c-text-1, #eaeaea);
-      margin-bottom: 4px;
-    }
-    .autodom-gate-card[data-gate-category="destructive"] .autodom-gate-title {
-      color: #ff7878;
-    }
-    .autodom-gate-tool {
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 11px;
-      color: var(--c-text-2, #b8b8b8);
-      margin-bottom: 6px;
-      word-break: break-all;
-    }
-    .autodom-gate-preview {
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 11px;
-      color: var(--c-text-2, #b8b8b8);
-      background: rgba(255, 255, 255, 0.03);
-      border-radius: 6px;
-      padding: 6px 8px;
-      max-height: 140px;
-      overflow: auto;
-      white-space: pre-wrap;
-      margin: 0 0 8px 0;
-    }
-    .autodom-gate-actions {
-      display: flex;
-      gap: 6px;
-      flex-wrap: wrap;
-    }
-    .autodom-gate-btn {
-      font: inherit;
-      font-size: 12px;
-      padding: 5px 10px;
-      border-radius: 6px;
-      border: 1px solid var(--c-border, #3a3a3a);
-      background: transparent;
-      color: var(--c-text-1, #eaeaea);
-      cursor: pointer;
-    }
-    .autodom-gate-btn:hover:not(:disabled) {
-      background: rgba(255, 255, 255, 0.06);
-    }
-    .autodom-gate-btn:disabled {
-      opacity: 0.45;
-      cursor: not-allowed;
-    }
-    .autodom-gate-btn.allow {
-      background: var(--c-accent, #2563eb);
-      border-color: transparent;
-      color: #fff;
-    }
-    .autodom-gate-btn.deny {
-      color: #ff7878;
-      border-color: #5a2a2a;
-    }
-    .autodom-gate-status {
-      margin-top: 6px;
-      font-size: 11px;
-      color: var(--c-text-2, #b8b8b8);
-      font-style: italic;
-    }
-  `;
-  document.documentElement.appendChild(style);
 
   // Toggle button removed — it was obscuring the page.
   // Panel is opened via popup button, Ctrl+Shift+K, or service worker message.
@@ -4593,6 +1129,10 @@
   panel.id = PANEL_ID;
   panel.setAttribute("role", "complementary");
   panel.setAttribute("aria-label", "AutoDOM AI Chat");
+  // CSS expects --autodom-avatar to resolve to the SVG-data-URL form
+  // built above; we set it as a custom property so the CSS file (which
+  // can't run JS interpolation) can reference it via var(...).
+  try { panel.style.setProperty("--autodom-avatar", AUTODOM_AVATAR_URL); } catch (_) {}
   panel.innerHTML = `
     <!-- Resize handle (left edge — drag, double-click resets, arrows nudge). -->
     <div class="autodom-chat-resize-handle"
@@ -4990,6 +1530,8 @@
   inlineOverlay.setAttribute("role", "dialog");
   inlineOverlay.setAttribute("aria-label", "AutoDOM AI Quick Prompt");
   inlineOverlay.setAttribute("aria-modal", "true");
+  // Same --autodom-avatar wiring as the main panel — see comment above.
+  try { inlineOverlay.style.setProperty("--autodom-avatar", AUTODOM_AVATAR_URL); } catch (_) {}
   inlineOverlay.innerHTML = `
     <div class="autodom-inline-header">
       <div class="logo" aria-hidden="true">
@@ -5079,6 +1621,7 @@
     { command: "/js", insert: "/js ", description: "Run JavaScript on the page" },
     { command: "/run", insert: "/run ", description: "Run automation script" },
     { command: "/auto", insert: "/auto ", description: "Vision-plan: one-shot screenshot→plan→execute (faster)" },
+    { command: "/quick", insert: "/quick ", description: "Quick mode: compact commands, faster execution (lightning mode)" },
   ];
   let _slashActiveIndex = 0;
 
@@ -5206,8 +1749,44 @@
     return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
   }
 
+  let _pastChatsClearArmed = false;
+  let _pastChatsClearTimer = null;
+  function _disarmPastChatsClear() {
+    _pastChatsClearArmed = false;
+    if (_pastChatsClearTimer) {
+      clearTimeout(_pastChatsClearTimer);
+      _pastChatsClearTimer = null;
+    }
+    const btn = pastChatsMenu && pastChatsMenu.querySelector(".autodom-past-chat-clear");
+    if (!btn) return;
+    btn.classList.remove("is-armed");
+    btn.textContent = "Clear history";
+    btn.setAttribute("title", "Clear all saved past chats");
+    btn.setAttribute("aria-label", "Clear all saved past chats");
+  }
+
+  function _handleClearPastChats() {
+    if (isProcessing || !pastChatsMenu || pastChatsMenu.hidden) return;
+    const btn = pastChatsMenu.querySelector(".autodom-past-chat-clear");
+    if (!btn) return;
+    if (!_pastChatsClearArmed) {
+      _pastChatsClearArmed = true;
+      btn.classList.add("is-armed");
+      btn.textContent = "Click again to confirm";
+      btn.setAttribute("title", "Click again to clear all saved past chats");
+      btn.setAttribute("aria-label", "Click again to clear all saved past chats");
+      _pastChatsClearTimer = setTimeout(_disarmPastChatsClear, 3000);
+      return;
+    }
+    _disarmPastChatsClear();
+    _clearAllLongLivedPersist();
+    _renderPastChatsMenu([]);
+    _positionPastChatsMenu();
+  }
+
   function _closePastChatsMenu() {
     if (!pastChatsMenu || !pastChatsBtn) return;
+    _disarmPastChatsClear();
     pastChatsMenu.hidden = true;
     pastChatsBtn.setAttribute("aria-expanded", "false");
   }
@@ -5264,6 +1843,22 @@
       _appendPastChatsEmpty("No past chats yet. Use New chat to save this conversation and start fresh.");
       return;
     }
+
+    const actions = document.createElement("div");
+    actions.className = "autodom-past-chat-actions";
+    const clearHistoryBtn = document.createElement("button");
+    clearHistoryBtn.type = "button";
+    clearHistoryBtn.className = "autodom-past-chat-clear";
+    clearHistoryBtn.textContent = "Clear history";
+    clearHistoryBtn.setAttribute("title", "Clear all saved past chats");
+    clearHistoryBtn.setAttribute("aria-label", "Clear all saved past chats");
+    clearHistoryBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      _handleClearPastChats();
+    });
+    actions.appendChild(clearHistoryBtn);
+    pastChatsMenu.appendChild(actions);
 
     list
       .slice()
@@ -7285,6 +3880,99 @@
     }
   }
 
+  // ─── Plan Approval Card ───────────────────────────────────
+  // Renders an inline card in the chat thread when the agent calls
+  // `update_plan`. The user can Approve (agent continues) or Reject
+  // (agent stops). Mirrors the ACTION_GATE_REQUEST pattern.
+  function _renderPlanApprovalCard(req) {
+    clearWelcome();
+    const card = document.createElement("div");
+    card.className = "autodom-chat-msg system autodom-plan-card";
+    card.dataset.planRequestId = req.requestId;
+
+    const header = document.createElement("div");
+    header.className = "autodom-plan-header";
+
+    const icon = document.createElement("span");
+    icon.className = "autodom-plan-icon";
+    icon.textContent = "⚡"; // lightning bolt
+
+    const titleEl = document.createElement("span");
+    titleEl.className = "autodom-plan-title";
+    titleEl.textContent = req.title || "Agent Plan";
+
+    header.appendChild(icon);
+    header.appendChild(titleEl);
+
+    // Domains list
+    const domains = Array.isArray(req.domains) ? req.domains : [];
+    if (domains.length > 0) {
+      const domainsEl = document.createElement("div");
+      domainsEl.className = "autodom-plan-domains";
+      domainsEl.textContent = "Sites: " + domains.join(", ");
+      card.appendChild(header);
+      card.appendChild(domainsEl);
+    } else {
+      card.appendChild(header);
+    }
+
+    // Approach text
+    if (req.approach) {
+      const approachEl = document.createElement("pre");
+      approachEl.className = "autodom-plan-approach";
+      approachEl.textContent = String(req.approach).substring(0, 600);
+      card.appendChild(approachEl);
+    }
+
+    const btnRow = document.createElement("div");
+    btnRow.className = "autodom-plan-actions";
+
+    const approveBtn = document.createElement("button");
+    approveBtn.className = "autodom-gate-btn allow";
+    approveBtn.textContent = "Approve";
+
+    const rejectBtn = document.createElement("button");
+    rejectBtn.className = "autodom-gate-btn deny";
+    rejectBtn.textContent = "Reject";
+
+    const _sendResponse = (approved) => {
+      approveBtn.disabled = true;
+      rejectBtn.disabled = true;
+      const statusEl = document.createElement("div");
+      statusEl.className = "autodom-gate-status";
+      statusEl.textContent = approved ? "Plan approved" : "Plan rejected";
+      card.appendChild(statusEl);
+      try {
+        chrome.runtime.sendMessage(
+          {
+            type: "PLAN_APPROVAL_RESPONSE",
+            requestId: req.requestId,
+            approved,
+          },
+          _swallowRuntimeLastError,
+        );
+      } catch (_) {}
+    };
+
+    approveBtn.addEventListener("click", () => _sendResponse(true));
+    rejectBtn.addEventListener("click", () => _sendResponse(false));
+
+    btnRow.appendChild(approveBtn);
+    btnRow.appendChild(rejectBtn);
+    card.appendChild(btnRow);
+
+    // Keyboard: Enter = approve, Esc = reject.
+    card.tabIndex = 0;
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); approveBtn.click(); }
+      else if (e.key === "Escape") { e.preventDefault(); rejectBtn.click(); }
+    });
+
+    messagesContainer.appendChild(card);
+    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    try { card.focus(); } catch (_) {}
+  }
+
   function addMessage(role, content, extra) {
     clearWelcome();
 
@@ -7926,12 +4614,68 @@
     return document.getElementById("__autodom_messages");
   }
 
+  // ─── Scroll-to-bottom helper ─────────────────────────────────
+  // Streaming used to call `list.scrollTop = list.scrollHeight` on every
+  // SSE chunk. That forces a synchronous layout per chunk, fights the
+  // user when they scroll up to read mid-stream, and causes visible jitter
+  // on long replies. The helper coalesces calls via rAF and supports two
+  // modes:
+  //   • "force"             — always scroll to the bottom (user just
+  //                           sent a message, restoring history, etc.)
+  //   • "stickIfNearBottom" — only scroll when the user is already
+  //                           near the bottom (typical streaming case;
+  //                           Claude / ChatGPT do this so reading
+  //                           previous content isn't interrupted).
+  // Callers using "stickIfNearBottom" MUST capture the near-bottom flag
+  // BEFORE mutating the DOM (otherwise the just-appended chunk has
+  // already grown scrollHeight and the user reads as "not near bottom").
+  // _scrollSchedule per-element so concurrent live regions don't fight.
+  const _scrollSchedule = new WeakMap(); // el → { rafId, mode, sticky }
+  const _SCROLL_STICK_PX = 64;
+  function _isNearBottom(el) {
+    if (!el) return true;
+    return el.scrollHeight - el.scrollTop - el.clientHeight <= _SCROLL_STICK_PX;
+  }
+  function _scheduleScrollToBottom(el, mode, opts) {
+    if (!el) return;
+    // For the sticky case the caller passes the pre-mutation flag; if
+    // omitted we sample now (used by the few callers that don't mutate
+    // directly before scheduling).
+    const stickyOk = mode === "force" ||
+      (opts && typeof opts.wasNearBottom === "boolean"
+        ? opts.wasNearBottom
+        : _isNearBottom(el));
+    let entry = _scrollSchedule.get(el);
+    if (entry) {
+      // Force always wins over sticky; once sticky was vetoed (stickyOk
+      // false) leave it vetoed.
+      if (mode === "force") entry.mode = "force";
+      if (!stickyOk && entry.mode !== "force") entry.sticky = false;
+      return;
+    }
+    entry = { mode, sticky: stickyOk, rafId: 0 };
+    _scrollSchedule.set(el, entry);
+    entry.rafId = requestAnimationFrame(() => {
+      _scrollSchedule.delete(el);
+      try {
+        if (entry.mode === "force" || entry.sticky) {
+          el.scrollTop = el.scrollHeight;
+        }
+      } catch (_) {
+        /* element may have been detached between scheduling and rAF */
+      }
+    });
+  }
+
   function _ensureStreamingBubble(runId) {
     if (!runId) return null;
     let entry = _streamingBubbles.get(runId);
     if (entry && entry.bubble && entry.bubble.isConnected) return entry;
     const list = _ensureMessageList();
     if (!list) return null;
+    // Capture near-bottom BEFORE we append the new bubble so the sticky
+    // check reflects user intent at the moment the stream started.
+    const wasNearBottom = _isNearBottom(list);
     const wrap = document.createElement("div");
     wrap.className = "autodom-chat-msg ai-response streaming";
     wrap.dataset.runId = runId;
@@ -7943,7 +4687,11 @@
     cursor.textContent = "▍";
     wrap.appendChild(cursor);
     list.appendChild(wrap);
-    try { list.scrollTop = list.scrollHeight; } catch (_) {}
+    // First bubble for this run: always scroll. Either the user just
+    // sent (wasNearBottom is true by definition) or they explicitly
+    // scrolled away (in which case we still want them to see the
+    // assistant has started replying — match Claude's behaviour).
+    _scheduleScrollToBottom(list, "force");
     entry = { bubble: wrap, textNode, text: "" };
     _streamingBubbles.set(runId, entry);
     return entry;
@@ -7957,14 +4705,19 @@
     // must never be painted into a user-visible bubble even mid-stream.
     let safe = chunk;
     try { safe = _scrubContextIdentifiers(chunk); } catch (_) {}
+    if (!safe) return;
+    const list = _ensureMessageList();
+    // Capture near-bottom BEFORE appending the chunk — once we append,
+    // scrollHeight grows and the user that was at-bottom would read
+    // as "not near bottom" and we'd stop following the stream.
+    const wasNearBottom = list ? _isNearBottom(list) : true;
     entry.text += safe;
-    // textContent (NOT innerHTML) — interim text is plain, the final
-    // markdown render arrives separately via AI_CHAT_RESPONSE.
-    entry.textNode.textContent = entry.text;
-    try {
-      const list = _ensureMessageList();
-      if (list) list.scrollTop = list.scrollHeight;
-    } catch (_) {}
+    // Append a text node for just the new chunk instead of resetting
+    // textContent to the full accumulated string. This turns streaming
+    // from O(n²) (full string copy + DOM text re-parse per chunk) into
+    // O(n) — critical for long replies.
+    entry.textNode.appendChild(document.createTextNode(safe));
+    if (list) _scheduleScrollToBottom(list, "stickIfNearBottom", { wasNearBottom });
   }
 
   function _resetStreamingBubble(runId) {
@@ -8549,11 +5302,17 @@
       options && Array.isArray(options.attachments) ? options.attachments : [];
     // /auto <task> opts in to vision-plan mode (single screenshot+snapshot →
     // planning call → local replay). Strip the prefix before sending.
+    // /quick <task> opts in to quick mode (compact command language).
     let mode = null;
     if (typeof text === "string" && /^\/auto(\s|$)/i.test(text.trim())) {
       mode = "vision-plan";
       text = text.trim().replace(/^\/auto\s*/i, "");
+    } else if (typeof text === "string" && /^\/quick(\s|$)/i.test(text.trim())) {
+      mode = "quick";
+      text = text.trim().replace(/^\/quick\s*/i, "");
     }
+    // Also pick up mode from options (set when parseCommand returns type:"ai_automate")
+    if (!mode && options && options.mode) mode = options.mode;
     _log("sendAiMessage:", text.substring(0, 80), attachments.length ? `(+${attachments.length} image)` : "", mode ? `[mode=${mode}]` : "");
     if (_contextInvalidated) {
       return {
@@ -8911,6 +5670,9 @@
         case "auto":
           // Vision-plan mode: one-shot screenshot+snapshot → JSON plan → replay.
           return { type: "ai_automate", prompt: rest.trim(), mode: "vision-plan" };
+        case "quick":
+          // Quick mode: compact command language, no tool schema — faster execution.
+          return { type: "ai_automate", prompt: rest.trim(), mode: "quick" };
         default:
           return { tool: tool, params: rest ? tryParseJSON(rest) : {} };
       }
@@ -9649,16 +6411,22 @@
           "assistant",
           command.mode === "vision-plan"
             ? "Usage: /auto <task description>."
-            : "Usage: /run <JS code> or /run <task description>.",
+            : command.mode === "quick"
+              ? "Usage: /quick <task description>."
+              : "Usage: /run <JS code> or /run <task description>.",
         );
         return;
       }
-      // Natural-language automation uses vision-plan by default: one planner
-      // call, then local replay. This is much faster than the chatty loop.
+      // Route to the appropriate mode:
+      //   vision-plan → /auto prefix (stripped by sendAiMessage)
+      //   quick       → /quick prefix (stripped by sendAiMessage)
+      //   default     → plain automation framing
       text =
         command.mode === "vision-plan"
           ? `/auto ${goal}`
-          : `Automate this on the current page. Plan, then call browser tools (click, type, navigate, etc.) to do it. Stop when finished. Task: ${goal}`;
+          : command.mode === "quick"
+            ? `/quick ${goal}`
+            : `Automate this on the current page. Plan, then call browser tools (click, type, navigate, etc.) to do it. Stop when finished. Task: ${goal}`;
       command = null;
     }
 
@@ -9682,6 +6450,7 @@
         "  /js <code> \u2014 Execute JavaScript\n" +
         "  /run <code> \u2014 Run local Playwright/Selenium-style automation\n" +
         "  /run <task> or /auto <task> \u2014 Fast AI automation plan + replay\n" +
+        "  /quick <task> \u2014 Quick mode: compact command language (fastest)\n" +
         "  /extract \u2014 Extract page text\n\n" +
         "Shortcuts:\n" +
         "  Cmd/Ctrl+Shift+K \u2014 Toggle sidebar\n" +
@@ -10728,6 +7497,25 @@
       }
       return;
     }
+    // ─── Plan approval request from agent loop ──────────────────
+    if (message.type === "PLAN_APPROVAL_REQUEST" && message.requestId) {
+      try {
+        _renderPlanApprovalCard(message);
+      } catch (err) {
+        // On render failure, auto-approve so the run doesn't hang.
+        try {
+          chrome.runtime.sendMessage(
+            {
+              type: "PLAN_APPROVAL_RESPONSE",
+              requestId: message.requestId,
+              approved: true,
+            },
+            _swallowRuntimeLastError,
+          );
+        } catch (_) {}
+      }
+      return;
+    }
     // ─── Agent run state changed (e.g. user switched to this tab
     // mid-run, or the SW just rebound panelTabId after a refresh).
     // Apply the worker's current state directly so the overlay + busy
@@ -10858,12 +7646,20 @@
   // Chrome's native side panel (duplicate surfaces). Only Escape
   // remains as a page-local shortcut.
   //
-  // Firefox fallback: if `chrome.commands` is unavailable, restore the
-  // in-page bindings so the shortcuts still work for the injected
-  // panel surface.
+  // Firefox fallback: if manifest command bindings are absent, restore
+  // in-page shortcuts for the injected panel surface. Do NOT use
+  // `chrome.commands` presence as the signal here: content scripts don't
+  // expose that API even when manifest commands are active, which causes
+  // duplicate handling (native side panel + injected panel) on Cmd/Ctrl+
+  // Shift+K.
   const _hasManifestCommands = (() => {
     try {
-      return !!(chrome && chrome.commands);
+      const manifest = chrome?.runtime?.getManifest?.();
+      const commands = manifest && manifest.commands;
+      return !!(
+        commands &&
+        (commands["toggle-chat-panel"] || commands["toggle-inline-ai"])
+      );
     } catch (_) {
       return false;
     }

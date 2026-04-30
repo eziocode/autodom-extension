@@ -3219,6 +3219,14 @@ function _responseStyleSuffix(value) {
   return RESPONSE_STYLE_INSTRUCTIONS[_resolveResponseStyle(value)];
 }
 
+const BROWSER_AGENT_PROTOCOL =
+  "Browser-agent protocol:\n" +
+  "- Observe first: use page context, get_dom_state, take_snapshot, and richer search/traversal tools before answering from guesswork.\n" +
+  "- Identify targets by visible text, role/name, index, selector, frame/shadow context, and state; do not rely on brittle selectors when better evidence exists.\n" +
+  "- Handle iframes, shadow DOM, popups/windows, tabs, dialogs, downloads, and SPA network-idle states before declaring something unavailable.\n" +
+  "- Act in short verified batches: perform the browser step, wait for the page to settle, then verify with state/text/URL/title/snapshot evidence.\n" +
+  "- Ask before destructive, payment, account, credential, or irreversible actions unless the user has already clearly authorized the exact action.\n";
+
 function buildProviderSystemPrompt(context, opts) {
   let prompt =
     "You are AutoDOM's browser agent. Help the user interact with the current web page.\n";
@@ -3227,6 +3235,7 @@ function buildProviderSystemPrompt(context, opts) {
   prompt +=
     "Respond clearly and actionably. If browser data is needed, use AutoDOM/MCP browser tools instead of asking the user to run commands or paste DOM output. " +
     "Never use raw internal shorthand like IC7 or CB0 in the user-facing answer; if you need to mention an indexed element, say element #7 and describe it in plain English, and never tell users to type placeholder tokens.\n\n";
+  prompt += BROWSER_AGENT_PROTOCOL + "\n";
   prompt += `Page title: ${scrubSensitiveContextText(context?.title || "Unknown")}\n`;
   prompt += `Page URL: ${scrubSensitiveContextText(context?.url || "Unknown")}\n`;
   if (context?.visibleOverlayText) {
@@ -3492,6 +3501,18 @@ const CLI_AGENT_TOOLS = [
     params: { maxElements: 60 },
   },
   {
+    name: "take_snapshot",
+    description:
+      "Read a structured DOM/accessibility snapshot with roles, names, text, and hierarchy. Use for semantic target finding and verification.",
+    params: { maxDepth: 6 },
+  },
+  {
+    name: "deep_query",
+    description:
+      "Search main document, iframes, and shadow roots for a selector or visible text when the target location is unknown.",
+    params: { text: "Save", limit: 20 },
+  },
+  {
     name: "batch_actions",
     description:
       "Execute up to 8 known browser actions sequentially in one call. Prefer this after get_dom_state when the next click/type/wait steps are clear.",
@@ -3531,6 +3552,12 @@ const CLI_AGENT_TOOLS = [
     params: { timeout: 10000 },
   },
   {
+    name: "wait_for_network_idle",
+    description:
+      "Wait for SPA/network activity to settle after clicks, form submits, navigation, or route changes.",
+    params: { timeout: 10000, idleTime: 500 },
+  },
+  {
     name: "wait_for_element",
     description: "Wait for a CSS selector to appear.",
     params: { selector: "form", timeout: 10000 },
@@ -3539,6 +3566,18 @@ const CLI_AGENT_TOOLS = [
     name: "wait_for_text",
     description: "Wait for visible text to appear on the page.",
     params: { text: "Leads", timeout: 10000 },
+  },
+  {
+    name: "check_element_state",
+    description:
+      "Verify whether an element exists, is visible, disabled/checked, in viewport, and what value/text it has.",
+    params: { selector: "button[type='submit']" },
+  },
+  {
+    name: "handle_dialog",
+    description:
+      "Accept or dismiss alert/confirm/prompt dialogs that may block the page after an action.",
+    params: { action: "accept" },
   },
   {
     name: "scroll",
@@ -3559,6 +3598,63 @@ const CLI_AGENT_TOOLS = [
     name: "extract_text",
     description: "Extract visible page text or text under a selector.",
     params: { selector: "body" },
+  },
+  {
+    name: "list_iframes",
+    description:
+      "List iframes, including cross-origin frames, with frameId/src/visibility. Use before iframe_interact.",
+    params: {},
+  },
+  {
+    name: "iframe_interact",
+    description:
+      "Read or act inside a specific iframe using frameId or iframeSelector. Actions include get_dom_state, extract_text, query, click, type, fill_form, scroll, and check_element_state.",
+    params: { frameId: 0, action: "get_dom_state" },
+  },
+  {
+    name: "list_shadow_roots",
+    description:
+      "List open shadow-root hosts and suggested piercing paths before using shadow_interact.",
+    params: { maxDepth: 5 },
+  },
+  {
+    name: "shadow_interact",
+    description:
+      "Read or act inside open shadow DOM using a piercing selector such as 'my-widget >>> button'.",
+    params: { piercingSelector: "my-widget >>> button", action: "query" },
+  },
+  {
+    name: "list_popups",
+    description:
+      "List browser windows/popups when a page opens content outside the active tab.",
+    params: { popupsOnly: true },
+  },
+  {
+    name: "switch_to_popup",
+    description:
+      "Focus a popup/window and pin subsequent tool calls to its active tab.",
+    params: { windowId: 0 },
+  },
+  {
+    name: "wait_for_popup",
+    description:
+      "Wait for a new popup/window after an action, optionally switching to it.",
+    params: { timeout: 10000, switchTo: true },
+  },
+  {
+    name: "list_tabs",
+    description: "List open tabs so the agent can switch context instead of asking the user.",
+    params: {},
+  },
+  {
+    name: "switch_tab",
+    description: "Activate a tab and pin subsequent tool calls to it.",
+    params: { tabId: 0 },
+  },
+  {
+    name: "open_new_tab",
+    description: "Open a URL in a new tab and optionally pin subsequent tool calls to it.",
+    params: { url: "https://example.com", active: true },
   },
   {
     name: "press_key",
@@ -3752,8 +3848,10 @@ function buildCliAgentPrompt({
     `Rules:\n` +
     `- Do not run shell commands, terminal commands, or CLI tools. Return only the JSON decision for AutoDOM to execute.\n` +
     `- For browser actions, call tools. Never ask the user to run /dom, /click, /nav, paste DOM output, or manually click/type when a tool can do it.\n` +
-    `- When 2+ next browser steps are known, prefer batch_actions so AutoDOM can execute them without another AI round-trip.\n` +
-    `- For multi-step tasks, call get_dom_state first, then click/type/wait as needed.\n` +
+    `- Perception order: use get_dom_state for indexes, take_snapshot for role/accessibility structure, then deep_query/list_iframes/list_shadow_roots/list_popups/list_tabs if the target is hidden or in another browser surface.\n` +
+    `- For multi-step tasks, observe first, identify the target by text/role/index/selector/state, then click/type/wait as needed.\n` +
+    `- When 2+ next browser steps are known, prefer batch_actions so AutoDOM can execute them without another AI round-trip; include waits/verification when the page may re-render.\n` +
+    `- After actions, verify with wait_for_network_idle, wait_for_text, check_element_state, get_page_info, get_dom_state, or take_snapshot before claiming success.\n` +
     `- For "create a lead", open/navigate to Leads and the create form if possible. If required lead values are missing, stop and ask for those values; do not invent data or save/submit a record with missing user-provided details.\n` +
     `- If a tool fails, replan using the result instead of repeating the same failed call.\n\n` +
     `Tool observations:\n${observationText}\n` +
@@ -3792,8 +3890,11 @@ async function callCliBrowserAgent({
       "navigate",
       "scroll",
       "wait_for_element",
+      "wait_for_text",
+      "wait_for_network_idle",
       "select_option",
       "press_key",
+      "handle_dialog",
     ]);
     const MAX_PASSES = 5;
     const MAX_REPAIRS_PER_PASS = 2;
@@ -3834,9 +3935,9 @@ async function callCliBrowserAgent({
           `Output ONLY a single JSON object (no prose, no markdown fences) of shape:\n` +
           `{"done":<bool>,"steps":[{"tool":"<name>","args":{...}}]}\n\n` +
           `Set "done":true (and "steps":[]) when the user's task is fully accomplished based on the current snapshot. Otherwise list the next concrete steps.\n` +
-          `Allowed tools: click_by_index, type_by_index, navigate, scroll, wait_for_element, select_option, press_key.\n` +
+          `Allowed tools: click_by_index, type_by_index, navigate, scroll, wait_for_element, wait_for_text, wait_for_network_idle, select_option, press_key, handle_dialog.\n` +
           `Use snapshot indices (e.g. CB0, IC0) for click_by_index/type_by_index.\n` +
-          `Keep steps minimal and deterministic. Do not include get_dom_state — you already have the snapshot.\n` +
+          `Keep steps minimal and deterministic. Include waits/dialog handling when page state depends on them. Do not include get_dom_state — you already have the snapshot.\n` +
           `Do NOT repeat steps that have already been executed successfully.\n\n` +
           `Page: ${context?.title || ""} (${context?.url || ""})\n` +
           `User task: ${text}\n` +
@@ -3947,7 +4048,7 @@ async function callCliBrowserAgent({
           const repairPrompt =
             `You are AutoDOM's plan-repair agent. The previous step failed; the page may have shifted (new modal, re-rendered list, changed indices).\n` +
             `Output ONLY a JSON object: {"steps":[{"tool":"<name>","args":{...}}]}\n` +
-            `Allowed tools: click_by_index, type_by_index, navigate, scroll, wait_for_element, select_option, press_key.\n` +
+            `Allowed tools: click_by_index, type_by_index, navigate, scroll, wait_for_element, wait_for_text, wait_for_network_idle, select_option, press_key, handle_dialog.\n` +
             `Use indices from the NEW snapshot below. Return the steps needed to recover and finish this batch (do not repeat already-completed steps).\n\n` +
             `Original task: ${text}\n` +
             `Failed step: ${failedStepStr}\n` +
