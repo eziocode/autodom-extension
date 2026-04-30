@@ -25,12 +25,45 @@ import { join } from "path";
 import { promisify } from "util";
 import { randomBytes, timingSafeEqual } from "crypto";
 import {
-  listAutomationBackends,
   runAutomationScript,
   validateAutomationScript,
 } from "./automation/backends.js";
 
 const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+const DEFAULT_CLI_INSTALLS = Object.freeze({
+  claude: {
+    label: "Claude Code CLI",
+    binary: "claude",
+    npmPackage: "@anthropic-ai/claude-code",
+  },
+  codex: {
+    label: "Codex CLI",
+    binary: "codex",
+    npmPackage: "@openai/codex",
+  },
+  copilot: {
+    label: "GitHub Copilot CLI",
+    binary: "copilot",
+    npmPackage: "@github/copilot",
+  },
+});
+
+function getDefaultCliInstall(kind) {
+  const info = DEFAULT_CLI_INSTALLS[String(kind || "").toLowerCase()];
+  return info
+    ? {
+        ...info,
+        installCommand: `npm install -g ${info.npmPackage}`,
+      }
+    : null;
+}
+
+function tailInstallOutput(text, limit = 1200) {
+  const normalized = String(text || "").trim();
+  return normalized.length > limit
+    ? normalized.slice(normalized.length - limit)
+    : normalized;
+}
 
 // ─── Wire-Protocol Logger ────────────────────────────────────
 // Only enabled when AUTODOM_WIRE_LOG=1 is set, to avoid unnecessary
@@ -412,8 +445,6 @@ const TOOL_TIERS = new Map([
   ["execute_async_script", "read"],
   ["performance_analyze_insight", "read"],
   ["get_pending_chat_requests", "read"],
-  ["list_automation_backends", "read"],
-  ["validate_automation_script", "read"],
 
   // Write tools — modify page state but are generally reversible
   ["click", "write"],
@@ -440,8 +471,6 @@ const TOOL_TIERS = new Map([
   ["upload_file", "write"],
   ["performance_start_trace", "write"],
   ["performance_stop_trace", "write"],
-  ["run_browser_script", "write"],
-  ["run_automation_script", "write"],
 
   // Destructive tools — irreversible actions (navigation, form submission)
   ["navigate", "destructive"],
@@ -1322,12 +1351,19 @@ function _processWsMessage(socket, message) {
   // so the user gets immediate feedback before sending real chat messages.
   if (message.type === "CHECK_CLI_BINARY") {
     const { id, binary, kind } = message;
+    const installInfo = getDefaultCliInstall(kind);
     const send = (payload) => {
       try {
         socket.send(
           JSON.stringify({
             type: "CHECK_CLI_BINARY_RESPONSE",
             id,
+            ...(installInfo
+              ? {
+                  installCommand: installInfo.installCommand,
+                  npmPackage: installInfo.npmPackage,
+                }
+              : {}),
             ...payload,
           }),
         );
@@ -1377,8 +1413,13 @@ function _processWsMessage(socket, message) {
         ok: false,
         error:
           e.code === "ENOENT"
-            ? `Binary '${binary}' not found on PATH. Install it (e.g. npm i -g @anthropic-ai/claude-code) or use the absolute path.`
+            ? `Binary '${binary}' not found on PATH.${
+                installInfo
+                  ? ` Install it with: ${installInfo.installCommand}`
+                  : " Install it or use the absolute path."
+              }`
             : e.message,
+        notFound: e.code === "ENOENT",
       });
     });
     proc.on("close", (code) => {
@@ -1397,6 +1438,103 @@ function _processWsMessage(socket, message) {
         send({
           ok: false,
           error: `'${binary} --version' exited ${code}.${stderr ? " " + stderr.substring(0, 200) : ""}`,
+        });
+      }
+    });
+    return;
+  }
+
+  if (message.type === "INSTALL_CLI_PACKAGE") {
+    const { id, kind, npmPackage, binary } = message;
+    const installInfo = getDefaultCliInstall(kind);
+    const send = (payload) => {
+      try {
+        socket.send(
+          JSON.stringify({
+            type: "INSTALL_CLI_PACKAGE_RESPONSE",
+            id,
+            kind,
+            ...(installInfo
+              ? {
+                  binary: installInfo.binary,
+                  installCommand: installInfo.installCommand,
+                }
+              : {}),
+            ...payload,
+          }),
+        );
+      } catch (_) {}
+    };
+    if (!installInfo) {
+      send({
+        ok: false,
+        error: `No default npm package is configured for CLI kind '${kind || ""}'`,
+      });
+      return;
+    }
+    if (npmPackage !== installInfo.npmPackage || binary !== installInfo.binary) {
+      send({
+        ok: false,
+        error: "Refusing to install an unrecognized CLI package",
+      });
+      return;
+    }
+
+    const npmBinary = process.platform === "win32" ? "npm.cmd" : "npm";
+    const args = ["install", "-g", installInfo.npmPackage];
+    process.stderr.write(
+      `[AutoDOM] CLI install: ${npmBinary} ${args.join(" ")}\n`,
+    );
+    let proc;
+    try {
+      proc = spawn(npmBinary, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: process.env,
+      });
+    } catch (spawnErr) {
+      send({
+        ok: false,
+        error: `Failed to spawn npm: ${spawnErr.message}`,
+      });
+      return;
+    }
+
+    const out = [];
+    const err = [];
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { proc.kill("SIGTERM"); } catch (_) {}
+      send({
+        ok: false,
+        error: `Timed out running ${installInfo.installCommand}`,
+      });
+    }, 180000);
+    proc.stdout.on("data", (d) => out.push(d));
+    proc.stderr.on("data", (d) => err.push(d));
+    proc.on("error", (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      send({ ok: false, error: e.message });
+    });
+    proc.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const stdout = tailInstallOutput(Buffer.concat(out).toString("utf8"));
+      const stderr = tailInstallOutput(Buffer.concat(err).toString("utf8"));
+      if (code === 0) {
+        send({ ok: true, stdout, stderr });
+      } else {
+        send({
+          ok: false,
+          stdout,
+          stderr,
+          error: `${installInfo.installCommand} exited ${code}.${
+            stderr ? " " + stderr.substring(0, 240) : ""
+          }`,
         });
       }
     });
@@ -4557,94 +4695,11 @@ const server = new FastMCP({
   version: "1.0.0",
 });
 
-// ─── Local Automation Script Tools ───────────────────────────
-// Non-AI workflow: validate and run user-provided local scripts through a
-// backend registry. Playwright is the first-class backend; more backends can be
-// added in server/automation/backends.js without changing MCP tool callers.
-
-server.addTool({
-  name: "list_automation_backends",
-  description:
-    "List local automation backends available to run user-provided scripts. This does not call external AI or cloud services.",
-  parameters: z.object({}),
-  execute: async () => JSON.stringify({ backends: listAutomationBackends() }, null, 2),
-});
-
-server.addTool({
-  name: "validate_automation_script",
-  description:
-    "Validate a local automation script before execution. Accepts either a local scriptPath or inline source.",
-  parameters: z.object({
-    backend: z
-      .enum(["playwright", "node"])
-      .optional()
-      .default("playwright")
-      .describe("Automation backend"),
-    scriptPath: z
-      .string()
-      .optional()
-      .describe("Absolute or relative local path to the script"),
-    source: z.string().optional().describe("Inline script source"),
-  }),
-  execute: async (params) =>
-    JSON.stringify(validateAutomationScript(params), null, 2),
-});
-
-server.addTool({
-  name: "run_automation_script",
-  description:
-    "Run a user-provided local automation script through the selected backend. For backend='playwright', install Playwright locally and export default async function({ page, browser, context, params, log }).",
-  parameters: z.object({
-    backend: z
-      .enum(["playwright", "node"])
-      .optional()
-      .default("playwright")
-      .describe("Automation backend"),
-    scriptPath: z
-      .string()
-      .optional()
-      .describe("Absolute or relative local path to a local script"),
-    source: z.string().optional().describe("Inline script source"),
-    cwd: z.string().optional().describe("Working directory for the run"),
-    timeoutMs: z
-      .number()
-      .optional()
-      .default(60000)
-      .describe("Execution timeout in milliseconds"),
-    browser: z
-      .enum(["chromium", "firefox", "webkit"])
-      .optional()
-      .default("chromium")
-      .describe("Playwright browser launcher"),
-    headless: z.boolean().optional().default(true),
-    params: z
-      .record(z.any())
-      .optional()
-      .default({})
-      .describe("JSON parameters passed to the script"),
-  }),
-  execute: async (params) => {
-    const result = await runAutomationScript(params);
-    if (!result.ok) _logToolError("run_automation_script", result.error, params);
-    return JSON.stringify(result, null, 2);
-  },
-});
-
-server.addTool({
-  name: "run_browser_script",
-  description:
-    "Run JavaScript source in the active browser tab through the AutoDOM browser extension. This is browser-extension-based execution and requires no AI/cloud service.",
-  parameters: z.object({
-    source: z.string().describe("Browser JavaScript source to run in the active tab"),
-    params: z.record(z.any()).optional().default({}),
-    timeoutMs: z.number().optional().default(15000),
-  }),
-  execute: async (params) => {
-    const result = await callExtensionTool("run_browser_script", params);
-    if (result?.error) _logToolError("run_browser_script", result.error, params);
-    return JSON.stringify(result, null, 2);
-  },
-});
+// ─── Script Runner Scope ─────────────────────────────────────
+// Playwright/Node/browser-extension script runners are intentionally not
+// registered as MCP tools. The popup Script tab reaches them through
+// RUN_AUTOMATION_SCRIPT / VALIDATE_AUTOMATION_SCRIPT over WebSocket, keeping
+// IDE clients focused on interactive browser tools instead of local scripts.
 
 // ─── Token-Efficient Tools (inspired by OpenBrowser-AI) ──────
 // These tools reduce token usage by 3-6x compared to individual tool calls.

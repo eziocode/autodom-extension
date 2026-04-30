@@ -57,8 +57,6 @@
     "deep_query",
     "wait_for_network_idle",
     "get_pending_chat_requests",
-    "list_automation_backends",
-    "validate_automation_script",
     "performance_analyze_insight",
   ]);
 
@@ -70,8 +68,6 @@
     "evaluate_script",
     "execute_async_script",
     "execute_code",
-    "run_browser_script",
-    "run_automation_script",
     "set_cookie",
     "set_storage",
     "upload_file",

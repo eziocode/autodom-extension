@@ -44,6 +44,7 @@ const DOM = {
   cliPromptText: $("#cliPromptText"),
   cliPromptInstall: $("#cliPromptInstall"),
   cliPromptUseDefault: $("#cliPromptUseDefault"),
+  cliPromptInstallBtn: $("#cliPromptInstallBtn"),
   cliPromptDocsBtn: $("#cliPromptDocsBtn"),
   rateLimitToggle: $("#rateLimitToggle"),
   rateLimitMax: $("#rateLimitMax"),
@@ -309,18 +310,21 @@ const CLI_KIND_INFO = {
   claude: {
     label: "Claude Code CLI",
     binary: "claude",
+    npmPackage: "@anthropic-ai/claude-code",
     install: "npm install -g @anthropic-ai/claude-code",
     docsUrl: "https://docs.anthropic.com/en/docs/claude-code/quickstart",
   },
   codex: {
     label: "Codex CLI",
     binary: "codex",
+    npmPackage: "@openai/codex",
     install: "npm install -g @openai/codex",
     docsUrl: "https://github.com/openai/codex",
   },
   copilot: {
     label: "GitHub Copilot CLI",
     binary: "copilot",
+    npmPackage: "@github/copilot",
     install: "npm install -g @github/copilot",
     docsUrl: "https://docs.github.com/en/copilot/github-copilot-in-the-cli",
     authHint:
@@ -333,6 +337,11 @@ const CLI_KIND_INFO = {
     docsUrl: "",
   },
 };
+
+function getCliKindInfo(kind) {
+  return CLI_KIND_INFO[kind] || CLI_KIND_INFO.claude;
+}
+
 let activityLogs = [];
 let activityFilter = "all";
 
@@ -749,7 +758,7 @@ const _secretAreaName =
       //   • Otherwise the user has typed a custom path/binary — leave
       //     it alone so we don't clobber their override.
       const kind = DOM.providerCliKind.value || "claude";
-      const info = CLI_KIND_INFO[kind] || CLI_KIND_INFO.claude;
+      const info = getCliKindInfo(kind);
       const knownDefaults = Object.values(CLI_KIND_INFO)
         .map((i) => (i.binary || "").trim())
         .filter(Boolean);
@@ -773,7 +782,7 @@ const _secretAreaName =
   if (DOM.cliPromptUseDefault) {
     DOM.cliPromptUseDefault.addEventListener("click", () => {
       const kind = DOM.providerCliKind?.value || "claude";
-      const info = CLI_KIND_INFO[kind] || CLI_KIND_INFO.claude;
+      const info = getCliKindInfo(kind);
       if (!info.binary) {
         updateProviderUI(
           "Custom CLI has no default — enter the binary name or absolute path.",
@@ -788,10 +797,14 @@ const _secretAreaName =
     });
   }
 
+  if (DOM.cliPromptInstallBtn) {
+    DOM.cliPromptInstallBtn.addEventListener("click", installDefaultCliPackage);
+  }
+
   if (DOM.cliPromptDocsBtn) {
     DOM.cliPromptDocsBtn.addEventListener("click", () => {
       const kind = DOM.providerCliKind?.value || "claude";
-      const info = CLI_KIND_INFO[kind] || CLI_KIND_INFO.claude;
+      const info = getCliKindInfo(kind);
       if (info.docsUrl) {
         chrome.tabs.create({ url: info.docsUrl });
       }
@@ -1476,10 +1489,65 @@ function _resetPresetIfManualEdit() {
 // user can verify the chosen CLI is installed and reachable on PATH
 // before sending real chat messages. Requires the MCP bridge to be
 // connected (CLI execution itself happens server-side).
+async function installDefaultCliPackage() {
+  const kind = DOM.providerCliKind?.value || "claude";
+  const info = getCliKindInfo(kind);
+  if (!info.npmPackage || !info.binary) {
+    updateProviderUI(
+      "Custom CLI has no default npm package — install it manually and enter the binary.",
+    );
+    return;
+  }
+
+  const installCommand = info.install || `npm install -g ${info.npmPackage}`;
+  const approved = window.confirm(
+    `Install ${info.label}?\n\nThis will run on the local AutoDOM bridge host:\n${installCommand}\n\nContinue?`,
+  );
+  if (!approved) {
+    updateProviderUI("CLI install cancelled.");
+    return;
+  }
+
+  if (DOM.providerCliBinary && !DOM.providerCliBinary.value.trim()) {
+    DOM.providerCliBinary.value = info.binary;
+  }
+  await saveProviderSettings({ skipTest: true });
+
+  if (DOM.cliPromptInstallBtn) DOM.cliPromptInstallBtn.disabled = true;
+  if (DOM.checkCliBtn) DOM.checkCliBtn.disabled = true;
+  DOM.providerStatus.textContent = `Installing ${info.label} with npm…`;
+  addLog(`Installing ${info.label}: ${installCommand}`, "info");
+
+  try {
+    const response = await sendRuntimeMessage({
+      type: "INSTALL_CLI_PACKAGE",
+      kind,
+      binary: info.binary,
+      npmPackage: info.npmPackage,
+    });
+    if (response?.ok) {
+      DOM.providerStatus.textContent = `✓ Installed ${info.label}. Checking CLI…`;
+      addLog(`Installed ${info.label}: ${installCommand}`, "success");
+      await checkCliBinary();
+    } else {
+      const err = response?.error || "CLI install failed";
+      DOM.providerStatus.textContent = `✕ ${err.substring(0, 120)}`;
+      addLog(`CLI install failed: ${err}`, "error");
+    }
+  } catch (err) {
+    DOM.providerStatus.textContent = `✕ ${err.message || err}`;
+    addLog(`CLI install error: ${err.message || err}`, "error");
+  } finally {
+    if (DOM.cliPromptInstallBtn) DOM.cliPromptInstallBtn.disabled = false;
+    if (DOM.checkCliBtn) DOM.checkCliBtn.disabled = false;
+  }
+}
+
 async function checkCliBinary() {
   if (!DOM.checkCliBtn) return;
   const binary = (DOM.providerCliBinary?.value || "").trim();
   const kind = DOM.providerCliKind?.value || "claude";
+  const info = getCliKindInfo(kind);
   if (!binary) {
     DOM.providerStatus.textContent = "Set a CLI binary first (e.g. claude).";
     return;
@@ -1498,8 +1566,16 @@ async function checkCliBinary() {
       addLog(`CLI ready: ${binary} (${ver.substring(0, 60)})`, "success");
     } else {
       const err = response?.error || "CLI check failed";
-      DOM.providerStatus.textContent = `✕ ${err.substring(0, 100)}`;
-      addLog(`CLI check failed: ${err}`, "error");
+      const installHint =
+        response?.installCommand || (response?.notFound ? info.install : "");
+      DOM.providerStatus.textContent = `✕ ${err.substring(0, 100)}${
+        installHint ? " Use Install with npm below." : ""
+      }`;
+      addLog(
+        `CLI check failed: ${err}${installHint ? ` · ${installHint}` : ""}`,
+        "error",
+      );
+      renderCliPrompt();
     }
   } catch (err) {
     DOM.providerStatus.textContent = `✕ ${err.message || err}`;
@@ -1834,12 +1910,14 @@ function renderCliPrompt() {
     return;
   }
   const kind = DOM.providerCliKind?.value || providerSettings.cliKind || "claude";
-  const info = CLI_KIND_INFO[kind] || CLI_KIND_INFO.claude;
+  const info = getCliKindInfo(kind);
   const currentBinary = (DOM.providerCliBinary?.value || "").trim();
+  const isDefaultBinary = !!info.binary && currentBinary === info.binary;
 
-  // If the user already supplied a binary, the prompt becomes redundant —
-  // hide it to keep the popup compact.
-  if (currentBinary) {
+  // If the user supplied a custom binary/path, the default npm package prompt
+  // may be misleading. Keep it visible for empty/default binaries so missing
+  // npm-installed CLIs are still discoverable from the settings UI.
+  if (currentBinary && !isDefaultBinary) {
     DOM.cliPromptBox.style.display = "none";
     return;
   }
@@ -1847,7 +1925,9 @@ function renderCliPrompt() {
   DOM.cliPromptBox.style.display = "";
   if (DOM.cliPromptText) {
     const base = info.binary
-      ? `${info.label} not configured. Default binary: '${info.binary}'. If it isn't on your $PATH yet, install it:`
+      ? currentBinary
+        ? `${info.label} is set to default binary '${info.binary}'. If it is missing on PATH, install its npm package:`
+        : `${info.label} not configured. Default binary: '${info.binary}'. Install it with npm or use the default binary:`
       : `${info.label} selected — enter the binary name or absolute path above.`;
     DOM.cliPromptText.textContent = info.authHint
       ? `${base}\nAuth: ${info.authHint}`
@@ -1855,9 +1935,15 @@ function renderCliPrompt() {
   }
   if (DOM.cliPromptInstall) {
     DOM.cliPromptInstall.textContent = info.install;
+    DOM.cliPromptInstall.style.display = info.install ? "" : "none";
   }
   if (DOM.cliPromptUseDefault) {
-    DOM.cliPromptUseDefault.style.display = info.binary ? "" : "none";
+    DOM.cliPromptUseDefault.style.display =
+      info.binary && currentBinary !== info.binary ? "" : "none";
+  }
+  if (DOM.cliPromptInstallBtn) {
+    DOM.cliPromptInstallBtn.style.display =
+      info.npmPackage && info.binary ? "" : "none";
   }
   if (DOM.cliPromptDocsBtn) {
     DOM.cliPromptDocsBtn.style.display = info.docsUrl ? "" : "none";
@@ -2011,7 +2097,7 @@ function updateProviderUI(statusOverride) {
   // Sensible defaults for CLI inputs the first time the user picks "cli"
   if (isCli && DOM.providerCliBinary && !DOM.providerCliBinary.value) {
     const kindKey = DOM.providerCliKind?.value || providerSettings.cliKind || "claude";
-    const info = CLI_KIND_INFO[kindKey] || CLI_KIND_INFO.claude;
+    const info = getCliKindInfo(kindKey);
     DOM.providerCliBinary.value =
       providerSettings.cliBinary || info.binary || "";
   }

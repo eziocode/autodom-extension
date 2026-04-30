@@ -2363,6 +2363,26 @@ function connectWebSocket(port) {
               ok: !!message.ok,
               version: message.version || "",
               error: message.error || null,
+              notFound: message.notFound === true,
+              installCommand: message.installCommand || "",
+              npmPackage: message.npmPackage || "",
+            });
+          }
+          return;
+        }
+
+        if (message.type === "INSTALL_CLI_PACKAGE_RESPONSE") {
+          const pending = pendingCliInstalls.get(message.id);
+          if (pending) {
+            pendingCliInstalls.delete(message.id);
+            pending.resolve({
+              ok: !!message.ok,
+              error: message.error || null,
+              stdout: message.stdout || "",
+              stderr: message.stderr || "",
+              installCommand: message.installCommand || "",
+              binary: message.binary || "",
+              kind: message.kind || "",
             });
           }
           return;
@@ -2931,6 +2951,53 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: err.message });
     }
     return true; // async
+  }
+
+  if (message.type === "INSTALL_CLI_PACKAGE") {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      sendResponse({
+        ok: false,
+        error:
+          "MCP bridge not connected. Click 'Connect / Start MCP' first — npm install runs in the local bridge process.",
+      });
+      return false;
+    }
+    const kind = (message.kind || "").trim();
+    const binary = (message.binary || "").trim();
+    const npmPackage = (message.npmPackage || "").trim();
+    if (!kind || !binary || !npmPackage) {
+      sendResponse({ ok: false, error: "Missing CLI install metadata" });
+      return false;
+    }
+    const id = ++cliInstallIdCounter;
+    const timer = setTimeout(() => {
+      if (pendingCliInstalls.has(id)) {
+        pendingCliInstalls.delete(id);
+        sendResponse({ ok: false, error: "Bridge did not finish npm install in time" });
+      }
+    }, 180000);
+    pendingCliInstalls.set(id, {
+      resolve: (r) => {
+        clearTimeout(timer);
+        sendResponse(r);
+      },
+    });
+    try {
+      ws.send(
+        JSON.stringify({
+          type: "INSTALL_CLI_PACKAGE",
+          id,
+          kind,
+          binary,
+          npmPackage,
+        }),
+      );
+    } catch (err) {
+      pendingCliInstalls.delete(id);
+      clearTimeout(timer);
+      sendResponse({ ok: false, error: err.message });
+    }
+    return true;
   }
 
   // ── ActionGate messages ─────────────────────────────────────
@@ -3986,6 +4053,8 @@ function refreshAiRequestActivity() {
 // Pending CLI presence-check requests (popup → SW → bridge → spawn → back)
 const pendingCliChecks = new Map();
 let cliCheckIdCounter = 0;
+const pendingCliInstalls = new Map();
+let cliInstallIdCounter = 0;
 const pendingAutomationRuns = new Map();
 let automationRunIdCounter = 0;
 const pendingAutomationValidations = new Map();
@@ -4101,7 +4170,6 @@ const TOOL_HANDLERS = new Map([
   ["performance_analyze_insight", toolPerformanceAnalyzeInsight],
   // ─── Token-Efficient Tools ─────────────────────────────────
   ["execute_code", toolExecuteCode],
-  ["run_browser_script", toolRunBrowserScript],
   ["get_dom_state", toolGetDomState],
   ["batch_actions", toolBatchActions],
   ["click_by_index", toolClickByIndex],
