@@ -15,7 +15,9 @@
     "cookies",
     "clipboardWrite",
     "webNavigation",
-    "sidePanel"
+    "sidePanel",
+    "downloads",
+    "offscreen"
   ],
   "host_permissions": [
     "<all_urls>"

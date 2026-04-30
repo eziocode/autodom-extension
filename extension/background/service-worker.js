@@ -43,6 +43,8 @@ const UPDATE_CHECK_INTERVAL_MINUTES = 30;
 const UPDATE_CHECK_INTERVAL_MS = UPDATE_CHECK_INTERVAL_MINUTES * 60 * 1000;
 const UPDATE_MANIFEST_FETCH_TIMEOUT_MS = 8000;
 const AUTO_UPDATE_RELOAD_COOLDOWN_MS = 10 * 60 * 1000;
+const OFFSCREEN_KEEPALIVE_STORAGE_KEY = "autodomOffscreenKeepaliveEnabled";
+const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const UPDATE_STORAGE_KEYS = {
   pending: "pendingUpdate",
   lastCheckAt: "autodomLastUpdateCheckAt",
@@ -52,6 +54,7 @@ const UPDATE_STORAGE_KEYS = {
   autoUpdateApplyAttemptAt: "autodomAutoUpdateApplyAttemptAt",
 };
 let _updateCheckInFlight = null;
+let _offscreenEnsureInFlight = null;
 const activityStorage = (() => {
   try {
     return chrome.storage.session || chrome.storage.local;
@@ -77,6 +80,124 @@ const _secretStorageIsSession =
   chrome.storage &&
   chrome.storage.session &&
   secretStorage === chrome.storage.session;
+
+function _supportsOffscreenKeepalive() {
+  return !!(
+    chrome &&
+    chrome.offscreen &&
+    typeof chrome.offscreen.createDocument === "function" &&
+    typeof chrome.offscreen.closeDocument === "function" &&
+    chrome.runtime &&
+    typeof chrome.runtime.getURL === "function"
+  );
+}
+
+function _isOffscreenKeepaliveEnabled() {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get([OFFSCREEN_KEEPALIVE_STORAGE_KEY], (result) => {
+        const stored = _storageResult(result, "offscreen keepalive setting");
+        resolve(stored[OFFSCREEN_KEEPALIVE_STORAGE_KEY] === true);
+      });
+    } catch (_) {
+      resolve(false);
+    }
+  });
+}
+
+async function _hasOffscreenDocumentOpen() {
+  if (
+    !self.clients ||
+    typeof self.clients.matchAll !== "function" ||
+    !chrome.runtime?.getURL
+  ) {
+    return false;
+  }
+  const offscreenUrl = chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH);
+  try {
+    const clients = await self.clients.matchAll({
+      includeUncontrolled: true,
+      type: "window",
+    });
+    return clients.some((client) => client.url === offscreenUrl);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function _ensureOffscreenKeepalive(reason = "unknown") {
+  if (!_supportsOffscreenKeepalive()) return false;
+  if (_offscreenEnsureInFlight) return _offscreenEnsureInFlight;
+
+  _offscreenEnsureInFlight = (async () => {
+    const enabled = await _isOffscreenKeepaliveEnabled();
+    if (!enabled) return false;
+    if (await _hasOffscreenDocumentOpen()) return true;
+
+    const workerReason = chrome.offscreen?.Reason?.WORKERS;
+    if (!workerReason) {
+      _debugWarn(
+        "[AutoDOM SW] Offscreen keepalive unavailable: missing WORKERS reason enum",
+      );
+      return false;
+    }
+
+    try {
+      await chrome.offscreen.createDocument({
+        url: OFFSCREEN_DOCUMENT_PATH,
+        reasons: [workerReason],
+        justification:
+          "Keep the MV3 service worker warm for active MCP automation sessions.",
+      });
+      _debugLog("[AutoDOM SW] Offscreen keepalive document created:", reason);
+      return true;
+    } catch (err) {
+      const msg = String(err?.message || err || "");
+      if (
+        msg.includes("Only a single offscreen document") ||
+        msg.includes("already exists")
+      ) {
+        return true;
+      }
+      _debugWarn(
+        "[AutoDOM SW] Failed to create offscreen keepalive document:",
+        msg,
+      );
+      return false;
+    }
+  })();
+
+  try {
+    return await _offscreenEnsureInFlight;
+  } finally {
+    _offscreenEnsureInFlight = null;
+  }
+}
+
+async function _closeOffscreenKeepalive(reason = "unknown") {
+  if (!_supportsOffscreenKeepalive()) return false;
+  try {
+    if (!(await _hasOffscreenDocumentOpen())) return true;
+    await chrome.offscreen.closeDocument();
+    _debugLog("[AutoDOM SW] Offscreen keepalive document closed:", reason);
+    return true;
+  } catch (err) {
+    const msg = String(err?.message || err || "");
+    if (msg.includes("No current offscreen document")) return true;
+    _debugWarn("[AutoDOM SW] Failed to close offscreen document:", msg);
+    return false;
+  }
+}
+
+async function _syncOffscreenKeepalive(reason = "sync") {
+  try {
+    if (shouldRunMcp) {
+      await _ensureOffscreenKeepalive(reason);
+    } else {
+      await _closeOffscreenKeepalive(reason);
+    }
+  } catch (_) {}
+}
 
 function _storageResult(result, context) {
   let runtimeError = "";
@@ -508,7 +629,6 @@ function _modelLooksCompatibleWithSettings(model, settings) {
   if (!id) return false;
   const source = (settings?.source || "").toLowerCase();
   const base = _normalizedProviderBaseUrl(settings?.baseUrl);
-  const cliKind = (settings?.cliKind || "").toLowerCase();
   const d = id.toLowerCase();
 
   if (source === "anthropic" || source === "claude") {
@@ -528,13 +648,7 @@ function _modelLooksCompatibleWithSettings(model, settings) {
   if (source === "ollama") {
     return !d.startsWith("claude") && !/^(gpt-(?:3|4|5)|o\d|chatgpt|text-)/.test(d);
   }
-  if (source === "cli") {
-    if (cliKind === "claude") return d.startsWith("claude");
-    if (cliKind === "codex") return /^(gpt|o\d)/.test(d);
-    if (cliKind === "copilot") return /^(gpt|claude)/.test(d);
-    return false;
-  }
-  if (source === "ide") return false;
+  if (source === "cli" || source === "ide") return false;
   return true;
 }
 
@@ -3152,6 +3266,7 @@ function connectWebSocket(port) {
         _sessionTimedOut = false;
         shouldRunMcp = false;
         stopAutoConnect();
+        void _syncOffscreenKeepalive("session_timeout");
         broadcastStatus(false, "Session timed out due to inactivity", "warn");
         broadcastToAllTabs([
           { type: "HIDE_SESSION_BORDER" },
@@ -3318,6 +3433,11 @@ function stopKeepAlive() {
 // ─── Message Handler from Popup ──────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "SW_KEEPALIVE") {
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (message.type !== "USER_ACTION") {
     _debugLog(
       "[AutoDOM SW] onMessage:",
@@ -3431,6 +3551,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     _startupRestoreOnly = false;
     _sessionTimedOut = false; // Clear timeout flag on fresh start
     chrome.storage.local.set({ mcpPort: port, mcpRunning: true });
+    void _syncOffscreenKeepalive("start_mcp");
 
     // Connect to the WebSocket server (started by IDE or manually)
     connectWebSocket(port);
@@ -3691,6 +3812,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     autoConnectFallbackTried = false;
     stopAutoConnect();
     chrome.storage.local.set({ autoConnect: false, mcpRunning: false });
+    void _syncOffscreenKeepalive("stop_mcp");
     disconnectWebSocket();
     sendResponse({ success: true });
     return false;
@@ -3720,6 +3842,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         chrome.storage.local.set({ mcpRunning: false });
       }
     }
+    void _syncOffscreenKeepalive("set_auto_connect");
     sendResponse({ success: true });
     return false;
   }
@@ -3766,7 +3889,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     aiProviderSettings = {
       source: incomingProvider.source || "ide",
       apiKey: incomingProvider.apiKey || "",
-      model: incomingProvider.model || "",
+      model:
+        incomingProvider.source === "cli" || incomingProvider.source === "ide"
+          ? ""
+          : incomingProvider.model || "",
       baseUrl: incomingProvider.baseUrl || "",
       // ── Local CLI provider settings (passed through to bridge) ──
       cliBinary: incomingProvider.cliBinary || "",
@@ -4270,12 +4396,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         cliBinary: aiProviderSettings.cliBinary || "",
         cliKind: aiProviderSettings.cliKind || "",
         cliExtraArgs: aiProviderSettings.cliExtraArgs || "",
-        // Forward the model picker selection so CLI/IDE providers honour
-        // the dropdown instead of silently using their built-in default.
+        // CLI providers own their model choice; passing a stale UI model
+        // here makes CLIs fail with "model from --model flag is not available".
+        // Direct providers use their provider-specific model fields instead.
         cliModel:
-          (message.model || "").trim() ||
-          (aiProviderSettings.model || "").trim() ||
-          "",
+          aiProviderSettings.source === "cli" ||
+          aiProviderSettings.source === "ide"
+            ? ""
+            : (message.model || "").trim() ||
+              (aiProviderSettings.model || "").trim() ||
+              "",
         // Reply-style selection from the chat panel (concise|jetbrains|chatbar).
         // The bridge appends the matching instruction to its system prompt.
         responseStyle: responseStyle || "concise",
@@ -6650,23 +6780,13 @@ chrome.storage.local.get(
       preset: stored.aiProviderPreset || "custom",
     };
 
-    // One-shot migration (mirrors popup.js): older builds auto-filled a
-    // hardcoded model for CLI providers. We no longer hardcode — let the
-    // CLI use its own configured default. Drop legacy values so we omit
-    // --model at runtime.
-    const _LEGACY_CLI_MODELS = new Set([
-      "gpt-5",
-      "gpt-5-codex",
-      "claude-sonnet-4-6",
-      "claude-haiku-4-5-20251001",
-      "claude-opus-4-7",
-      "claude-sonnet-4.5",
-      "o4-mini",
-    ]);
+    // One-shot migration (mirrors popup.js): CLI/IDE providers should not
+    // persist a model in the shared provider field. A stale value from a
+    // previous direct provider can otherwise become an invalid --model flag.
     if (
       (aiProviderSettings.source === "cli" ||
         aiProviderSettings.source === "ide") &&
-      _LEGACY_CLI_MODELS.has(aiProviderSettings.model)
+      aiProviderSettings.model
     ) {
       aiProviderSettings.model = "";
       try {
@@ -6704,6 +6824,7 @@ chrome.storage.local.get(
     } else {
       stopAutoConnect();
     }
+    void _syncOffscreenKeepalive("startup_restore");
   },
 );
 
@@ -6763,6 +6884,7 @@ chrome.runtime.onInstalled.addListener(() => {
       } else {
         stopAutoConnect();
       }
+      void _syncOffscreenKeepalive("installed_restore");
     },
   );
 });
@@ -7166,6 +7288,7 @@ try {
     chrome.runtime.onStartup.addListener(() => {
       _ensureUpdateCheckAlarm();
       _runExtensionUpdateCheck({ source: "browser_startup" });
+      void _syncOffscreenKeepalive("browser_startup");
     });
   }
   if (chrome.alarms && chrome.alarms.onAlarm) {
@@ -7214,6 +7337,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           await _runExtensionUpdateCheck({ source: "auto_update_enabled" });
         }
       }
+      sendResponse({ ok: true, enabled });
+    })();
+    return true;
+  }
+  if (msg && msg.type === "AUTODOM_SET_OFFSCREEN_KEEPALIVE") {
+    (async () => {
+      const enabled = msg.enabled === true;
+      try {
+        chrome.storage.local.set({ [OFFSCREEN_KEEPALIVE_STORAGE_KEY]: enabled });
+      } catch (_) {}
+      await _syncOffscreenKeepalive("manual_toggle");
       sendResponse({ ok: true, enabled });
     })();
     return true;

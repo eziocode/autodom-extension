@@ -355,6 +355,11 @@
     return src;
   }
 
+  function _isCliModelProvider() {
+    const src = _modelPickerState.providerSource;
+    return src === "ide" || src === "cli";
+  }
+
   function _catalogKey() {
     const key = _catalogBaseKey();
     if ((key === "openai" || key === "ollama") && _modelPickerState.baseUrl) {
@@ -388,6 +393,7 @@
   }
 
   function _currentModelId() {
+    if (_isCliModelProvider()) return "";
     const key = _catalogKey();
     const baseKey = _catalogBaseKey();
     const override =
@@ -399,6 +405,7 @@
   }
 
   function _modelsForCurrentProvider() {
+    if (_isCliModelProvider()) return [];
     const key = _catalogKey();
     const baseKey = _catalogBaseKey();
     const live = _liveModels[key];
@@ -440,12 +447,11 @@
       if (/dashscope|aliyuncs/.test(base)) return /^(qwen|qwq)/.test(d);
       return true;
     }
-    if (key === "anthropic" || key === "ide:claude") return d.startsWith("claude");
+    if (key === "anthropic") return d.startsWith("claude");
     if (key === "ollama") {
       return !d.startsWith("claude") && !/^(gpt-(?:3|4|5)|o\d|chatgpt|text-)/.test(d);
     }
-    if (key === "ide:copilot") return /^(gpt|claude)/.test(d);
-    if (key === "ide:codex") return /^(gpt|o\d)/.test(d);
+    if (key.startsWith("ide:")) return false;
     return true; // unknown key → don't filter
   }
 
@@ -560,11 +566,11 @@
     try { _refreshModelPickerUI(); } catch (_) {}
   }
 
-  // When the bridge tells us which model the underlying CLI actually ran
-  // with (claude --output-format json), update the picker so it reflects
-  // reality. Otherwise the dropdown keeps showing the user's selection
-  // even when the CLI silently ignored --model and used its own default.
+  // When a direct provider reports the actual model used, update the picker
+  // so it reflects reality. CLI bridges are intentionally ignored here:
+  // persisting their model can later become an invalid --model flag.
   function _reconcileActualModel(actualId) {
+    if (_isCliModelProvider()) return;
     if (!actualId || typeof actualId !== "string") return;
     const id = actualId.trim();
     if (!id) return;

@@ -516,6 +516,18 @@ const directProviderConfig = {
   cliTimeoutMs: Number(process.env.AUTODOM_CLI_TIMEOUT_MS || 90000),
 };
 
+const LEGACY_CLI_MODEL_DEFAULTS = new Set([
+  "gpt-4.1-mini",
+  "gpt-4.1",
+  "gpt-5",
+  "gpt-5-codex",
+  "claude-sonnet-4-6",
+  "claude-haiku-4-5-20251001",
+  "claude-opus-4-7",
+  "claude-sonnet-4.5",
+  "o4-mini",
+]);
+
 // ─── WebSocket Message Batching ──────────────────────────────
 // When multiple tool calls arrive in rapid succession (e.g. batch_actions
 // dispatching sequentially, or parallel IDE requests), we micro-batch
@@ -4715,9 +4727,14 @@ async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta }) 
     .trim()
     .split(/\s+/)
     .filter(Boolean);
-  const pickedModel = (providerConfig.cliModel || "").trim();
-  const modelArgs = pickedModel ? ["--model", pickedModel] : [];
   const userArgsJoined = " " + extraArgs.join(" ") + " ";
+  const configuredModel = (providerConfig.cliModel || "").trim();
+  const pickedModel = LEGACY_CLI_MODEL_DEFAULTS.has(configuredModel)
+    ? ""
+    : configuredModel;
+  const userPickedModelArg = /\s--model(\s|=)/.test(userArgsJoined);
+  const modelArgs =
+    pickedModel && !userPickedModelArg ? ["--model", pickedModel] : [];
   const userPickedJsonOutput =
     /\s--output-format(\s|=)/.test(userArgsJoined) ||
     /\s--json(\s|$)/.test(userArgsJoined);
