@@ -25,6 +25,7 @@ const DOM = {
   logClear: $("#logClear"),
   connectBtn: $("#connectBtn"),
   autoConnectToggle: $("#autoConnectToggle"),
+  autoUpdateToggle: $("#autoUpdateToggle"),
   aiChatBtn: $("#aiChatBtn"),
   providerSelect: $("#providerSelect"),
   providerApiKey: $("#providerApiKey"),
@@ -65,6 +66,7 @@ let isConnected = false;
 
 const REFRESH_GLYPH = "↻";
 const UPDATE_LABEL = "Update";
+const AUTO_UPDATE_STORAGE_KEY = "autodomAutoUpdateEnabled";
 
 // Render the ↻ button in either its idle (refresh) state or its
 // "update available" CTA state. Driven by chrome.storage.local.pendingUpdate
@@ -171,56 +173,34 @@ async function runUpdateCheck() {
   versionEl.textContent = "checking…";
 
   try {
-    const api =
-      (typeof browser !== "undefined" && browser.runtime && browser.runtime.requestUpdateCheck)
-        ? browser.runtime
-        : chrome.runtime;
-
-    if (!api || typeof api.requestUpdateCheck !== "function") {
-      setLabel("not supported");
+    const result = await sendRuntimeMessage({
+      type: "AUTODOM_CHECK_FOR_UPDATE",
+      force: true,
+      source: "popup_manual",
+    });
+    if (result?.error || result?.ok === false || result?.success === false) {
+      setLabel(`error: ${(result && result.error) || "check failed"}`.slice(0, 40));
       return;
     }
 
-    const result = await new Promise((resolve, reject) => {
-      try {
-        const ret = api.requestUpdateCheck((status, details) => {
-          if (chrome.runtime.lastError) {
-            reject(chrome.runtime.lastError);
-          } else {
-            resolve({ status, details });
-          }
-        });
-        // Firefox returns a Promise instead of using a callback.
-        if (ret && typeof ret.then === "function") {
-          ret.then(
-            (r) => resolve(Array.isArray(r) ? { status: r[0], details: r[1] } : r),
-            reject
-          );
-        }
-      } catch (err) {
-        reject(err);
-      }
-    });
-
     const status = (result && result.status) || "unknown";
     if (status === "update_available") {
-      const v = (result.details && result.details.version) || null;
-      // Tell the SW so it persists the flag and badges the toolbar icon —
-      // no-op if the SW already heard onUpdateAvailable independently.
-      try {
-        await chrome.runtime.sendMessage({
-          type: "AUTODOM_UPDATE_AVAILABLE",
-          version: v,
-        });
-      } catch (_) {}
+      const v =
+        (result.pendingUpdate && result.pendingUpdate.version) ||
+        (result.details && result.details.version) ||
+        "?";
       btn.classList.remove("spin");
       btn.disabled = false;
-      paintUpdateButton({ version: v || "?" });
+      paintUpdateButton({ version: v });
       return;
     } else if (status === "no_update") {
       setLabel("up to date");
     } else if (status === "throttled") {
       setLabel("rate-limited");
+    } else if (status === "skipped" && result.reason === "not_due") {
+      setLabel("checked recently");
+    } else if (status === "unsupported") {
+      setLabel("not supported");
     } else {
       setLabel(String(status));
     }
@@ -229,6 +209,24 @@ async function runUpdateCheck() {
   } finally {
     btn.classList.remove("spin");
     btn.disabled = false;
+  }
+}
+
+async function requestDueUpdateCheck(source) {
+  try {
+    const result = await sendRuntimeMessage({
+      type: "AUTODOM_CHECK_FOR_UPDATE",
+      force: false,
+      source,
+    });
+    if (result?.pendingUpdate) {
+      paintUpdateButton(result.pendingUpdate);
+    }
+  } catch (err) {
+    console.warn(
+      "[AutoDOM Popup] Background update check failed:",
+      err?.message || err,
+    );
   }
 }
 
@@ -388,6 +386,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         paintUpdateButton(changes.pendingUpdate.newValue || null);
       });
     } catch (_) {}
+    requestDueUpdateCheck("popup_open");
   }
 
 // API keys live in chrome.storage.session (RAM-only). Falls back to local
@@ -403,6 +402,7 @@ const _secretAreaName =
     "mcpPort",
     "serverPath",
     "autoConnect",
+    AUTO_UPDATE_STORAGE_KEY,
     "aiProviderSource",
     "aiProviderApiKey",
     "aiProviderModel",
@@ -431,6 +431,7 @@ const _secretAreaName =
   const port = stored.mcpPort || 9876;
   const serverPath = stored.serverPath || null;
   const autoConnect = stored.autoConnect === true;
+  const autoUpdate = stored[AUTO_UPDATE_STORAGE_KEY] === true;
 
   providerSettings = {
     source: stored.aiProviderSource || "ide",
@@ -470,6 +471,7 @@ const _secretAreaName =
 
   DOM.portInput.value = port;
   DOM.autoConnectToggle.checked = autoConnect;
+  if (DOM.autoUpdateToggle) DOM.autoUpdateToggle.checked = autoUpdate;
   if (DOM.providerSelect) DOM.providerSelect.value = providerSettings.source;
   if (DOM.providerApiKey) DOM.providerApiKey.value = providerSettings.apiKey;
   if (DOM.providerModel) DOM.providerModel.value = providerSettings.model;
@@ -599,6 +601,30 @@ const _secretAreaName =
     }
   });
 
+  if (DOM.autoUpdateToggle) {
+    DOM.autoUpdateToggle.addEventListener("change", async (e) => {
+      const enabled = e.target.checked;
+      await chrome.storage.local.set({ [AUTO_UPDATE_STORAGE_KEY]: enabled });
+      const response = await sendRuntimeMessage({
+        type: "AUTODOM_SET_AUTO_UPDATE",
+        enabled,
+      });
+      if (response?.error || response?.ok === false || response?.success === false) {
+        addLog(
+          `Failed to update auto-update: ${response?.error || "background worker unavailable"}`,
+          "error",
+        );
+        return;
+      }
+      addLog(
+        enabled
+          ? "Auto-update enabled. Pending updates will apply automatically."
+          : "Auto-update disabled. Updates will wait for manual apply.",
+        "info",
+      );
+    });
+  }
+
   // Listen for path/provider updates (both local and session areas)
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (changes.serverPath) {
@@ -610,6 +636,15 @@ const _secretAreaName =
 
     if (areaName === "local" && (changes.mcpDetectedPort || changes.mcpPort)) {
       refreshPortMismatchHint();
+    }
+
+    if (
+      areaName === "local" &&
+      changes[AUTO_UPDATE_STORAGE_KEY] &&
+      DOM.autoUpdateToggle
+    ) {
+      DOM.autoUpdateToggle.checked =
+        changes[AUTO_UPDATE_STORAGE_KEY].newValue === true;
     }
 
     if (changes[ACTIVITY_LOG_KEY]) {

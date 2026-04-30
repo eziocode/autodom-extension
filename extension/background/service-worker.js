@@ -36,6 +36,19 @@ let autoConnectFallbackTried = false;
 let _sessionTimedOut = false; // Set when server or extension inactivity timeout fires
 const ACTIVITY_LOG_KEY = "autodomActivityLogs";
 const ACTIVITY_LOG_LIMIT = 250;
+const UPDATE_CHECK_ALARM_NAME = "autodom-periodic-update-check";
+const UPDATE_CHECK_INTERVAL_MINUTES = 5 * 60;
+const UPDATE_CHECK_INTERVAL_MS = UPDATE_CHECK_INTERVAL_MINUTES * 60 * 1000;
+const AUTO_UPDATE_RELOAD_COOLDOWN_MS = 10 * 60 * 1000;
+const UPDATE_STORAGE_KEYS = {
+  pending: "pendingUpdate",
+  lastCheckAt: "autodomLastUpdateCheckAt",
+  lastCheckStatus: "autodomLastUpdateCheckStatus",
+  lastCheckSource: "autodomLastUpdateCheckSource",
+  autoUpdateEnabled: "autodomAutoUpdateEnabled",
+  autoUpdateApplyAttemptAt: "autodomAutoUpdateApplyAttemptAt",
+};
+let _updateCheckInFlight = null;
 const activityStorage = (() => {
   try {
     return chrome.storage.session || chrome.storage.local;
@@ -6067,23 +6080,39 @@ chrome.storage.local.get(
 
 // Also auto-connect on extension install/update
 chrome.runtime.onInstalled.addListener(() => {
+  _ensureUpdateCheckAlarm();
+
   // A fresh install or successful update arrival clears any pending-update
   // marker. The new manifest version is already running, so the popup
   // should drop back to its idle state.
   try {
-    chrome.storage.local.remove("pendingUpdate");
+    chrome.storage.local.remove([
+      UPDATE_STORAGE_KEYS.pending,
+      UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt,
+    ]);
     if (chrome.action && chrome.action.setBadgeText) {
       chrome.action.setBadgeText({ text: "" });
+    }
+    if (chrome.action && chrome.action.setTitle) {
+      const actionTitle =
+        chrome.runtime.getManifest()?.action?.default_title || "AutoDOM";
+      chrome.action.setTitle({ title: actionTitle });
     }
   } catch (_) {}
 
   chrome.storage.local.get(
-    ["mcpPort", "autoConnect", "mcpRunning"],
+    [
+      "mcpPort",
+      "autoConnect",
+      "mcpRunning",
+      UPDATE_STORAGE_KEYS.autoUpdateEnabled,
+    ],
     (result) => {
       const stored = _storageResult(result, "installed settings");
       const port = stored.mcpPort || 9876;
       const autoConnect =
         typeof stored.autoConnect === "boolean" ? stored.autoConnect : false;
+      const autoUpdate = stored[UPDATE_STORAGE_KEYS.autoUpdateEnabled] === true;
       const initialRunning = autoConnect;
 
       shouldRunMcp = initialRunning;
@@ -6097,6 +6126,7 @@ chrome.runtime.onInstalled.addListener(() => {
       chrome.storage.local.set({
         mcpPort: port,
         autoConnect,
+        [UPDATE_STORAGE_KEYS.autoUpdateEnabled]: autoUpdate,
         mcpRunning: initialRunning,
       });
       if (initialRunning) {
@@ -6115,13 +6145,131 @@ chrome.runtime.onInstalled.addListener(() => {
 // fact so the popup can flip the ↻ button into an "Update" affordance, and
 // we paint a small accent badge on the toolbar icon so the user notices
 // without opening the popup.
-function _setPendingUpdate(version) {
+function _readUpdateStorage(keys, context) {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(keys, (result) => {
+        resolve(_storageResult(result, context));
+      });
+    } catch (err) {
+      _debugWarn(
+        `[AutoDOM SW] ${context} storage read failed:`,
+        err?.message || err,
+      );
+      resolve({});
+    }
+  });
+}
+
+function _writeUpdateStorage(values, context) {
+  return new Promise((resolve) => {
+    try {
+      chrome.storage.local.set(values, () => {
+        let runtimeError = "";
+        try {
+          runtimeError = chrome.runtime.lastError?.message || "";
+        } catch (_) {
+          runtimeError = "";
+        }
+        if (runtimeError) {
+          _debugWarn(`[AutoDOM SW] ${context} storage write failed: ${runtimeError}`);
+          resolve(false);
+          return;
+        }
+        resolve(true);
+      });
+    } catch (err) {
+      _debugWarn(
+        `[AutoDOM SW] ${context} storage write failed:`,
+        err?.message || err,
+      );
+      resolve(false);
+    }
+  });
+}
+
+function _requestRuntimeUpdateCheck() {
+  const api =
+    typeof browser !== "undefined" &&
+    browser.runtime &&
+    typeof browser.runtime.requestUpdateCheck === "function"
+      ? browser.runtime
+      : chrome.runtime;
+
+  if (!api || typeof api.requestUpdateCheck !== "function") {
+    return Promise.resolve({ status: "unsupported", details: null });
+  }
+
+  return new Promise((resolve, reject) => {
+    try {
+      const ret = api.requestUpdateCheck((status, details) => {
+        let runtimeError = null;
+        try {
+          runtimeError = chrome.runtime.lastError || null;
+        } catch (_) {
+          runtimeError = null;
+        }
+        if (runtimeError) {
+          reject(runtimeError);
+          return;
+        }
+        resolve({ status, details });
+      });
+      if (ret && typeof ret.then === "function") {
+        ret.then(
+          (result) => {
+            resolve(
+              Array.isArray(result)
+                ? { status: result[0], details: result[1] }
+                : result,
+            );
+          },
+          reject,
+        );
+      }
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+async function _maybeAutoApplyPendingUpdate(pending, source) {
+  if (!pending || !pending.version) return false;
+  const stored = await _readUpdateStorage(
+    [
+      UPDATE_STORAGE_KEYS.autoUpdateEnabled,
+      UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt,
+    ],
+    "auto-update settings",
+  );
+  if (stored[UPDATE_STORAGE_KEYS.autoUpdateEnabled] !== true) return false;
+
+  const now = Date.now();
+  const lastAttempt = Number(stored[UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt]) || 0;
+  if (now - lastAttempt < AUTO_UPDATE_RELOAD_COOLDOWN_MS) return false;
+
+  await _writeUpdateStorage(
+    { [UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt]: now },
+    "auto-update apply marker",
+  );
+  _debugLog(
+    `[AutoDOM SW] Auto-applying pending update ${pending.version} (${source || "unknown"})`,
+  );
+  setTimeout(() => {
+    try { chrome.runtime.reload(); } catch (_) {}
+  }, 500);
+  return true;
+}
+
+async function _setPendingUpdate(version, source) {
+  const normalizedVersion = version || "?";
+  const pending = {
+    version: normalizedVersion,
+    detectedAt: Date.now(),
+  };
   try {
     chrome.storage.local.set({
-      pendingUpdate: {
-        version: version || null,
-        detectedAt: Date.now(),
-      },
+      [UPDATE_STORAGE_KEYS.pending]: pending,
     });
     if (chrome.action && chrome.action.setBadgeText) {
       chrome.action.setBadgeText({ text: "•" });
@@ -6132,18 +6280,151 @@ function _setPendingUpdate(version) {
     }
     if (chrome.action && chrome.action.setTitle) {
       chrome.action.setTitle({
-        title: version
+        title: version && version !== "?"
           ? `AutoDOM — update to v${version} ready (click)`
           : "AutoDOM — update ready (click)",
       });
     }
-  } catch (_) {}
+  } catch (err) {
+    _debugWarn("[AutoDOM SW] Failed to persist pending update:", err?.message || err);
+  }
+  await _maybeAutoApplyPendingUpdate(pending, source);
+  return pending;
+}
+
+async function _runExtensionUpdateCheck(opts = {}) {
+  if (_updateCheckInFlight) return _updateCheckInFlight;
+  _updateCheckInFlight = _runExtensionUpdateCheckNow(opts);
+  try {
+    return await _updateCheckInFlight;
+  } finally {
+    _updateCheckInFlight = null;
+  }
+}
+
+async function _runExtensionUpdateCheckNow(opts = {}) {
+  const force = opts.force === true;
+  const source = opts.source || "background";
+  const now = Date.now();
+  const stored = await _readUpdateStorage(
+    [
+      UPDATE_STORAGE_KEYS.pending,
+      UPDATE_STORAGE_KEYS.lastCheckAt,
+      UPDATE_STORAGE_KEYS.autoUpdateEnabled,
+    ],
+    "update check state",
+  );
+  const pending = stored[UPDATE_STORAGE_KEYS.pending];
+  if (pending && pending.version) {
+    await _maybeAutoApplyPendingUpdate(pending, source);
+    return {
+      ok: true,
+      status: "update_available",
+      reason: "pending",
+      pendingUpdate: pending,
+      nextCheckAt: now + UPDATE_CHECK_INTERVAL_MS,
+    };
+  }
+
+  const lastCheckAt = Number(stored[UPDATE_STORAGE_KEYS.lastCheckAt]) || 0;
+  if (!force && lastCheckAt > 0 && now - lastCheckAt < UPDATE_CHECK_INTERVAL_MS) {
+    return {
+      ok: true,
+      status: "skipped",
+      reason: "not_due",
+      lastCheckAt,
+      nextCheckAt: lastCheckAt + UPDATE_CHECK_INTERVAL_MS,
+    };
+  }
+
+  try {
+    const result = await _requestRuntimeUpdateCheck();
+    const status = (result && result.status) || "unknown";
+    const details = (result && result.details) || null;
+    const writes = {
+      [UPDATE_STORAGE_KEYS.lastCheckAt]: now,
+      [UPDATE_STORAGE_KEYS.lastCheckStatus]: status,
+      [UPDATE_STORAGE_KEYS.lastCheckSource]: source,
+    };
+    await _writeUpdateStorage(writes, "update check result");
+
+    if (status === "update_available") {
+      const pendingUpdate = await _setPendingUpdate(
+        details && details.version,
+        source,
+      );
+      return {
+        ok: true,
+        status,
+        details,
+        pendingUpdate,
+        nextCheckAt: now + UPDATE_CHECK_INTERVAL_MS,
+      };
+    }
+
+    return {
+      ok: true,
+      status,
+      details,
+      lastCheckAt: now,
+      nextCheckAt: now + UPDATE_CHECK_INTERVAL_MS,
+    };
+  } catch (err) {
+    await _writeUpdateStorage(
+      {
+        [UPDATE_STORAGE_KEYS.lastCheckAt]: now,
+        [UPDATE_STORAGE_KEYS.lastCheckStatus]: "error",
+        [UPDATE_STORAGE_KEYS.lastCheckSource]: source,
+      },
+      "update check error",
+    );
+    _debugWarn("[AutoDOM SW] Update check failed:", err?.message || err);
+    return {
+      ok: false,
+      status: "error",
+      error: err?.message || String(err),
+      lastCheckAt: now,
+      nextCheckAt: now + UPDATE_CHECK_INTERVAL_MS,
+    };
+  }
+}
+
+function _ensureUpdateCheckAlarm() {
+  try {
+    if (!chrome.alarms || typeof chrome.alarms.create !== "function") return;
+    chrome.alarms.create(UPDATE_CHECK_ALARM_NAME, {
+      delayInMinutes: 1,
+      periodInMinutes: UPDATE_CHECK_INTERVAL_MINUTES,
+    });
+  } catch (err) {
+    _debugWarn("[AutoDOM SW] Failed to schedule update checks:", err?.message || err);
+  }
 }
 
 if (chrome.runtime && chrome.runtime.onUpdateAvailable) {
   chrome.runtime.onUpdateAvailable.addListener((details) => {
-    _setPendingUpdate(details && details.version);
+    _setPendingUpdate(details && details.version, "runtime_update_available");
   });
+}
+
+try {
+  _ensureUpdateCheckAlarm();
+  _runExtensionUpdateCheck({ source: "service_worker_startup" });
+  if (chrome.runtime && chrome.runtime.onStartup) {
+    chrome.runtime.onStartup.addListener(() => {
+      _ensureUpdateCheckAlarm();
+      _runExtensionUpdateCheck({ source: "browser_startup" });
+    });
+  }
+  if (chrome.alarms && chrome.alarms.onAlarm) {
+    chrome.alarms.onAlarm.addListener((alarm) => {
+      if (alarm && alarm.name === UPDATE_CHECK_ALARM_NAME) {
+        _runExtensionUpdateCheck({ source: "alarm" });
+      }
+    });
+  }
+} catch (err) {
+  _debugWarn("[AutoDOM SW] Update scheduler setup failed:", err?.message || err);
 }
 
 // Popup → service worker: forward a manual `update_available` result so the
@@ -6151,9 +6432,39 @@ if (chrome.runtime && chrome.runtime.onUpdateAvailable) {
 // browser's own scheduler.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.type === "AUTODOM_UPDATE_AVAILABLE") {
-    _setPendingUpdate(msg.version);
+    _setPendingUpdate(msg.version, msg.source || "manual_forward");
     sendResponse({ ok: true });
     return false;
+  }
+  if (msg && msg.type === "AUTODOM_CHECK_FOR_UPDATE") {
+    _runExtensionUpdateCheck({
+      force: msg.force === true,
+      source: msg.source || "message",
+    }).then(sendResponse);
+    return true;
+  }
+  if (msg && msg.type === "AUTODOM_SET_AUTO_UPDATE") {
+    (async () => {
+      const enabled = msg.enabled === true;
+      await _writeUpdateStorage(
+        { [UPDATE_STORAGE_KEYS.autoUpdateEnabled]: enabled },
+        "auto-update preference",
+      );
+      if (enabled) {
+        const stored = await _readUpdateStorage(
+          [UPDATE_STORAGE_KEYS.pending],
+          "pending update",
+        );
+        const pending = stored[UPDATE_STORAGE_KEYS.pending];
+        if (pending && pending.version) {
+          await _maybeAutoApplyPendingUpdate(pending, "auto_update_enabled");
+        } else {
+          await _runExtensionUpdateCheck({ source: "auto_update_enabled" });
+        }
+      }
+      sendResponse({ ok: true, enabled });
+    })();
+    return true;
   }
   if (msg && msg.type === "AUTODOM_APPLY_UPDATE") {
     // chrome.runtime.reload() unloads the service worker and applies the

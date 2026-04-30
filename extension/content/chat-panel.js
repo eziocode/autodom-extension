@@ -10166,6 +10166,16 @@
       if (area !== "local" || !changes.pendingUpdate) return;
       _syncUpdateUI(changes.pendingUpdate.newValue);
     });
+    if (SIDE_PANEL_MODE) {
+      chrome.runtime.sendMessage(
+        {
+          type: "AUTODOM_CHECK_FOR_UPDATE",
+          force: false,
+          source: "sidepanel_open",
+        },
+        _swallowRuntimeLastError,
+      );
+    }
   } catch (_) {}
 
   chatInput.addEventListener("input", autoResizeInput);

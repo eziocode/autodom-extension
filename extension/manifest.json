@@ -7,6 +7,7 @@
   "update_url": "https://eziocode.github.io/autodom-extension/updates.xml",
   "permissions": [
     "activeTab",
+    "alarms",
     "scripting",
     "tabs",
     "storage",
