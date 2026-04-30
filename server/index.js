@@ -455,6 +455,10 @@ const TOOL_TIERS = new Map([
   ["execute_async_script", "read"],
   ["performance_analyze_insight", "read"],
   ["get_pending_chat_requests", "read"],
+  ["browser_snapshot", "read"],
+  ["browser_console_messages", "read"],
+  ["browser_network_requests", "read"],
+  ["browser_take_screenshot", "read"],
 
   // Write tools — modify page state but are generally reversible
   ["click", "write"],
@@ -481,12 +485,26 @@ const TOOL_TIERS = new Map([
   ["upload_file", "write"],
   ["performance_start_trace", "write"],
   ["performance_stop_trace", "write"],
+  ["browser_click", "write"],
+  ["browser_type", "write"],
+  ["browser_hover", "write"],
+  ["browser_press_key", "write"],
+  ["browser_select_option", "write"],
+  ["browser_drag", "write"],
 
   // Destructive tools — irreversible actions (navigation, form submission)
   ["navigate", "destructive"],
   ["fill_form", "destructive"],
   ["batch_actions", "destructive"],
   ["respond_to_chat", "destructive"],
+  ["browser_navigate", "destructive"],
+  ["browser_navigate_back", "destructive"],
+  ["browser_tabs", "destructive"],
+  ["browser_wait_for", "read"],
+  ["browser_resize", "destructive"],
+  ["browser_handle_dialog", "destructive"],
+  ["browser_evaluate", "destructive"],
+  ["browser_close", "destructive"],
 ]);
 
 function getToolTier(toolName) {
@@ -2044,7 +2062,7 @@ function _processWsMessage(socket, message) {
               responseText += "No major accessibility issues detected! ✓";
             }
           } else {
-            responseText = JSON.stringify(result, null, 2);
+            responseText = stringifyToolResult(result);
           }
         } else if (
           lower.startsWith("go to ") ||
@@ -3503,8 +3521,105 @@ async function callOllamaProvider({
   };
 }
 
-const CLI_AGENT_MAX_TURNS = 5;
-const CLI_AGENT_RESULT_LIMIT = 12000;
+function parseEnvInt(name, fallback, min, max) {
+  const raw = Number.parseInt(process.env[name] || "", 10);
+  if (!Number.isFinite(raw)) return fallback;
+  return Math.min(max, Math.max(min, raw));
+}
+
+const CLI_AGENT_MAX_TURNS = parseEnvInt(
+  "AUTODOM_CLI_AGENT_MAX_TURNS",
+  5,
+  1,
+  12,
+);
+const CLI_AGENT_RESULT_LIMIT = parseEnvInt(
+  "AUTODOM_CLI_AGENT_RESULT_LIMIT",
+  12000,
+  1000,
+  120000,
+);
+const CLI_AGENT_HISTORY_CHAR_LIMIT = parseEnvInt(
+  "AUTODOM_CLI_AGENT_HISTORY_CHAR_LIMIT",
+  6000,
+  1000,
+  30000,
+);
+const CLI_AGENT_PERF_DEFAULTS = Object.freeze({
+  default: {
+    maxTurns: CLI_AGENT_MAX_TURNS,
+    resultLimit: CLI_AGENT_RESULT_LIMIT,
+    historyCharLimit: CLI_AGENT_HISTORY_CHAR_LIMIT,
+    visionPlanMaxPasses: 5,
+    visionPlanMaxRepairsPerPass: 2,
+  },
+  copilot: {
+    maxTurns: 4,
+    resultLimit: 8000,
+    historyCharLimit: 4000,
+    visionPlanMaxPasses: 3,
+    visionPlanMaxRepairsPerPass: 1,
+  },
+  codex: {
+    maxTurns: 5,
+    resultLimit: 10000,
+    historyCharLimit: 5000,
+    visionPlanMaxPasses: 4,
+    visionPlanMaxRepairsPerPass: 1,
+  },
+  claude: {
+    maxTurns: 6,
+    resultLimit: 14000,
+    historyCharLimit: 7000,
+    visionPlanMaxPasses: 5,
+    visionPlanMaxRepairsPerPass: 2,
+  },
+});
+
+function _cliPerfSuffix(kind) {
+  const raw = String(kind || "default").trim().toUpperCase();
+  const normalized = raw.replace(/[^A-Z0-9]+/g, "_");
+  return normalized || "DEFAULT";
+}
+
+function resolveCliAgentPerf(kind) {
+  const normalizedKind = String(kind || "").trim().toLowerCase();
+  const base =
+    CLI_AGENT_PERF_DEFAULTS[normalizedKind] || CLI_AGENT_PERF_DEFAULTS.default;
+  const suffix = _cliPerfSuffix(normalizedKind || "default");
+  return {
+    maxTurns: parseEnvInt(
+      `AUTODOM_CLI_AGENT_MAX_TURNS_${suffix}`,
+      base.maxTurns,
+      1,
+      12,
+    ),
+    resultLimit: parseEnvInt(
+      `AUTODOM_CLI_AGENT_RESULT_LIMIT_${suffix}`,
+      base.resultLimit,
+      1000,
+      120000,
+    ),
+    historyCharLimit: parseEnvInt(
+      `AUTODOM_CLI_AGENT_HISTORY_CHAR_LIMIT_${suffix}`,
+      base.historyCharLimit,
+      1000,
+      30000,
+    ),
+    visionPlanMaxPasses: parseEnvInt(
+      `AUTODOM_CLI_VISION_PLAN_MAX_PASSES_${suffix}`,
+      base.visionPlanMaxPasses,
+      1,
+      10,
+    ),
+    visionPlanMaxRepairsPerPass: parseEnvInt(
+      `AUTODOM_CLI_VISION_PLAN_MAX_REPAIRS_PER_PASS_${suffix}`,
+      base.visionPlanMaxRepairsPerPass,
+      0,
+      5,
+    ),
+  };
+}
 const CLI_AGENT_TOOLS = [
   {
     name: "get_dom_state",
@@ -3674,6 +3789,10 @@ const CLI_AGENT_TOOLS = [
     params: { key: "Enter" },
   },
 ];
+const CLI_AGENT_TOOL_PROMPT = CLI_AGENT_TOOLS.map(
+  (tool) =>
+    `- ${tool.name}: ${tool.description} Example params: ${JSON.stringify(tool.params)}`,
+).join("\n");
 const CLI_AGENT_TOOL_NAMES = new Set(CLI_AGENT_TOOLS.map((tool) => tool.name));
 
 function shouldUseCliBrowserAgent(text, context, conversationHistory) {
@@ -3740,15 +3859,15 @@ function containsManualBrowserGuidance(text) {
   );
 }
 
-function truncateCliAgentResult(value) {
+function truncateCliAgentResult(value, limit = CLI_AGENT_RESULT_LIMIT) {
   let text;
   try {
     text = JSON.stringify(value, null, 2);
   } catch (_) {
     text = String(value);
   }
-  if (text.length <= CLI_AGENT_RESULT_LIMIT) return text;
-  return `${text.substring(0, CLI_AGENT_RESULT_LIMIT)}\n...[truncated ${text.length - CLI_AGENT_RESULT_LIMIT} chars]`;
+  if (text.length <= limit) return text;
+  return `${text.substring(0, limit)}\n...[truncated ${text.length - limit} chars]`;
 }
 
 function extractFirstJsonObject(text) {
@@ -3827,10 +3946,11 @@ function buildCliAgentPrompt({
   observations,
   invalidResponse,
   responseStyle,
+  historyCharLimit = CLI_AGENT_HISTORY_CHAR_LIMIT,
 }) {
   const historyText = conversationToProviderText(conversationHistory).substring(
     0,
-    6000,
+    historyCharLimit,
   );
   const observationText = observations.length
     ? observations
@@ -3853,7 +3973,7 @@ function buildCliAgentPrompt({
       : "") +
     (historyText ? `\nConversation so far:\n${historyText}\n` : "") +
     `\nUser request: ${text}\n\n` +
-    `Available tools:\n${JSON.stringify(CLI_AGENT_TOOLS, null, 2)}\n\n` +
+    `Available tools:\n${CLI_AGENT_TOOL_PROMPT}\n\n` +
     `Return exactly one JSON object and no markdown/code fences.\n` +
     `To call a tool: {"action":"tool","tool":"get_dom_state","params":{"maxElements":60},"reason":"inspect current page"}\n` +
     `To finish: {"action":"final","response":"Done — ..."}\n\n` +
@@ -3887,6 +4007,7 @@ async function callCliBrowserAgent({
   let invalidResponse = "";
   let lastCliMeta = {};
   let skipBootstrapDomState = false;
+  const cliPerf = resolveCliAgentPerf(providerConfig?.cliKind);
 
   // ── Vision-plan fast path: one snapshot → JSON plan → replay ──
   // CLI bridges are text-only, so we send the snapshot tree (not a
@@ -3908,8 +4029,8 @@ async function callCliBrowserAgent({
       "press_key",
       "handle_dialog",
     ]);
-    const MAX_PASSES = 5;
-    const MAX_REPAIRS_PER_PASS = 2;
+    const MAX_PASSES = cliPerf.visionPlanMaxPasses;
+    const MAX_REPAIRS_PER_PASS = cliPerf.visionPlanMaxRepairsPerPass;
     // Planner-only flag tells runCliPrompt to skip CLI agent loops
     // (copilot's --allow-all-tools etc.) — we want a single LLM reply.
     const plannerProviderConfig = {
@@ -4030,7 +4151,7 @@ async function callCliBrowserAgent({
           observations.push({
             tool: step.tool,
             params: args,
-            result: truncateCliAgentResult(r),
+            result: truncateCliAgentResult(r, cliPerf.resultLimit),
           });
           completedHistory.push({
             tool: step.tool,
@@ -4139,11 +4260,11 @@ async function callCliBrowserAgent({
     observations.push({
       tool: "get_dom_state",
       params: { maxElements: 60 },
-      result: truncateCliAgentResult(result),
+      result: truncateCliAgentResult(result, cliPerf.resultLimit),
     });
   }
 
-  for (let turn = 0; turn < CLI_AGENT_MAX_TURNS; turn++) {
+  for (let turn = 0; turn < cliPerf.maxTurns; turn++) {
     if (_isAborted(requestId)) throw new AiAbortError(requestId);
     const prompt = buildCliAgentPrompt({
       text,
@@ -4152,6 +4273,7 @@ async function callCliBrowserAgent({
       observations,
       invalidResponse,
       responseStyle: providerConfig?.responseStyle,
+      historyCharLimit: cliPerf.historyCharLimit,
     });
     const cliResult = await runCliPrompt({ prompt, providerConfig, requestId });
     lastCliMeta = cliResult;
@@ -4174,7 +4296,7 @@ async function callCliBrowserAgent({
             params: { maxElements: 60 },
             result:
               "The CLI tried to give manual instructions instead of acting. AutoDOM ran get_dom_state so you can choose the next executable tool.\n" +
-              truncateCliAgentResult(result),
+              truncateCliAgentResult(result, cliPerf.resultLimit),
           });
           invalidResponse = decision.response;
           continue;
@@ -4216,7 +4338,7 @@ async function callCliBrowserAgent({
     observations.push({
       tool: decision.tool,
       params: decision.params || {},
-      result: truncateCliAgentResult(result),
+      result: truncateCliAgentResult(result, cliPerf.resultLimit),
     });
 
     if (result?.confirmRequired) {
@@ -4993,6 +5115,120 @@ const server = new FastMCP({
   version: "1.0.0",
 });
 
+function _toolResult(result) {
+  return JSON.stringify(result, null, 2);
+}
+
+function _playwrightTarget(params = {}) {
+  return String(
+    params.target || params.selector || params.element || params.startTarget || "",
+  ).trim();
+}
+
+async function _callPlaywrightCompatTool(toolName, params = {}) {
+  const p = params || {};
+  switch (toolName) {
+    case "browser_snapshot":
+      return callExtensionTool("take_snapshot", {
+        selector: p.target || p.selector || "",
+        maxDepth: p.depth || p.maxDepth || 6,
+      });
+    case "browser_click": {
+      const selector = _playwrightTarget(p);
+      if (String(p.button || "").toLowerCase() === "right") {
+        return callExtensionTool("right_click", { selector });
+      }
+      return callExtensionTool("click", {
+        selector,
+        text: p.text || "",
+        dblClick: p.doubleClick === true,
+      });
+    }
+    case "browser_type": {
+      const typed = await callExtensionTool("type_text", {
+        selector: _playwrightTarget(p),
+        text: p.text,
+        clearFirst: p.clearFirst === true,
+      });
+      if (!typed?.error && p.submit === true) {
+        const submitted = await callExtensionTool("press_key", {
+          key: "Enter",
+          selector: _playwrightTarget(p),
+        });
+        return { typed, submitted };
+      }
+      return typed;
+    }
+    case "browser_hover":
+      return callExtensionTool("hover", { selector: _playwrightTarget(p) });
+    case "browser_press_key":
+      return callExtensionTool("press_key", {
+        key: p.key,
+        selector: _playwrightTarget(p) || undefined,
+      });
+    case "browser_navigate":
+      return callExtensionTool("navigate", { url: p.url });
+    case "browser_navigate_back":
+      return callExtensionTool("navigate", { action: "back" });
+    case "browser_take_screenshot":
+      return callExtensionTool("take_screenshot", p);
+    case "browser_console_messages":
+      return callExtensionTool("get_console_logs", p);
+    case "browser_network_requests":
+      return callExtensionTool("get_network_requests", p);
+    case "browser_resize":
+      return callExtensionTool("set_viewport", { width: p.width, height: p.height });
+    case "browser_select_option":
+      return callExtensionTool("select_option", {
+        selector: _playwrightTarget(p),
+        value: Array.isArray(p.values) ? p.values[0] : p.value,
+        text: p.text,
+        index: p.index,
+      });
+    case "browser_drag":
+      return callExtensionTool("drag_and_drop", {
+        sourceSelector: p.startTarget || p.sourceSelector,
+        targetSelector: p.endTarget || p.targetSelector,
+      });
+    case "browser_handle_dialog":
+      return callExtensionTool("handle_dialog", {
+        action: p.accept === false ? "dismiss" : "accept",
+        promptText: p.promptText,
+      });
+    case "browser_tabs":
+    case "browser_wait_for":
+    case "browser_evaluate":
+    case "browser_close":
+      return callExtensionTool(toolName, p);
+    default:
+      throw new Error(`Unknown Playwright compatibility tool: ${toolName}`);
+  }
+}
+
+function _registerPlaywrightCompatTool({ name, description, parameters }) {
+  server.addTool({
+    name,
+    description:
+      `${description} Playwright MCP-compatible alias backed by AutoDOM's active-tab browser tools. ` +
+      "Prefer browser_snapshot/get_dom_state before acting so element targets are deterministic.",
+    parameters,
+    execute: async (params) => _toolResult(await _callPlaywrightCompatTool(name, params)),
+  });
+}
+
+const PLAYWRIGHT_TARGET_PARAM = z
+  .string()
+  .optional()
+  .describe("CSS selector or AutoDOM snapshot target for the element");
+
+function stringifyToolResult(result) {
+  try {
+    return JSON.stringify(result);
+  } catch (_) {
+    return String(result);
+  }
+}
+
 // ─── Script Runner Scope ─────────────────────────────────────
 // AutoDOM scripts run only in the active browser tab (browser-extension
 // backend) via the popup Scripts tab — manual run only. The server does not
@@ -5034,7 +5270,7 @@ server.addTool({
       code,
       timeout: timeout || 15000,
     });
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5065,7 +5301,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("get_dom_state", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5085,7 +5321,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("click_by_index", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5106,7 +5342,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("type_by_index", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5328,7 +5564,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("extract_data", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5348,7 +5584,7 @@ server.addTool({
   }),
   execute: async ({ url, action }) => {
     const result = await callExtensionTool("navigate", { url, action });
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5374,7 +5610,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("click", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5393,7 +5629,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("type_text", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5425,7 +5661,7 @@ server.addTool({
         content: [{ type: "image", data: base64, mimeType }],
       };
     }
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5443,7 +5679,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("take_snapshot", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5461,7 +5697,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("evaluate_script", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5481,7 +5717,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("fill_form", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5495,7 +5731,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("hover", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5517,7 +5753,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("press_key", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5528,7 +5764,7 @@ server.addTool({
     "Get current page metadata: title, URL, meta tags, form/link/image counts.",
   execute: async () => {
     const result = await callExtensionTool("get_page_info", {});
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5547,7 +5783,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("wait_for_text", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5566,7 +5802,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("query_elements", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5582,7 +5818,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("extract_text", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5600,7 +5836,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("get_network_requests", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5611,7 +5847,7 @@ server.addTool({
     "Get captured console messages (log, warn, error, info, debug). Call once to install capture, then again to retrieve.",
   execute: async () => {
     const result = await callExtensionTool("get_console_logs", {});
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5629,7 +5865,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("list_tabs", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5644,7 +5880,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("switch_tab", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5667,7 +5903,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("wait_for_new_tab", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5681,7 +5917,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("close_tab", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5709,7 +5945,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("scroll", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5726,7 +5962,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("select_option", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5750,7 +5986,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("wait_for_element", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5768,7 +6004,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("wait_for_navigation", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5788,7 +6024,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("handle_dialog", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5804,7 +6040,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("get_cookies", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5827,7 +6063,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("set_cookie", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5849,7 +6085,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("get_storage", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5877,7 +6113,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("set_storage", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5899,7 +6135,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("get_html", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5918,7 +6154,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("set_attribute", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5932,7 +6168,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("check_element_state", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5946,7 +6182,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("drag_and_drop", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5959,7 +6195,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("right_click", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5977,7 +6213,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("execute_async_script", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -5992,7 +6228,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("set_viewport", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6010,7 +6246,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("open_new_tab", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6033,7 +6269,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("wait_for_network_idle", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6051,7 +6287,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("start_recording", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6061,7 +6297,7 @@ server.addTool({
   description: "Stop the active session recording.",
   execute: async () => {
     const result = await callExtensionTool("stop_recording", {});
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6075,7 +6311,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("get_recording", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6086,7 +6322,7 @@ server.addTool({
     "Get a human-readable case summary of all recorded actions. Useful for generating test cases, bug reports, or workflow documentation.",
   execute: async () => {
     const result = await callExtensionTool("get_session_summary", {});
-    return result.summary || JSON.stringify(result, null, 2);
+    return result.summary || stringifyToolResult(result);
   },
 });
 
@@ -6113,7 +6349,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("emulate", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6129,7 +6365,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("upload_file", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6146,7 +6382,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("performance_start_trace", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6163,7 +6399,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("performance_stop_trace", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6186,7 +6422,7 @@ server.addTool({
       "performance_analyze_insight",
       params,
     );
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6315,7 +6551,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("list_popups", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6334,7 +6570,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("switch_to_popup", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6348,7 +6584,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("close_popup", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6372,7 +6608,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("wait_for_popup", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6387,7 +6623,7 @@ server.addTool({
   parameters: z.object({}),
   execute: async (params) => {
     const result = await callExtensionTool("list_iframes", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6442,7 +6678,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("iframe_interact", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6464,7 +6700,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("list_shadow_roots", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6510,7 +6746,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("shadow_interact", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6538,7 +6774,7 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("deep_query", params);
-    return JSON.stringify(result, null, 2);
+    return stringifyToolResult(result);
   },
 });
 
@@ -6666,7 +6902,7 @@ if (STOP_ONLY) {
                         content: [
                           {
                             type: "text",
-                            text: JSON.stringify(result, null, 2),
+                            text: stringifyToolResult(result),
                           },
                         ],
                       },

@@ -4760,6 +4760,112 @@ async function broadcastMcpStopToAllTabs() {
 
 // Tool dispatch map — O(1) lookup instead of a long switch statement.
 // New tools only need one line added here instead of a case block.
+function _playwrightCompatTarget(params = {}) {
+  return String(
+    params.target || params.selector || params.element || params.startTarget || "",
+  ).trim();
+}
+
+async function toolBrowserSnapshot(params = {}) {
+  return toolSnapshot({
+    maxDepth: params.depth || params.maxDepth || 6,
+    selector: params.target || params.selector || "",
+  });
+}
+
+async function toolBrowserClick(params = {}) {
+  const selector = _playwrightCompatTarget(params);
+  if (!selector && !params.text) return { error: "browser_click requires target or text" };
+  if (String(params.button || "").toLowerCase() === "right") {
+    return toolRightClick({ selector });
+  }
+  return toolClick({
+    selector,
+    text: params.text || "",
+    dblClick: params.doubleClick === true,
+  });
+}
+
+async function toolBrowserType(params = {}) {
+  const selector = _playwrightCompatTarget(params);
+  if (!selector) return { error: "browser_type requires target" };
+  if (typeof params.text !== "string") return { error: "browser_type requires text" };
+  const typed = await toolTypeText({
+    selector,
+    text: params.text,
+    clearFirst: params.clearFirst === true,
+  });
+  if (!typed?.error && params.submit === true) {
+    const submitted = await toolPressKey({ key: "Enter", selector });
+    return { typed, submitted };
+  }
+  return typed;
+}
+
+async function toolBrowserWaitFor(params = {}) {
+  const timeout =
+    typeof params.time === "number"
+      ? Math.max(0, params.time * 1000)
+      : params.timeout || 10000;
+  if (typeof params.text === "string" && params.text) {
+    return toolWaitForText({ text: params.text, timeout });
+  }
+  if (typeof params.textGone === "string" && params.textGone) {
+    const tab = await getActiveTab();
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      const present = await executeInTab(
+        tab.id,
+        (text) => document.body.innerText.includes(text),
+        [params.textGone],
+      );
+      if (!present) return { success: true, elapsed: Date.now() - start };
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    return {
+      success: false,
+      error: `Text "${params.textGone}" still present after ${timeout}ms`,
+    };
+  }
+  await new Promise((r) => setTimeout(r, timeout));
+  return { success: true, elapsed: timeout };
+}
+
+async function toolBrowserTabs(params = {}) {
+  const action = String(params.action || "list").toLowerCase();
+  if (action === "list") return toolListTabs({ currentWindow: true });
+  if (action === "new") {
+    return toolOpenNewTab({ url: params.url || "about:blank", active: true });
+  }
+  if (action === "select") return toolSwitchTab({ tabId: params.tabId, index: params.index });
+  if (action === "close") {
+    if (params.tabId) return toolCloseTab({ tabId: params.tabId });
+    if (typeof params.index === "number") {
+      const tabs = await chrome.tabs.query({ currentWindow: true });
+      const tab = tabs[params.index];
+      return tab ? toolCloseTab({ tabId: tab.id }) : { error: "Tab not found" };
+    }
+    const tab = await getActiveTab();
+    return toolCloseTab({ tabId: tab.id });
+  }
+  return { error: `Unsupported browser_tabs action: ${action}` };
+}
+
+async function toolBrowserEvaluate(params = {}) {
+  const fn = String(params.function || params.code || "").trim();
+  if (!fn) return { error: "browser_evaluate requires function" };
+  const selector = _playwrightCompatTarget(params);
+  const script = selector
+    ? `return (${fn})(document.querySelector(${JSON.stringify(selector)}));`
+    : `return (${fn})();`;
+  return toolEvaluateScript({ script });
+}
+
+async function toolBrowserClose() {
+  const tab = await getActiveTab();
+  return toolCloseTab({ tabId: tab.id });
+}
+
 const TOOL_HANDLERS = new Map([
   ["navigate", toolNavigate],
   ["click", toolClick],
@@ -4831,6 +4937,36 @@ const TOOL_HANDLERS = new Map([
   // ─── Download Tools ────────────────────────────────────────
   ["list_downloads", toolListDownloads],
   ["wait_for_download", toolWaitForDownload],
+  // ─── Playwright MCP compatibility aliases ─────────────────
+  ["browser_snapshot", toolBrowserSnapshot],
+  ["browser_click", toolBrowserClick],
+  ["browser_type", toolBrowserType],
+  ["browser_wait_for", toolBrowserWaitFor],
+  ["browser_tabs", toolBrowserTabs],
+  ["browser_console_messages", toolGetConsoleLogs],
+  ["browser_network_requests", toolGetNetworkRequests],
+  ["browser_take_screenshot", toolScreenshot],
+  ["browser_navigate", toolNavigate],
+  ["browser_navigate_back", () => toolNavigate({ action: "back" })],
+  ["browser_press_key", toolPressKey],
+  ["browser_select_option", (params) => toolSelectOption({
+    selector: _playwrightCompatTarget(params),
+    value: Array.isArray(params?.values) ? params.values[0] : params?.value,
+    text: params?.text,
+    index: params?.index,
+  })],
+  ["browser_hover", (params) => toolHover({ selector: _playwrightCompatTarget(params) })],
+  ["browser_drag", (params) => toolDragAndDrop({
+    sourceSelector: params?.startTarget || params?.sourceSelector,
+    targetSelector: params?.endTarget || params?.targetSelector,
+  })],
+  ["browser_resize", toolSetViewport],
+  ["browser_handle_dialog", (params) => toolHandleDialog({
+    action: params?.accept === false ? "dismiss" : "accept",
+    promptText: params?.promptText,
+  })],
+  ["browser_evaluate", toolBrowserEvaluate],
+  ["browser_close", toolBrowserClose],
 ]);
 
 async function handleToolCall(tool, params, id) {

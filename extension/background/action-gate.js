@@ -58,6 +58,10 @@
     "wait_for_network_idle",
     "get_pending_chat_requests",
     "performance_analyze_insight",
+    "browser_snapshot",
+    "browser_console_messages",
+    "browser_network_requests",
+    "browser_take_screenshot",
   ]);
 
   // Anything in this list bypasses a site's "allow mutating" rule and is
@@ -81,6 +85,13 @@
     "emulate",
     "set_viewport",
     "handle_dialog",
+    "browser_navigate",
+    "browser_navigate_back",
+    "browser_tabs",
+    "browser_resize",
+    "browser_handle_dialog",
+    "browser_evaluate",
+    "browser_close",
   ]);
 
   function classify(toolName) {
