@@ -4855,10 +4855,10 @@ async function toolBrowserEvaluate(params = {}) {
   const fn = String(params.function || params.code || "").trim();
   if (!fn) return { error: "browser_evaluate requires function" };
   const selector = _playwrightCompatTarget(params);
-  const script = selector
-    ? `return (${fn})(document.querySelector(${JSON.stringify(selector)}));`
-    : `return (${fn})();`;
-  return toolEvaluateScript({ script });
+  const code = selector
+    ? `const __autodomTarget = document.querySelector(${JSON.stringify(selector)}); return await (${fn})(__autodomTarget);`
+    : `return await (${fn})();`;
+  return toolExecuteCode({ code, timeout: params.timeout });
 }
 
 async function toolBrowserClose() {
@@ -4949,22 +4949,34 @@ const TOOL_HANDLERS = new Map([
   ["browser_navigate", toolNavigate],
   ["browser_navigate_back", () => toolNavigate({ action: "back" })],
   ["browser_press_key", toolPressKey],
-  ["browser_select_option", (params) => toolSelectOption({
-    selector: _playwrightCompatTarget(params),
-    value: Array.isArray(params?.values) ? params.values[0] : params?.value,
-    text: params?.text,
-    index: params?.index,
-  })],
+  [
+    "browser_select_option",
+    (params) =>
+      toolSelectOption({
+        selector: _playwrightCompatTarget(params),
+        value: Array.isArray(params?.values) ? params.values[0] : params?.value,
+        text: params?.text,
+        index: params?.index,
+      }),
+  ],
   ["browser_hover", (params) => toolHover({ selector: _playwrightCompatTarget(params) })],
-  ["browser_drag", (params) => toolDragAndDrop({
-    sourceSelector: params?.startTarget || params?.sourceSelector,
-    targetSelector: params?.endTarget || params?.targetSelector,
-  })],
+  [
+    "browser_drag",
+    (params) =>
+      toolDragAndDrop({
+        sourceSelector: params?.startTarget || params?.sourceSelector,
+        targetSelector: params?.endTarget || params?.targetSelector,
+      }),
+  ],
   ["browser_resize", toolSetViewport],
-  ["browser_handle_dialog", (params) => toolHandleDialog({
-    action: params?.accept === false ? "dismiss" : "accept",
-    promptText: params?.promptText,
-  })],
+  [
+    "browser_handle_dialog",
+    (params) =>
+      toolHandleDialog({
+        action: params?.accept === false ? "dismiss" : "accept",
+        promptText: params?.promptText,
+      }),
+  ],
   ["browser_evaluate", toolBrowserEvaluate],
   ["browser_close", toolBrowserClose],
 ]);

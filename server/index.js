@@ -459,6 +459,7 @@ const TOOL_TIERS = new Map([
   ["browser_console_messages", "read"],
   ["browser_network_requests", "read"],
   ["browser_take_screenshot", "read"],
+  ["browser_wait_for", "read"],
 
   // Write tools — modify page state but are generally reversible
   ["click", "write"],
@@ -500,14 +501,20 @@ const TOOL_TIERS = new Map([
   ["browser_navigate", "destructive"],
   ["browser_navigate_back", "destructive"],
   ["browser_tabs", "destructive"],
-  ["browser_wait_for", "read"],
   ["browser_resize", "destructive"],
   ["browser_handle_dialog", "destructive"],
   ["browser_evaluate", "destructive"],
   ["browser_close", "destructive"],
 ]);
 
-function getToolTier(toolName) {
+function getToolTier(toolName, params = {}) {
+  // Parameter-aware tiering for composite compatibility tools.
+  if (toolName === "browser_tabs") {
+    const action = String(params?.action || "list").toLowerCase();
+    if (action === "list") return "read";
+    if (action === "select") return "write";
+    if (action === "new" || action === "close") return "destructive";
+  }
   return TOOL_TIERS.get(toolName) || "write"; // Default to write (safe assumption)
 }
 
@@ -2521,7 +2528,7 @@ function callExtensionTool(tool, params) {
     // ─── Domain Guardrails Check ─────────────────────────────
     // For write/destructive tools, verify the current domain is allowed.
     // We check against the last-known URL from the extension state.
-    const tier = getToolTier(tool);
+    const tier = getToolTier(tool, params);
     if (tier !== "read") {
       // Extract domain from params if available (navigate has url param)
       let checkDomain = null;
@@ -5115,10 +5122,6 @@ const server = new FastMCP({
   version: "1.0.0",
 });
 
-function _toolResult(result) {
-  return JSON.stringify(result, null, 2);
-}
-
 function _playwrightTarget(params = {}) {
   return String(
     params.target || params.selector || params.element || params.startTarget || "",
@@ -5212,7 +5215,8 @@ function _registerPlaywrightCompatTool({ name, description, parameters }) {
       `${description} Playwright MCP-compatible alias backed by AutoDOM's active-tab browser tools. ` +
       "Prefer browser_snapshot/get_dom_state before acting so element targets are deterministic.",
     parameters,
-    execute: async (params) => _toolResult(await _callPlaywrightCompatTool(name, params)),
+    execute: async (params) =>
+      stringifyToolResult(await _callPlaywrightCompatTool(name, params)),
   });
 }
 
@@ -5220,6 +5224,172 @@ const PLAYWRIGHT_TARGET_PARAM = z
   .string()
   .optional()
   .describe("CSS selector or AutoDOM snapshot target for the element");
+
+const PLAYWRIGHT_COMPAT_TOOLS = [
+  {
+    name: "browser_snapshot",
+    description: "Capture a structured accessibility-style snapshot of the current page.",
+    parameters: z.object({
+      target: PLAYWRIGHT_TARGET_PARAM,
+      selector: PLAYWRIGHT_TARGET_PARAM,
+      maxDepth: z.number().optional().describe("Maximum DOM depth to include"),
+      depth: z.number().optional().describe("Alias for maxDepth"),
+    }),
+  },
+  {
+    name: "browser_click",
+    description: "Click an element on the current page.",
+    parameters: z.object({
+      target: PLAYWRIGHT_TARGET_PARAM,
+      selector: PLAYWRIGHT_TARGET_PARAM,
+      text: z.string().optional().describe("Fallback text to click when no selector is known"),
+      button: z.string().optional().describe("Mouse button; use 'right' for context click"),
+      doubleClick: z.boolean().optional().describe("Double-click instead of single click"),
+    }),
+  },
+  {
+    name: "browser_type",
+    description: "Type text into a focused or targeted input element.",
+    parameters: z.object({
+      target: PLAYWRIGHT_TARGET_PARAM,
+      selector: PLAYWRIGHT_TARGET_PARAM,
+      text: z.string().describe("Text to type"),
+      submit: z.boolean().optional().describe("Press Enter after typing"),
+      clearFirst: z.boolean().optional().describe("Clear the field before typing"),
+    }),
+  },
+  {
+    name: "browser_hover",
+    description: "Hover an element on the current page.",
+    parameters: z.object({ target: PLAYWRIGHT_TARGET_PARAM, selector: PLAYWRIGHT_TARGET_PARAM }),
+  },
+  {
+    name: "browser_press_key",
+    description: "Press a keyboard key, optionally scoped to an element.",
+    parameters: z.object({
+      key: z.string().describe("Key name such as Enter, Escape, Tab, ArrowDown"),
+      target: PLAYWRIGHT_TARGET_PARAM,
+      selector: PLAYWRIGHT_TARGET_PARAM,
+    }),
+  },
+  {
+    name: "browser_navigate",
+    description: "Navigate the active tab to a URL.",
+    parameters: z.object({ url: z.string().describe("URL to load") }),
+  },
+  {
+    name: "browser_navigate_back",
+    description: "Navigate the active tab back in history.",
+    parameters: z.object({}),
+  },
+  {
+    name: "browser_take_screenshot",
+    description: "Capture a screenshot of the current page.",
+    parameters: z.object({
+      fullPage: z.boolean().optional().describe("Capture the full page when supported"),
+      selector: PLAYWRIGHT_TARGET_PARAM,
+      format: z.string().optional().describe("Image format, usually png or jpeg"),
+    }),
+  },
+  {
+    name: "browser_console_messages",
+    description: "Read recent browser console messages.",
+    parameters: z.object({
+      level: z.string().optional().describe("Optional level filter such as error, warn, info"),
+      limit: z.number().optional().describe("Maximum number of messages"),
+    }),
+  },
+  {
+    name: "browser_network_requests",
+    description: "Read recent network requests observed for the page.",
+    parameters: z.object({
+      urlPattern: z.string().optional().describe("Optional URL substring or pattern filter"),
+      limit: z.number().optional().describe("Maximum number of requests"),
+    }),
+  },
+  {
+    name: "browser_resize",
+    description: "Resize the active tab viewport.",
+    parameters: z.object({
+      width: z.number().describe("Viewport width in pixels"),
+      height: z.number().describe("Viewport height in pixels"),
+    }),
+  },
+  {
+    name: "browser_select_option",
+    description: "Select an option in a select element.",
+    parameters: z.object({
+      target: PLAYWRIGHT_TARGET_PARAM,
+      selector: PLAYWRIGHT_TARGET_PARAM,
+      value: z.string().optional().describe("Option value"),
+      values: z
+        .array(z.string())
+        .optional()
+        .describe("Playwright-style values array; first value is used"),
+      text: z.string().optional().describe("Visible option text"),
+      index: z.number().optional().describe("Option index"),
+    }),
+  },
+  {
+    name: "browser_drag",
+    description: "Drag one element onto another.",
+    parameters: z.object({
+      startTarget: z.string().optional().describe("Source element selector or snapshot target"),
+      endTarget: z.string().optional().describe("Destination element selector or snapshot target"),
+      sourceSelector: PLAYWRIGHT_TARGET_PARAM,
+      targetSelector: PLAYWRIGHT_TARGET_PARAM,
+    }),
+  },
+  {
+    name: "browser_handle_dialog",
+    description: "Accept or dismiss the currently open browser dialog.",
+    parameters: z.object({
+      accept: z.boolean().optional().describe("Accept when true or omitted; dismiss when false"),
+      promptText: z.string().optional().describe("Text to enter for prompt dialogs"),
+    }),
+  },
+  {
+    name: "browser_tabs",
+    description: "List, open, select, or close browser tabs.",
+    parameters: z.object({
+      action: z
+        .enum(["list", "new", "select", "close"])
+        .optional()
+        .default("list")
+        .describe("Tab operation to perform"),
+      url: z.string().optional().describe("URL for action=new"),
+      tabId: z.number().optional().describe("Tab id for select/close"),
+      index: z.number().optional().describe("Window-local tab index for select/close"),
+    }),
+  },
+  {
+    name: "browser_wait_for",
+    description: "Wait for text to appear, text to disappear, or a duration to pass.",
+    parameters: z.object({
+      text: z.string().optional().describe("Text to wait for"),
+      textGone: z.string().optional().describe("Text to wait until absent"),
+      time: z.number().optional().describe("Seconds to wait"),
+      timeout: z.number().optional().describe("Timeout in milliseconds"),
+    }),
+  },
+  {
+    name: "browser_evaluate",
+    description: "Evaluate a JavaScript function in the page, optionally passing one target element.",
+    parameters: z.object({
+      function: z.string().describe("Function source, for example () => document.title"),
+      target: PLAYWRIGHT_TARGET_PARAM,
+      selector: PLAYWRIGHT_TARGET_PARAM,
+      timeout: z.number().optional().describe("Max execution time in milliseconds"),
+    }),
+  },
+  {
+    name: "browser_close",
+    description: "Close the active tab.",
+    parameters: z.object({}),
+  },
+];
+
+PLAYWRIGHT_COMPAT_TOOLS.forEach(_registerPlaywrightCompatTool);
 
 function stringifyToolResult(result) {
   try {
@@ -5388,7 +5558,7 @@ server.addTool({
     // ─── Dry Run Mode ──────────────────────────────────────
     if (dryRun) {
       const plan = actions.map((action, i) => {
-        const tier = getToolTier(action.tool);
+        const tier = getToolTier(action.tool, action.params || {});
         const known = TOOL_TIERS.has(action.tool);
         return {
           step: i,
@@ -5424,7 +5594,12 @@ server.addTool({
       const { tool, params } = actions[i];
       try {
         const result = await callExtensionTool(tool, params || {});
-        results.push({ step: i, tool, tier: getToolTier(tool), result });
+        results.push({
+          step: i,
+          tool,
+          tier: getToolTier(tool, params || {}),
+          result,
+        });
         if (stopOnError && result && result.error) {
           results.push({
             stopped: true,
@@ -5436,7 +5611,7 @@ server.addTool({
         results.push({
           step: i,
           tool,
-          tier: getToolTier(tool),
+          tier: getToolTier(tool, params || {}),
           error: err.message,
         });
         if (stopOnError) {

@@ -9,7 +9,7 @@
  * Exposed as globalThis.AutoDOMActionGate via importScripts() in the SW.
  *
  * Decision flow:
- *   classify(tool) → one of "safe-read" | "mutating" | "destructive"
+ *   classify(tool, params?) → one of "safe-read" | "mutating" | "destructive"
  *   resolveDecision(origin, category, settings) → "allow" | "ask" | "deny"
  *   requestDecision({ tabId, origin, toolName, params }):
  *     - if pre-allowed, return { allowed: true, reason: "pre-approved" }
@@ -62,6 +62,7 @@
     "browser_console_messages",
     "browser_network_requests",
     "browser_take_screenshot",
+    "browser_wait_for",
   ]);
 
   // Anything in this list bypasses a site's "allow mutating" rule and is
@@ -94,7 +95,15 @@
     "browser_close",
   ]);
 
-  function classify(toolName) {
+  function classify(toolName, params = {}) {
+    // Parameter-aware classification for compatibility tools that can represent
+    // both read and state-changing operations.
+    if (toolName === "browser_tabs") {
+      const action = String(params?.action || "list").toLowerCase();
+      if (action === "list") return "safe-read";
+      if (action === "select") return "mutating";
+      if (action === "new" || action === "close") return "destructive";
+    }
     if (SAFE_READ.has(toolName)) return "safe-read";
     if (DESTRUCTIVE.has(toolName)) return "destructive";
     return "mutating";
@@ -224,7 +233,7 @@
   }
 
   async function requestDecision({ tabId, origin, toolName, params, category }) {
-    const cat = category || classify(toolName);
+    const cat = category || classify(toolName, params);
     // Parallelize independent storage reads: previously these awaited
     // sequentially, doubling the per-tool storage round-trip cost on every
     // turn of the agent loop.
