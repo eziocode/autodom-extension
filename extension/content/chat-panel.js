@@ -4687,10 +4687,10 @@
         </svg>
       </button>
       <span class="autodom-chat-quick-divider" aria-hidden="true"></span>
-      <button class="autodom-chat-quick-btn" type="button" data-prompt="Summarize this page in 4 short bullets."><span class="prompt-spark" aria-hidden="true">✨</span>Summarize</button>
-      <button class="autodom-chat-quick-btn" type="button" data-prompt="What can I do on this page? List the main actions."><span class="prompt-spark" aria-hidden="true">✨</span>What can I do?</button>
-      <button class="autodom-chat-quick-btn" type="button" data-prompt="List the most important interactive elements on this page."><span class="prompt-spark" aria-hidden="true">✨</span>Key controls</button>
-      <button class="autodom-chat-quick-btn" type="button" data-prompt="Check this page for accessibility issues and summarize the top problems."><span class="prompt-spark" aria-hidden="true">✨</span>A11y audit</button>
+      <button class="autodom-chat-quick-btn" type="button" data-prompt="__summarize__"><span class="prompt-spark" aria-hidden="true">✨</span>Summarize</button>
+      <button class="autodom-chat-quick-btn" type="button" data-prompt="__explain__"><span class="prompt-spark" aria-hidden="true">✨</span>What can I do?</button>
+      <button class="autodom-chat-quick-btn" type="button" data-prompt="__key_controls__"><span class="prompt-spark" aria-hidden="true">✨</span>Key controls</button>
+      <button class="autodom-chat-quick-btn" type="button" data-prompt="__a11y__"><span class="prompt-spark" aria-hidden="true">✨</span>A11y audit</button>
     </div>
     <div class="autodom-chat-toast" id="__autodom_chat_toast" role="status" aria-live="polite" aria-hidden="true"></div>
 
@@ -10338,6 +10338,17 @@
       );
       return;
     }
+    if (prompt === "__a11y__") {
+      aiPageQuery("Accessibility issues on this page", (title) =>
+        "Check this web page for accessibility issues and summarize the top " +
+        "problems using markdown. Focus on user-impacting issues such as " +
+        "missing labels, ambiguous controls, heading structure, keyboard " +
+        "navigation, contrast risks that are evident from text/classes, and " +
+        "missing document language. Prioritize the most important problems " +
+        "and include concise fixes. Do not dump raw DOM elements."
+      );
+      return;
+    }
     chatInput.value = prompt;
     autoResizeInput();
     chatInput.focus();
@@ -10374,6 +10385,35 @@
     // composer so it shares the same routing/abort/typing UI.
     const prompt = btn.dataset.prompt;
     if (prompt) {
+      if (prompt === "__summarize__") {
+        await aiSummarizePage();
+        return;
+      }
+      if (prompt === "__explain__") {
+        await aiPageQuery("What can I do on this page?", (title) =>
+          "Explain what a user can do on this web page using markdown. " +
+          "Summarize the main purpose, the primary workflows, and the most " +
+          "useful actions. Avoid raw DOM lists; describe meaningful tasks."
+        );
+        return;
+      }
+      if (prompt === "__key_controls__") {
+        await aiPageQuery("Key controls on this page", (title) =>
+          "Analyze this web page and describe the key controls and actions " +
+          "available to the user using markdown. Group them logically and " +
+          "explain what the user can accomplish. Do not return a raw list of " +
+          "DOM elements or tag names."
+        );
+        return;
+      }
+      if (prompt === "__a11y__") {
+        await aiPageQuery("Accessibility issues on this page", (title) =>
+          "Check this web page for accessibility issues and summarize the top " +
+          "problems using markdown. Prioritize user-impacting issues and " +
+          "include concise fixes. Do not dump raw DOM elements."
+        );
+        return;
+      }
       chatInput.value = prompt;
       autoResizeInput();
       await sendMessage();

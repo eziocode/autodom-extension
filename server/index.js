@@ -2520,6 +2520,20 @@ function shouldAttachBrowserSnapshot(lowerText) {
   );
 }
 
+function isRichPageAnalysisIntent(lowerText) {
+  const lower = String(lowerText || "").trim();
+  if (!lower) return false;
+  return (
+    /\b(?:summari[sz]e|summary|tldr|tl;dr)\b/.test(lower) ||
+    /\b(?:what'?s on|what is on|what can i do on|explain)\s+(?:this|the)?\s*(?:page|site|screen|tab)?\b/.test(lower) ||
+    (
+      /\b(?:key|important|main|interactive)\b/.test(lower) &&
+      /\b(?:controls?|elements?|actions?|buttons?|fields?)\b/.test(lower)
+    ) ||
+    /\b(?:accessibility|a11y)\b/.test(lower)
+  );
+}
+
 function isAutomationIntent(lowerText) {
   // Detects user requests that imply iterative tool-use ("click and submit",
   // "create a lead", "fill the form", multi-step task descriptions). These
@@ -2563,20 +2577,17 @@ function isPageValueExtractionRequest(lowerText) {
 
 function shouldPreferLocalBrowserHeuristic(lowerText) {
   const lower = String(lowerText || "");
+  if (isRichPageAnalysisIntent(lower)) return false;
   return (
     lower.includes("screenshot") ||
     lower.includes("capture") ||
     lower === "ss" ||
     lower.includes("dom state") ||
-    lower.includes("interactive") ||
     lower.includes("what can i click") ||
-    lower.includes("elements") ||
     lower.includes("page info") ||
     lower.includes("page details") ||
     lower.includes("what page") ||
     lower.includes("where am i") ||
-    lower.includes("accessibility") ||
-    lower.includes("a11y") ||
     lower.startsWith("go to ") ||
     lower.startsWith("navigate to ") ||
     lower.startsWith("open ") ||
@@ -3989,7 +4000,11 @@ async function routeDirectProviderChat({
   }
 
   if (provider === "cli") {
-    if (mode === "vision-plan" || shouldUseCliBrowserAgent(text, context, conversationHistory)) {
+    const richPageAnalysis = isRichPageAnalysisIntent(text);
+    if (
+      !richPageAnalysis &&
+      (mode === "vision-plan" || shouldUseCliBrowserAgent(text, context, conversationHistory))
+    ) {
       // Default natural-language browser-automation requests to the
       // one-shot vision-plan path (Comet-like UX, Playwright-like speed).
       // Chatty per-turn loop remains as a fallback inside the agent for
