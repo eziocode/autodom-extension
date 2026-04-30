@@ -1693,8 +1693,6 @@ function getScriptRequestPayload() {
     backend,
     source,
     timeoutMs,
-    browser: "chromium",
-    headless: true,
     params: {},
   };
 }

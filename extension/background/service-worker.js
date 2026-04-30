@@ -4140,6 +4140,11 @@ const TOOL_HANDLERS = new Map([
   ["list_shadow_roots", toolListShadowRoots],
   ["shadow_interact", toolShadowInteract],
   ["deep_query", toolDeepQuery],
+  // ─── Canvas Tools ──────────────────────────────────────────
+  ["canvas_interact", toolCanvasInteract],
+  // ─── Download Tools ────────────────────────────────────────
+  ["list_downloads", toolListDownloads],
+  ["wait_for_download", toolWaitForDownload],
 ]);
 
 async function handleToolCall(tool, params, id) {
@@ -7663,16 +7668,28 @@ async function toolListIframes(params) {
   const frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id });
   if (!frames) return { error: "Could not retrieve frames for this tab" };
 
-  // Frame 0 is the main frame; the rest are sub-frames (iframes)
   const iframes = frames.filter((f) => f.frameId !== 0);
 
-  // Also get DOM-level info about each iframe
+  // Compute nesting depth for each frame using parentFrameId chain
+  const frameDepthMap = new Map();
+  frameDepthMap.set(0, 0);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const f of frames) {
+      if (!frameDepthMap.has(f.frameId) && frameDepthMap.has(f.parentFrameId)) {
+        frameDepthMap.set(f.frameId, frameDepthMap.get(f.parentFrameId) + 1);
+        changed = true;
+      }
+    }
+  }
+
+  // Get DOM-level info for top-level iframes only (nested ones aren't in the main document)
   const domInfo = await executeInTab(
     tab.id,
     () => {
       const iframes = document.querySelectorAll("iframe");
-      return Array.from(iframes).map((iframe, index) => ({
-        index,
+      return Array.from(iframes).map((iframe) => ({
         src: iframe.src || "",
         id: iframe.id || undefined,
         name: iframe.name || undefined,
@@ -7686,14 +7703,23 @@ async function toolListIframes(params) {
     [],
   );
 
+  // Match DOM info by src URL for top-level iframes
+  const domBySrc = new Map();
+  if (domInfo) {
+    for (const d of domInfo) {
+      if (d.src) domBySrc.set(d.src, d);
+    }
+  }
+
   return {
     mainFrameUrl: tab.url,
     iframeCount: iframes.length,
-    iframes: iframes.map((f, i) => ({
+    iframes: iframes.map((f) => ({
       frameId: f.frameId,
       parentFrameId: f.parentFrameId,
+      depth: frameDepthMap.get(f.frameId) ?? 1,
       url: f.url,
-      ...(domInfo && domInfo[i] ? domInfo[i] : {}),
+      ...(domBySrc.get(f.url) || {}),
     })),
   };
 }
@@ -7734,7 +7760,7 @@ async function toolIframeInteract(params) {
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id, frameIds: [targetFrameId] },
       world: "MAIN",
-      func: (action, selector, text, value, fields, clearFirst) => {
+      func: (action, selector, text, value, fields, clearFirst, direction, pixels) => {
         // click
         if (action === "click") {
           let el;
@@ -7910,9 +7936,59 @@ async function toolIframeInteract(params) {
           };
         }
 
+        // select_option
+        if (action === "select_option") {
+          const el = document.querySelector(selector);
+          if (!el) return { error: `Element not found in iframe: ${selector}` };
+          const opt = Array.from(el.options || []).find(
+            (o) => o.value === value || o.textContent.trim() === value,
+          );
+          if (opt) el.value = opt.value;
+          else el.value = value;
+          el.dispatchEvent(new Event("change", { bubbles: true }));
+          return { success: true, value: el.value };
+        }
+
+        // scroll
+        if (action === "scroll") {
+          const target = selector ? document.querySelector(selector) : document.scrollingElement || document.body;
+          if (!target) return { error: `Element not found in iframe: ${selector}` };
+          const px = (typeof pixels === "number" ? pixels : 300);
+          if (direction === "top") target.scrollTo({ top: 0, behavior: "auto" });
+          else if (direction === "bottom") target.scrollTo({ top: target.scrollHeight, behavior: "auto" });
+          else if (direction === "up") target.scrollBy({ top: -px, behavior: "auto" });
+          else target.scrollBy({ top: px, behavior: "auto" });
+          return { success: true };
+        }
+
+        // hover
+        if (action === "hover") {
+          const el = document.querySelector(selector);
+          if (!el) return { error: `Element not found in iframe: ${selector}` };
+          el.scrollIntoView({ behavior: "auto", block: "center" });
+          el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
+          el.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false, cancelable: false, view: window }));
+          return { success: true, tag: el.tagName.toLowerCase() };
+        }
+
+        // check_element_state
+        if (action === "check_element_state") {
+          const el = document.querySelector(selector);
+          if (!el) return { exists: false, selector };
+          const rect = el.getBoundingClientRect();
+          return {
+            exists: true,
+            visible: el.offsetParent !== null,
+            inViewport: rect.top >= 0 && rect.left >= 0 && rect.bottom <= window.innerHeight && rect.right <= window.innerWidth,
+            disabled: el.disabled || false,
+            checked: el.checked !== undefined ? el.checked : undefined,
+            value: el.value !== undefined ? el.value : undefined,
+          };
+        }
+
         return { error: `Unknown iframe action: ${action}` };
       },
-      args: [action, selector, text, value, fields, clearFirst || false],
+      args: [action, selector, text, value, fields, clearFirst || false, params.direction, params.pixels],
     });
 
     if (results && results[0]) {
@@ -7996,7 +8072,7 @@ async function toolShadowInteract(params) {
 
   return await executeInTab(
     tab.id,
-    (piercingSelector, action, value, clearFirst, fields) => {
+    (piercingSelector, action, value, clearFirst, fields, direction, pixels) => {
       // Parse piercing selector: split on " >>> "
       const parts = piercingSelector.split(" >>> ").map((s) => s.trim());
       if (parts.length < 2) {
@@ -8182,9 +8258,35 @@ async function toolShadowInteract(params) {
         return { elementCount: elements.length, elements: Object.fromEntries(elements.entries()) };
       }
 
+      if (action === "select_option") {
+        const opt = Array.from(el.options || []).find(
+          (o) => o.value === value || o.textContent.trim() === value,
+        );
+        if (opt) el.value = opt.value;
+        else el.value = value;
+        el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        return { success: true, value: el.value };
+      }
+
+      if (action === "scroll") {
+        const px = typeof pixels === "number" ? pixels : 300;
+        if (direction === "top") el.scrollTo({ top: 0, behavior: "auto" });
+        else if (direction === "bottom") el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
+        else if (direction === "up") el.scrollBy({ top: -px, behavior: "auto" });
+        else el.scrollBy({ top: px, behavior: "auto" });
+        return { success: true };
+      }
+
+      if (action === "hover") {
+        el.scrollIntoView({ behavior: "auto", block: "center" });
+        el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, composed: true, view: window }));
+        el.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false, cancelable: false, composed: true, view: window }));
+        return { success: true, tag: el.tagName.toLowerCase() };
+      }
+
       return { error: `Unknown shadow action: ${action}` };
     },
-    [piercingSelector, action || "query", value, clearFirst || false, fields],
+    [piercingSelector, action || "query", value, clearFirst || false, fields, params.direction, params.pixels],
   );
 }
 
@@ -8270,43 +8372,39 @@ async function toolDeepQuery(params) {
           world: "MAIN",
           func: (selector, text, maxItems) => {
             const results = [];
-            if (selector) {
-              const els = document.querySelectorAll(selector);
-              for (
-                let i = 0;
-                i < Math.min(els.length, maxItems);
-                i++
-              ) {
-                results.push({
-                  tag: els[i].tagName.toLowerCase(),
-                  text: (els[i].textContent || "").trim().substring(0, 200),
-                  id: els[i].id || undefined,
-                  visible: els[i].offsetParent !== null,
-                  value: els[i].value || undefined,
-                });
+            function searchInRoot(root, context) {
+              if (selector) {
+                const els = root.querySelectorAll(selector);
+                for (let i = 0; i < Math.min(els.length, maxItems - results.length); i++) {
+                  results.push({
+                    context,
+                    tag: els[i].tagName.toLowerCase(),
+                    text: (els[i].textContent || "").trim().substring(0, 200),
+                    id: els[i].id || undefined,
+                    visible: els[i].offsetParent !== null,
+                    value: els[i].value || undefined,
+                  });
+                }
               }
-            }
-            if (text) {
-              const walker = document.createTreeWalker(
-                document.body,
-                NodeFilter.SHOW_TEXT,
-              );
-              while (walker.nextNode() && results.length < maxItems) {
-                if (walker.currentNode.textContent.trim().includes(text)) {
-                  const parent = walker.currentNode.parentElement;
-                  if (parent) {
-                    results.push({
-                      tag: parent.tagName.toLowerCase(),
-                      text: walker.currentNode.textContent
-                        .trim()
-                        .substring(0, 200),
-                      id: parent.id || undefined,
-                      visible: parent.offsetParent !== null,
-                    });
+              if (text) {
+                const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                while (walker.nextNode() && results.length < maxItems) {
+                  if (walker.currentNode.textContent.trim().includes(text)) {
+                    const parent = walker.currentNode.parentElement;
+                    if (parent) results.push({ context, tag: parent.tagName.toLowerCase(), text: walker.currentNode.textContent.trim().substring(0, 200), id: parent.id || undefined, visible: parent.offsetParent !== null });
+                  }
+                }
+              }
+              if (results.length < maxItems) {
+                const all = root.querySelectorAll("*");
+                for (const el of all) {
+                  if (el.shadowRoot && results.length < maxItems) {
+                    searchInRoot(el.shadowRoot, context + " >>> " + el.tagName.toLowerCase() + (el.id ? "#" + el.id : ""));
                   }
                 }
               }
             }
+            searchInRoot(document, "iframe");
             return results;
           },
           args: [
@@ -8316,10 +8414,13 @@ async function toolDeepQuery(params) {
           ],
         });
         if (results && results[0] && results[0].result) {
+          const framePrefix = `iframe[frameId=${frame.frameId}](${frame.url?.substring(0, 60)})`;
           for (const item of results[0].result) {
             iframeResults.push({
               ...item,
-              context: `iframe[frameId=${frame.frameId}](${frame.url?.substring(0, 80)})`,
+              context: item.context && item.context !== "iframe"
+                ? `${framePrefix} / ${item.context}`
+                : framePrefix,
             });
           }
         }
@@ -8336,4 +8437,151 @@ async function toolDeepQuery(params) {
     totalFound: allResults.length,
     results: allResults.slice(0, maxItems),
   };
+}
+
+// ─── Canvas Tools ────────────────────────────────────────────
+
+async function toolCanvasInteract(params) {
+  const tab = await getActiveTab();
+  const { action, selector, x, y, maxSize, pathCommands, strokeStyle, fillStyle, lineWidth } = params;
+  const canvasSel = selector || "canvas";
+
+  return await executeInTab(
+    tab.id,
+    (action, canvasSel, x, y, maxSize, pathCommands, strokeStyle, fillStyle, lineWidth) => {
+      const canvas = document.querySelector(canvasSel);
+      if (!canvas) return { error: `Canvas not found: ${canvasSel}` };
+      if (canvas.tagName.toLowerCase() !== "canvas")
+        return { error: `Element is not a <canvas>: ${canvasSel}` };
+
+      if (action === "get_size") {
+        return { width: canvas.width, height: canvas.height, cssWidth: canvas.offsetWidth, cssHeight: canvas.offsetHeight };
+      }
+
+      if (action === "get_image_data") {
+        const max = maxSize || 256;
+        const scale = Math.min(1, max / Math.max(canvas.width, canvas.height, 1));
+        const w = Math.round(canvas.width * scale);
+        const h = Math.round(canvas.height * scale);
+        const offscreen = document.createElement("canvas");
+        offscreen.width = w;
+        offscreen.height = h;
+        const ctx = offscreen.getContext("2d");
+        ctx.drawImage(canvas, 0, 0, w, h);
+        return { dataUrl: offscreen.toDataURL("image/png"), originalSize: { width: canvas.width, height: canvas.height }, renderedSize: { width: w, height: h } };
+      }
+
+      if (action === "read_pixel") {
+        if (x === undefined || y === undefined) return { error: "x and y required for read_pixel" };
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return { error: "Could not get 2D context" };
+        const d = ctx.getImageData(Math.round(x), Math.round(y), 1, 1).data;
+        return { x: Math.round(x), y: Math.round(y), r: d[0], g: d[1], b: d[2], a: d[3], hex: "#" + [d[0], d[1], d[2]].map((v) => v.toString(16).padStart(2, "0")).join("") };
+      }
+
+      if (action === "click") {
+        if (x === undefined || y === undefined) return { error: "x and y required for click" };
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        const clientX = rect.left + x / scaleX;
+        const clientY = rect.top + y / scaleY;
+        canvas.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, clientX, clientY, view: window }));
+        canvas.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, clientX, clientY, view: window }));
+        canvas.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, clientX, clientY, view: window }));
+        return { success: true, canvasX: x, canvasY: y, clientX, clientY };
+      }
+
+      if (action === "draw_path") {
+        if (!pathCommands || !Array.isArray(pathCommands)) return { error: "pathCommands array required for draw_path" };
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return { error: "Could not get 2D context" };
+        ctx.save();
+        if (strokeStyle) ctx.strokeStyle = strokeStyle;
+        if (fillStyle) ctx.fillStyle = fillStyle;
+        ctx.lineWidth = lineWidth || 2;
+        ctx.beginPath();
+        for (const cmd of pathCommands) {
+          if (typeof ctx[cmd.cmd] === "function") {
+            ctx[cmd.cmd](...(cmd.args || []));
+          } else if (cmd.cmd === "strokeStyle" || cmd.cmd === "fillStyle" || cmd.cmd === "lineWidth") {
+            ctx[cmd.cmd] = cmd.args[0];
+          }
+        }
+        ctx.restore();
+        return { success: true, commandsExecuted: pathCommands.length };
+      }
+
+      return { error: `Unknown canvas action: ${action}` };
+    },
+    [action, canvasSel, x, y, maxSize, pathCommands, strokeStyle, fillStyle, lineWidth],
+  );
+}
+
+// ─── Download Tools ──────────────────────────────────────────
+
+async function toolListDownloads({ limit, state } = {}) {
+  const query = {};
+  if (state) query.state = state;
+  const items = await chrome.downloads.search({ ...query, limit: limit || 10, orderBy: ["-startTime"] });
+  return {
+    count: items.length,
+    downloads: items.map((d) => ({
+      id: d.id,
+      filename: d.filename,
+      url: d.url?.substring(0, 200),
+      state: d.state,
+      bytesReceived: d.bytesReceived,
+      totalBytes: d.totalBytes,
+      startTime: d.startTime,
+      endTime: d.endTime || undefined,
+      exists: d.exists,
+      danger: d.danger !== "safe" ? d.danger : undefined,
+    })),
+  };
+}
+
+async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter } = {}) {
+  const maxWait = timeout || 15000;
+  const start = Date.now();
+
+  // Snapshot existing download IDs so we only watch for new ones
+  const existing = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 50 });
+  const existingIds = new Set(existing.map((d) => d.id));
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      chrome.downloads.onCreated.removeListener(onCreated);
+      resolve({ error: `No new download started within ${maxWait}ms` });
+    }, maxWait);
+
+    async function onCreated(item) {
+      if (existingIds.has(item.id)) return;
+      if (filenameFilter && !item.filename.includes(filenameFilter) && !item.url.includes(filenameFilter)) return;
+      clearTimeout(timer);
+      chrome.downloads.onCreated.removeListener(onCreated);
+
+      if (!waitForComplete) {
+        return resolve({ id: item.id, filename: item.filename, url: item.url?.substring(0, 200), state: item.state });
+      }
+
+      // Wait for completion
+      const completeTimer = setTimeout(() => {
+        chrome.downloads.onChanged.removeListener(onChanged);
+        resolve({ id: item.id, filename: item.filename, state: "timeout_waiting_for_complete" });
+      }, Math.max(0, maxWait - (Date.now() - start)));
+
+      function onChanged(delta) {
+        if (delta.id !== item.id) return;
+        if (delta.state && (delta.state.current === "complete" || delta.state.current === "interrupted")) {
+          clearTimeout(completeTimer);
+          chrome.downloads.onChanged.removeListener(onChanged);
+          resolve({ id: item.id, filename: item.filename, url: item.url?.substring(0, 200), state: delta.state.current });
+        }
+      }
+      chrome.downloads.onChanged.addListener(onChanged);
+    }
+
+    chrome.downloads.onCreated.addListener(onCreated);
+  });
 }

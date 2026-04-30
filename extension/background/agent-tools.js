@@ -233,6 +233,9 @@
                     "switch_tab",
                     "open_new_tab",
                     "close_tab",
+                    "canvas_interact",
+                    "iframe_interact",
+                    "shadow_interact",
                   ],
                 },
                 args: { type: "object", additionalProperties: true },
@@ -549,9 +552,10 @@
       name: "iframe_interact",
       description:
         "Execute an action inside a specific iframe (works across origins). " +
-        "Actions: 'extract_text' (read body/selector text — use this to summarize content in cross-origin iframes), " +
-        "'query', 'click', 'type', 'fill_form', 'get_dom_state'. " +
-        "Resolve the target with frameId from list_iframes (preferred) or iframeSelector.",
+        "Actions: 'extract_text', 'query', 'click', 'type', 'fill_form', 'get_dom_state', " +
+        "'select_option', 'scroll', 'hover', 'check_element_state'. " +
+        "Resolve the target with frameId from list_iframes (preferred) or iframeSelector. " +
+        "list_iframes shows nesting depth — nested iframes (iframe inside iframe) each have their own frameId.",
       parameters: {
         type: "object",
         properties: {
@@ -559,17 +563,19 @@
           iframeSelector: { type: "string", description: "CSS selector for the <iframe> element on the parent page (fallback)" },
           action: {
             type: "string",
-            enum: ["extract_text", "query", "click", "type", "fill_form", "get_dom_state"],
+            enum: ["extract_text", "query", "click", "type", "fill_form", "get_dom_state", "select_option", "scroll", "hover", "check_element_state"],
           },
           selector: { type: "string", description: "CSS selector inside the iframe" },
           text: { type: "string", description: "Text to match (for click)" },
-          value: { type: "string", description: "Value to type" },
+          value: { type: "string", description: "Value to type or option value for select_option" },
           fields: {
             type: "array",
             description: "For fill_form: array of { selector, value }",
             items: { type: "object" },
           },
           clearFirst: { type: "boolean" },
+          direction: { type: "string", description: "For scroll: up/down/top/bottom" },
+          pixels: { type: "integer", description: "For scroll: pixel amount" },
         },
         required: ["action"],
       },
@@ -595,7 +601,8 @@
       description:
         "Interact with elements inside open shadow DOMs using a piercing selector " +
         "('host >>> inner' or nested 'host1 >>> host2 >>> target'). " +
-        "Actions: 'query' (default), 'click', 'type', 'extract_text', 'query_all', 'fill_form', 'get_dom_state'. " +
+        "Actions: 'query' (default), 'click', 'type', 'extract_text', 'query_all', 'fill_form', 'get_dom_state', " +
+        "'select_option', 'scroll', 'hover'. " +
         "Closed shadow roots are not accessible — fall back to deep_query if this fails.",
       parameters: {
         type: "object",
@@ -606,7 +613,7 @@
           },
           action: {
             type: "string",
-            enum: ["query", "click", "type", "extract_text", "query_all", "fill_form", "get_dom_state"],
+            enum: ["query", "click", "type", "extract_text", "query_all", "fill_form", "get_dom_state", "select_option", "scroll", "hover"],
           },
           value: { type: "string" },
           clearFirst: { type: "boolean" },
@@ -615,6 +622,8 @@
             description: "For fill_form: array of { selector, value } resolved inside the deepest shadow root",
             items: { type: "object" },
           },
+          direction: { type: "string", description: "For scroll: up/down/top/bottom" },
+          pixels: { type: "integer", description: "For scroll: pixel amount" },
         },
         required: ["piercingSelector"],
       },
@@ -623,7 +632,8 @@
     {
       name: "deep_query",
       description:
-        "One-shot search across the main document, every iframe (including cross-origin), and every open shadow root. " +
+        "One-shot search across the main document, every iframe (including cross-origin), shadow roots, " +
+        "and shadow roots nested inside iframes. " +
         "Use when you don't know whether the target lives in the main DOM, an iframe, or a shadow root. " +
         "Provide either a CSS selector or text to match.",
       parameters: {
@@ -633,6 +643,75 @@
           text: { type: "string", description: "Text substring to match" },
           limit: { type: "integer", description: "Max results (default 30)" },
         },
+      },
+    },
+
+    // ── Canvas ──
+    {
+      name: "canvas_interact",
+      description:
+        "Interact with an HTML5 <canvas> element. " +
+        "Actions: 'get_size' (width/height), 'get_image_data' (returns small PNG data-URL, downscaled if large), " +
+        "'read_pixel' (RGBA at x,y), 'click' (dispatch MouseEvent at canvas x,y coordinates), " +
+        "'draw_path' (draw lines/shapes via 2D context — provide pathCommands array). " +
+        "Use selector to target a specific canvas (default: first canvas on page).",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: { type: "string", description: "CSS selector for the canvas element (default: 'canvas')" },
+          action: {
+            type: "string",
+            enum: ["get_size", "get_image_data", "read_pixel", "click", "draw_path"],
+          },
+          x: { type: "number", description: "X coordinate (for click/read_pixel)" },
+          y: { type: "number", description: "Y coordinate (for click/read_pixel)" },
+          maxSize: { type: "integer", description: "For get_image_data: max dimension for downscaling (default 256)" },
+          pathCommands: {
+            type: "array",
+            description: "For draw_path: array of { cmd, args } e.g. [{ cmd: 'moveTo', args: [10,10] }, { cmd: 'lineTo', args: [100,100] }, { cmd: 'stroke' }]",
+            items: { type: "object" },
+          },
+          strokeStyle: { type: "string", description: "For draw_path: stroke color (default '#000')" },
+          fillStyle: { type: "string", description: "For draw_path: fill color" },
+          lineWidth: { type: "number", description: "For draw_path: line width (default 2)" },
+        },
+        required: ["action"],
+      },
+      danger: "write",
+    },
+
+    // ── Downloads ──
+    {
+      name: "list_downloads",
+      description:
+        "List recent browser downloads (filename, URL, state, bytesReceived, totalBytes). " +
+        "Use to check what was downloaded after triggering a download action.",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: { type: "integer", description: "Max results (default 10)" },
+          state: {
+            type: "string",
+            enum: ["in_progress", "interrupted", "complete"],
+            description: "Filter by download state",
+          },
+        },
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "wait_for_download",
+      description:
+        "Wait for a new download to start and optionally complete. Returns filename, URL, and final state. " +
+        "Call this BEFORE triggering the download action when you know a file download is coming.",
+      parameters: {
+        type: "object",
+        properties: {
+          timeout: { type: "integer", description: "Max wait in ms (default 15000)" },
+          waitForComplete: { type: "boolean", description: "Also wait until download finishes (default false)" },
+          filenameFilter: { type: "string", description: "Substring the filename must contain" },
+        },
+        additionalProperties: false,
       },
     },
 
