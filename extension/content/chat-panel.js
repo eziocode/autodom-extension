@@ -149,6 +149,8 @@
   let _userAborted = false;
   let inlineMode = false; // inline overlay mode (like browser atlas)
   let _statusPollInterval = null;
+  let _composerResizeObserver = null;
+  let _composerResizeFallback = null;
 
   // AutoDOM brand mark used as the AI chat avatar. Kept inline (data URI)
   // so it costs zero network requests and is shared across every message
@@ -6765,6 +6767,14 @@
       clearInterval(_statusPollInterval);
       _statusPollInterval = null;
     }
+    if (_composerResizeObserver) {
+      try { _composerResizeObserver.disconnect(); } catch (_) {}
+      _composerResizeObserver = null;
+    }
+    if (_composerResizeFallback) {
+      try { window.removeEventListener("resize", _composerResizeFallback); } catch (_) {}
+      _composerResizeFallback = null;
+    }
     // Close panel/overlay gracefully without invoking logging paths after invalidation
     if (wasOpen) {
       isOpen = false;
@@ -10065,10 +10075,17 @@
   // also drag-resize the in-page panel).
   try {
     if (typeof ResizeObserver !== "undefined") {
-      const _ro = new ResizeObserver(() => { try { autoResizeInput(); } catch (_) {} });
-      _ro.observe(panel);
+      _composerResizeObserver = new ResizeObserver(() => {
+        if (_contextInvalidated) return;
+        try { autoResizeInput(); } catch (_) {}
+      });
+      _composerResizeObserver.observe(panel);
     } else {
-      window.addEventListener("resize", () => { try { autoResizeInput(); } catch (_) {} });
+      _composerResizeFallback = () => {
+        if (_contextInvalidated) return;
+        try { autoResizeInput(); } catch (_) {}
+      };
+      window.addEventListener("resize", _composerResizeFallback);
     }
   } catch (_) {}
 

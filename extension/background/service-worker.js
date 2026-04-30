@@ -111,6 +111,19 @@ function _writeApiKey(value) {
   } catch (_) {}
 }
 
+function _providerStatusPayload(settings, model) {
+  const source = settings?.source || "ide";
+  return {
+    source,
+    hasApiKey: !!(settings?.apiKey || "").trim(),
+    model:
+      typeof model === "string"
+        ? model
+        : _effectiveConfiguredProviderModel(settings || {}),
+    baseUrl: settings?.baseUrl || "",
+  };
+}
+
 // ─── Pre-activation Provider Connection Test ────────────────
 // Lightweight ping to verify a provider's credentials, base URL,
 // and (where possible) model before the user enables direct AI.
@@ -3185,12 +3198,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       running: shouldRunMcp,
       port: getCurrentPort(),
       recording: sessionRecording.active,
-      provider: {
-        source: aiProviderSettings.source,
-        apiKey: aiProviderSettings.apiKey,
-        model: effectiveModel,
-        baseUrl: aiProviderSettings.baseUrl,
-      },
+      provider: _providerStatusPayload(aiProviderSettings, effectiveModel),
     });
     return false;
   }
@@ -3202,7 +3210,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       JSON.stringify({
         source: incomingProvider.source,
         hasApiKey: !!(incomingProvider.apiKey || "").trim(),
-        apiKeyLen: (incomingProvider.apiKey || "").length,
         model: incomingProvider.model,
         baseUrl: incomingProvider.baseUrl,
       }),
@@ -3225,7 +3232,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       JSON.stringify({
         source: aiProviderSettings.source,
         hasApiKey: !!aiProviderSettings.apiKey,
-        apiKeyLen: aiProviderSettings.apiKey.length,
         model: aiProviderSettings.model,
         baseUrl: aiProviderSettings.baseUrl,
       }),
@@ -3257,12 +3263,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     sendResponse({
       success: true,
-      provider: {
-        source: aiProviderSettings.source,
-        apiKey: aiProviderSettings.apiKey,
-        model: effectiveModel,
-        baseUrl: aiProviderSettings.baseUrl,
-      },
+      provider: _providerStatusPayload(aiProviderSettings, effectiveModel),
       statusText:
         aiProviderSettings.source === "ide"
           ? isConnected
@@ -3275,12 +3276,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     chrome.runtime.sendMessage({
       type: "AI_PROVIDER_STATUS",
-      provider: {
-        source: aiProviderSettings.source,
-        apiKey: aiProviderSettings.apiKey,
-        model: effectiveModel,
-        baseUrl: aiProviderSettings.baseUrl,
-      },
+      provider: _providerStatusPayload(aiProviderSettings, effectiveModel),
       statusText:
         aiProviderSettings.source === "ide"
           ? isConnected
@@ -3580,7 +3576,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       JSON.stringify({
         source: aiProviderSettings.source,
         hasKey: !!(aiProviderSettings.apiKey || "").trim(),
-        keyLen: (aiProviderSettings.apiKey || "").length,
         model: aiProviderSettings.model,
         baseUrl: aiProviderSettings.baseUrl,
       }),
@@ -6077,7 +6072,6 @@ chrome.storage.local.get(
       JSON.stringify({
         source: aiProviderSettings.source,
         hasApiKey: !!aiProviderSettings.apiKey,
-        apiKeyLen: aiProviderSettings.apiKey.length,
         model: aiProviderSettings.model,
         baseUrl: aiProviderSettings.baseUrl,
       }),

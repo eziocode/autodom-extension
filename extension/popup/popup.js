@@ -1500,9 +1500,26 @@ async function installDefaultCliPackage() {
   }
 
   const installCommand = info.install || `npm install -g ${info.npmPackage}`;
-  const approved = window.confirm(
-    `Install ${info.label}?\n\nThis will run on the local AutoDOM bridge host:\n${installCommand}\n\nContinue?`,
-  );
+  // When popup.html is hosted inside the chat panel's settings iframe
+  // its origin (chrome-extension://…) differs from the top frame
+  // (the host page), and Chrome silently suppresses window.confirm()
+  // from cross-origin subframes (intervention shipped in Chrome 92).
+  // The suppressed call returns false, the function bails, and the
+  // user sees nothing happen. In embedded mode the click on the
+  // "Install with npm" button is itself the explicit consent, so
+  // skip the modal there. Wrap the call in try/catch so any future
+  // dialog-blocking policy can't silently kill the install path.
+  const isEmbedded = document.body && document.body.classList.contains("embedded");
+  let approved = true;
+  if (!isEmbedded) {
+    try {
+      approved = window.confirm(
+        `Install ${info.label}?\n\nThis will run on the local AutoDOM bridge host:\n${installCommand}\n\nContinue?`,
+      );
+    } catch (_) {
+      approved = true;
+    }
+  }
   if (!approved) {
     updateProviderUI("CLI install cancelled.");
     return;
@@ -1812,10 +1829,19 @@ chrome.runtime.onMessage.addListener((message) => {
   }
   if (message.type === "AI_PROVIDER_STATUS") {
     if (message.provider) {
+      const providerHasApiKeyField = Object.prototype.hasOwnProperty.call(
+        message.provider,
+        "apiKey",
+      );
+      const nextApiKey = providerHasApiKeyField
+        ? message.provider.apiKey || ""
+        : message.provider.hasApiKey
+          ? providerSettings.apiKey || ""
+          : "";
       providerSettings = {
         ...providerSettings,
         source: message.provider.source || providerSettings.source || "ide",
-        apiKey: message.provider.apiKey || providerSettings.apiKey || "",
+        apiKey: nextApiKey,
         model: message.provider.model || providerSettings.model || "",
       };
       if (DOM.providerSelect)
