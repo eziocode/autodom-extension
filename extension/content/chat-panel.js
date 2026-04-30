@@ -5763,6 +5763,16 @@
         case "quick":
           // Quick mode: compact command language, no tool schema — faster execution.
           return { type: "ai_automate", prompt: rest.trim(), mode: "quick" };
+        case "offscreen": {
+          const mode = (rest || "").trim().toLowerCase();
+          if (mode === "on" || mode === "enable" || mode === "true") {
+            return { type: "offscreen_keepalive", enabled: true };
+          }
+          if (mode === "off" || mode === "disable" || mode === "false") {
+            return { type: "offscreen_keepalive", enabled: false };
+          }
+          return { type: "offscreen_keepalive", statusOnly: true };
+        }
         default:
           return { tool: tool, params: rest ? tryParseJSON(rest) : {} };
       }
@@ -6541,12 +6551,61 @@
         "  /run <code> \u2014 Run local Playwright/Selenium-style automation\n" +
         "  /run <task> or /auto <task> \u2014 Fast AI automation plan + replay\n" +
         "  /quick <task> \u2014 Quick mode: compact command language (fastest)\n" +
+        "  /offscreen on|off|status \u2014 Toggle SW keepalive mode\n" +
         "  /extract \u2014 Extract page text\n\n" +
         "Shortcuts:\n" +
         "  Cmd/Ctrl+Shift+K \u2014 Toggle sidebar\n" +
         "  Cmd/Ctrl+Shift+L \u2014 Quick prompt";
       addMessage("assistant", helpText);
       _pushHistory({ role: "assistant", content: helpText });
+      return;
+    }
+
+    if (command && command.type === "offscreen_keepalive") {
+      try {
+        if (command.statusOnly) {
+          chrome.storage?.local?.get?.(
+            ["autodomOffscreenKeepaliveEnabled"],
+            (res) => {
+              const enabled = res?.autodomOffscreenKeepaliveEnabled === true;
+              addMessage(
+                "assistant",
+                `Offscreen keepalive is currently **${enabled ? "ON" : "OFF"}**.`,
+              );
+              _pushHistory({
+                role: "assistant",
+                content: `[offscreen keepalive ${enabled ? "on" : "off"}]`,
+              });
+            },
+          );
+        } else {
+          chrome.runtime.sendMessage(
+            {
+              type: "AUTODOM_SET_OFFSCREEN_KEEPALIVE",
+              enabled: command.enabled === true,
+            },
+            (resp) => {
+              try { void chrome.runtime.lastError; } catch (_) {}
+              const ok = resp && resp.ok;
+              const enabled = command.enabled === true;
+              addMessage(
+                ok ? "assistant" : "error",
+                ok
+                  ? `Offscreen keepalive set to **${enabled ? "ON" : "OFF"}**.`
+                  : "Failed to update offscreen keepalive setting.",
+              );
+              _pushHistory({
+                role: "assistant",
+                content: ok
+                  ? `[offscreen keepalive ${enabled ? "on" : "off"}]`
+                  : "[offscreen keepalive update failed]",
+              });
+            },
+          );
+        }
+      } catch (err) {
+        addMessage("error", `Failed to update offscreen keepalive: ${err.message || err}`);
+      }
       return;
     }
 
