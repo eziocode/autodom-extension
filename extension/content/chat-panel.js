@@ -667,6 +667,28 @@
     const ceiling = Math.min(PANEL_WIDTH_MAX, Math.floor(window.innerWidth * 0.8));
     return Math.max(PANEL_WIDTH_MIN, Math.min(ceiling, Math.round(n)));
   }
+  // Run non-critical work after first paint and idle time so panel open
+  // isn't blocked by storage/network calls. Falls back cleanly on engines
+  // without requestIdleCallback.
+  function _deferAfterFirstPaint(task, timeout = 1200) {
+    if (typeof task !== "function") return;
+    const run = () => {
+      if (typeof requestIdleCallback === "function") {
+        requestIdleCallback(() => {
+          try { task(); } catch (_) {}
+        }, { timeout });
+        return;
+      }
+      setTimeout(() => {
+        try { task(); } catch (_) {}
+      }, 0);
+    };
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(run);
+    } else {
+      setTimeout(run, 0);
+    }
+  }
   function _loadChatSettings() {
     try {
       chrome.storage?.local?.get?.([STORAGE_KEY_SETTINGS], (items) => {
@@ -692,7 +714,9 @@
         // If long-lived persistence is on and the per-tab session was
         // empty (fresh tab / browser restart), pull the last saved
         // chat back from chrome.storage.local and re-render it.
-        try { _restoreLongLivedIfNeeded(); } catch (_) {}
+        _deferAfterFirstPaint(() => {
+          _restoreLongLivedIfNeeded();
+        }, 2000);
       });
     } catch (_) {}
   }
@@ -1057,7 +1081,7 @@
               );
             });
             if (parent) parent.insertBefore(messagesContainer, nextSibling);
-            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            _scheduleScrollToBottom(messagesContainer, "force");
             // Mirror back to sessionStorage so subsequent in-tab reloads
             // are served from the fast synchronous path.
             persistChatState(true);
@@ -1106,8 +1130,8 @@
     } catch (_) {
       // Extension context invalidated mid-injection. Fall back to
       // doing nothing — the next reload will recover.
-      link.remove();
-      guard.remove();
+      try { guard.remove(); } catch (_) {}
+      return;
     }
     const reveal = () => {
       try { guard.remove(); } catch (_) {}
@@ -1932,7 +1956,7 @@
       addMessage(msg.role, msg.content, Object.keys(extra).length > 0 ? extra : undefined);
     });
     if (parent) parent.insertBefore(messagesContainer, nextSibling);
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    _scheduleScrollToBottom(messagesContainer, "force");
   }
 
   function _loadPersistedThread(id) {
@@ -2990,8 +3014,10 @@
     }
   });
 
-  _loadModelPickerState();
   _refreshModelPickerUI();
+  _deferAfterFirstPaint(() => {
+    _loadModelPickerState();
+  }, 1800);
 
   // Fresh content-script load (hard refresh, SPA route change, first
   // inject). Ask the SW whether any agent run is still active so this
@@ -3655,8 +3681,13 @@
         msg.appendChild(row);
       }
 
+      const wasNearBottom = _isNearBottom(messagesContainer);
       messagesContainer.appendChild(msg);
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      _scheduleScrollToBottom(
+        messagesContainer,
+        "stickIfNearBottom",
+        { wasNearBottom },
+      );
       // The alert isn't part of the persisted conversation — it's ambient
       // UI. Don't push it into `messages` so reloads stay clean.
       return msg;
@@ -3866,7 +3897,7 @@
     });
 
     messagesContainer.appendChild(card);
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    _scheduleScrollToBottom(messagesContainer, "force");
     // Focus so keyboard shortcuts work without a click.
     try { card.focus(); } catch (_) {}
   }
@@ -3969,7 +4000,7 @@
     });
 
     messagesContainer.appendChild(card);
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    _scheduleScrollToBottom(messagesContainer, "force");
     try { card.focus(); } catch (_) {}
   }
 
@@ -4011,8 +4042,13 @@
       details.appendChild(pre);
       msg.appendChild(details);
 
+      const wasNearBottom = _isNearBottom(messagesContainer);
       messagesContainer.appendChild(msg);
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      _scheduleScrollToBottom(
+        messagesContainer,
+        "stickIfNearBottom",
+        { wasNearBottom },
+      );
       messages.push({ role, content, toolName });
       persistChatState();
       return msg;
@@ -4175,8 +4211,13 @@
       delete msg.__autodomModelBadge;
     }
 
+    const wasNearBottom = _isNearBottom(messagesContainer);
     messagesContainer.appendChild(msg);
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    _scheduleScrollToBottom(
+      messagesContainer,
+      "stickIfNearBottom",
+      { wasNearBottom },
+    );
 
     messages.push({
       role,
@@ -4201,6 +4242,39 @@
   function renderMarkdownInto(container, src) {
     container.textContent = "";
     if (!src) return;
+    if (
+      src.length > 12_000 &&
+      !container.__autodomMdUpgradeQueued &&
+      !container.__autodomMdUpgrading
+    ) {
+      container.textContent = src;
+      container.__autodomMdUpgradeQueued = true;
+      const deferredSrc = src;
+      const upgrade = () => {
+        if (!container || !container.isConnected) {
+          container.__autodomMdUpgradeQueued = false;
+          return;
+        }
+        container.__autodomMdUpgradeQueued = false;
+        container.__autodomMdUpgrading = true;
+        try {
+          renderMarkdownInto(container, deferredSrc);
+        } finally {
+          container.__autodomMdUpgrading = false;
+        }
+      };
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => {
+          if (typeof queueMicrotask === "function") queueMicrotask(upgrade);
+          else setTimeout(upgrade, 0);
+        });
+      } else if (typeof queueMicrotask === "function") {
+        queueMicrotask(upgrade);
+      } else {
+        setTimeout(upgrade, 0);
+      }
+      return;
+    }
 
     // Defense-in-depth: some callers render directly. Scrub internal
     // placeholders/account ids here too so no UI path leaks them.
@@ -4567,7 +4641,7 @@
         );
       } catch (_) {}
     });
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    _scheduleScrollToBottom(messagesContainer, "force");
     return turn;
   }
 
@@ -4874,8 +4948,13 @@
           head.click();
         }
       });
+      const wasNearBottom = _isNearBottom(messagesContainer);
       container.appendChild(card);
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      _scheduleScrollToBottom(
+        messagesContainer,
+        "stickIfNearBottom",
+        { wasNearBottom },
+      );
       return;
     }
     if (evt.phase === "end") {
@@ -4917,7 +4996,12 @@
           if (head) head.setAttribute("aria-expanded", "true");
         }
       }
-      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+      const wasNearBottom = _isNearBottom(messagesContainer);
+      _scheduleScrollToBottom(
+        messagesContainer,
+        "stickIfNearBottom",
+        { wasNearBottom },
+      );
     }
   }
 
@@ -6812,7 +6896,7 @@
 
         msg.appendChild(btnRow);
         messagesContainer.appendChild(msg);
-        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        _scheduleScrollToBottom(messagesContainer, "force");
         messages.push({
           role: "assistant",
           content: `[Confirmation required for ${command.tool}]`,
@@ -6866,8 +6950,13 @@
         img.alt = "Screenshot";
         msg.appendChild(img);
 
+        const wasNearBottom = _isNearBottom(messagesContainer);
         messagesContainer.appendChild(msg);
-        messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        _scheduleScrollToBottom(
+          messagesContainer,
+          "stickIfNearBottom",
+          { wasNearBottom },
+        );
         messages.push({ role: "assistant", content: "[screenshot]" });
         _pushHistory({
           role: "assistant",
@@ -7735,7 +7824,7 @@
     });
     if (parent) parent.insertBefore(messagesContainer, nextSibling);
     // Scroll to bottom
-    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    _scheduleScrollToBottom(messagesContainer, "force");
   }
   if (restored.wasOpen) {
     // Re-open panel if it was open before reload/navigation
@@ -7744,6 +7833,9 @@
   }
 
   updateContext();
+  _deferAfterFirstPaint(() => {
+    Promise.resolve(getPageContext()).catch(() => {});
+  }, 2200);
 
   // SPA navigation detection — uses History API interception instead of
   // a MutationObserver on the entire DOM tree. This eliminates thousands

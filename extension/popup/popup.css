@@ -207,25 +207,33 @@ body {
 }
 
 .version-update-btn {
+    --update-glyph: oklch(62% 0.18 250);
     display: inline-flex;
     align-items: center;
     justify-content: center;
     width: 20px;
     height: 20px;
     padding: 0;
-    font-size: 12px;
+    font-size: 13px;
+    font-weight: 600;
     line-height: 1;
-    color: var(--text-muted);
-    background: var(--bg-raised);
-    border: 1px solid var(--border);
+    color: var(--update-glyph);
+    background: color-mix(in oklch, var(--update-glyph) 12%, var(--bg-raised));
+    border: 1px solid color-mix(in oklch, var(--update-glyph) 55%, var(--border));
     border-radius: 999px;
     cursor: pointer;
-    transition: color 0.15s, background 0.15s;
+    transition: color 0.15s, background 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+
+@media (prefers-color-scheme: dark) {
+    .version-update-btn { --update-glyph: oklch(75% 0.16 250); }
 }
 
 .version-update-btn:hover:not(:disabled) {
-    color: var(--text);
-    background: var(--bg-hover, var(--bg-raised));
+    color: #fff;
+    background: var(--update-glyph);
+    border-color: var(--update-glyph);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--update-glyph) 25%, transparent);
 }
 
 .version-update-btn:disabled {

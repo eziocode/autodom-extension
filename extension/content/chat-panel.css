@@ -3556,7 +3556,7 @@
 #__autodom_chat_panel .autodom-chat-msg,
 #__autodom_inline_overlay .autodom-chat-msg {
   content-visibility: auto;
-  contain-intrinsic-size: 0 200px;
+  contain-intrinsic-size: 0 120px;
   contain: layout paint style;
 }
 #__autodom_chat_panel .autodom-chat-msg.streaming,
