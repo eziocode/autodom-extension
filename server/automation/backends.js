@@ -132,10 +132,16 @@ try {
   if (!playwrightSpecifier) {
     throw new Error("Cannot find package 'playwright'");
   }
-  const playwright = await import(playwrightSpecifier);
+  const playwrightModule = await import(playwrightSpecifier);
+  const playwright = playwrightModule.chromium
+    ? playwrightModule
+    : playwrightModule.default;
   const mod = await import(${JSON.stringify(userUrl)});
   const browserName = ${JSON.stringify(browser)};
   const launcher = playwright[browserName] || playwright.chromium;
+  if (!launcher?.launch) {
+    throw new Error(\`Unsupported Playwright browser '\${browserName}'\`);
+  }
   browser = await launcher.launch({ headless: ${JSON.stringify(toBool(headless, true))} });
   const context = await browser.newContext();
   const page = await context.newPage();
@@ -194,6 +200,14 @@ try {
     ) {
       result.error =
         "Playwright is not installed for the AutoDOM server. Run `cd server && npm install playwright` or provide a backend installed in this environment.";
+    } else if (
+      !result.ok &&
+      /Executable doesn't exist|playwright install/.test(
+        `${result.stderr}\n${result.stdout}`,
+      )
+    ) {
+      result.error =
+        "Playwright is installed, but its browser runtime is missing. Run `cd server && npx playwright install chromium` and retry.";
     }
     result.backend = "playwright";
     return result;

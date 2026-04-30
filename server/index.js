@@ -280,6 +280,15 @@ const INACTIVITY_TIMEOUT_MS = parseInt(
   process.env.AUTODOM_INACTIVITY_TIMEOUT || "600000",
   10,
 ); // 10 minutes default
+const PROXY_CONNECT_TIMEOUT_MS = parseInt(
+  process.env.AUTODOM_PROXY_CONNECT_TIMEOUT || "4000",
+  10,
+);
+const PROXY_LOCK_WAIT_MS = parseInt(
+  process.env.AUTODOM_PROXY_LOCK_WAIT || "4000",
+  10,
+);
+const PROXY_LOCK_POLL_MS = 100;
 const SSE_PORT = parseInt(getArgValue("--sse-port") || "0", 10);
 
 // ─── Domain Guardrails ───────────────────────────────────────
@@ -874,6 +883,7 @@ async function shutdown(code = 0) {
 }
 
 let proxyClient = null; // If we are a secondary instance, we connect to the primary instance here
+let proxyConnectPromise = null;
 let isPrimaryServer = true;
 
 // Tracks AI chat request ids the user has cancelled via the chat
@@ -1216,46 +1226,177 @@ async function startWebSocketServer() {
   });
 }
 
-function setupProxyClient(resolve) {
-  // Read the primary's token from the lockfile so we can authenticate.
-  let token = AUTH_TOKEN;
-  try {
-    const lock = JSON.parse(readFileSync(lockFilePath, "utf8"));
-    if (lock?.token) token = lock.token;
-  } catch (_) {
-    // Fall back to our own AUTH_TOKEN (likely won't match, but try anyway).
+async function readProxyAuthToken() {
+  const deadline = Date.now() + PROXY_LOCK_WAIT_MS;
+  while (Date.now() <= deadline) {
+    const lock = await readLockFile().catch(() => null);
+    if (lock?.port === WS_PORT && lock?.token) {
+      return lock.token;
+    }
+    if (lock?.pid && !(await isProcessRunning(lock.pid))) {
+      await fs.rm(lockFilePath, { force: true }).catch(() => {});
+      break;
+    }
+    if (Date.now() >= deadline) break;
+    await delay(PROXY_LOCK_POLL_MS);
   }
-  proxyClient = new WebSocket(
-    `ws://127.0.0.1:${WS_PORT}/?token=${encodeURIComponent(token)}`,
-  );
 
-  proxyClient.on("open", () => {
-    process.stderr.write(
-      "[AutoDOM] Proxy client connected to primary server.\n",
-    );
-    resolve();
-  });
+  // If the user intentionally configured a shared token, it is valid for all
+  // concurrent server instances even before the lockfile exists.
+  return process.env.AUTODOM_TOKEN ? AUTH_TOKEN : null;
+}
 
-  proxyClient.on("error", (err) => {
-    process.stderr.write(
-      `[AutoDOM] Proxy client failed to connect: ${err.message}\n`,
-    );
-    resolve();
-  });
+function rejectPendingProxyCalls(error) {
+  if (isPrimaryServer) return;
+  for (const [id, pending] of pendingCalls) {
+    clearTimeout(pending.timer);
+    pendingCalls.delete(id);
+    pending.resolve({ error });
+  }
+}
 
-  proxyClient.on("message", (data) => {
-    try {
-      const message = JSON.parse(data.toString());
-      if (message.type === "TOOL_RESULT" && message.id != null) {
-        const pending = pendingCalls.get(message.id);
-        if (pending) {
-          clearTimeout(pending.timer);
-          pendingCalls.delete(message.id);
-          pending.resolve(message.result);
+async function ensureProxyClientConnected() {
+  if (proxyClient?.readyState === WebSocket.OPEN) {
+    return true;
+  }
+  if (proxyConnectPromise) {
+    return await proxyConnectPromise;
+  }
+
+  proxyConnectPromise = (async () => {
+    if (proxyClient) {
+      try {
+        proxyClient.terminate();
+      } catch (_) {}
+      proxyClient = null;
+    }
+
+    const token = await readProxyAuthToken();
+    if (!token) {
+      process.stderr.write(
+        `[AutoDOM] Proxy client could not read primary auth token from ${lockFilePath}\n`,
+      );
+      return false;
+    }
+
+    return await new Promise((resolveConnected) => {
+      let settled = false;
+      let opened = false;
+      let timer = null;
+      const ws = new WebSocket(
+        `ws://127.0.0.1:${WS_PORT}/?token=${encodeURIComponent(token)}`,
+      );
+      proxyClient = ws;
+
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (!ok && proxyClient === ws) {
+          try {
+            ws.terminate();
+          } catch (_) {}
+          proxyClient = null;
         }
-      }
-    } catch (e) {}
+        resolveConnected(ok);
+      };
+
+      timer = setTimeout(() => {
+        process.stderr.write(
+          `[AutoDOM] Proxy client timed out connecting to primary server after ${PROXY_CONNECT_TIMEOUT_MS}ms\n`,
+        );
+        finish(false);
+      }, PROXY_CONNECT_TIMEOUT_MS);
+      timer.unref?.();
+
+      ws.on("open", () => {
+        opened = true;
+        process.stderr.write(
+          "[AutoDOM] Proxy client connected to primary server.\n",
+        );
+        finish(true);
+      });
+
+      ws.on("error", (err) => {
+        process.stderr.write(
+          `[AutoDOM] Proxy client failed to connect: ${err.message}\n`,
+        );
+        if (!opened) finish(false);
+      });
+
+      ws.on("close", (code, reasonBuffer) => {
+        if (proxyClient === ws) {
+          proxyClient = null;
+        }
+        const reason = reasonBuffer?.toString?.("utf8") || "";
+        const suffix = reason ? ` reason=${reason}` : "";
+        if (!opened) {
+          process.stderr.write(
+            `[AutoDOM] Proxy client closed before connection (code=${code}${suffix})\n`,
+          );
+          finish(false);
+          return;
+        }
+        process.stderr.write(
+          `[AutoDOM] Proxy client disconnected from primary server (code=${code}${suffix})\n`,
+        );
+        rejectPendingProxyCalls(
+          "Proxy connection to primary AutoDOM server closed.",
+        );
+      });
+
+      ws.on("message", (data) => {
+        try {
+          const message = JSON.parse(data.toString());
+          if (message.type === "TOOL_RESULT" && message.id != null) {
+            const pending = pendingCalls.get(message.id);
+            if (pending) {
+              clearTimeout(pending.timer);
+              pendingCalls.delete(message.id);
+              pending.resolve(message.result);
+            }
+          }
+        } catch (e) {}
+      });
+    });
+  })().finally(() => {
+    proxyConnectPromise = null;
   });
+
+  return await proxyConnectPromise;
+}
+
+function setupProxyClient(resolve) {
+  ensureProxyClientConnected()
+    .catch((err) => {
+      process.stderr.write(
+        `[AutoDOM] Proxy setup failed: ${err?.message || err}\n`,
+      );
+    })
+    .finally(resolve);
+}
+
+async function tryRecoverSecondaryAsPrimary() {
+  if (isPrimaryServer) return true;
+  process.stderr.write(
+    "[AutoDOM] Proxy unavailable; attempting to recover as primary bridge.\n",
+  );
+  try {
+    isPrimaryServer = true;
+    await startWebSocketServer();
+    if (isPrimaryServer) {
+      process.stderr.write(
+        "[AutoDOM] Recovered secondary server as primary bridge.\n",
+      );
+      return true;
+    }
+  } catch (err) {
+    process.stderr.write(
+      `[AutoDOM] Secondary recovery as primary failed: ${err?.message || err}\n`,
+    );
+  }
+  isPrimaryServer = false;
+  return false;
 }
 
 function setupWssConnection(wss) {
@@ -2279,32 +2420,56 @@ function callExtensionTool(tool, params) {
 
     // Route through proxy if we are a secondary instance
     if (!isPrimaryServer) {
-      if (!proxyClient || proxyClient.readyState !== 1) {
-        diagLog(
-          `toolCall FAIL tool=${tool} reason=proxy_unreachable proxyState=${proxyClient ? proxyClient.readyState : "null"}`,
-        );
-        wrappedResolve({
-          error: "Secondary server could not reach primary AutoDOM server.",
-        });
-        return;
-      }
-      const id = ++callIdCounter;
-      const timer = setTimeout(() => {
-        pendingCalls.delete(id);
-        resolve({
-          error: `Tool "${tool}" timed out across proxy after ${TOOL_TIMEOUT}ms`,
-        });
-      }, TOOL_TIMEOUT);
+      (async () => {
+        let connected = await ensureProxyClientConnected();
+        if (!connected) {
+          const recoveredPrimary = await tryRecoverSecondaryAsPrimary();
+          if (recoveredPrimary) {
+            resolve(await callExtensionTool(tool, params));
+            return;
+          }
+          connected = await ensureProxyClientConnected();
+        }
+        if (!connected || !proxyClient || proxyClient.readyState !== 1) {
+          diagLog(
+            `toolCall FAIL tool=${tool} reason=proxy_unreachable proxyState=${proxyClient ? proxyClient.readyState : "null"}`,
+          );
+          wrappedResolve({
+            error:
+              "Secondary server could not reach primary AutoDOM server. The primary bridge may still be starting, may have exited, or may be blocked by a stale process. Retry once; if it persists, run `node server/index.js --stop` and reconnect AutoDOM.",
+          });
+          return;
+        }
+        const id = ++callIdCounter;
+        const timer = setTimeout(() => {
+          pendingCalls.delete(id);
+          wrappedResolve({
+            error: `Tool "${tool}" timed out across proxy after ${TOOL_TIMEOUT}ms`,
+          });
+        }, TOOL_TIMEOUT);
 
-      pendingCalls.set(id, { resolve: wrappedResolve, reject, timer });
-      proxyClient.send(
-        JSON.stringify({
-          type: "INTERNAL_PROXY_CALL",
-          id,
-          tool,
-          params,
-        }),
-      );
+        pendingCalls.set(id, { resolve: wrappedResolve, reject, timer });
+        try {
+          proxyClient.send(
+            JSON.stringify({
+              type: "INTERNAL_PROXY_CALL",
+              id,
+              tool,
+              params,
+            }),
+          );
+        } catch (err) {
+          clearTimeout(timer);
+          pendingCalls.delete(id);
+          wrappedResolve({
+            error: `Secondary server lost proxy connection to primary AutoDOM server: ${err?.message || err}`,
+          });
+        }
+      })().catch((err) => {
+        wrappedResolve({
+          error: `Secondary server failed to proxy tool "${tool}": ${err?.message || err}`,
+        });
+      });
       return;
     }
 
