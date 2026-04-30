@@ -37,8 +37,11 @@ let _sessionTimedOut = false; // Set when server or extension inactivity timeout
 const ACTIVITY_LOG_KEY = "autodomActivityLogs";
 const ACTIVITY_LOG_LIMIT = 250;
 const UPDATE_CHECK_ALARM_NAME = "autodom-periodic-update-check";
-const UPDATE_CHECK_INTERVAL_MINUTES = 5 * 60;
+// Poll the tiny updates.xml often, but only call Chrome's throttled
+// requestUpdateCheck() after the manifest says a newer version exists.
+const UPDATE_CHECK_INTERVAL_MINUTES = 30;
 const UPDATE_CHECK_INTERVAL_MS = UPDATE_CHECK_INTERVAL_MINUTES * 60 * 1000;
+const UPDATE_MANIFEST_FETCH_TIMEOUT_MS = 8000;
 const AUTO_UPDATE_RELOAD_COOLDOWN_MS = 10 * 60 * 1000;
 const UPDATE_STORAGE_KEYS = {
   pending: "pendingUpdate",
@@ -6253,6 +6256,85 @@ function _requestRuntimeUpdateCheck() {
   });
 }
 
+function _compareExtensionVersions(a, b) {
+  const left = String(a || "").split(".");
+  const right = String(b || "").split(".");
+  const length = Math.max(left.length, right.length);
+  for (let i = 0; i < length; i += 1) {
+    const l = Number.parseInt(left[i] || "0", 10) || 0;
+    const r = Number.parseInt(right[i] || "0", 10) || 0;
+    if (l !== r) return l > r ? 1 : -1;
+  }
+  return 0;
+}
+
+function _readUpdateXmlAttr(tag, name) {
+  const match = String(tag || "").match(
+    new RegExp(`${name}\\s*=\\s*(['"])(.*?)\\1`, "i"),
+  );
+  return match ? match[2] : "";
+}
+
+function _parsePublishedUpdateManifest(xml, extensionId) {
+  const apps = String(xml || "").match(/<app\b[\s\S]*?<\/app>/gi) || [];
+  for (const app of apps) {
+    const appId = _readUpdateXmlAttr(app, "appid");
+    if (extensionId && appId && appId !== extensionId) continue;
+    const updateMatch = app.match(/<updatecheck\b[^>]*\/?>/i);
+    if (!updateMatch) continue;
+    return {
+      appId,
+      version: _readUpdateXmlAttr(updateMatch[0], "version"),
+      codebase: _readUpdateXmlAttr(updateMatch[0], "codebase"),
+    };
+  }
+  return null;
+}
+
+async function _requestPublishedUpdateManifest() {
+  const manifest = chrome.runtime.getManifest ? chrome.runtime.getManifest() : {};
+  const updateUrl = manifest?.update_url || "";
+  if (!updateUrl || typeof fetch !== "function") {
+    return { status: "unsupported", details: null };
+  }
+
+  const ac =
+    typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = ac
+    ? setTimeout(() => ac.abort(), UPDATE_MANIFEST_FETCH_TIMEOUT_MS)
+    : null;
+  try {
+    const response = await fetch(updateUrl, {
+      cache: "no-store",
+      signal: ac ? ac.signal : undefined,
+    });
+    if (!response.ok) {
+      throw new Error(`update manifest HTTP ${response.status}`);
+    }
+    const details = _parsePublishedUpdateManifest(
+      await response.text(),
+      chrome.runtime.id || "",
+    );
+    if (!details || !details.version) {
+      return { status: "unknown", details: null };
+    }
+    const currentVersion = manifest?.version || "";
+    return {
+      status:
+        _compareExtensionVersions(details.version, currentVersion) > 0
+          ? "new_release_found"
+          : "no_update",
+      details: {
+        ...details,
+        currentVersion,
+        updateUrl,
+      },
+    };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function _maybeAutoApplyPendingUpdate(pending, source) {
   if (!pending || !pending.version) return false;
   const stored = await _readUpdateStorage(
@@ -6357,20 +6439,52 @@ async function _runExtensionUpdateCheckNow(opts = {}) {
     };
   }
 
+  let preflight = null;
+  try {
+    preflight = await _requestPublishedUpdateManifest();
+  } catch (err) {
+    _debugWarn(
+      "[AutoDOM SW] Update manifest preflight failed; falling back to runtime check:",
+      err?.message || err,
+    );
+  }
+
+  if (preflight && preflight.status === "no_update") {
+    await _writeUpdateStorage(
+      {
+        [UPDATE_STORAGE_KEYS.lastCheckAt]: now,
+        [UPDATE_STORAGE_KEYS.lastCheckStatus]: "no_update",
+        [UPDATE_STORAGE_KEYS.lastCheckSource]: source,
+      },
+      "update manifest preflight result",
+    );
+    return {
+      ok: true,
+      status: "no_update",
+      details: preflight.details,
+      lastCheckAt: now,
+      nextCheckAt: now + UPDATE_CHECK_INTERVAL_MS,
+    };
+  }
+
   try {
     const result = await _requestRuntimeUpdateCheck();
     const status = (result && result.status) || "unknown";
     const details = (result && result.details) || null;
     const writes = {
       [UPDATE_STORAGE_KEYS.lastCheckAt]: now,
-      [UPDATE_STORAGE_KEYS.lastCheckStatus]: status,
+      [UPDATE_STORAGE_KEYS.lastCheckStatus]:
+        preflight?.status === "new_release_found" && status !== "update_available"
+          ? "new_release_found"
+          : status,
       [UPDATE_STORAGE_KEYS.lastCheckSource]: source,
     };
     await _writeUpdateStorage(writes, "update check result");
 
     if (status === "update_available") {
       const pendingUpdate = await _setPendingUpdate(
-        details && details.version,
+        (details && details.version) ||
+          (preflight?.details && preflight.details.version),
         source,
       );
       return {
@@ -6378,6 +6492,18 @@ async function _runExtensionUpdateCheckNow(opts = {}) {
         status,
         details,
         pendingUpdate,
+        nextCheckAt: now + UPDATE_CHECK_INTERVAL_MS,
+      };
+    }
+
+    if (preflight && preflight.status === "new_release_found") {
+      return {
+        ok: true,
+        status: "new_release_found",
+        details: preflight.details,
+        runtimeStatus: status,
+        runtimeDetails: details,
+        lastCheckAt: now,
         nextCheckAt: now + UPDATE_CHECK_INTERVAL_MS,
       };
     }

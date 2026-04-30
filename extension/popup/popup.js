@@ -198,6 +198,9 @@ async function runUpdateCheck() {
       setLabel("up to date");
     } else if (status === "throttled") {
       setLabel("rate-limited");
+    } else if (status === "new_release_found") {
+      const v = (result.details && result.details.version) || "?";
+      setLabel(`v${v} found`);
     } else if (status === "skipped" && result.reason === "not_due") {
       setLabel("checked recently");
     } else if (status === "unsupported") {
