@@ -276,7 +276,7 @@
   // colour string (`#rrggbb`, `oklch(...)`, etc.) is accepted; null
   // / unset means "use the theme's built-in accent".
   const STORAGE_KEY_ACCENT = "__autodom_chat_accent";
-  const STORAGE_KEY_SETTINGS = "__autodom_chat_settings"; // { verboseLogs: bool, panelWidth: number, persistAcrossSessions: bool, widthByHost: {host:number}, collapsedByHost: {host:bool} }
+  const STORAGE_KEY_SETTINGS = "__autodom_chat_settings"; // { verboseLogs: bool, panelWidth: number, persistAcrossSessions: bool, responseStyle: string, completionSound: bool, widthByHost: {host:number}, collapsedByHost: {host:bool} }
   // chrome.storage.local mirrors of the chat (survives tab close + browser
   // restart). Only written when the "Keep chat across browser sessions"
   // toggle is ON. Tab-local sessionStorage above is always used; this
@@ -631,6 +631,7 @@
     verboseLogs: true,
     panelWidth: PANEL_WIDTH_DEFAULT,
     persistAcrossSessions: false,
+    completionSound: true,
     // Reply formatting style. concise|jetbrains|chatbar — plumbed end-to-end
     // (panel → SW → providers/bridge → CLI prompt). The provider system
     // prompt picks up a matching instruction so every code path obeys it.
@@ -677,6 +678,8 @@
             _chatSettings.panelWidth = _clampPanelWidth(s.panelWidth);
           if (typeof s.persistAcrossSessions === "boolean")
             _chatSettings.persistAcrossSessions = s.persistAcrossSessions;
+          if (typeof s.completionSound === "boolean")
+            _chatSettings.completionSound = s.completionSound;
           if (typeof s.responseStyle === "string" &&
               ["concise", "jetbrains", "chatbar"].includes(s.responseStyle))
             _chatSettings.responseStyle = s.responseStyle;
@@ -5451,8 +5454,69 @@
   // button can never get out of sync (e.g. stuck disabled after an
   // error, or showing "send" while a request is still running on the
   // bridge).
+  let _completionAudioCtx = null;
+  let _lastCompletionBeepAt = 0;
+  function _shouldNotifyCompletion() {
+    return !isOpen || !!document.hidden;
+  }
+  function _primeCompletionAudio() {
+    if (!_chatSettings.completionSound) return;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!_completionAudioCtx) _completionAudioCtx = new Ctx();
+      if (_completionAudioCtx.state === "suspended") {
+        _completionAudioCtx.resume().catch(() => {});
+      }
+    } catch (_) {}
+  }
+  function _playCompletionBeep() {
+    if (!_chatSettings.completionSound) return;
+    if (_userAborted) return;
+    if (!_shouldNotifyCompletion()) return;
+    const now = Date.now();
+    if (now - _lastCompletionBeepAt < 700) return;
+    _lastCompletionBeepAt = now;
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      if (!_completionAudioCtx) _completionAudioCtx = new Ctx();
+      const ctx = _completionAudioCtx;
+      const run = () => {
+        const t0 = ctx.currentTime + 0.01;
+        const gain = ctx.createGain();
+        gain.gain.setValueAtTime(0.0001, t0);
+        gain.gain.exponentialRampToValueAtTime(0.07, t0 + 0.03);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.28);
+        gain.connect(ctx.destination);
+
+        const osc1 = ctx.createOscillator();
+        osc1.type = "sine";
+        osc1.frequency.setValueAtTime(740, t0);
+        osc1.frequency.exponentialRampToValueAtTime(920, t0 + 0.12);
+        osc1.connect(gain);
+        osc1.start(t0);
+        osc1.stop(t0 + 0.12);
+
+        const osc2 = ctx.createOscillator();
+        osc2.type = "sine";
+        osc2.frequency.setValueAtTime(980, t0 + 0.13);
+        osc2.frequency.exponentialRampToValueAtTime(1180, t0 + 0.24);
+        osc2.connect(gain);
+        osc2.start(t0 + 0.13);
+        osc2.stop(t0 + 0.24);
+      };
+      if (ctx.state === "suspended") {
+        ctx.resume().then(run).catch(() => {});
+      } else {
+        run();
+      }
+    } catch (_) {}
+  }
   function _setBusy(busy) {
+    const wasBusy = !!isProcessing;
     isProcessing = !!busy;
+    if (busy) _primeCompletionAudio();
     if (sendBtn) {
       if (busy) {
         sendBtn.classList.add("is-stop");
@@ -5502,6 +5566,7 @@
       }
     });
     _updateAutomationUi();
+    if (wasBusy && !busy) _playCompletionBeep();
   }
 
   // ─── Automation Activity UI ───────────────────────────────
@@ -5994,6 +6059,8 @@
       if (typeof s.responseStyle === "string" &&
           ["concise", "jetbrains", "chatbar"].includes(s.responseStyle))
         _chatSettings.responseStyle = s.responseStyle;
+      if (typeof s.completionSound === "boolean")
+        _chatSettings.completionSound = s.completionSound;
       // Mirror the persist-across-sessions flag too, since the popup's
       // Chat tab is now the only place this is toggled. Apply the
       // same side effects the legacy in-panel toggle did so flipping

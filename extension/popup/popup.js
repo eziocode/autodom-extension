@@ -990,16 +990,19 @@ function initChatAppearanceTab() {
 }
 
 // ─── Chat panel settings (mirrors __autodom_chat_settings used by chat-panel.js) ───
-// chat-panel.js owns the storage shape; we only touch the two boolean
-// fields that map to UI toggles here. A storage.onChanged listener
+// chat-panel.js owns the storage shape; we only touch the toggle-backed
+// fields that map to UI controls here. A storage.onChanged listener
 // keeps the popup in sync if the user flips the same toggle from
 // another window/tab.
 function initChatSettingsTab() {
   const STORAGE_KEY = "__autodom_chat_settings";
   const verboseToggle = document.getElementById("chatVerboseToggle");
   const persistToggle = document.getElementById("chatPersistToggle");
+  const completionSoundToggle = document.getElementById(
+    "chatCompletionSoundToggle",
+  );
   const styleSelect = document.getElementById("chatResponseStyle");
-  if (!verboseToggle || !persistToggle) return;
+  if (!verboseToggle || !persistToggle || !completionSoundToggle) return;
 
   function applyToUI(s) {
     if (!s || typeof s !== "object") return;
@@ -1007,6 +1010,8 @@ function initChatSettingsTab() {
       verboseToggle.checked = s.verboseLogs;
     if (typeof s.persistAcrossSessions === "boolean")
       persistToggle.checked = s.persistAcrossSessions;
+    if (typeof s.completionSound === "boolean")
+      completionSoundToggle.checked = s.completionSound;
     if (styleSelect && typeof s.responseStyle === "string" &&
         ["concise", "jetbrains", "chatbar"].includes(s.responseStyle)) {
       styleSelect.value = s.responseStyle;
@@ -1014,12 +1019,14 @@ function initChatSettingsTab() {
   }
 
   // Initial load — defaults match chat-panel.js (verboseLogs:true,
-  // persistAcrossSessions:false, responseStyle:"concise") so first-time
+  // persistAcrossSessions:false, completionSound:true,
+  // responseStyle:"concise") so first-time
   // users see the same state regardless of which surface they look at.
   chrome.storage?.local?.get?.([STORAGE_KEY], (items) => {
     const s = (items && items[STORAGE_KEY]) || {
       verboseLogs: true,
       persistAcrossSessions: false,
+      completionSound: true,
       responseStyle: "concise",
     };
     applyToUI({
@@ -1029,6 +1036,10 @@ function initChatSettingsTab() {
         typeof s.persistAcrossSessions === "boolean"
           ? s.persistAcrossSessions
           : false,
+      completionSound:
+        typeof s.completionSound === "boolean"
+          ? s.completionSound
+          : true,
       responseStyle:
         typeof s.responseStyle === "string" ? s.responseStyle : "concise",
     });
@@ -1047,6 +1058,9 @@ function initChatSettingsTab() {
   });
   persistToggle.addEventListener("change", () => {
     persistField("persistAcrossSessions", !!persistToggle.checked);
+  });
+  completionSoundToggle.addEventListener("change", () => {
+    persistField("completionSound", !!completionSoundToggle.checked);
   });
   if (styleSelect) {
     styleSelect.addEventListener("change", () => {
