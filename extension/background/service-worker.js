@@ -5872,6 +5872,33 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   }
 });
 
+// ─── Side Panel Liveness Registry ────────────────────────────
+// Chrome exposes `sidePanel.open()` but no `close()`. To make
+// Cmd/Ctrl+Shift+K a true toggle, the side-panel page connects a
+// long-lived port on load. Presence of a port for a windowId means
+// the panel is open; on a second shortcut press we ask the panel to
+// `window.close()` itself over that port.
+const sidePanelPorts = new Map(); // windowId -> Port
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== "autodom-sidepanel") return;
+  // The side panel page has no associated tab in port.sender, so the
+  // page sends its windowId in the first message. Until then, key by
+  // a sentinel and let the message fix the entry.
+  let key = "__pending__";
+  sidePanelPorts.set(key, port);
+  port.onMessage.addListener((msg) => {
+    if (msg && msg.type === "AUTODOM_SIDEPANEL_HELLO" && msg.windowId != null) {
+      sidePanelPorts.delete(key);
+      key = msg.windowId;
+      sidePanelPorts.set(key, port);
+    }
+  });
+  port.onDisconnect.addListener(() => {
+    if (sidePanelPorts.get(key) === port) sidePanelPorts.delete(key);
+  });
+});
+
 // ─── Keyboard Command Handlers ───────────────────────────────
 // Handle manifest-registered keyboard shortcuts (Ctrl+Shift+K, Ctrl+Shift+L)
 // These fire even when no popup/page is focused, unlike content-script listeners.
@@ -5887,6 +5914,19 @@ chrome.commands.onCommand.addListener(async (command) => {
       // injected panel only when sidePanel API is unavailable (older
       // Chrome, Firefox via manifest.firefox.json, restricted pages
       // where the side panel can't be opened).
+      //
+      // Toggle behavior: if the side panel is already open in this
+      // window (we have a live port), tell it to close itself.
+      const existing = sidePanelPorts.get(tab.windowId);
+      if (existing) {
+        try {
+          existing.postMessage({ type: "AUTODOM_SIDEPANEL_CLOSE" });
+        } catch (_) {
+          // Port already torn down — drop it and fall through to open.
+          sidePanelPorts.delete(tab.windowId);
+        }
+        if (sidePanelPorts.has(tab.windowId)) return;
+      }
       try {
         if (chrome.sidePanel && typeof chrome.sidePanel.open === "function") {
           await chrome.sidePanel.open({ windowId: tab.windowId });

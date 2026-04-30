@@ -1649,6 +1649,11 @@
       font-weight: 600 !important;
       color: var(--c-text) !important;
     }
+    .autodom-chat-settings-overlay-mount {
+      flex: 1 1 auto !important;
+      min-height: 0 !important;
+      display: flex !important;
+    }
     .autodom-chat-settings-overlay-frame {
       flex: 1 1 auto !important;
       width: 100% !important;
@@ -4785,7 +4790,10 @@
         </button>
         <span class="autodom-chat-settings-overlay-title">Extension settings</span>
       </div>
-      <iframe class="autodom-chat-settings-overlay-frame" id="__autodom_settings_overlay_frame" title="AutoDOM extension settings"></iframe>
+      <div
+        class="autodom-chat-settings-overlay-mount"
+        id="__autodom_settings_overlay_mount"
+      ></div>
     </div>
   `;
   document.documentElement.appendChild(panel);
@@ -6344,15 +6352,29 @@
   // toggle changes made in the popup.
   const settingsBtn = document.getElementById("__autodom_settings_btn");
   const settingsOverlay = document.getElementById("__autodom_settings_overlay");
-  const settingsOverlayFrame = document.getElementById(
-    "__autodom_settings_overlay_frame",
+  const settingsOverlayMount = document.getElementById(
+    "__autodom_settings_overlay_mount",
   );
+  let settingsOverlayFrame = null;
   const settingsOverlayBack = document.getElementById(
     "__autodom_settings_overlay_back",
   );
   let _settingsOverlayLastFocus = null;
+  function _ensureSettingsOverlayFrame() {
+    if (settingsOverlayFrame) return settingsOverlayFrame;
+    if (!settingsOverlayMount) return null;
+    const frame = document.createElement("iframe");
+    frame.className = "autodom-chat-settings-overlay-frame";
+    frame.id = "__autodom_settings_overlay_frame";
+    frame.title = "AutoDOM extension settings";
+    settingsOverlayMount.appendChild(frame);
+    settingsOverlayFrame = frame;
+    return frame;
+  }
   function _openSettingsOverlay() {
-    if (!settingsOverlay || !settingsOverlayFrame) return;
+    if (!settingsOverlay) return;
+    const frame = _ensureSettingsOverlayFrame();
+    if (!frame) return;
     try {
       _settingsOverlayLastFocus = document.activeElement;
     } catch (_) {
@@ -6362,8 +6384,8 @@
     // until the user actually asks for settings. The ?embedded=1
     // hint tells popup.js to relax its fixed-width body and hide
     // the redundant "Open AI Chat" button.
-    if (!settingsOverlayFrame.getAttribute("src")) {
-      settingsOverlayFrame.setAttribute(
+    if (!frame.getAttribute("src")) {
+      frame.setAttribute(
         "src",
         chrome.runtime.getURL("popup/popup.html") + "?embedded=1",
       );
@@ -10762,33 +10784,49 @@
   });
 
   // ─── Keyboard Shortcuts ────────────────────────────────────
-  // Ctrl/Cmd + Shift + K → Toggle sidebar chat panel
-  // Ctrl/Cmd + Shift + L → Toggle quick prompt overlay
-  // Escape → Close active panel/overlay
-  document.addEventListener("keydown", (e) => {
-    // Ctrl/Cmd + Shift + K: Toggle sidebar
-    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === "K") {
-      e.preventDefault();
-      isMcpActive = true;
-      if (inlineMode) closeInlineOverlay();
-      if (isOpen) {
-        closePanel();
-      } else {
-        openPanel();
-        checkConnectionStatus();
-      }
+  // Ctrl/Cmd + Shift + K and Ctrl/Cmd + Shift + L are owned by the
+  // manifest `commands` entries and dispatched by the service worker
+  // (see service-worker.js → chrome.commands.onCommand). Registering
+  // them here too caused the in-page injected panel to open alongside
+  // Chrome's native side panel (duplicate surfaces). Only Escape
+  // remains as a page-local shortcut.
+  //
+  // Firefox fallback: if `chrome.commands` is unavailable, restore the
+  // in-page bindings so the shortcuts still work for the injected
+  // panel surface.
+  const _hasManifestCommands = (() => {
+    try {
+      return !!(chrome && chrome.commands);
+    } catch (_) {
+      return false;
     }
+  })();
 
-    // Ctrl/Cmd + Shift + L: Toggle inline AI overlay
-    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === "L") {
-      e.preventDefault();
-      isMcpActive = true;
-      if (isOpen) closePanel();
-      if (inlineMode) {
-        closeInlineOverlay();
-      } else {
-        openInlineOverlay();
-        checkConnectionStatus();
+  document.addEventListener("keydown", (e) => {
+    if (!_hasManifestCommands) {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === "K") {
+        e.preventDefault();
+        isMcpActive = true;
+        if (inlineMode) closeInlineOverlay();
+        if (isOpen) {
+          closePanel();
+        } else {
+          openPanel();
+          checkConnectionStatus();
+        }
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === "L") {
+        e.preventDefault();
+        isMcpActive = true;
+        if (isOpen) closePanel();
+        if (inlineMode) {
+          closeInlineOverlay();
+        } else {
+          openInlineOverlay();
+          checkConnectionStatus();
+        }
+        return;
       }
     }
 
