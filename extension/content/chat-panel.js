@@ -1124,12 +1124,16 @@
   if (!SIDE_PANEL_MODE && !document.getElementById(STYLE_ID + "_link")) {
     const guard = document.createElement("style");
     guard.id = STYLE_ID + "_critical";
-    // Hide the panel + overlay roots until the real CSS loads. Use
-    // visibility (not display:none) so layout still settles correctly
-    // and onload remove is a one-property update.
+    // Hide the panel + overlay roots AND suppress transitions until the
+    // real CSS loads.  opacity:0 + visibility:hidden is belt-and-
+    // suspenders — some browsers can flash a single frame of
+    // visibility:hidden fixed-position content on high-z layers.
+    // transition:none prevents the slide-in / page-push animation from
+    // playing when restoring a previously-open panel on refresh.
     guard.textContent =
       "#" + PANEL_ID + ",#" + INLINE_OVERLAY_ID +
-      "{visibility:hidden!important;}";
+      "{opacity:0!important;visibility:hidden!important;transition:none!important}" +
+      "html.__autodom_panel_open{transition:none!important}";
     document.documentElement.appendChild(guard);
 
     const link = document.createElement("link");
@@ -1144,7 +1148,22 @@
       return;
     }
     const reveal = () => {
-      try { guard.remove(); } catch (_) {}
+      try {
+        // Phase 1: remove the visibility cloak but keep transitions
+        // suppressed so a restored-open panel appears instantly
+        // instead of sliding in.
+        guard.textContent =
+          "#" + PANEL_ID + ",#" + INLINE_OVERLAY_ID +
+          "{transition:none!important}" +
+          "html.__autodom_panel_open{transition:none!important}";
+      } catch (_) {}
+      // Phase 2: after the browser has painted the settled layout,
+      // drop the transition lock so future open/close animates normally.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          try { guard.remove(); } catch (_) {}
+        });
+      });
     };
     link.addEventListener("load", reveal, { once: true });
     // If the stylesheet 404s for any reason (file missing in a partial
@@ -2539,6 +2558,7 @@
     }
     updateContext();
     checkConnectionStatus();
+    _startStatusPolling();
     persistChatState(true);
     _updateAutomationUi();
   }
@@ -2552,6 +2572,7 @@
     isOpen = false;
     panel.classList.remove("open");
     _setHtmlPushed(false);
+    if (!inlineMode) _stopStatusPolling();
     persistChatState(true);
     _updateAutomationUi();
     // Closing the panel should not kill automation; _updateAutomationUi()
@@ -3256,6 +3277,7 @@
     inlineResponse.classList.remove("visible");
     inlineResponseContent.textContent = "";
     inlineHints.style.display = "flex";
+    _startStatusPolling();
     setTimeout(() => inlineInput.focus(), 100);
   }
 
@@ -3263,6 +3285,7 @@
     inlineMode = false;
     inlineBackdrop.classList.remove("visible");
     inlineOverlay.classList.remove("visible");
+    if (!isOpen && !SIDE_PANEL_MODE) _stopStatusPolling();
   }
 
   inlineBackdrop.addEventListener("click", closeInlineOverlay);
@@ -3333,7 +3356,21 @@
     _pageContextCacheTime = 0;
   }
 
+  function _maybePerfLogSlowPath(label, ms, extra, minMs = _SLOW_PAGE_CONTEXT_MS) {
+    if (!Number.isFinite(ms) || ms < minMs) return;
+    const now = Date.now();
+    if (now - _lastPerfLogTs < _PERF_LOG_MIN_GAP_MS) return;
+    _lastPerfLogTs = now;
+    _log(
+      `[perf] ${label}: ${Math.round(ms)}ms` +
+      (extra ? ` ${extra}` : ""),
+    );
+  }
+
   async function getPageContext() {
+    const t0 = (typeof performance !== "undefined" && performance.now)
+      ? performance.now()
+      : Date.now();
     const now = Date.now();
     if (_cachedPageContext && now - _pageContextCacheTime < _PAGE_CONTEXT_TTL) {
       return _cachedPageContext;
@@ -3369,6 +3406,10 @@
         }
         _cachedPageContext = context;
         _pageContextCacheTime = now;
+        const dt = ((typeof performance !== "undefined" && performance.now)
+          ? performance.now()
+          : Date.now()) - t0;
+        _maybePerfLogSlowPath("getPageContext(sidepanel)", dt);
         return context;
       }
       if (pageInfo && pageInfo.blocked) {
@@ -3390,6 +3431,10 @@
         };
         _cachedPageContext = context;
         _pageContextCacheTime = now;
+        const dt = ((typeof performance !== "undefined" && performance.now)
+          ? performance.now()
+          : Date.now()) - t0;
+        _maybePerfLogSlowPath("getPageContext(sidepanel-blocked)", dt);
         return context;
       }
       const context = {
@@ -3408,6 +3453,10 @@
       };
       _cachedPageContext = context;
       _pageContextCacheTime = now;
+      const dt = ((typeof performance !== "undefined" && performance.now)
+        ? performance.now()
+        : Date.now()) - t0;
+      _maybePerfLogSlowPath("getPageContext(sidepanel-unavailable)", dt);
       return context;
     }
 
@@ -3457,6 +3506,10 @@
 
     _cachedPageContext = context;
     _pageContextCacheTime = now;
+    const dt = ((typeof performance !== "undefined" && performance.now)
+      ? performance.now()
+      : Date.now()) - t0;
+    _maybePerfLogSlowPath("getPageContext(page)", dt);
     return context;
   }
 
@@ -3502,10 +3555,7 @@
       clearTimeout(_mcpInactiveCloseTimer);
       _mcpInactiveCloseTimer = null;
     }
-    if (_statusPollInterval) {
-      clearInterval(_statusPollInterval);
-      _statusPollInterval = null;
-    }
+    _stopStatusPolling();
     if (_composerResizeObserver) {
       try { _composerResizeObserver.disconnect(); } catch (_) {}
       _composerResizeObserver = null;
@@ -3615,8 +3665,30 @@
     });
   }
 
-  // Poll connection status every 5 seconds (faster than before to reduce stale state)
-  _statusPollInterval = setInterval(checkConnectionStatus, 5000);
+  function _shouldPollConnectionStatus() {
+    return !_contextInvalidated && (isOpen || inlineMode || SIDE_PANEL_MODE);
+  }
+
+  function _startStatusPolling() {
+    if (_statusPollInterval || !_shouldPollConnectionStatus()) return;
+    _statusPollInterval = setInterval(() => {
+      if (!_shouldPollConnectionStatus()) {
+        _stopStatusPolling();
+        return;
+      }
+      checkConnectionStatus();
+    }, 5000);
+  }
+
+  function _stopStatusPolling() {
+    if (_statusPollInterval) {
+      clearInterval(_statusPollInterval);
+      _statusPollInterval = null;
+    }
+  }
+
+  // Single eager status check on startup; periodic polling starts only while
+  // a visible chat surface is active.
   checkConnectionStatus();
 
   // Side-panel mode: auto-open the panel and force-show MCP-active
@@ -5824,6 +5896,12 @@
   // offline. The full prompt is NEVER pushed into conversation
   // history — only a short label — to avoid bloating later turns.
   const _MAX_PAGE_TEXT = 12000;
+  const _SHADOW_TEXT_MAX_ROOTS = 16;
+  const _SHADOW_TEXT_MAX_HOST_SCAN_PER_ROOT = 800;
+  const _SLOW_PAGE_CONTEXT_MS = 160;
+  const _SLOW_PAGE_TEXT_MS = 120;
+  const _PERF_LOG_MIN_GAP_MS = 10000;
+  let _lastPerfLogTs = 0;
 
   function normalizeReadableText(text) {
     return _scrubContextIdentifiers(text)
@@ -5863,27 +5941,60 @@
   }
 
   function collectShadowText(root, limit) {
+    const maxLen = Math.max(0, Number(limit) || 0);
+    if (!maxLen) return "";
     const chunks = [];
     const queue = [root || document];
     const seen = new Set();
-    while (queue.length && chunks.join("\n").length < limit) {
+    let totalLen = 0;
+    // Bound traversal on huge pages: enough depth for useful context, without
+    // worst-case full-tree walks through every shadow host.
+    const MAX_SHADOW_ROOTS = _SHADOW_TEXT_MAX_ROOTS;
+    const MAX_HOST_SCAN_PER_ROOT = _SHADOW_TEXT_MAX_HOST_SCAN_PER_ROOT;
+    while (
+      queue.length &&
+      totalLen < maxLen &&
+      seen.size < MAX_SHADOW_ROOTS
+    ) {
       const current = queue.shift();
       if (!current || seen.has(current)) continue;
       seen.add(current);
       try {
-        const hosts = current.querySelectorAll
-          ? current.querySelectorAll("*")
-          : [];
-        for (const el of hosts) {
-          if (isAutodomElement(el)) continue;
-          if (el.shadowRoot) queue.push(el.shadowRoot);
+        if (current.querySelectorAll) {
+          const owner = current.ownerDocument || document;
+          if (owner && owner.createTreeWalker) {
+            const walker = owner.createTreeWalker(current, 1);
+            let scanned = 0;
+            while (scanned < MAX_HOST_SCAN_PER_ROOT) {
+              const el = walker.nextNode();
+              if (!el) break;
+              scanned++;
+              if (isAutodomElement(el)) continue;
+              if (el.shadowRoot && !seen.has(el.shadowRoot)) {
+                queue.push(el.shadowRoot);
+              }
+            }
+          } else {
+            const hosts = current.querySelectorAll("*");
+            let scanned = 0;
+            for (const el of hosts) {
+              if (scanned++ >= MAX_HOST_SCAN_PER_ROOT) break;
+              if (isAutodomElement(el)) continue;
+              if (el.shadowRoot && !seen.has(el.shadowRoot)) {
+                queue.push(el.shadowRoot);
+              }
+            }
+          }
         }
         const text = current.innerText || current.textContent || "";
         const clean = normalizeReadableText(text);
-        if (clean && clean.length > 40) chunks.push(clean);
+        if (clean && clean.length > 40) {
+          chunks.push(clean);
+          totalLen += clean.length + 2;
+        }
       } catch (_) {}
     }
-    return normalizeReadableText(chunks.join("\n\n")).substring(0, limit);
+    return normalizeReadableText(chunks.join("\n\n")).substring(0, maxLen);
   }
 
   function getVisibleOverlayText(limit = 4000) {
@@ -6187,6 +6298,9 @@
   }
 
   function extractMainPageText() {
+    const t0 = (typeof performance !== "undefined" && performance.now)
+      ? performance.now()
+      : Date.now();
     const overlayText = getVisibleOverlayText();
     const candidates = [
       document.querySelector("main"),
@@ -6215,7 +6329,19 @@
     if (shadowText && !text.includes(shadowText.substring(0, 200))) {
       parts.push(`Shadow DOM content:\n${shadowText}`);
     }
-    return normalizeReadableText(parts.join("\n\n")).substring(0, _MAX_PAGE_TEXT);
+    const result = normalizeReadableText(parts.join("\n\n")).substring(0, _MAX_PAGE_TEXT);
+    const dt = ((typeof performance !== "undefined" && performance.now)
+      ? performance.now()
+      : Date.now()) - t0;
+    if (dt >= _SLOW_PAGE_TEXT_MS) {
+      _maybePerfLogSlowPath(
+        "extractMainPageText",
+        dt,
+        `(len=${result.length}, roots<=${_SHADOW_TEXT_MAX_ROOTS}, scan<=${_SHADOW_TEXT_MAX_HOST_SCAN_PER_ROOT})`,
+        _SLOW_PAGE_TEXT_MS,
+      );
+    }
+    return result;
   }
 
   function buildLocalSummary() {
@@ -8167,9 +8293,23 @@
     _scheduleScrollToBottom(messagesContainer, "force");
   }
   if (restored.wasOpen) {
-    // Re-open panel if it was open before reload/navigation
+    // Re-open panel instantly without the slide-in transition.
+    // When the guard <style> is present (fresh injection) it already
+    // suppresses transitions; this inline override covers the
+    // re-injection path where the CSS link already existed and no
+    // guard was created.
+    panel.style.setProperty("transition", "none", "important");
+    document.documentElement.style.setProperty("transition", "none", "important");
     isMcpActive = true;
     openPanel();
+    // Re-enable transitions after the browser has painted the
+    // settled state so future open/close actions animate normally.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        panel.style.removeProperty("transition");
+        document.documentElement.style.removeProperty("transition");
+      });
+    });
   }
 
   updateContext();

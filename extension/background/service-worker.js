@@ -4712,6 +4712,8 @@ function resolvePendingAiRequests(error) {
   }
 }
 
+let _lastBroadcastMcpActive = null;
+
 function broadcastStatus(connected, log, logLevel) {
   chrome.runtime
     .sendMessage({
@@ -4724,8 +4726,12 @@ function broadcastStatus(connected, log, logLevel) {
     .catch(() => {}); // popup may not be open
 
   // Also broadcast MCP status to all content scripts so chat panel
-  // can show/hide itself based on MCP connection state
-  broadcastMcpStatusToTabs(connected);
+  // can show/hide itself based on MCP connection state.
+  // Dedup: reconnect loops can emit repeated identical status updates.
+  if (_lastBroadcastMcpActive !== connected) {
+    _lastBroadcastMcpActive = connected;
+    broadcastMcpStatusToTabs(connected);
+  }
 }
 
 async function broadcastMcpStatusToTabs(connected) {
@@ -6651,11 +6657,8 @@ async function broadcastToAllTabs(messages) {
 // LOC parse cost on every page load.
 const _CHAT_PANEL_MESSAGE_TYPES = new Set([
   "SHOW_CHAT_PANEL",
-  "HIDE_CHAT_PANEL",
   "TOGGLE_CHAT_PANEL",
   "TOGGLE_INLINE_AI",
-  "MCP_STATUS_CHANGED",
-  "AI_PROVIDER_STATUS",
 ]);
 function _messageNeedsChatPanel(msg) {
   return msg && _CHAT_PANEL_MESSAGE_TYPES.has(msg.type);
