@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AutoDOM",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2lfnsVPzHuaGTK7kMkPTak8t3uUOB8TULW3rxn1rCYoXs+NdpWrgsr+5lkoF+93oNCpPH7E9gdW2dov3DSOzjqWHbtk4qW4M4gMrSXOPhZjUcIW0Ls/OHrTlLOxS6pLnt39doszi5LMP4J/wSCQ5+nzpezZbuiuQHpVvysjF8sanj4eM+byECrB2o3KwIBrbZ4ltP82QZlEZGTcchCqoVml+SaO0EyoCPsL4arKAJ52mzlU9a/o2QFXkj9zMdYOzHtWdtKTz6fkIra72x1sBo6ac0k2QyA0cm0JH0l6fZefyJOXSYSXn0A98c0SHwWGWUAcPAcPgxo8+AcmqwBo/xQIDAQAB",
-  "version": "3.0.6",
+  "version": "3.0.7",
   "description": "Local MCP server for AI-driven browser automation. Connect your IDE agent to control the browser. Includes an inline AI chat panel powered by MCP.",
   "update_url": "https://eziocode.github.io/autodom-extension/updates.xml",
   "permissions": [
