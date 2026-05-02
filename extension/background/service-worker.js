@@ -5927,8 +5927,22 @@ async function toolWaitForElement(params) {
         const el = document.querySelector(selector);
         if (desiredState === "attached") return !!el;
         if (desiredState === "detached") return !el;
-        if (desiredState === "visible") return el && el.offsetParent !== null;
-        if (desiredState === "hidden") return !el || el.offsetParent === null;
+        if (desiredState === "visible") {
+          if (!el) return false;
+          // offsetParent is null for position:fixed elements and <body>,
+          // so use checkVisibility() (Chrome 105+) for a robust check.
+          if (typeof el.checkVisibility === "function")
+            return el.checkVisibility();
+          const s = getComputedStyle(el);
+          return s.display !== "none" && s.visibility !== "hidden";
+        }
+        if (desiredState === "hidden") {
+          if (!el) return true;
+          if (typeof el.checkVisibility === "function")
+            return !el.checkVisibility();
+          const s = getComputedStyle(el);
+          return s.display === "none" || s.visibility === "hidden";
+        }
         return !!el;
       },
       [selector, desiredState],
