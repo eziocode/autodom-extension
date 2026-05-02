@@ -833,6 +833,7 @@
   let _pendingLongLivedSnapshot = null;
   let _chatClearGeneration = 0;
   let _blockLongLivedRestore = false;
+  let _mcpInactiveCloseTimer = null;
   let _activeThreadId = "";
 
   function _buildChatStateSnapshot() {
@@ -2481,18 +2482,29 @@
   function setMcpActive(active) {
     _log("setMcpActive:", active, "was:", isMcpActive);
     isMcpActive = active;
+    if (active) {
+      if (_mcpInactiveCloseTimer) {
+        clearTimeout(_mcpInactiveCloseTimer);
+        _mcpInactiveCloseTimer = null;
+      }
+      return;
+    }
     // MCP indicator in context bar is hidden via CSS — connection status
     // is shown solely through the header status badge (setConnectionStatus).
-    if (!active) {
-      // Auto-close panel when MCP disconnects
-      if (isOpen) {
-        addMessage("system", "MCP session ended. Chat panel will close.");
-        setTimeout(() => closePanel(), 2000);
-      }
-      // Close inline overlay too
-      if (inlineMode) {
-        closeInlineOverlay();
-      }
+    // Auto-close panel when MCP disconnects.
+    // Guard with a cancellable timer: refresh/startup can briefly report
+    // inactive before the live status arrives, and we must not close in
+    // that reconnect window.
+    if (isOpen && !_mcpInactiveCloseTimer) {
+      addMessage("system", "MCP session ended. Chat panel will close.");
+      _mcpInactiveCloseTimer = setTimeout(() => {
+        _mcpInactiveCloseTimer = null;
+        if (!isMcpActive && isOpen) closePanel();
+      }, 2000);
+    }
+    // Close inline overlay too
+    if (inlineMode) {
+      closeInlineOverlay();
     }
   }
 
@@ -2533,6 +2545,10 @@
 
   function closePanel() {
     _log("closePanel called");
+    if (_mcpInactiveCloseTimer) {
+      clearTimeout(_mcpInactiveCloseTimer);
+      _mcpInactiveCloseTimer = null;
+    }
     isOpen = false;
     panel.classList.remove("open");
     _setHtmlPushed(false);
@@ -3482,6 +3498,10 @@
     const wasInline = inlineMode;
     try { persistChatState(true, true); } catch (_) {}
     _contextInvalidated = true;
+    if (_mcpInactiveCloseTimer) {
+      clearTimeout(_mcpInactiveCloseTimer);
+      _mcpInactiveCloseTimer = null;
+    }
     if (_statusPollInterval) {
       clearInterval(_statusPollInterval);
       _statusPollInterval = null;
