@@ -5896,7 +5896,7 @@
   // offline. The full prompt is NEVER pushed into conversation
   // history — only a short label — to avoid bloating later turns.
   const _MAX_PAGE_TEXT = 12000;
-  const _SHADOW_TEXT_MAX_ROOTS = 16;
+  const _SHADOW_TEXT_MAX_ROOTS = 20;
   const _SHADOW_TEXT_MAX_HOST_SCAN_PER_ROOT = 800;
   const _SLOW_PAGE_CONTEXT_MS = 160;
   const _SLOW_PAGE_TEXT_MS = 120;
