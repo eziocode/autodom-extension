@@ -16,7 +16,7 @@ that lets GitHub Copilot, JetBrains AI, Claude, Cursor, Gemini CLI and friends
 
 ## ✨ What you get
 
-- 🧰 **70 browser tools** exposed over MCP — DOM, navigation, network, cookies, tabs, JS eval, screenshots, scripts, and more.
+- 🧰 **84 browser tools** exposed over MCP — DOM, navigation, network, cookies, tabs, JS eval, screenshots, Playwright-compatible aliases, and more.
 - 💬 **In-page AI chat panel** and inline overlay so you can talk to your agent without leaving the tab.
 - 🤖 **Bring-your-own provider** — OpenAI, Anthropic, local Ollama, or your IDE's existing CLI agent (Copilot, Claude Code, Codex).
 - 🔒 **Local-first.** All traffic stays on `127.0.0.1`. Secrets live in session-only browser storage.
@@ -207,6 +207,7 @@ autodom-extension/
 ├── dist/               Prebuilt Chrome zip + signed CRX
 ├── setup.sh / .ps1     Zero-touch installer
 ├── INSTALL.md          Detailed install + per-IDE setup
+├── CHANGELOG.md        Version history and release notes
 ├── AUTOMATION.md       Local script runner guide
 ├── UPDATES.md          Update channel + enterprise rollout
 └── SECURITY.md         Auth model, secret storage, permissions
@@ -217,6 +218,7 @@ autodom-extension/
 ## 📚 Documentation
 
 - **[INSTALL.md](INSTALL.md)** — manual install, per-IDE setup, ports, uninstall
+- **[CHANGELOG.md](CHANGELOG.md)** — version history and release notes
 - **[AUTOMATION.md](AUTOMATION.md)** — local browser automation without AI
 - **[UPDATES.md](UPDATES.md)** — release channel and enterprise rollout
 - **[SECURITY.md](SECURITY.md)** — auth tokens, secret storage, permissions
