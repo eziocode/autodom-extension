@@ -4,6 +4,17 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## [3.0.8] — 2026-05-06
+
+### Improved
+- Removed the beta Scripts surface from popup settings and simplified popup initialization for lower UI overhead.
+- Removed legacy script-runner message paths (`RUN_AUTOMATION_SCRIPT` / `VALIDATE_AUTOMATION_SCRIPT`) from the extension bridge and service worker.
+
+### Fixed
+- Cleaned stale script/beta references and related dead code in popup, service worker, and server bridge logic.
+
+---
+
 ## [3.0.7] — 2025-05-05
 
 ### Fixed

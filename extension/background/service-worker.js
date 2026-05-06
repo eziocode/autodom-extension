@@ -3054,10 +3054,6 @@ function connectWebSocket(port) {
           return;
         }
 
-        // AUTOMATION_SCRIPT_RESULT / AUTOMATION_SCRIPT_VALIDATION used to be
-        // emitted by server-side Playwright/Node runners. Those backends were
-        // removed; scripts now run only in the active tab via the popup.
-
         // Streaming text deltas from the bridge server (CLI provider).
         // Forward to the chat panel so it can paint tokens incrementally
         // into a transient assistant bubble keyed by runId. The eventual
@@ -3720,80 +3716,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: true });
     })();
     return true;
-  }
-
-  if (message.type === "RUN_AUTOMATION_SCRIPT") {
-    // Manual run only: scripts may only be invoked from the extension popup
-    // Scripts tab. Reject calls from content scripts, chat panels, or other
-    // extension surfaces so background/MCP traffic cannot trigger script
-    // execution.
-    if (!isPopupSender(sender)) {
-      sendResponse({
-        ok: false,
-        status: "error",
-        error: "Automation scripts can only be run manually from the popup Scripts tab.",
-      });
-      return false;
-    }
-    const params = message.params || {};
-    const backend = params.backend || "browser-extension";
-    if (backend !== "browser-extension") {
-      sendResponse({
-        ok: false,
-        status: "error",
-        error:
-          "Server-side Playwright/Node automation backends were removed. Use the Browser extension backend.",
-      });
-      return false;
-    }
-    (async () => {
-      try {
-        const result = await toolRunBrowserScript({
-          source: params.source || "",
-          params: params.params || {},
-          timeoutMs: params.timeoutMs || 15000,
-        });
-        sendResponse(result);
-      } catch (err) {
-        sendResponse({ ok: false, status: "error", error: err?.message || String(err) });
-      }
-    })();
-    return true;
-  }
-
-  if (message.type === "VALIDATE_AUTOMATION_SCRIPT") {
-    if (!isPopupSender(sender)) {
-      sendResponse({
-        ok: false,
-        error: "Automation script validation is only available from the popup Scripts tab.",
-      });
-      return false;
-    }
-    const params = message.params || {};
-    const backend = params.backend || "browser-extension";
-    if (backend !== "browser-extension") {
-      sendResponse({
-        ok: false,
-        backend,
-        error:
-          "Server-side Playwright/Node automation backends were removed. Use the Browser extension backend.",
-      });
-      return false;
-    }
-    // MV3 service-worker CSP blocks `new Function` / eval, so parse-by-compile
-    // isn't available here. Defer real syntax checking to run time, where the
-    // script is compiled in the page's main world via executeInTab.
-    const src = String(params.source || "").trim();
-    if (!src) {
-      sendResponse({
-        ok: false,
-        backend: "browser-extension",
-        error: "Script source is empty",
-      });
-    } else {
-      sendResponse({ ok: true, backend: "browser-extension" });
-    }
-    return false;
   }
 
   if (message.type === "ACTIVITY_LOG_APPEND") {
@@ -4682,22 +4604,6 @@ const pendingCliChecks = new Map();
 let cliCheckIdCounter = 0;
 const pendingCliInstalls = new Map();
 let cliInstallIdCounter = 0;
-
-// Restrict RUN_AUTOMATION_SCRIPT / VALIDATE_AUTOMATION_SCRIPT to messages
-// originating from the extension popup. Manual run only — chat panels and
-// content scripts cannot drive script execution.
-function isPopupSender(sender) {
-  if (!sender) return false;
-  if (sender.id && sender.id !== chrome.runtime.id) return false;
-  const url = sender.url || "";
-  if (!url) return false;
-  try {
-    const popupUrl = chrome.runtime.getURL("popup/popup.html");
-    return url === popupUrl || url.startsWith(popupUrl + "?") || url.startsWith(popupUrl + "#");
-  } catch (_) {
-    return false;
-  }
-}
 
 function resolvePendingAiRequests(error) {
   for (const [id, pending] of pendingAiRequests.entries()) {
@@ -5817,6 +5723,32 @@ async function toolCloseTab(params) {
   const { tabId } = params;
   if (!tabId) return { error: "tabId is required" };
   try {
+    // Safety guard: never let AutoDOM close the last tab in a window.
+    // If it is the last tab, create a replacement first so the browser
+    // window stays alive and does not appear to "crash/quit".
+    let targetTab;
+    try {
+      targetTab = await chrome.tabs.get(tabId);
+    } catch (_) {
+      return { error: `Tab not found: ${tabId}` };
+    }
+
+    const tabsInWindow = await chrome.tabs.query({ windowId: targetTab.windowId });
+    if (tabsInWindow.length <= 1) {
+      try {
+        await chrome.tabs.create({
+          windowId: targetTab.windowId,
+          url: "about:blank",
+          active: true,
+        });
+      } catch (createErr) {
+        return {
+          error:
+            `Refusing to close last tab in window ${targetTab.windowId} because replacement tab creation failed: ${createErr.message}`,
+        };
+      }
+    }
+
     await chrome.tabs.remove(tabId);
     return { success: true, closedTabId: tabId };
   } catch (err) {
@@ -7836,90 +7768,6 @@ async function executeCodeViaCdp(tabId, code, timeoutMs) {
   }
 }
 
-async function toolRunBrowserScript(params) {
-  const tab = await getActiveTab();
-  const source = String(params?.source || "");
-  const scriptParams = params?.params || {};
-  const timeoutMs = params?.timeoutMs || params?.timeout || 15000;
-  if (!source.trim()) {
-    return { ok: false, status: "validation_error", error: "Script source is empty" };
-  }
-
-  return await executeInTab(
-    tab.id,
-    (source, scriptParams, timeoutMs) => {
-      return new Promise((resolve) => {
-        const logs = [];
-        const startedAt = Date.now();
-        const log = (...args) => {
-          logs.push(
-            args
-              .map((v) => {
-                try {
-                  return typeof v === "string" ? v : JSON.stringify(v);
-                } catch (_) {
-                  return String(v);
-                }
-              })
-              .join(" "),
-          );
-        };
-        const finish = (payload) => {
-          clearTimeout(timer);
-          resolve({
-            backend: "browser-extension",
-            elapsedMs: Date.now() - startedAt,
-            logs,
-            ...payload,
-          });
-        };
-        const timer = setTimeout(() => {
-          finish({
-            ok: false,
-            status: "timeout",
-            error: `Browser script timed out after ${timeoutMs}ms`,
-          });
-        }, timeoutMs);
-
-        try {
-          const fn = new Function(
-            "params",
-            "log",
-            `"use strict"; return (async () => {\n${source}\n})()`,
-          );
-          Promise.resolve(fn(scriptParams, log))
-            .then((value) => {
-              try {
-                finish({
-                  ok: true,
-                  status: "completed",
-                  result: JSON.parse(JSON.stringify(value ?? null)),
-                });
-              } catch (_) {
-                finish({ ok: true, status: "completed", result: String(value) });
-              }
-            })
-            .catch((err) => {
-              finish({
-                ok: false,
-                status: "failed",
-                error: err?.message || String(err),
-              });
-            });
-        } catch (err) {
-          finish({
-            ok: false,
-            status: "validation_error",
-            error: err?.message || String(err),
-          });
-        }
-      });
-    },
-    [source, scriptParams, timeoutMs],
-    "ISOLATED",
-  );
-}
-
 // get_dom_state: Compact map of interactive elements with numeric indices.
 // Returns ~2-5K chars instead of 500K+ for full snapshots.
 async function toolGetDomState(params) {
@@ -8623,11 +8471,18 @@ async function toolSwitchToPopup(params) {
   }
 }
 
-// Close a popup/window by windowId
+// Close a popup window by windowId
 async function toolClosePopup(params) {
   const { windowId } = params;
   if (!windowId) return { error: "windowId is required" };
   try {
+    const win = await chrome.windows.get(windowId);
+    if (!win || win.type !== "popup") {
+      return {
+        error:
+          `Refusing to close window ${windowId}: not a popup window. Use close_tab for regular browser windows.`,
+      };
+    }
     await chrome.windows.remove(windowId);
     return { success: true, closedWindowId: windowId };
   } catch (err) {

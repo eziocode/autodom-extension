@@ -2381,43 +2381,6 @@ function _processWsMessage(socket, message) {
     return;
   }
 
-  if (message.type === "RUN_AUTOMATION_SCRIPT" && message.id != null) {
-    // Server-side Playwright/Node script runners were removed. The extension
-    // popup runs scripts directly in the active tab via the browser-extension
-    // backend, so the bridge should never receive this message anymore.
-    try {
-      socket.send(
-        JSON.stringify({
-          type: "AUTOMATION_SCRIPT_RESULT",
-          id: message.id,
-          result: {
-            ok: false,
-            status: "unsupported",
-            error:
-              "Server-side automation backends were removed. Use the popup Scripts tab (Browser extension backend) to run scripts manually in the active tab.",
-          },
-        }),
-      );
-    } catch (_) {}
-    return;
-  }
-
-  if (message.type === "VALIDATE_AUTOMATION_SCRIPT" && message.id != null) {
-    try {
-      socket.send(
-        JSON.stringify({
-          type: "AUTOMATION_SCRIPT_VALIDATION",
-          id: message.id,
-          result: {
-            ok: false,
-            error:
-              "Server-side automation backends were removed. Use the popup Scripts tab (Browser extension backend) for validation.",
-          },
-        }),
-      );
-    } catch (_) {}
-    return;
-  }
 }
 
 process.on("exit", removeLockFileIfOwnedSync);
@@ -5400,11 +5363,10 @@ function stringifyToolResult(result) {
 }
 
 // ─── Script Runner Scope ─────────────────────────────────────
-// AutoDOM scripts run only in the active browser tab (browser-extension
-// backend) via the popup Scripts tab — manual run only. The server does not
-// register script-runner MCP tools and does not spawn Playwright/Node child
-// processes; that keeps IDE clients focused on interactive browser tools and
-// prevents background script execution from interfering with MCP traffic.
+// Legacy RUN_AUTOMATION_SCRIPT / VALIDATE_AUTOMATION_SCRIPT bridge handlers
+// were removed. The server does not register script-runner MCP tools and does
+// not spawn Playwright/Node child processes; this keeps IDE clients focused on
+// interactive browser tools and avoids background script execution paths.
 
 // ─── Token-Efficient Tools (inspired by OpenBrowser-AI) ──────
 // These tools reduce token usage by 3-6x compared to individual tool calls.
@@ -6752,8 +6714,8 @@ server.addTool({
 server.addTool({
   name: "close_popup",
   description:
-    "Close a browser popup/window by its windowId. " +
-    "Use list_popups to find the windowId of the popup you want to close.",
+    "Close a browser popup window by its windowId. " +
+    "Use list_popups to find the popup windowId. AutoDOM refuses to close normal browser windows via this tool.",
   parameters: z.object({
     windowId: z.number().describe("Window ID of the popup/window to close"),
   }),

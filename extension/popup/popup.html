@@ -24,7 +24,7 @@
                     </div>
                 </div>
                 <span class="version-group">
-                    <span class="version" id="appVersion">v2.0.0</span>
+                    <span class="version" id="appVersion">v3.0.8</span>
                     <button
                         type="button"
                         class="version-update-btn"
@@ -37,7 +37,6 @@
 
 	            <nav class="tab-bar">
 	                <button class="tab active" data-tab="status">Status</button>
-	                <button class="tab" data-tab="scripts">Scripts<span class="tab-beta-badge" aria-label="Beta — work in progress">BETA</span></button>
 	                <button class="tab" data-tab="security">Security</button>
 	                <button class="tab" data-tab="config">Config</button>
 	                <button class="tab" data-tab="chat">Chat</button>
@@ -342,58 +341,6 @@
                             </div>
                         </div>
                     </section>
-	                </div>
-	
-	                <div class="tab-content" id="tab-scripts">
-	                    <div class="beta-notice" role="note">
-	                        <span class="beta-notice-pill">BETA</span>
-	                        <span class="beta-notice-text">Scripts is a work in progress — some backends and actions are still being polished.</span>
-	                    </div>
-	                    <section class="panel">
-	                        <div class="panel-header">
-	                            <span class="section-label">Automation Script</span>
-	                        </div>
-	                        <div class="field-stack">
-	                            <label class="field-label" for="scriptBackend">Backend</label>
-	                            <select id="scriptBackend" class="config-input">
-	                                <option value="browser-extension">Browser extension</option>
-	                            </select>
-	                            <label class="field-label" for="scriptFile">Local script file</label>
-	                            <input id="scriptFile" class="config-input file-input" type="file" accept=".js,.mjs,.cjs,.txt" />
-	                            <label class="field-label" for="scriptSource">Script source</label>
-	                            <textarea
-	                                id="scriptSource"
-	                                class="config-input script-editor"
-	                                spellcheck="false"
-	                                placeholder="log('Title:', document.title);
-return { title: document.title, url: location.href };"
-	                            ></textarea>
-	                            <div class="field-row">
-	                                <input
-	                                    type="number"
-	                                    id="scriptTimeout"
-	                                    class="config-input"
-	                                    min="1000"
-	                                    max="300000"
-	                                    value="15000"
-	                                />
-	                                <span class="field-hint">timeout ms</span>
-	                            </div>
-	                            <div class="button-row">
-	                                <button class="secondary-btn" id="validateScriptBtn">Validate</button>
-	                                <button class="action-btn" id="runScriptBtn">Run</button>
-	                            </div>
-	                            <p class="field-hint" id="scriptStatus">Scripts run manually in the active tab via the browser extension. Click Run to execute.</p>
-	                        </div>
-	                    </section>
-	
-	                    <section class="panel">
-	                        <div class="panel-header">
-	                            <span class="section-label">Execution Output</span>
-	                            <button class="text-btn" id="clearScriptOutputBtn">Clear</button>
-	                        </div>
-	                        <pre class="script-output" id="scriptOutput">No script run yet.</pre>
-	                    </section>
 	                </div>
 	
 	                <div class="tab-content" id="tab-security">
