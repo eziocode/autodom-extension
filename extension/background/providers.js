@@ -562,6 +562,11 @@
     const wantStream = typeof onDelta === "function";
     debug && debug("[AutoDOM SW] Calling Ollama:", cleanBase + "/api/chat", "model:", m, "tools:", tools ? tools.length : 0, "stream:", wantStream);
     const body = { model: m, messages, stream: !!wantStream };
+    // Keep local inference deterministic and avoid accidental remote routing.
+    body.options = {
+      ...(body.options || {}),
+      num_ctx: 8192,
+    };
     if (Array.isArray(tools) && tools.length > 0) {
       body.tools = tools;
     }
@@ -573,7 +578,34 @@
     });
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");
-      throw new Error(`Ollama ${resp.status}: ${errText.substring(0, 300)}`);
+      let reqPreview = "";
+      try {
+        reqPreview = JSON.stringify({
+          url: `${cleanBase}/api/chat`,
+          model: m,
+          stream: !!wantStream,
+          hasTools: Array.isArray(tools) && tools.length > 0,
+          msgCount: Array.isArray(messages) ? messages.length : 0,
+          firstMsgRole: Array.isArray(messages) && messages[0] ? messages[0].role : "",
+          options: body.options || {},
+        });
+      } catch (_) {}
+      const hdr = String(resp.headers?.get("www-authenticate") || "").trim();
+      const detail = errText.substring(0, 800) || resp.statusText || "no body";
+      if (resp.status === 403) {
+        const originHint =
+          "Ollama blocked this browser-extension request origin. " +
+          "Start Ollama with: OLLAMA_ORIGINS=\"chrome-extension://*,http://localhost,http://127.0.0.1\" ollama serve";
+        throw new Error(
+          `Ollama 403: Forbidden. ${originHint}` +
+            (reqPreview ? ` | request: ${reqPreview}` : ""),
+        );
+      }
+      throw new Error(
+        `Ollama ${resp.status}: ${detail}` +
+          (hdr ? ` | www-authenticate: ${hdr}` : "") +
+          (reqPreview ? ` | request: ${reqPreview}` : ""),
+      );
     }
     let msg;
     if (wantStream) {
