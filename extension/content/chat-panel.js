@@ -6827,6 +6827,247 @@
     }
   }
 
+  // ─── sendMessage helpers ───────────────────────────────────
+  // These were extracted from sendMessage() to keep that function from
+  // drifting back into the 100+ cyclomatic complexity mega-function it
+  // grew into. Each helper relies on the surrounding IIFE closure for
+  // access to chatInput, addMessage, _pushHistory, etc.
+
+  // Regexes hoisted out of the hot path so we don't re-compile per call.
+  const _SUMMARIZE_INTENT_RE =
+    /^summari[sz]e (this )?(page|site|article|content)\b/;
+  const _EXPLAIN_PAGE_INTENT_RES = [
+    /^what can i do (on|with) (this )?(page|site)\b/,
+    /^what'?s on (this )?(page|site)\b/,
+    /^explain (this )?(page|site)\b/,
+  ];
+
+  // Intercept "summarize this page" intent BEFORE adding the user
+  // message — aiSummarizePage adds its own short label and runs the
+  // page-aware summarization path (AI when online, local fallback).
+  // Returns true if the intent was handled (caller should bail out).
+  async function _maybeHandleSummarizeIntent(lowerText) {
+    if (
+      lowerText === "summarize" ||
+      lowerText === "summary" ||
+      _SUMMARIZE_INTENT_RE.test(lowerText) ||
+      lowerText === "tldr" ||
+      lowerText === "tl;dr"
+    ) {
+      chatInput.value = "";
+      autoResizeInput();
+      await aiSummarizePage();
+      return true;
+    }
+    return false;
+  }
+
+  async function _maybeHandleExplainPageIntent(lowerText) {
+    if (_EXPLAIN_PAGE_INTENT_RES.some((re) => re.test(lowerText))) {
+      chatInput.value = "";
+      autoResizeInput();
+      await aiPageQuery("What can I do on this page?", () =>
+        "Explain what a user can do on this web page using markdown. " +
+        "Summarize the main purpose, the primary workflows, and the most " +
+        "useful actions. Avoid raw DOM lists; describe meaningful tasks.",
+      );
+      return true;
+    }
+    return false;
+  }
+
+  // /run with natural-language argument: drop into AI routing with an
+  // explicit automation framing, so the agent picks tools instead of
+  // V8 trying to parse the description as JavaScript.
+  // Returns { handled: true } if caller should bail; otherwise the
+  // (possibly rewritten) text + command for the rest of the pipeline.
+  function _rewriteAiAutomateCommand(text, command) {
+    if (!command || command.type !== "ai_automate") return { text, command };
+    const goal = command.prompt || "";
+    if (!goal) {
+      addMessage(
+        "assistant",
+        command.mode === "vision-plan"
+          ? "Usage: /auto <task description>."
+          : command.mode === "quick"
+            ? "Usage: /quick <task description>."
+            : "Usage: /run <JS code> or /run <task description>.",
+      );
+      return { handled: true };
+    }
+    // Route to the appropriate mode:
+    //   vision-plan → /auto prefix (stripped by sendAiMessage)
+    //   quick       → /quick prefix (stripped by sendAiMessage)
+    //   default     → plain automation framing
+    const nextText =
+      command.mode === "vision-plan"
+        ? `/auto ${goal}`
+        : command.mode === "quick"
+          ? `/quick ${goal}`
+          : `Automate this on the current page. Plan, then call browser tools (click, type, navigate, etc.) to do it. Stop when finished. Task: ${goal}`;
+    return { text: nextText, command: null };
+  }
+
+  function _handleHelpCommand() {
+    // Help is always available regardless of connection status
+    const helpText =
+      "\u{1F4D6} AutoDOM AI Chat Commands\n\n" +
+      "AI Mode (default):\n" +
+      "  Just type naturally — AI understands context!\n" +
+      '  "Click the login button"\n' +
+      '  "Summarize this page"\n' +
+      '  "Fill in the form with test data"\n\n' +
+      "Slash Commands (direct tool calls):\n" +
+      "  /dom \u2014 Interactive elements map\n" +
+      "  /click <index|text> \u2014 Click element\n" +
+      "  /type <index> <text> \u2014 Type into element\n" +
+      "  /nav <url> \u2014 Navigate to URL\n" +
+      "  /screenshot \u2014 Capture page\n" +
+      "  /snapshot \u2014 DOM tree snapshot\n" +
+      "  /info \u2014 Page metadata\n" +
+      "  /js <code> \u2014 Execute JavaScript\n" +
+      "  /run <code> \u2014 Run local Playwright/Selenium-style automation\n" +
+      "  /run <task> or /auto <task> \u2014 Fast AI automation plan + replay\n" +
+      "  /quick <task> \u2014 Quick mode: compact command language (fastest)\n" +
+      "  /offscreen on|off|status \u2014 Toggle SW keepalive mode\n" +
+      "  /extract \u2014 Extract page text\n\n" +
+      "Shortcuts:\n" +
+      "  Cmd/Ctrl+Shift+K \u2014 Toggle sidebar\n" +
+      "  Cmd/Ctrl+Shift+L \u2014 Quick prompt";
+    addMessage("assistant", helpText);
+    _pushHistory({ role: "assistant", content: helpText });
+  }
+
+  function _handleOffscreenKeepaliveCommand(command) {
+    try {
+      if (command.statusOnly) {
+        chrome.storage?.local?.get?.(
+          ["autodomOffscreenKeepaliveEnabled"],
+          (res) => {
+            const enabled = res?.autodomOffscreenKeepaliveEnabled === true;
+            addMessage(
+              "assistant",
+              `Offscreen keepalive is currently **${enabled ? "ON" : "OFF"}**.`,
+            );
+            _pushHistory({
+              role: "assistant",
+              content: `[offscreen keepalive ${enabled ? "on" : "off"}]`,
+            });
+          },
+        );
+      } else {
+        chrome.runtime.sendMessage(
+          {
+            type: "AUTODOM_SET_OFFSCREEN_KEEPALIVE",
+            enabled: command.enabled === true,
+          },
+          (resp) => {
+            try { void chrome.runtime.lastError; } catch (_) {}
+            const ok = resp && resp.ok;
+            const enabled = command.enabled === true;
+            addMessage(
+              ok ? "assistant" : "error",
+              ok
+                ? `Offscreen keepalive set to **${enabled ? "ON" : "OFF"}**.`
+                : "Failed to update offscreen keepalive setting.",
+            );
+            _pushHistory({
+              role: "assistant",
+              content: ok
+                ? `[offscreen keepalive ${enabled ? "on" : "off"}]`
+                : "[offscreen keepalive update failed]",
+            });
+          },
+        );
+      }
+    } catch (err) {
+      addMessage("error", `Failed to update offscreen keepalive: ${err.message || err}`);
+    }
+  }
+
+  function _renderAiSuccess(aiResult) {
+    // Successful AI response
+    const responseText = _sanitizeAiResponseText(
+      aiResult.response || "AI processed your request.",
+    );
+    const toolCalls = aiResult.toolCalls || [];
+    _log(
+      "AI success, response length:",
+      responseText.length,
+      "toolCalls:",
+      toolCalls.length,
+    );
+
+    // If the bridge reported the actual model the underlying CLI used
+    // (claude --output-format json surfaces this), reconcile the model
+    // picker with reality. The picker is otherwise stuck showing the
+    // user's last guess, even when the CLI silently ignored --model
+    // (unknown id, locked session, etc.).
+    try { _reconcileActualModel(aiResult.model); } catch (_) {}
+
+    // Clear any in-flight streaming bubble for this turn so we don't
+    // show the plain-text stream + the markdown-rendered final side
+    // by side. The markdown render below is always authoritative.
+    try {
+      for (const rid of Array.from(_streamingBubbles.keys())) {
+        _resetStreamingBubble(rid);
+      }
+      _streamedRunIds.clear();
+    } catch (_) {}
+
+    addMessage("ai-response", responseText, {
+      toolCalls,
+      model: aiResult.model,
+    });
+    _pushHistory({ role: "assistant", content: responseText });
+  }
+
+  async function _renderAiFallback(text, aiResult) {
+    _log("AI fallback, trying local NLP...");
+    // AI routing not available — try local NLP-to-tool mapping
+    const localCommand = parseNaturalLanguage(text);
+    if (localCommand) {
+      await executeToolCommand(localCommand);
+      return;
+    }
+    // No local mapping either — raise a proper alert rather than a
+    // quiet chat line, so the user is nudged to fix the setup.
+    showAiUnavailableAlert(
+      aiResult.error
+        ? `Request couldn't be routed: ${aiResult.error}`
+        : "The AI agent didn't respond.",
+    );
+  }
+
+  function _renderAiError(text, aiResult) {
+    // Real AI error (API 4xx/5xx, timeout, agent-side error, etc.).
+    // Use the alert surface so it's visible and actionable.
+    addAiAlert({
+      dedupeKey: "ai-error",
+      tone: "error",
+      title: "AI request failed",
+      body: String(aiResult.error),
+      actions: [
+        {
+          label: "Open settings",
+          kind: "ghost",
+          onClick: () => {
+            try { _openSettingsOverlay(); } catch (_) {}
+            _openExtensionPopup();
+          },
+        },
+        {
+          label: "Retry",
+          kind: "primary",
+          onClick: () => {
+            chatInput.value = text;
+            sendMessage();
+          },
+        },
+      ],
+    });
+  }
+
   // ─── Send Message (Main Handler) ───────────────────────────
   async function sendMessage() {
     let text = chatInput.value.trim();
@@ -6851,36 +7092,10 @@
       }
     } catch (_) {}
 
-    // Intercept "summarize this page" intent BEFORE adding the user
-    // message — aiSummarizePage adds its own short label and runs the
-    // page-aware summarization path (AI when online, local fallback).
+    // Intent shortcuts — handled BEFORE the user message is recorded.
     const _lower = text.toLowerCase();
-    if (
-      _lower === "summarize" ||
-      _lower === "summary" ||
-      /^summari[sz]e (this )?(page|site|article|content)\b/.test(_lower) ||
-      _lower === "tldr" ||
-      _lower === "tl;dr"
-    ) {
-      chatInput.value = "";
-      autoResizeInput();
-      await aiSummarizePage();
-      return;
-    }
-    if (
-      /^what can i do (on|with) (this )?(page|site)\b/.test(_lower) ||
-      /^what'?s on (this )?(page|site)\b/.test(_lower) ||
-      /^explain (this )?(page|site)\b/.test(_lower)
-    ) {
-      chatInput.value = "";
-      autoResizeInput();
-      await aiPageQuery("What can I do on this page?", () =>
-        "Explain what a user can do on this web page using markdown. " +
-        "Summarize the main purpose, the primary workflows, and the most " +
-        "useful actions. Avoid raw DOM lists; describe meaningful tasks.",
-      );
-      return;
-    }
+    if (await _maybeHandleSummarizeIntent(_lower)) return;
+    if (await _maybeHandleExplainPageIntent(_lower)) return;
 
     addMessage("user", text, pendingAttachments.length > 0 ? { attachments: pendingAttachments.slice() } : undefined);
     // Snapshot + clear NOW so re-entrant Enter / fast double-clicks can't
@@ -6898,120 +7113,29 @@
       attachments: _attachmentsForTurn.length > 0 ? _attachmentsForTurn : undefined,
     });
 
-    // Check for slash commands first (direct tool invocation)
-    // Slash commands use local tool handlers and do NOT require MCP bridge
+    // Check for slash commands first (direct tool invocation).
+    // Slash commands use local tool handlers and do NOT require MCP bridge.
     let command = parseCommand(text);
 
-    // /run with natural-language argument: drop into AI routing with an
-    // explicit automation framing, so the agent picks tools instead of
-    // V8 trying to parse the description as JavaScript.
-    if (command && command.type === "ai_automate") {
-      const goal = command.prompt || "";
-      if (!goal) {
-        addMessage(
-          "assistant",
-          command.mode === "vision-plan"
-            ? "Usage: /auto <task description>."
-            : command.mode === "quick"
-              ? "Usage: /quick <task description>."
-              : "Usage: /run <JS code> or /run <task description>.",
-        );
-        return;
-      }
-      // Route to the appropriate mode:
-      //   vision-plan → /auto prefix (stripped by sendAiMessage)
-      //   quick       → /quick prefix (stripped by sendAiMessage)
-      //   default     → plain automation framing
-      text =
-        command.mode === "vision-plan"
-          ? `/auto ${goal}`
-          : command.mode === "quick"
-            ? `/quick ${goal}`
-            : `Automate this on the current page. Plan, then call browser tools (click, type, navigate, etc.) to do it. Stop when finished. Task: ${goal}`;
-      command = null;
-    }
+    // /run, /auto, /quick with a natural-language argument may rewrite
+    // text into an AI prompt (or bail early on usage errors).
+    const _rewrite = _rewriteAiAutomateCommand(text, command);
+    if (_rewrite.handled) return;
+    text = _rewrite.text;
+    command = _rewrite.command;
 
     if (command && command.type === "help") {
-      // Help is always available regardless of connection status
-      const helpText =
-        "\u{1F4D6} AutoDOM AI Chat Commands\n\n" +
-        "AI Mode (default):\n" +
-        "  Just type naturally — AI understands context!\n" +
-        '  "Click the login button"\n' +
-        '  "Summarize this page"\n' +
-        '  "Fill in the form with test data"\n\n' +
-        "Slash Commands (direct tool calls):\n" +
-        "  /dom \u2014 Interactive elements map\n" +
-        "  /click <index|text> \u2014 Click element\n" +
-        "  /type <index> <text> \u2014 Type into element\n" +
-        "  /nav <url> \u2014 Navigate to URL\n" +
-        "  /screenshot \u2014 Capture page\n" +
-        "  /snapshot \u2014 DOM tree snapshot\n" +
-        "  /info \u2014 Page metadata\n" +
-        "  /js <code> \u2014 Execute JavaScript\n" +
-        "  /run <code> \u2014 Run local Playwright/Selenium-style automation\n" +
-        "  /run <task> or /auto <task> \u2014 Fast AI automation plan + replay\n" +
-        "  /quick <task> \u2014 Quick mode: compact command language (fastest)\n" +
-        "  /offscreen on|off|status \u2014 Toggle SW keepalive mode\n" +
-        "  /extract \u2014 Extract page text\n\n" +
-        "Shortcuts:\n" +
-        "  Cmd/Ctrl+Shift+K \u2014 Toggle sidebar\n" +
-        "  Cmd/Ctrl+Shift+L \u2014 Quick prompt";
-      addMessage("assistant", helpText);
-      _pushHistory({ role: "assistant", content: helpText });
+      _handleHelpCommand();
       return;
     }
 
     if (command && command.type === "offscreen_keepalive") {
-      try {
-        if (command.statusOnly) {
-          chrome.storage?.local?.get?.(
-            ["autodomOffscreenKeepaliveEnabled"],
-            (res) => {
-              const enabled = res?.autodomOffscreenKeepaliveEnabled === true;
-              addMessage(
-                "assistant",
-                `Offscreen keepalive is currently **${enabled ? "ON" : "OFF"}**.`,
-              );
-              _pushHistory({
-                role: "assistant",
-                content: `[offscreen keepalive ${enabled ? "on" : "off"}]`,
-              });
-            },
-          );
-        } else {
-          chrome.runtime.sendMessage(
-            {
-              type: "AUTODOM_SET_OFFSCREEN_KEEPALIVE",
-              enabled: command.enabled === true,
-            },
-            (resp) => {
-              try { void chrome.runtime.lastError; } catch (_) {}
-              const ok = resp && resp.ok;
-              const enabled = command.enabled === true;
-              addMessage(
-                ok ? "assistant" : "error",
-                ok
-                  ? `Offscreen keepalive set to **${enabled ? "ON" : "OFF"}**.`
-                  : "Failed to update offscreen keepalive setting.",
-              );
-              _pushHistory({
-                role: "assistant",
-                content: ok
-                  ? `[offscreen keepalive ${enabled ? "on" : "off"}]`
-                  : "[offscreen keepalive update failed]",
-              });
-            },
-          );
-        }
-      } catch (err) {
-        addMessage("error", `Failed to update offscreen keepalive: ${err.message || err}`);
-      }
+      _handleOffscreenKeepaliveCommand(command);
       return;
     }
 
     // If it's a slash command, execute directly via local tool handlers
-    // (these don't require MCP bridge — they use chrome.scripting APIs)
+    // (these don't require MCP bridge — they use chrome.scripting APIs).
     if (command && command.tool) {
       await executeToolCommand(command);
       return;
@@ -7065,82 +7189,11 @@
       hideTyping();
 
       if (aiResult && !aiResult.fallback && !aiResult.error) {
-        // Successful AI response
-        const responseText = _sanitizeAiResponseText(
-          aiResult.response || "AI processed your request.",
-        );
-        const toolCalls = aiResult.toolCalls || [];
-        _log(
-          "AI success, response length:",
-          responseText.length,
-          "toolCalls:",
-          toolCalls.length,
-        );
-
-        // If the bridge reported the actual model the underlying CLI used
-        // (claude --output-format json surfaces this), reconcile the model
-        // picker with reality. The picker is otherwise stuck showing the
-        // user's last guess, even when the CLI silently ignored --model
-        // (unknown id, locked session, etc.).
-        try { _reconcileActualModel(aiResult.model); } catch (_) {}
-
-        // Clear any in-flight streaming bubble for this turn so we don't
-        // show the plain-text stream + the markdown-rendered final side
-        // by side. The markdown render below is always authoritative.
-        try {
-          for (const rid of Array.from(_streamingBubbles.keys())) {
-            _resetStreamingBubble(rid);
-          }
-          _streamedRunIds.clear();
-        } catch (_) {}
-
-        addMessage("ai-response", responseText, {
-          toolCalls,
-          model: aiResult.model,
-        });
-        _pushHistory({ role: "assistant", content: responseText });
+        _renderAiSuccess(aiResult);
       } else if (aiResult && aiResult.fallback) {
-        _log("AI fallback, trying local NLP...");
-        // AI routing not available — try local NLP-to-tool mapping
-        const localCommand = parseNaturalLanguage(text);
-        if (localCommand) {
-          await executeToolCommand(localCommand);
-        } else {
-          // No local mapping either — raise a proper alert rather than a
-          // quiet chat line, so the user is nudged to fix the setup.
-          showAiUnavailableAlert(
-            aiResult.error
-              ? `Request couldn't be routed: ${aiResult.error}`
-              : "The AI agent didn't respond.",
-          );
-        }
+        await _renderAiFallback(text, aiResult);
       } else if (aiResult && aiResult.error) {
-        // Real AI error (API 4xx/5xx, timeout, agent-side error, etc.).
-        // Use the alert surface so it's visible and actionable.
-        addAiAlert({
-          dedupeKey: "ai-error",
-          tone: "error",
-          title: "AI request failed",
-          body: String(aiResult.error),
-          actions: [
-            {
-              label: "Open settings",
-              kind: "ghost",
-              onClick: () => {
-                try { _openSettingsOverlay(); } catch (_) {}
-                _openExtensionPopup();
-              },
-            },
-            {
-              label: "Retry",
-              kind: "primary",
-              onClick: () => {
-                chatInput.value = text;
-                sendMessage();
-              },
-            },
-          ],
-        });
+        _renderAiError(text, aiResult);
       }
     } catch (err) {
       hideTyping();

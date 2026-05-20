@@ -1709,914 +1709,948 @@ function setupWssConnection(wss) {
   });
 }
 
-function _processWsMessage(socket, message) {
-  // ─── Cancellation: chat-panel stop button ────────────────────
-  // The extension forwards user-initiated aborts here. We mark the
-  // request id as aborted so any in-progress agent loop can short-
-  // circuit between awaits, and so we never emit a late
-  // AI_CHAT_RESPONSE for a request the UI has already torn down.
-  if (message.type === "AI_CHAT_ABORT") {
-    if (typeof message.id !== "undefined" && message.id !== null) {
-      abortedAiRequests.add(message.id);
-      _killCliProviderProcess(message.id, "AI_CHAT_ABORT");
-      // Auto-evict after 5 minutes so the set doesn't grow forever.
-      setTimeout(() => abortedAiRequests.delete(message.id), 300000).unref?.();
+// ─── WebSocket Message Handlers ──────────────────────────────
+// _processWsMessage was a 900-line, cyclomatic-349 function dispatching
+// 9 message types via chained `if (message.type === ...)`. Each branch is
+// now an independent handler; _processWsMessage is just a dispatch table.
+
+// ── AI_CHAT_ABORT ────────────────────────────────────────────
+// The extension forwards user-initiated aborts here. We mark the
+// request id as aborted so any in-progress agent loop can short-
+// circuit between awaits, and so we never emit a late
+// AI_CHAT_RESPONSE for a request the UI has already torn down.
+function _handleAiChatAbort(_socket, message) {
+  if (typeof message.id !== "undefined" && message.id !== null) {
+    abortedAiRequests.add(message.id);
+    _killCliProviderProcess(message.id, "AI_CHAT_ABORT");
+    // Auto-evict after 5 minutes so the set doesn't grow forever.
+    setTimeout(() => abortedAiRequests.delete(message.id), 300000).unref?.();
+    process.stderr.write(
+      `[AutoDOM] AI_CHAT_ABORT received for id=${message.id}\n`,
+    );
+  }
+}
+
+// ── CHECK_CLI_BINARY ─────────────────────────────────────────
+// CLI presence check (popup → bridge → spawn binary --version).
+// Verifies the configured local CLI binary is installed and reachable
+// so the user gets immediate feedback before sending real chat messages.
+function _handleCheckCliBinary(socket, message) {
+  const { id, binary, kind } = message;
+  const installInfo = getDefaultCliInstall(kind);
+  const send = (payload) => {
+    try {
+      socket.send(
+        JSON.stringify({
+          type: "CHECK_CLI_BINARY_RESPONSE",
+          id,
+          ...(installInfo
+            ? {
+                installCommand: installInfo.installCommand,
+                npmPackage: installInfo.npmPackage,
+              }
+            : {}),
+          ...payload,
+        }),
+      );
+    } catch (_) {}
+  };
+  if (!binary || typeof binary !== "string") {
+    send({ ok: false, error: "Missing binary" });
+    return;
+  }
+  // Pick a safe "is this CLI alive?" probe per kind.
+  // claude: `claude --version` (Anthropic CLI prints e.g. "1.x.x (Claude Code)")
+  // codex:  `codex --version` (OpenAI Codex CLI)
+  // custom: `<binary> --version`
+  const args = ["--version"];
+  process.stderr.write(
+    `[AutoDOM] CLI check: spawning '${binary}' ${JSON.stringify(args)}\n`,
+  );
+  let proc;
+  try {
+    proc = spawn(binary, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    });
+  } catch (spawnErr) {
+    send({
+      ok: false,
+      error: `Failed to spawn '${binary}': ${spawnErr.message}`,
+    });
+    return;
+  }
+  const out = [];
+  const err = [];
+  let settled = false;
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    try { proc.kill("SIGTERM"); } catch (_) {}
+    send({ ok: false, error: `Timed out probing '${binary}'` });
+  }, 6000);
+  proc.stdout.on("data", (d) => out.push(d));
+  proc.stderr.on("data", (d) => err.push(d));
+  proc.on("error", (e) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    send({
+      ok: false,
+      error:
+        e.code === "ENOENT"
+          ? `Binary '${binary}' not found on PATH.${
+              installInfo
+                ? ` Install it with: ${installInfo.installCommand}`
+                : " Install it or use the absolute path."
+            }`
+          : e.message,
+      notFound: e.code === "ENOENT",
+    });
+  });
+  proc.on("close", (code) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    const stdout = Buffer.concat(out).toString("utf8").trim();
+    const stderr = Buffer.concat(err).toString("utf8").trim();
+    // Some CLIs print --version to stderr; accept either.
+    const version = stdout || stderr;
+    if (code === 0 && version) {
+      send({ ok: true, version, kind });
+    } else if (code === 0) {
+      send({ ok: true, version: "(no version output)", kind });
+    } else {
+      send({
+        ok: false,
+        error: `'${binary} --version' exited ${code}.${stderr ? " " + stderr.substring(0, 200) : ""}`,
+      });
+    }
+  });
+}
+
+// ── INSTALL_CLI_PACKAGE ──────────────────────────────────────
+function _handleInstallCliPackage(socket, message) {
+  const { id, kind, npmPackage, binary } = message;
+  const installInfo = getDefaultCliInstall(kind);
+  const send = (payload) => {
+    try {
+      socket.send(
+        JSON.stringify({
+          type: "INSTALL_CLI_PACKAGE_RESPONSE",
+          id,
+          kind,
+          ...(installInfo
+            ? {
+                binary: installInfo.binary,
+                installCommand: installInfo.installCommand,
+              }
+            : {}),
+          ...payload,
+        }),
+      );
+    } catch (_) {}
+  };
+  if (!installInfo) {
+    send({
+      ok: false,
+      error: `No default npm package is configured for CLI kind '${kind || ""}'`,
+    });
+    return;
+  }
+  if (npmPackage !== installInfo.npmPackage || binary !== installInfo.binary) {
+    send({
+      ok: false,
+      error: "Refusing to install an unrecognized CLI package",
+    });
+    return;
+  }
+
+  // Prefer launching a visible terminal so the user can see install
+  // progress and respond to interactive prompts (npm sudo, GitHub
+  // device-login, etc.). The bridge process has no TTY of its own,
+  // so a silent in-process spawn looked broken to users. Fall back
+  // to the headless spawn only when no terminal could be opened
+  // (e.g. headless Linux without DISPLAY, CI containers).
+  const terminal = launchInstallInTerminal(installInfo.installCommand);
+  if (terminal && terminal.launched) {
+    process.stderr.write(
+      `[AutoDOM] CLI install launched in ${terminal.label}: ${installInfo.installCommand}\n`,
+    );
+    send({
+      ok: true,
+      launched: true,
+      terminalLabel: terminal.label,
+    });
+    return;
+  }
+
+  const npmBinary = process.platform === "win32" ? "npm.cmd" : "npm";
+  const args = ["install", "-g", installInfo.npmPackage];
+  process.stderr.write(
+    `[AutoDOM] CLI install: ${npmBinary} ${args.join(" ")}\n`,
+  );
+  let proc;
+  try {
+    proc = spawn(npmBinary, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    });
+  } catch (spawnErr) {
+    send({
+      ok: false,
+      error: `Failed to spawn npm: ${spawnErr.message}`,
+    });
+    return;
+  }
+
+  const out = [];
+  const err = [];
+  let settled = false;
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    try { proc.kill("SIGTERM"); } catch (_) {}
+    send({
+      ok: false,
+      error: `Timed out running ${installInfo.installCommand}`,
+    });
+  }, 180000);
+  proc.stdout.on("data", (d) => out.push(d));
+  proc.stderr.on("data", (d) => err.push(d));
+  proc.on("error", (e) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    send({ ok: false, error: e.message });
+  });
+  proc.on("close", (code) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    const stdout = tailInstallOutput(Buffer.concat(out).toString("utf8"));
+    const stderr = tailInstallOutput(Buffer.concat(err).toString("utf8"));
+    if (code === 0) {
+      send({ ok: true, stdout, stderr });
+    } else {
+      send({
+        ok: false,
+        stdout,
+        stderr,
+        error: `${installInfo.installCommand} exited ${code}.${
+          stderr ? " " + stderr.substring(0, 240) : ""
+        }`,
+      });
+    }
+  });
+}
+
+// ── AI_CHAT_REQUEST ──────────────────────────────────────────
+// The browser's chat panel sends natural language messages here.
+// We process them by:
+// 1. Gathering page context from the extension
+// 2. Using available MCP tools to fulfill the request
+// 3. Sending back an AI_CHAT_RESPONSE with the result
+//
+// When a full AI agent (Claude, GPT, etc.) is connected via the IDE,
+// the agent handles the request. Otherwise, we provide a smart
+// tool-dispatch fallback using the page context + NLP heuristics.
+function _handleAiChatRequest(socket, message) {
+  const { id, text, context, conversationHistory, provider, providerConfig, mode } =
+    message;
+  touchActivity();
+
+  // Debug: log what provider info we received from the extension
+  process.stderr.write(
+    `[AutoDOM] ━━━ AI_CHAT_REQUEST ━━━\n` +
+      `[AutoDOM]   text: "${(text || "").substring(0, 60)}"\n` +
+      `[AutoDOM]   provider (raw): ${JSON.stringify(provider)}\n` +
+      `[AutoDOM]   providerConfig.provider: ${providerConfig?.provider || "(none)"}\n` +
+      `[AutoDOM]   providerConfig.openaiApiKey: ${providerConfig?.openaiApiKey ? "SET (" + providerConfig.openaiApiKey.length + " chars)" : "EMPTY"}\n` +
+      `[AutoDOM]   providerConfig.anthropicApiKey: ${providerConfig?.anthropicApiKey ? "SET (" + providerConfig.anthropicApiKey.length + " chars)" : "EMPTY"}\n` +
+      `[AutoDOM]   providerConfig.ollamaBaseUrl: ${providerConfig?.ollamaBaseUrl || "EMPTY"}\n` +
+      `[AutoDOM]   providerConfig.ollamaModel: ${providerConfig?.ollamaModel || "EMPTY"}\n` +
+      `[AutoDOM]   providerConfig.openaiBaseUrl: ${providerConfig?.openaiBaseUrl || "EMPTY"}\n`,
+  );
+
+  if (!extensionSocket || extensionSocket.readyState !== 1) {
+    _safeSendAiResponse(socket, {
+      type: "AI_CHAT_RESPONSE",
+      id: id,
+      error: "Chrome extension is not connected.",
+    });
+    return;
+  }
+
+  _runAiChatRequestAsync(socket, message);
+}
+
+async function _runAiChatRequestAsync(socket, message) {
+  const { id, text, context, conversationHistory, provider, providerConfig, mode } =
+    message;
+  // Helper: throw if the user has cancelled this request. Awaited
+  // points in the agent loop should call this to short-circuit
+  // before doing more work (extra tool calls, follow-up provider
+  // round-trips, etc.).
+  const _checkAbort = () => {
+    if (_isAborted(id)) throw new AiAbortError(id);
+  };
+  try {
+    _checkAbort();
+    const lower = (text || "").toLowerCase().trim();
+    const toolCalls = [];
+    let responseText = "";
+    let effectiveContext = context || {};
+
+    const effectiveProvider = normalizeProviderSelection(
+      provider || providerConfig?.provider || directProviderConfig.provider,
+    );
+    const mergedProviderConfig = mergeProviderConfig(providerConfig);
+
+    const _hasCredentials = providerHasCredentials(
+      effectiveProvider,
+      mergedProviderConfig,
+    );
+    const _willRouteToProvider =
+      effectiveProvider !== "ide" && _hasCredentials;
+    const _preferLocalBrowserHeuristic =
+      shouldPreferLocalBrowserHeuristic(lower);
+
+    process.stderr.write(
+      `[AutoDOM]   normalizeProviderSelection input: ${JSON.stringify(provider || providerConfig?.provider || directProviderConfig.provider)}\n` +
+        `[AutoDOM]   effectiveProvider: "${effectiveProvider}"\n` +
+        `[AutoDOM]   hasCredentials: ${_hasCredentials}\n` +
+        `[AutoDOM]   willRouteToDirectProvider: ${_willRouteToProvider}\n` +
+        `[AutoDOM]   mergedConfig.provider: "${mergedProviderConfig.provider}"\n` +
+        `[AutoDOM]   mergedConfig.openaiApiKey: ${mergedProviderConfig.openaiApiKey ? "SET (" + mergedProviderConfig.openaiApiKey.length + " chars)" : "EMPTY"}\n` +
+        `[AutoDOM]   mergedConfig.anthropicApiKey: ${mergedProviderConfig.anthropicApiKey ? "SET" : "EMPTY"}\n` +
+        `[AutoDOM]   mergedConfig.ollamaBaseUrl: ${mergedProviderConfig.ollamaBaseUrl || "EMPTY"}\n` +
+        `[AutoDOM]   mergedConfig.ollamaModel: ${mergedProviderConfig.ollamaModel || "EMPTY"}\n` +
+        `[AutoDOM]   directProviderConfig.provider: "${directProviderConfig.provider}"\n` +
+        `[AutoDOM] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`,
+    );
+
+    if (!_willRouteToProvider) {
       process.stderr.write(
-        `[AutoDOM] AI_CHAT_ABORT received for id=${message.id}\n`,
+        `[AutoDOM] ⚠ NOT routing to direct provider. Reason: ` +
+          `${effectiveProvider === "ide" ? "effectiveProvider is 'ide'" : `no credentials for '${effectiveProvider}'`}. ` +
+          `Falling through to heuristic/IDE routing.\n`,
       );
     }
-    return;
-  }
 
-  // ─── AI Chat Request from In-Browser Chat Panel ────────────
-  // The browser's chat panel sends natural language messages here.
-  // We process them by:
-  // 1. Gathering page context from the extension
-  // 2. Using available MCP tools to fulfill the request
-  // 3. Sending back an AI_CHAT_RESPONSE with the result
-  //
-  // When a full AI agent (Claude, GPT, etc.) is connected via the IDE,
-  // the agent handles the request. Otherwise, we provide a smart
-  // tool-dispatch fallback using the page context + NLP heuristics.
-  // ─── CLI presence check (popup → bridge → spawn binary --version) ──
-  // Verifies the configured local CLI binary is installed and reachable
-  // so the user gets immediate feedback before sending real chat messages.
-  if (message.type === "CHECK_CLI_BINARY") {
-    const { id, binary, kind } = message;
-    const installInfo = getDefaultCliInstall(kind);
-    const send = (payload) => {
-      try {
-        socket.send(
-          JSON.stringify({
-            type: "CHECK_CLI_BINARY_RESPONSE",
-            id,
-            ...(installInfo
-              ? {
-                  installCommand: installInfo.installCommand,
-                  npmPackage: installInfo.npmPackage,
-                }
-              : {}),
-            ...payload,
-          }),
-        );
-      } catch (_) {}
-    };
-    if (!binary || typeof binary !== "string") {
-      send({ ok: false, error: "Missing binary" });
-      return;
-    }
-    // Pick a safe "is this CLI alive?" probe per kind.
-    // claude: `claude --version` (Anthropic CLI prints e.g. "1.x.x (Claude Code)")
-    // codex:  `codex --version` (OpenAI Codex CLI)
-    // custom: `<binary> --version`
-    const args = ["--version"];
-    process.stderr.write(
-      `[AutoDOM] CLI check: spawning '${binary}' ${JSON.stringify(args)}\n`,
-    );
-    let proc;
-    try {
-      proc = spawn(binary, args, {
-        stdio: ["ignore", "pipe", "pipe"],
-        env: process.env,
+    const _pageValueExtraction = isPageValueExtractionRequest(lower);
+    // Attach a snapshot whenever the user is asking about page content —
+    // the IDE-sampling path also benefits, since otherwise the IDE-side
+    // LLM only sees title/URL and has nothing to extract from.
+    const _attachSnapshotForIde =
+      !_willRouteToProvider &&
+      !_preferLocalBrowserHeuristic &&
+      shouldAttachBrowserSnapshot(lower);
+    if (
+      (
+        _willRouteToProvider &&
+        !_preferLocalBrowserHeuristic &&
+        shouldAttachBrowserSnapshot(lower)
+      ) ||
+      _pageValueExtraction ||
+      _attachSnapshotForIde
+    ) {
+      _checkAbort();
+      const snapshotResult = await callExtensionTool("execute_code", {
+        code: buildActivePageSnapshotScript(text || ""),
+        timeout: 20000,
       });
-    } catch (spawnErr) {
-      send({
-        ok: false,
-        error: `Failed to spawn '${binary}': ${spawnErr.message}`,
-      });
-      return;
-    }
-    const out = [];
-    const err = [];
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      try { proc.kill("SIGTERM"); } catch (_) {}
-      send({ ok: false, error: `Timed out probing '${binary}'` });
-    }, 6000);
-    proc.stdout.on("data", (d) => out.push(d));
-    proc.stderr.on("data", (d) => err.push(d));
-    proc.on("error", (e) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      send({
-        ok: false,
-        error:
-          e.code === "ENOENT"
-            ? `Binary '${binary}' not found on PATH.${
-                installInfo
-                  ? ` Install it with: ${installInfo.installCommand}`
-                  : " Install it or use the absolute path."
-              }`
-            : e.message,
-        notFound: e.code === "ENOENT",
-      });
-    });
-    proc.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      const stdout = Buffer.concat(out).toString("utf8").trim();
-      const stderr = Buffer.concat(err).toString("utf8").trim();
-      // Some CLIs print --version to stderr; accept either.
-      const version = stdout || stderr;
-      if (code === 0 && version) {
-        send({ ok: true, version, kind });
-      } else if (code === 0) {
-        send({ ok: true, version: "(no version output)", kind });
-      } else {
-        send({
-          ok: false,
-          error: `'${binary} --version' exited ${code}.${stderr ? " " + stderr.substring(0, 200) : ""}`,
+      toolCalls.push({ tool: "execute_code", purpose: "active_page_snapshot" });
+      effectiveContext = {
+        ...effectiveContext,
+        browserSnapshot: snapshotResult?.error
+          ? { error: snapshotResult.error }
+          : snapshotResult?.result || snapshotResult,
+      };
+      if (_pageValueExtraction) {
+        const extractionResponse = effectiveContext.browserSnapshot?.error
+          ? `AutoDOM couldn't scan the active page: ${effectiveContext.browserSnapshot.error}`
+          : formatRequestedDataExtraction(effectiveContext.browserSnapshot);
+        _safeSendAiResponse(socket, {
+          type: "AI_CHAT_RESPONSE",
+          id: id,
+          response: extractionResponse || "AutoDOM checked the active page, but no requested page values were found.",
+          toolCalls: toolCalls,
+          model: null,
         });
+        return;
       }
-    });
-    return;
-  }
-
-  if (message.type === "INSTALL_CLI_PACKAGE") {
-    const { id, kind, npmPackage, binary } = message;
-    const installInfo = getDefaultCliInstall(kind);
-    const send = (payload) => {
-      try {
-        socket.send(
-          JSON.stringify({
-            type: "INSTALL_CLI_PACKAGE_RESPONSE",
-            id,
-            kind,
-            ...(installInfo
-              ? {
-                  binary: installInfo.binary,
-                  installCommand: installInfo.installCommand,
-                }
-              : {}),
-            ...payload,
-          }),
-        );
-      } catch (_) {}
-    };
-    if (!installInfo) {
-      send({
-        ok: false,
-        error: `No default npm package is configured for CLI kind '${kind || ""}'`,
-      });
-      return;
-    }
-    if (npmPackage !== installInfo.npmPackage || binary !== installInfo.binary) {
-      send({
-        ok: false,
-        error: "Refusing to install an unrecognized CLI package",
-      });
-      return;
     }
 
-    // Prefer launching a visible terminal so the user can see install
-    // progress and respond to interactive prompts (npm sudo, GitHub
-    // device-login, etc.). The bridge process has no TTY of its own,
-    // so a silent in-process spawn looked broken to users. Fall back
-    // to the headless spawn only when no terminal could be opened
-    // (e.g. headless Linux without DISPLAY, CI containers).
-    const terminal = launchInstallInTerminal(installInfo.installCommand);
-    if (terminal && terminal.launched) {
+    if (
+      effectiveProvider !== "ide" &&
+      _hasCredentials &&
+      !_preferLocalBrowserHeuristic
+    ) {
       process.stderr.write(
-        `[AutoDOM] CLI install launched in ${terminal.label}: ${installInfo.installCommand}\n`,
+        `[AutoDOM] ✓ Routing to direct provider: ${effectiveProvider}\n`,
       );
-      send({
-        ok: true,
-        launched: true,
-        terminalLabel: terminal.label,
+      // Stream user-visible text deltas back to the extension so the
+      // chat panel can paint tokens as they arrive instead of waiting
+      // for the full provider response. Only enabled for the CLI path
+      // today (other direct-provider branches in this file still buffer
+      // their full response before returning) — runCliPrompt detects
+      // the absence of the callback and falls back to silent buffering
+      // for non-CLI providers.
+      const _chatStreamEmitter = makeChatDeltaEmitter(socket, id);
+      const providerResult = await routeDirectProviderChat({
+        provider: effectiveProvider,
+        text,
+        context: effectiveContext,
+        conversationHistory,
+        providerConfig: mergedProviderConfig,
+        requestId: id,
+        mode: mode || null,
+        onTextDelta: (chunk) => _chatStreamEmitter.push(chunk),
       });
-      return;
-    }
+      _chatStreamEmitter.flush();
 
-    const npmBinary = process.platform === "win32" ? "npm.cmd" : "npm";
-    const args = ["install", "-g", installInfo.npmPackage];
-    process.stderr.write(
-      `[AutoDOM] CLI install: ${npmBinary} ${args.join(" ")}\n`,
-    );
-    let proc;
-    try {
-      proc = spawn(npmBinary, args, {
-        stdio: ["ignore", "pipe", "pipe"],
-        env: process.env,
-      });
-    } catch (spawnErr) {
-      send({
-        ok: false,
-        error: `Failed to spawn npm: ${spawnErr.message}`,
-      });
-      return;
-    }
-
-    const out = [];
-    const err = [];
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      try { proc.kill("SIGTERM"); } catch (_) {}
-      send({
-        ok: false,
-        error: `Timed out running ${installInfo.installCommand}`,
-      });
-    }, 180000);
-    proc.stdout.on("data", (d) => out.push(d));
-    proc.stderr.on("data", (d) => err.push(d));
-    proc.on("error", (e) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      send({ ok: false, error: e.message });
-    });
-    proc.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      const stdout = tailInstallOutput(Buffer.concat(out).toString("utf8"));
-      const stderr = tailInstallOutput(Buffer.concat(err).toString("utf8"));
-      if (code === 0) {
-        send({ ok: true, stdout, stderr });
-      } else {
-        send({
-          ok: false,
-          stdout,
-          stderr,
-          error: `${installInfo.installCommand} exited ${code}.${
-            stderr ? " " + stderr.substring(0, 240) : ""
-          }`,
-        });
+      process.stderr.write(
+        `[AutoDOM] ✓ Direct provider responded: ${(providerResult?.response || "").substring(0, 100)}...\n`,
+      );
+      responseText = providerResult.response;
+      if (Array.isArray(providerResult.toolCalls)) {
+        toolCalls.push(...providerResult.toolCalls);
       }
-    });
-    return;
-  }
 
-  if (message.type === "AI_CHAT_REQUEST") {
-    const { id, text, context, conversationHistory, provider, providerConfig, mode } =
-      message;
-    touchActivity();
-
-    // Debug: log what provider info we received from the extension
-    process.stderr.write(
-      `[AutoDOM] ━━━ AI_CHAT_REQUEST ━━━\n` +
-        `[AutoDOM]   text: "${(text || "").substring(0, 60)}"\n` +
-        `[AutoDOM]   provider (raw): ${JSON.stringify(provider)}\n` +
-        `[AutoDOM]   providerConfig.provider: ${providerConfig?.provider || "(none)"}\n` +
-        `[AutoDOM]   providerConfig.openaiApiKey: ${providerConfig?.openaiApiKey ? "SET (" + providerConfig.openaiApiKey.length + " chars)" : "EMPTY"}\n` +
-        `[AutoDOM]   providerConfig.anthropicApiKey: ${providerConfig?.anthropicApiKey ? "SET (" + providerConfig.anthropicApiKey.length + " chars)" : "EMPTY"}\n` +
-        `[AutoDOM]   providerConfig.ollamaBaseUrl: ${providerConfig?.ollamaBaseUrl || "EMPTY"}\n` +
-        `[AutoDOM]   providerConfig.ollamaModel: ${providerConfig?.ollamaModel || "EMPTY"}\n` +
-        `[AutoDOM]   providerConfig.openaiBaseUrl: ${providerConfig?.openaiBaseUrl || "EMPTY"}\n`,
-    );
-
-    if (!extensionSocket || extensionSocket.readyState !== 1) {
       _safeSendAiResponse(socket, {
         type: "AI_CHAT_RESPONSE",
         id: id,
-        error: "Chrome extension is not connected.",
+        response: responseText,
+        toolCalls: toolCalls,
+        model: providerResult.model || null,
       });
       return;
     }
 
-    (async () => {
-      // Helper: throw if the user has cancelled this request. Awaited
-      // points in the agent loop should call this to short-circuit
-      // before doing more work (extra tool calls, follow-up provider
-      // round-trips, etc.).
-      const _checkAbort = () => {
-        if (_isAborted(id)) throw new AiAbortError(id);
-      };
-      try {
-        _checkAbort();
-        const lower = (text || "").toLowerCase().trim();
-        const toolCalls = [];
-        let responseText = "";
-        let effectiveContext = context || {};
+    _checkAbort();
 
-        const effectiveProvider = normalizeProviderSelection(
-          provider || providerConfig?.provider || directProviderConfig.provider,
-        );
-        const mergedProviderConfig = mergeProviderConfig(providerConfig);
+    // Heuristic + IDE-sampling fallback path. Extracted into its own
+    // helper so this function isn't a 500-line monolith.
+    const heuristicResult = await _runHeuristicAiChatPath({
+      socket,
+      id,
+      text,
+      lower,
+      context,
+      effectiveContext,
+      effectiveProvider,
+      toolCalls,
+    });
+    responseText = heuristicResult.responseText;
 
-        const _hasCredentials = providerHasCredentials(
-          effectiveProvider,
-          mergedProviderConfig,
-        );
-        const _willRouteToProvider =
-          effectiveProvider !== "ide" && _hasCredentials;
-        const _preferLocalBrowserHeuristic =
-          shouldPreferLocalBrowserHeuristic(lower);
+    _safeSendAiResponse(socket, {
+      type: "AI_CHAT_RESPONSE",
+      id: id,
+      response: responseText,
+      toolCalls: toolCalls,
+    });
+  } catch (err) {
+    if (err && err.aiAborted) {
+      process.stderr.write(
+        `[AutoDOM] AI request id=${id} aborted mid-flight — not sending response.\n`,
+      );
+      return;
+    }
+    _safeSendAiResponse(socket, {
+      type: "AI_CHAT_RESPONSE",
+      id: id,
+      error: `AI processing error: ${err.message}`,
+    });
+  }
+}
 
-        process.stderr.write(
-          `[AutoDOM]   normalizeProviderSelection input: ${JSON.stringify(provider || providerConfig?.provider || directProviderConfig.provider)}\n` +
-            `[AutoDOM]   effectiveProvider: "${effectiveProvider}"\n` +
-            `[AutoDOM]   hasCredentials: ${_hasCredentials}\n` +
-            `[AutoDOM]   willRouteToDirectProvider: ${_willRouteToProvider}\n` +
-            `[AutoDOM]   mergedConfig.provider: "${mergedProviderConfig.provider}"\n` +
-            `[AutoDOM]   mergedConfig.openaiApiKey: ${mergedProviderConfig.openaiApiKey ? "SET (" + mergedProviderConfig.openaiApiKey.length + " chars)" : "EMPTY"}\n` +
-            `[AutoDOM]   mergedConfig.anthropicApiKey: ${mergedProviderConfig.anthropicApiKey ? "SET" : "EMPTY"}\n` +
-            `[AutoDOM]   mergedConfig.ollamaBaseUrl: ${mergedProviderConfig.ollamaBaseUrl || "EMPTY"}\n` +
-            `[AutoDOM]   mergedConfig.ollamaModel: ${mergedProviderConfig.ollamaModel || "EMPTY"}\n` +
-            `[AutoDOM]   directProviderConfig.provider: "${directProviderConfig.provider}"\n` +
-            `[AutoDOM] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`,
-        );
+// Heuristic AI routing path: map natural-language intents to direct
+// tool calls and, when nothing matches, route to the IDE AI via MCP
+// sampling (or queue the request for `get_pending_chat_requests`).
+async function _heuristicIntentScreenshot(ctx) {
+  const { lower, toolCalls } = ctx;
+  if (!(lower.includes("screenshot") || lower.includes("capture") || lower === "ss")) return null;
+  const result = await callExtensionTool("take_screenshot", {});
+  toolCalls.push({ tool: "take_screenshot" });
+  if (result && result.screenshot) {
+    return "Screenshot captured successfully. The image is available in the chat panel.";
+  }
+  return `Screenshot result: ${JSON.stringify(result)}`;
+}
 
-        if (!_willRouteToProvider) {
-          process.stderr.write(
-            `[AutoDOM] ⚠ NOT routing to direct provider. Reason: ` +
-              `${effectiveProvider === "ide" ? "effectiveProvider is 'ide'" : `no credentials for '${effectiveProvider}'`}. ` +
-              `Falling through to heuristic/IDE routing.\n`,
-          );
-        }
+async function _heuristicIntentDomState(ctx) {
+  const { lower, context, toolCalls, preferIdeAi } = ctx;
+  if (preferIdeAi) return null;
+  if (!(lower.includes("dom state") || lower.includes("interactive") ||
+        lower.includes("what can i click") || lower.includes("elements"))) return null;
+  const result = await callExtensionTool("get_dom_state", {});
+  toolCalls.push({ tool: "get_dom_state" });
+  const count = result?.elementCount || result?.elements?.length || 0;
+  let responseText = `Found ${count} interactive elements on the page "${context?.title || "this page"}".\n\n`;
+  if (result?.elements) {
+    const elements = result.elements.slice(0, 20);
+    elements.forEach((el, i) => {
+      const label = el.ariaLabel || el.text || el.placeholder || el.value || "";
+      responseText += `[${el.index ?? i}] <${el.tag}>${label ? ` "${label.substring(0, 50)}"` : ""}${el.type ? ` (${el.type})` : ""}${el.href ? ` → ${el.href.substring(0, 60)}` : ""}\n`;
+    });
+    if (result.elements.length > 20) {
+      responseText += `\n... and ${result.elements.length - 20} more elements.`;
+    }
+  }
+  return responseText;
+}
 
-        const _pageValueExtraction = isPageValueExtractionRequest(lower);
-        // Attach a snapshot whenever the user is asking about page content —
-        // the IDE-sampling path also benefits, since otherwise the IDE-side
-        // LLM only sees title/URL and has nothing to extract from.
-        const _attachSnapshotForIde =
-          !_willRouteToProvider &&
-          !_preferLocalBrowserHeuristic &&
-          shouldAttachBrowserSnapshot(lower);
-        if (
-          (
-            _willRouteToProvider &&
-            !_preferLocalBrowserHeuristic &&
-            shouldAttachBrowserSnapshot(lower)
-          ) ||
-          _pageValueExtraction ||
-          _attachSnapshotForIde
-        ) {
-          _checkAbort();
-          const snapshotResult = await callExtensionTool("execute_code", {
-            code: buildActivePageSnapshotScript(text || ""),
-            timeout: 20000,
-          });
-          toolCalls.push({ tool: "execute_code", purpose: "active_page_snapshot" });
-          effectiveContext = {
-            ...effectiveContext,
-            browserSnapshot: snapshotResult?.error
-              ? { error: snapshotResult.error }
-              : snapshotResult?.result || snapshotResult,
-          };
-          if (_pageValueExtraction) {
-            const extractionResponse = effectiveContext.browserSnapshot?.error
-              ? `AutoDOM couldn't scan the active page: ${effectiveContext.browserSnapshot.error}`
-              : formatRequestedDataExtraction(effectiveContext.browserSnapshot);
-            _safeSendAiResponse(socket, {
-              type: "AI_CHAT_RESPONSE",
-              id: id,
-              response: extractionResponse || "AutoDOM checked the active page, but no requested page values were found.",
-              toolCalls: toolCalls,
-              model: null,
-            });
-            return;
-          }
-        }
+async function _heuristicIntentPageInfo(ctx) {
+  const { lower, context, toolCalls } = ctx;
+  if (!(lower.includes("page info") || lower.includes("page details") ||
+        lower.includes("what page") || lower.includes("where am i"))) return null;
+  const result = await callExtensionTool("get_page_info", {});
+  toolCalls.push({ tool: "get_page_info" });
+  let responseText = `Page: ${result?.title || context?.title || "Unknown"}\n`;
+  responseText += `URL: ${result?.url || context?.url || "Unknown"}\n`;
+  if (result?.forms) responseText += `Forms: ${result.forms}\n`;
+  if (result?.links) responseText += `Links: ${result.links}\n`;
+  if (result?.images) responseText += `Images: ${result.images}\n`;
+  return responseText;
+}
 
-        if (
-          effectiveProvider !== "ide" &&
-          _hasCredentials &&
-          !_preferLocalBrowserHeuristic
-        ) {
-          process.stderr.write(
-            `[AutoDOM] ✓ Routing to direct provider: ${effectiveProvider}\n`,
-          );
-          // Stream user-visible text deltas back to the extension so the
-          // chat panel can paint tokens as they arrive instead of waiting
-          // for the full provider response. Only enabled for the CLI path
-          // today (other direct-provider branches in this file still buffer
-          // their full response before returning) — runCliPrompt detects
-          // the absence of the callback and falls back to silent buffering
-          // for non-CLI providers.
-          const _chatStreamEmitter = makeChatDeltaEmitter(socket, id);
-          const providerResult = await routeDirectProviderChat({
-            provider: effectiveProvider,
-            text,
-            context: effectiveContext,
-            conversationHistory,
-            providerConfig: mergedProviderConfig,
-            requestId: id,
-            mode: mode || null,
-            onTextDelta: (chunk) => _chatStreamEmitter.push(chunk),
-          });
-          _chatStreamEmitter.flush();
+async function _heuristicIntentSummarize(ctx) {
+  const { lower, context, toolCalls, preferIdeAi } = ctx;
+  if (preferIdeAi) return null;
+  if (!(lower.includes("summarize") || lower.includes("summary") ||
+        lower === "tldr" || lower === "tl;dr" ||
+        lower.includes("what's on this page") || lower.includes("what is this page"))) return null;
+  const result = await callExtensionTool("execute_code", {
+    code: "return { title: document.title, url: location.href, text: document.body.innerText.substring(0, 4000), h1: [...document.querySelectorAll('h1')].map(h => h.textContent.trim()).filter(Boolean).slice(0, 5), h2: [...document.querySelectorAll('h2')].map(h => h.textContent.trim()).filter(Boolean).slice(0, 10), counts: { links: document.querySelectorAll('a[href]').length, buttons: document.querySelectorAll('button, [role=\"button\"]').length, inputs: document.querySelectorAll('input, textarea, select').length, forms: document.querySelectorAll('form').length } };",
+  });
+  toolCalls.push({ tool: "execute_code" });
+  const r = result?.result || {};
+  const title = scrubSensitiveContextText(r.title || context?.title || "this page").toString().trim();
+  let responseText = `## ${title}\n\n`;
+  if (Array.isArray(r.h1) && r.h1.length) {
+    const h1 = r.h1.map((item) => scrubSensitiveContextText(item)).filter(Boolean);
+    if (h1.length) responseText += `**Main heading**\n- ${h1.join("\n- ")}\n\n`;
+  }
+  if (Array.isArray(r.h2) && r.h2.length) {
+    const h2 = r.h2.map((item) => scrubSensitiveContextText(item)).filter(Boolean);
+    if (h2.length) responseText += `**Sections**\n- ${h2.join("\n- ")}\n\n`;
+  }
+  if (typeof r.text === "string" && r.text.trim()) {
+    const preview = scrubSensitiveContextText(r.text).substring(0, 1500).trim();
+    responseText += `**Excerpt**\n\n${preview}`;
+    if (r.text.length > 1500) responseText += "\n\n_(truncated)_";
+    responseText += "\n\n";
+  }
+  if (r.counts) {
+    const c = r.counts;
+    responseText += `**Page stats** — ${c.links || 0} links, ${c.buttons || 0} buttons, ${c.inputs || 0} inputs, ${c.forms || 0} forms.\n\n`;
+  }
+  responseText += "_For a smarter summary, configure a direct AI provider (GPT, Claude, or Ollama) in the extension popup._";
+  return responseText;
+}
 
-          process.stderr.write(
-            `[AutoDOM] ✓ Direct provider responded: ${(providerResult?.response || "").substring(0, 100)}...\n`,
-          );
-          responseText = providerResult.response;
-          if (Array.isArray(providerResult.toolCalls)) {
-            toolCalls.push(...providerResult.toolCalls);
-          }
-
-          _safeSendAiResponse(socket, {
-            type: "AI_CHAT_RESPONSE",
-            id: id,
-            response: responseText,
-            toolCalls: toolCalls,
-            model: providerResult.model || null,
-          });
-          return;
-        }
-
-        _checkAbort();
-
-        // ── Heuristic AI routing ──────────────────────────────
-        // Map natural language intents to tool calls and compose
-        // a helpful response from the results.
-        //
-        // When an IDE AI agent is connected via MCP sampling, "rich text"
-        // intents (summarize, list interactive elements, accessibility
-        // audit, what-can-I-do) should be answered by the real AI rather
-        // than the local heuristic — otherwise the user gets a generic
-        // page-stats dump or a raw DOM listing instead of an AI summary.
-        // Deterministic intents (click, scroll, navigate, screenshot,
-        // page info, extract text) stay on the heuristic path because
-        // they don't benefit from AI and need to remain instant.
-        const _preferIdeAiForRichIntent =
-          !!activeMcpSession &&
-          (
-            lower.includes("summarize") ||
-            lower.includes("summary") ||
-            lower === "tldr" ||
-            lower === "tl;dr" ||
-            lower.includes("what's on this page") ||
-            lower.includes("what is this page") ||
-            lower.includes("interactive") ||
-            lower.includes("dom state") ||
-            lower.includes("what can i click") ||
-            lower.includes("elements") ||
-            lower.includes("accessibility") ||
-            lower.includes("a11y")
-          );
-
-        if (_preferIdeAiForRichIntent) {
-          process.stderr.write(
-            `[AutoDOM] Rich intent detected; skipping heuristic and routing to IDE AI agent: "${(text || "").substring(0, 80)}"\n`,
-          );
-        }
-
-        if (
-          lower.includes("screenshot") ||
-          lower.includes("capture") ||
-          lower === "ss"
-        ) {
-          const result = await callExtensionTool("take_screenshot", {});
-          toolCalls.push({ tool: "take_screenshot" });
-          if (result && result.screenshot) {
-            responseText =
-              "Screenshot captured successfully. The image is available in the chat panel.";
-          } else {
-            responseText = `Screenshot result: ${JSON.stringify(result)}`;
-          }
-        } else if (
-          !_preferIdeAiForRichIntent &&
-          (
-            lower.includes("dom state") ||
-            lower.includes("interactive") ||
-            lower.includes("what can i click") ||
-            lower.includes("elements")
-          )
-        ) {
-          const result = await callExtensionTool("get_dom_state", {});
-          toolCalls.push({ tool: "get_dom_state" });
-          const count = result?.elementCount || result?.elements?.length || 0;
-          responseText = `Found ${count} interactive elements on the page "${context?.title || "this page"}".\n\n`;
-          if (result?.elements) {
-            const elements = result.elements.slice(0, 20);
-            elements.forEach((el, i) => {
-              const label =
-                el.ariaLabel || el.text || el.placeholder || el.value || "";
-              responseText += `[${el.index ?? i}] <${el.tag}>${label ? ` "${label.substring(0, 50)}"` : ""}${el.type ? ` (${el.type})` : ""}${el.href ? ` → ${el.href.substring(0, 60)}` : ""}\n`;
-            });
-            if (result.elements.length > 20) {
-              responseText += `\n... and ${result.elements.length - 20} more elements.`;
-            }
-          }
-        } else if (
-          lower.includes("page info") ||
-          lower.includes("page details") ||
-          lower.includes("what page") ||
-          lower.includes("where am i")
-        ) {
-          const result = await callExtensionTool("get_page_info", {});
-          toolCalls.push({ tool: "get_page_info" });
-          responseText = `Page: ${result?.title || context?.title || "Unknown"}\n`;
-          responseText += `URL: ${result?.url || context?.url || "Unknown"}\n`;
-          if (result?.forms) responseText += `Forms: ${result.forms}\n`;
-          if (result?.links) responseText += `Links: ${result.links}\n`;
-          if (result?.images) responseText += `Images: ${result.images}\n`;
-        } else if (
-          !_preferIdeAiForRichIntent &&
-          (
-            lower.includes("summarize") ||
-            lower.includes("summary") ||
-            lower === "tldr" ||
-            lower === "tl;dr" ||
-            lower.includes("what's on this page") ||
-            lower.includes("what is this page")
-          )
-        ) {
-          const result = await callExtensionTool("execute_code", {
-            code: "return { title: document.title, url: location.href, text: document.body.innerText.substring(0, 4000), h1: [...document.querySelectorAll('h1')].map(h => h.textContent.trim()).filter(Boolean).slice(0, 5), h2: [...document.querySelectorAll('h2')].map(h => h.textContent.trim()).filter(Boolean).slice(0, 10), counts: { links: document.querySelectorAll('a[href]').length, buttons: document.querySelectorAll('button, [role=\"button\"]').length, inputs: document.querySelectorAll('input, textarea, select').length, forms: document.querySelectorAll('form').length } };",
-          });
-          toolCalls.push({ tool: "execute_code" });
-          const r = result?.result || {};
-          const title =
-            scrubSensitiveContextText(r.title || context?.title || "this page")
-              .toString()
-              .trim();
-          responseText = `## ${title}\n\n`;
-          if (Array.isArray(r.h1) && r.h1.length) {
-            const h1 = r.h1
-              .map((item) => scrubSensitiveContextText(item))
-              .filter(Boolean);
-            if (h1.length) {
-              responseText += `**Main heading**\n- ${h1.join("\n- ")}\n\n`;
-            }
-          }
-          if (Array.isArray(r.h2) && r.h2.length) {
-            const h2 = r.h2
-              .map((item) => scrubSensitiveContextText(item))
-              .filter(Boolean);
-            if (h2.length) {
-              responseText += `**Sections**\n- ${h2.join("\n- ")}\n\n`;
-            }
-          }
-          if (typeof r.text === "string" && r.text.trim()) {
-            const preview = scrubSensitiveContextText(r.text)
-              .substring(0, 1500)
-              .trim();
-            responseText += `**Excerpt**\n\n${preview}`;
-            if (r.text.length > 1500) responseText += "\n\n_(truncated)_";
-            responseText += "\n\n";
-          }
-          if (r.counts) {
-            const c = r.counts;
-            responseText +=
-              `**Page stats** — ${c.links || 0} links, ${c.buttons || 0} ` +
-              `buttons, ${c.inputs || 0} inputs, ${c.forms || 0} forms.\n\n`;
-          }
-          responseText +=
-            "_For a smarter summary, configure a direct AI provider " +
-            "(GPT, Claude, or Ollama) in the extension popup._";
-        } else if (
-          !_preferIdeAiForRichIntent &&
-          (lower.includes("accessibility") || lower.includes("a11y"))
-        ) {
-          const result = await callExtensionTool("execute_code", {
-            code: `
-              const issues = [];
-              document.querySelectorAll('img').forEach(img => {
-                if (!img.getAttribute('alt')) issues.push('Missing alt: ' + (img.src||'').substring(0,80));
-              });
-              document.querySelectorAll('input:not([type="hidden"]),textarea,select').forEach(inp => {
-                const id = inp.id;
-                const label = id ? document.querySelector('label[for="'+id+'"]') : null;
-                const ariaLabel = inp.getAttribute('aria-label');
-                if (!label && !ariaLabel && !inp.closest('label'))
-                  issues.push('Unlabeled: <' + inp.tagName.toLowerCase() + '> name=' + (inp.name||'(none)'));
-              });
-              const h1s = document.querySelectorAll('h1').length;
-              if (h1s === 0) issues.push('No h1 element found');
-              if (h1s > 1) issues.push('Multiple h1 elements: ' + h1s);
-              const lang = document.documentElement.getAttribute('lang');
-              if (!lang) issues.push('Missing lang attribute on <html>');
-              return { issueCount: issues.length, issues: issues.slice(0, 30), lang: lang };
-            `,
-          });
-          toolCalls.push({ tool: "execute_code" });
-          if (result?.result) {
-            const r = result.result;
-            responseText = `Accessibility Check for "${context?.title || "this page"}":\n\n`;
-            responseText += `Issues found: ${r.issueCount}\n`;
-            if (r.lang) responseText += `Language: ${r.lang}\n`;
-            responseText += "\n";
-            if (r.issues && r.issues.length > 0) {
-              r.issues.forEach((issue, i) => {
-                responseText += `${i + 1}. ${issue}\n`;
-              });
-            } else {
-              responseText += "No major accessibility issues detected! ✓";
-            }
-          } else {
-            responseText = stringifyToolResult(result);
-          }
-        } else if (
-          lower.startsWith("go to ") ||
-          lower.startsWith("navigate to ") ||
-          lower.startsWith("open ")
-        ) {
-          const url = text.replace(/^(go to|navigate to|open)\s+/i, "").trim();
-          const fullUrl = url.startsWith("http") ? url : `https://${url}`;
-          const result = await callExtensionTool("navigate", { url: fullUrl });
-          toolCalls.push({ tool: "navigate" });
-          responseText = result?.success
-            ? `Navigated to ${result.url || fullUrl}. Page title: "${result.title || "loading..."}"`
-            : `Navigation result: ${JSON.stringify(result)}`;
-        } else if (lower.startsWith("click ")) {
-          const target = text.substring(6).trim();
-          if (!isNaN(target)) {
-            const result = await callExtensionTool("click_by_index", {
-              index: parseInt(target),
-            });
-            toolCalls.push({ tool: "click_by_index" });
-            responseText = result?.success
-              ? `Clicked element #${target}: <${result.tag || "element"}> "${result.text || ""}"`
-              : `Click result: ${JSON.stringify(result)}`;
-          } else {
-            const result = await callExtensionTool("click", { text: target });
-            toolCalls.push({ tool: "click" });
-            responseText = result?.success
-              ? `Clicked "${target}" — ${result.tag || "element"}: "${result.text || ""}"`
-              : `Click result: ${JSON.stringify(result)}`;
-          }
-        } else if (lower.includes("scroll down")) {
-          const result = await callExtensionTool("scroll", {
-            direction: "down",
-            amount: 500,
-          });
-          toolCalls.push({ tool: "scroll" });
-          responseText = result?.success
-            ? "Scrolled down 500px."
-            : `Scroll result: ${JSON.stringify(result)}`;
-        } else if (lower.includes("scroll up")) {
-          const result = await callExtensionTool("scroll", {
-            direction: "up",
-            amount: 500,
-          });
-          toolCalls.push({ tool: "scroll" });
-          responseText = result?.success
-            ? "Scrolled up 500px."
-            : `Scroll result: ${JSON.stringify(result)}`;
-        } else if (
-          lower.includes("extract") &&
-          (lower.includes("text") || lower.includes("content"))
-        ) {
-          const result = await callExtensionTool("execute_code", {
-            code: "return document.body.innerText.substring(0, 3000);",
-          });
-          toolCalls.push({ tool: "execute_code" });
-          responseText = `Extracted text from "${context?.title || "this page"}":\n\n${result?.result || JSON.stringify(result)}`;
-        } else if (isAutomationIntent(lower)) {
-          // ── Refuse early on non-agentic providers ───────────────
-          // We're in this branch because no direct provider was wired
-          // up (Copilot/IDE-only). The MCP sampling fallback can only
-          // do a single text reply — it cannot iteratively call tools,
-          // so multi-step automation ("create a lead", "fill the form
-          // and submit", etc.) will silently spin until the 55s timeout
-          // and then return useless advice. Fail fast with a clear
-          // message instead.
-          process.stderr.write(
-            `[AutoDOM] ⚠ Automation intent on non-agentic provider "${effectiveProvider}". Refusing early.\n`,
-          );
-          responseText =
-            `**Automation needs a direct AI provider.**\n\n` +
-            `Your request looks like a multi-step automation task ("${(text || "").substring(0, 80)}"), ` +
-            `but the current provider (\`${effectiveProvider}\`) only supports one-shot text replies via MCP sampling — ` +
-            `it cannot iteratively call browser tools.\n\n` +
-            `To run automations like this, open the AutoDOM popup and switch to a direct provider:\n` +
-            `- **Anthropic (Claude)** — recommended for complex automation\n` +
-            `- **OpenAI (GPT)** — works well with GPT-4-class models\n` +
-            `- **Ollama** — for local models (needs a capable tool-use model)\n\n` +
-            `Slash commands like \`/dom\`, \`/click <index>\`, \`/type <index> <text>\`, and \`/nav <url>\` work without a direct provider.`;
-        } else {
-          // ── Route to IDE AI agent via MCP sampling ──────────────
-          // Instead of showing a generic help menu, try to forward
-          // the user's natural language request to the IDE's AI agent
-          // using the MCP sampling/createMessage capability.
-          // This lets the IDE agent (Claude, GPT, etc.) process the
-          // request with full tool access and return an intelligent response.
-          let aiRouted = false;
-
-          if (activeMcpSession) {
-            try {
-              process.stderr.write(
-                `[AutoDOM] Routing chat to IDE AI agent via sampling: "${(text || "").substring(0, 80)}"\n`,
-              );
-
-              // Build a rich prompt with page context for the AI agent
-              let samplingPrompt = `The user is interacting with a web page through the AutoDOM browser extension's chat panel.\n\n`;
-              samplingPrompt += `Page: ${scrubSensitiveContextText(context?.title || "Unknown")}\n`;
-              samplingPrompt += `URL: ${scrubSensitiveContextText(context?.url || "Unknown")}\n`;
-              if (context?.interactiveElements) {
-                const ie = context.interactiveElements;
-                samplingPrompt += `Interactive elements: ${ie.links || 0} links, ${ie.buttons || 0} buttons, ${ie.inputs || 0} inputs, ${ie.forms || 0} forms\n`;
-              }
-              if (effectiveContext?.browserSnapshot && !effectiveContext.browserSnapshot.error) {
-                const snap = formatBrowserSnapshotForPrompt(effectiveContext.browserSnapshot);
-                if (snap) {
-                  samplingPrompt += `\nActive page data already captured by AutoDOM (use this directly; do not ask the user to run /dom or paste DOM output):\n${snap}\n`;
-                }
-              }
-              samplingPrompt += `\nUser request: "${text}"\n\n`;
-              samplingPrompt += `You have access to AutoDOM MCP tools (get_dom_state, click_by_index, type_by_index, execute_code, navigate, screenshot, scroll, etc.).\n`;
-              samplingPrompt += `Please fulfill the user's request using the available tools. Do not ask the user to run browser-console snippets, paste DOM output, or type internal placeholder tokens. Respond with a clear, helpful answer describing what you found or did. Never expose raw internal shorthand like IC7 or CB0 in the final answer; if you need to mention an indexed element, say element #7 and describe it in plain English.`;
-
-              const samplingResult = await activeMcpSession.requestSampling(
-                {
-                  messages: [
-                    {
-                      role: "user",
-                      content: { type: "text", text: samplingPrompt },
-                    },
-                  ],
-                  maxTokens: 4096,
-                },
-                { timeout: 55000 },
-              );
-
-              if (samplingResult && samplingResult.content) {
-                const aiText =
-                  typeof samplingResult.content === "string"
-                    ? samplingResult.content
-                    : samplingResult.content.text ||
-                      JSON.stringify(samplingResult.content);
-                responseText = aiText;
-                toolCalls.push({ tool: "_ide_ai_agent", via: "sampling" });
-                aiRouted = true;
-                process.stderr.write(
-                  `[AutoDOM] IDE AI agent responded (${aiText.length} chars)\n`,
-                );
-              }
-            } catch (samplingErr) {
-              process.stderr.write(
-                `[AutoDOM] Sampling failed (${samplingErr.message}), falling back to queue\n`,
-              );
-            }
-          }
-
-          // ── Fallback: No AI is actually connected ─────────────
-          // Sampling didn't work and no direct provider is configured.
-          // Show a short, actionable message instead of the verbose
-          // queue dump — the queued request rarely gets picked up
-          // unless the user has explicitly told their IDE agent to
-          // poll get_pending_chat_requests.
-          if (!aiRouted) {
-            const chatReqId = ++chatRequestIdCounter;
-            pendingChatRequests.set(chatReqId, {
-              id: chatReqId,
-              text: text,
-              context: context || {},
-              socket: socket,
-              wsMessageId: id,
-              timestamp: Date.now(),
-            });
-
-            // Auto-expire after 2 minutes
-            setTimeout(() => {
-              if (pendingChatRequests.has(chatReqId)) {
-                pendingChatRequests.delete(chatReqId);
-              }
-            }, 120000).unref();
-
-            responseText =
-              `**No AI provider is connected.**\n\n` +
-              `To chat with AutoDOM, please connect an AI:\n\n` +
-              `• Open the AutoDOM extension settings and add an **OpenAI**, **Anthropic**, or **Ollama** key/endpoint, **or**\n` +
-              `• Ask the AI agent in your IDE (Copilot, Codex, Cursor, etc.) to call \`get_pending_chat_requests\` to pick up this message.\n\n` +
-              `Slash commands like \`/dom\`, \`/screenshot\`, \`/click\`, \`/help\` work without an AI.`;
-
-            // Also emit a notification to stderr so IDE-side logs show the pending request
-            process.stderr.write(
-              `[AutoDOM] ⚡ Pending chat request #${chatReqId} (no AI connected): "${(text || "").substring(0, 100)}"\n`,
-            );
-          }
-        }
-
-        _safeSendAiResponse(socket, {
-          type: "AI_CHAT_RESPONSE",
-          id: id,
-          response: responseText,
-          toolCalls: toolCalls,
+async function _heuristicIntentAccessibility(ctx) {
+  const { lower, context, toolCalls, preferIdeAi } = ctx;
+  if (preferIdeAi) return null;
+  if (!(lower.includes("accessibility") || lower.includes("a11y"))) return null;
+  const result = await callExtensionTool("execute_code", {
+    code: `
+        const issues = [];
+        document.querySelectorAll('img').forEach(img => {
+          if (!img.getAttribute('alt')) issues.push('Missing alt: ' + (img.src||'').substring(0,80));
         });
-      } catch (err) {
-        if (err && err.aiAborted) {
-          process.stderr.write(
-            `[AutoDOM] AI request id=${id} aborted mid-flight — not sending response.\n`,
-          );
-          return;
-        }
-        _safeSendAiResponse(socket, {
-          type: "AI_CHAT_RESPONSE",
-          id: id,
-          error: `AI processing error: ${err.message}`,
+        document.querySelectorAll('input:not([type="hidden"]),textarea,select').forEach(inp => {
+          const id = inp.id;
+          const label = id ? document.querySelector('label[for="'+id+'"]') : null;
+          const ariaLabel = inp.getAttribute('aria-label');
+          if (!label && !ariaLabel && !inp.closest('label'))
+            issues.push('Unlabeled: <' + inp.tagName.toLowerCase() + '> name=' + (inp.name||'(none)'));
         });
+        const h1s = document.querySelectorAll('h1').length;
+        if (h1s === 0) issues.push('No h1 element found');
+        if (h1s > 1) issues.push('Multiple h1 elements: ' + h1s);
+        const lang = document.documentElement.getAttribute('lang');
+        if (!lang) issues.push('Missing lang attribute on <html>');
+        return { issueCount: issues.length, issues: issues.slice(0, 30), lang: lang };
+      `,
+  });
+  toolCalls.push({ tool: "execute_code" });
+  if (!result?.result) return stringifyToolResult(result);
+  const r = result.result;
+  let responseText = `Accessibility Check for "${context?.title || "this page"}":\n\n`;
+  responseText += `Issues found: ${r.issueCount}\n`;
+  if (r.lang) responseText += `Language: ${r.lang}\n`;
+  responseText += "\n";
+  if (r.issues && r.issues.length > 0) {
+    r.issues.forEach((issue, i) => { responseText += `${i + 1}. ${issue}\n`; });
+  } else {
+    responseText += "No major accessibility issues detected! ✓";
+  }
+  return responseText;
+}
+
+async function _heuristicIntentNavigate(ctx) {
+  const { lower, text, toolCalls } = ctx;
+  if (!(lower.startsWith("go to ") || lower.startsWith("navigate to ") || lower.startsWith("open "))) return null;
+  const url = text.replace(/^(go to|navigate to|open)\s+/i, "").trim();
+  const fullUrl = url.startsWith("http") ? url : `https://${url}`;
+  const result = await callExtensionTool("navigate", { url: fullUrl });
+  toolCalls.push({ tool: "navigate" });
+  return result?.success
+    ? `Navigated to ${result.url || fullUrl}. Page title: "${result.title || "loading..."}"`
+    : `Navigation result: ${JSON.stringify(result)}`;
+}
+
+async function _heuristicIntentClick(ctx) {
+  const { lower, text, toolCalls } = ctx;
+  if (!lower.startsWith("click ")) return null;
+  const target = text.substring(6).trim();
+  if (!isNaN(target)) {
+    const result = await callExtensionTool("click_by_index", { index: parseInt(target) });
+    toolCalls.push({ tool: "click_by_index" });
+    return result?.success
+      ? `Clicked element #${target}: <${result.tag || "element"}> "${result.text || ""}"`
+      : `Click result: ${JSON.stringify(result)}`;
+  }
+  const result = await callExtensionTool("click", { text: target });
+  toolCalls.push({ tool: "click" });
+  return result?.success
+    ? `Clicked "${target}" — ${result.tag || "element"}: "${result.text || ""}"`
+    : `Click result: ${JSON.stringify(result)}`;
+}
+
+async function _heuristicIntentScroll(ctx) {
+  const { lower, toolCalls } = ctx;
+  let direction = null;
+  if (lower.includes("scroll down")) direction = "down";
+  else if (lower.includes("scroll up")) direction = "up";
+  if (!direction) return null;
+  const result = await callExtensionTool("scroll", { direction, amount: 500 });
+  toolCalls.push({ tool: "scroll" });
+  return result?.success ? `Scrolled ${direction} 500px.` : `Scroll result: ${JSON.stringify(result)}`;
+}
+
+async function _heuristicIntentExtractText(ctx) {
+  const { lower, context, toolCalls } = ctx;
+  if (!(lower.includes("extract") && (lower.includes("text") || lower.includes("content")))) return null;
+  const result = await callExtensionTool("execute_code", {
+    code: "return document.body.innerText.substring(0, 3000);",
+  });
+  toolCalls.push({ tool: "execute_code" });
+  return `Extracted text from "${context?.title || "this page"}":\n\n${result?.result || JSON.stringify(result)}`;
+}
+
+function _heuristicIntentAutomationRefusal(ctx) {
+  const { lower, text, effectiveProvider } = ctx;
+  if (!isAutomationIntent(lower)) return null;
+  process.stderr.write(
+    `[AutoDOM] ⚠ Automation intent on non-agentic provider "${effectiveProvider}". Refusing early.\n`,
+  );
+  return (
+    `**Automation needs a direct AI provider.**\n\n` +
+    `Your request looks like a multi-step automation task ("${(text || "").substring(0, 80)}"), ` +
+    `but the current provider (\`${effectiveProvider}\`) only supports one-shot text replies via MCP sampling — ` +
+    `it cannot iteratively call browser tools.\n\n` +
+    `To run automations like this, open the AutoDOM popup and switch to a direct provider:\n` +
+    `- **Anthropic (Claude)** — recommended for complex automation\n` +
+    `- **OpenAI (GPT)** — works well with GPT-4-class models\n` +
+    `- **Ollama** — for local models (needs a capable tool-use model)\n\n` +
+    `Slash commands like \`/dom\`, \`/click <index>\`, \`/type <index> <text>\`, and \`/nav <url>\` work without a direct provider.`
+  );
+}
+
+const _HEURISTIC_INTENT_HANDLERS = [
+  _heuristicIntentScreenshot,
+  _heuristicIntentDomState,
+  _heuristicIntentPageInfo,
+  _heuristicIntentSummarize,
+  _heuristicIntentAccessibility,
+  _heuristicIntentNavigate,
+  _heuristicIntentClick,
+  _heuristicIntentScroll,
+  _heuristicIntentExtractText,
+  _heuristicIntentAutomationRefusal,
+];
+
+function _shouldPreferIdeAiForRichIntent(lower) {
+  if (!activeMcpSession) return false;
+  return (
+    lower.includes("summarize") || lower.includes("summary") ||
+    lower === "tldr" || lower === "tl;dr" ||
+    lower.includes("what's on this page") || lower.includes("what is this page") ||
+    lower.includes("interactive") || lower.includes("dom state") ||
+    lower.includes("what can i click") || lower.includes("elements") ||
+    lower.includes("accessibility") || lower.includes("a11y")
+  );
+}
+
+async function _runHeuristicAiChatPath({
+  socket,
+  id,
+  text,
+  lower,
+  context,
+  effectiveContext,
+  effectiveProvider,
+  toolCalls,
+}) {
+  const preferIdeAi = _shouldPreferIdeAiForRichIntent(lower);
+  if (preferIdeAi) {
+    process.stderr.write(
+      `[AutoDOM] Rich intent detected; skipping heuristic and routing to IDE AI agent: "${(text || "").substring(0, 80)}"\n`,
+    );
+  }
+  const ctx = { socket, id, text, lower, context, effectiveContext, effectiveProvider, toolCalls, preferIdeAi };
+  for (const handler of _HEURISTIC_INTENT_HANDLERS) {
+    const responseText = await handler(ctx);
+    if (responseText !== null && responseText !== undefined) {
+      return { responseText };
+    }
+  }
+  // Fallback: route to IDE AI agent via MCP sampling.
+  const responseText = await _routeViaIdeSamplingOrQueue({
+    socket, id, text, context, effectiveContext, toolCalls,
+  });
+  return { responseText };
+}
+
+async function _routeViaIdeSamplingOrQueue({
+  socket,
+  id,
+  text,
+  context,
+  effectiveContext,
+  toolCalls,
+}) {
+  let responseText = "";
+  let aiRouted = false;
+
+  if (activeMcpSession) {
+    try {
+      process.stderr.write(
+        `[AutoDOM] Routing chat to IDE AI agent via sampling: "${(text || "").substring(0, 80)}"\n`,
+      );
+
+      // Build a rich prompt with page context for the AI agent
+      let samplingPrompt = `The user is interacting with a web page through the AutoDOM browser extension's chat panel.\n\n`;
+      samplingPrompt += `Page: ${scrubSensitiveContextText(context?.title || "Unknown")}\n`;
+      samplingPrompt += `URL: ${scrubSensitiveContextText(context?.url || "Unknown")}\n`;
+      if (context?.interactiveElements) {
+        const ie = context.interactiveElements;
+        samplingPrompt += `Interactive elements: ${ie.links || 0} links, ${ie.buttons || 0} buttons, ${ie.inputs || 0} inputs, ${ie.forms || 0} forms\n`;
       }
-    })();
-    return;
+      if (effectiveContext?.browserSnapshot && !effectiveContext.browserSnapshot.error) {
+        const snap = formatBrowserSnapshotForPrompt(effectiveContext.browserSnapshot);
+        if (snap) {
+          samplingPrompt += `\nActive page data already captured by AutoDOM (use this directly; do not ask the user to run /dom or paste DOM output):\n${snap}\n`;
+        }
+      }
+      samplingPrompt += `\nUser request: "${text}"\n\n`;
+      samplingPrompt += `You have access to AutoDOM MCP tools (get_dom_state, click_by_index, type_by_index, execute_code, navigate, screenshot, scroll, etc.).\n`;
+      samplingPrompt += `Please fulfill the user's request using the available tools. Do not ask the user to run browser-console snippets, paste DOM output, or type internal placeholder tokens. Respond with a clear, helpful answer describing what you found or did. Never expose raw internal shorthand like IC7 or CB0 in the final answer; if you need to mention an indexed element, say element #7 and describe it in plain English.`;
+
+      const samplingResult = await activeMcpSession.requestSampling(
+        {
+          messages: [
+            {
+              role: "user",
+              content: { type: "text", text: samplingPrompt },
+            },
+          ],
+          maxTokens: 4096,
+        },
+        { timeout: 55000 },
+      );
+
+      if (samplingResult && samplingResult.content) {
+        const aiText =
+          typeof samplingResult.content === "string"
+            ? samplingResult.content
+            : samplingResult.content.text ||
+              JSON.stringify(samplingResult.content);
+        responseText = aiText;
+        toolCalls.push({ tool: "_ide_ai_agent", via: "sampling" });
+        aiRouted = true;
+        process.stderr.write(
+          `[AutoDOM] IDE AI agent responded (${aiText.length} chars)\n`,
+        );
+      }
+    } catch (samplingErr) {
+      process.stderr.write(
+        `[AutoDOM] Sampling failed (${samplingErr.message}), falling back to queue\n`,
+      );
+    }
   }
 
-  if (message.type === "INTERNAL_PROXY_CALL") {
-    // This is a secondary IDE instance sending a tool call
-    // Forward it to the real Chrome extension
-    if (extensionSocket && extensionSocket.readyState === 1) {
-      // We hijack the ID to map it back
-      const internalId = ++callIdCounter;
-      pendingCalls.set(internalId, {
-        resolve: (res) => {
-          socket.send(
-            JSON.stringify({
-              type: "TOOL_RESULT",
-              id: message.id,
-              result: res,
-            }),
-          );
-        },
-        reject: () => {},
-        timer: setTimeout(() => pendingCalls.delete(internalId), TOOL_TIMEOUT),
-      });
+  // Fallback: No AI is actually connected. Sampling didn't work and no
+  // direct provider is configured. Show a short, actionable message
+  // instead of the verbose queue dump — the queued request rarely gets
+  // picked up unless the user has explicitly told their IDE agent to
+  // poll get_pending_chat_requests.
+  if (!aiRouted) {
+    const chatReqId = ++chatRequestIdCounter;
+    pendingChatRequests.set(chatReqId, {
+      id: chatReqId,
+      text: text,
+      context: context || {},
+      socket: socket,
+      wsMessageId: id,
+      timestamp: Date.now(),
+    });
 
-      sendToExtensionImmediate({
-        type: "TOOL_CALL",
-        clientId: message.clientId || "proxy_unknown",
-        id: internalId,
-        tool: message.tool,
-        params: message.params,
-      });
-    } else {
-      try {
+    // Auto-expire after 2 minutes
+    setTimeout(() => {
+      if (pendingChatRequests.has(chatReqId)) {
+        pendingChatRequests.delete(chatReqId);
+      }
+    }, 120000).unref();
+
+    responseText =
+      `**No AI provider is connected.**\n\n` +
+      `To chat with AutoDOM, please connect an AI:\n\n` +
+      `• Open the AutoDOM extension settings and add an **OpenAI**, **Anthropic**, or **Ollama** key/endpoint, **or**\n` +
+      `• Ask the AI agent in your IDE (Copilot, Codex, Cursor, etc.) to call \`get_pending_chat_requests\` to pick up this message.\n\n` +
+      `Slash commands like \`/dom\`, \`/screenshot\`, \`/click\`, \`/help\` work without an AI.`;
+
+    process.stderr.write(
+      `[AutoDOM] ⚡ Pending chat request #${chatReqId} (no AI connected): "${(text || "").substring(0, 100)}"\n`,
+    );
+  }
+
+  return responseText;
+}
+
+// ── INTERNAL_PROXY_CALL ──────────────────────────────────────
+// A secondary IDE instance is sending a tool call; forward it to
+// the real Chrome extension and map the result back.
+function _handleInternalProxyCall(socket, message) {
+  if (extensionSocket && extensionSocket.readyState === 1) {
+    // We hijack the ID to map it back
+    const internalId = ++callIdCounter;
+    pendingCalls.set(internalId, {
+      resolve: (res) => {
         socket.send(
           JSON.stringify({
             type: "TOOL_RESULT",
             id: message.id,
-            result: {
-              error: "Chrome extension is not connected to the primary server.",
-            },
+            result: res,
           }),
         );
-      } catch (_) {}
-    }
-    return;
-  }
+      },
+      reject: () => {},
+      timer: setTimeout(() => pendingCalls.delete(internalId), TOOL_TIMEOUT),
+    });
 
-  if (message.type === "TOOL_RESULT" && message.id != null) {
-    const pending = pendingCalls.get(message.id);
-    if (pending) {
-      clearTimeout(pending.timer);
-      pendingCalls.delete(message.id);
-      pending.resolve(message.result);
-    }
-  }
-
-  if (message.type === "KEEPALIVE" || message.type === "PONG") {
-    // Reset inactivity timer on keepalive — the extension is still alive
-    touchActivity();
-    // Only identify as Chrome extension if we receive KEEPALIVE
-    if (extensionSocket !== socket) {
-      process.stderr.write("[AutoDOM] Chrome extension connected\n");
-      extensionSocket = socket;
-      // Start inactivity timer when extension connects
-      startInactivityTimer();
-      // Wake any callExtensionTool() invocations that were waiting out
-      // a transient extension drop.
-      _signalExtensionReady();
-      try {
-        socket.send(
-          JSON.stringify({
-            type: "SERVER_INFO",
-            serverPath: fileURLToPath(import.meta.url),
-            port: WS_PORT,
-          }),
-        );
-      } catch (_) {}
-    }
-    if (message.type === "KEEPALIVE" && socket.readyState === 1) {
-      try {
-        socket.send(JSON.stringify({ type: "PONG" }));
-      } catch (_) {}
-    }
-    return;
-  }
-
-  if (message.type === "GET_TOOL_LOGS") {
+    sendToExtensionImmediate({
+      type: "TOOL_CALL",
+      clientId: message.clientId || "proxy_unknown",
+      id: internalId,
+      tool: message.tool,
+      params: message.params,
+    });
+  } else {
     try {
       socket.send(
         JSON.stringify({
-          type: "TOOL_LOGS_RESPONSE",
-          logs: _toolErrorBuf.slice(),
-          logFile: TOOL_ERROR_LOG_PATH,
+          type: "TOOL_RESULT",
+          id: message.id,
+          result: {
+            error: "Chrome extension is not connected to the primary server.",
+          },
         }),
       );
     } catch (_) {}
-    return;
   }
+}
 
-  if (message.type === "CLEAR_TOOL_LOGS") {
-    _toolErrorBuf.length = 0;
-    fs.writeFile(TOOL_ERROR_LOG_PATH, "").catch(() => {});
+// ── TOOL_RESULT ──────────────────────────────────────────────
+function _handleToolResult(_socket, message) {
+  if (message.id == null) return;
+  const pending = pendingCalls.get(message.id);
+  if (pending) {
+    clearTimeout(pending.timer);
+    pendingCalls.delete(message.id);
+    pending.resolve(message.result);
+  }
+}
+
+// ── KEEPALIVE / PONG ─────────────────────────────────────────
+function _handleKeepaliveOrPong(socket, message) {
+  // Reset inactivity timer on keepalive — the extension is still alive
+  touchActivity();
+  // Only identify as Chrome extension if we receive KEEPALIVE
+  if (extensionSocket !== socket) {
+    process.stderr.write("[AutoDOM] Chrome extension connected\n");
+    extensionSocket = socket;
+    // Start inactivity timer when extension connects
+    startInactivityTimer();
+    // Wake any callExtensionTool() invocations that were waiting out
+    // a transient extension drop.
+    _signalExtensionReady();
     try {
       socket.send(
         JSON.stringify({
-          type: "TOOL_LOGS_CLEARED",
-          logFile: TOOL_ERROR_LOG_PATH,
+          type: "SERVER_INFO",
+          serverPath: fileURLToPath(import.meta.url),
+          port: WS_PORT,
         }),
       );
     } catch (_) {}
-    return;
   }
+  if (message.type === "KEEPALIVE" && socket.readyState === 1) {
+    try {
+      socket.send(JSON.stringify({ type: "PONG" }));
+    } catch (_) {}
+  }
+}
 
+// ── GET_TOOL_LOGS / CLEAR_TOOL_LOGS ──────────────────────────
+function _handleGetToolLogs(socket) {
+  try {
+    socket.send(
+      JSON.stringify({
+        type: "TOOL_LOGS_RESPONSE",
+        logs: _toolErrorBuf.slice(),
+        logFile: TOOL_ERROR_LOG_PATH,
+      }),
+    );
+  } catch (_) {}
+}
+
+function _handleClearToolLogs(socket) {
+  _toolErrorBuf.length = 0;
+  fs.writeFile(TOOL_ERROR_LOG_PATH, "").catch(() => {});
+  try {
+    socket.send(
+      JSON.stringify({
+        type: "TOOL_LOGS_CLEARED",
+        logFile: TOOL_ERROR_LOG_PATH,
+      }),
+    );
+  } catch (_) {}
+}
+
+// ── Dispatch Table ───────────────────────────────────────────
+// Replaces the previous 350-cyclomatic chain of if/return blocks.
+// PONG is aliased to the keepalive handler so we don't duplicate the
+// extension-identification logic.
+const _WS_MESSAGE_HANDLERS = Object.freeze({
+  AI_CHAT_ABORT: _handleAiChatAbort,
+  CHECK_CLI_BINARY: _handleCheckCliBinary,
+  INSTALL_CLI_PACKAGE: _handleInstallCliPackage,
+  AI_CHAT_REQUEST: _handleAiChatRequest,
+  INTERNAL_PROXY_CALL: _handleInternalProxyCall,
+  TOOL_RESULT: _handleToolResult,
+  KEEPALIVE: _handleKeepaliveOrPong,
+  PONG: _handleKeepaliveOrPong,
+  GET_TOOL_LOGS: _handleGetToolLogs,
+  CLEAR_TOOL_LOGS: _handleClearToolLogs,
+});
+
+function _processWsMessage(socket, message) {
+  const handler = _WS_MESSAGE_HANDLERS[message?.type];
+  if (handler) handler(socket, message);
 }
 
 process.on("exit", removeLockFileIfOwnedSync);

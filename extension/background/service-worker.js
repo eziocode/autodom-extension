@@ -1773,11 +1773,7 @@ async function runAgentLoop({
     const _styleOpts = { responseStyle: responseStyle || "concise" };
 
     try {
-    // ── Vision-plan mode: one-shot plan from screenshot+snapshot, then replay ──
-    // Triggered via /auto. Skips the chatty per-step model loop entirely:
-    // 1 vision call → JSON action script → local replay. On any failure we
-    // surface a clear error and stop — caller can retry without /auto.
-    visionPlanFastPath: if (mode === "vision-plan") {
+    async function _runVisionPlanPath() {
       const PLAN_ALLOWED_TOOLS_TEXT =
         "click_by_index, type_by_index, navigate, scroll, wait_for_element, wait_for_text, wait_for_network_idle, select_option, press_key, handle_dialog";
       const ALLOWED_PLAN_TOOLS = new Set([
@@ -1804,7 +1800,7 @@ async function runAgentLoop({
         snap = await executeAgentTool("take_snapshot", { maxDepth: 4 });
       } catch (e) {
         fastPlanFallbackMessages.push(`Vision plan snapshot failed (${e.message}); continue with the normal tool loop.`);
-        break visionPlanFastPath;
+        return { done: false };
       }
       try {
         shot = await executeAgentTool("take_screenshot", {});
@@ -1852,12 +1848,12 @@ async function runAgentLoop({
             signal,
           });
         } else {
-          return finish({ response: `⚠️ Vision plan not supported for provider: ${providerType}.`, toolCalls: accumulatedToolCalls });
+          return { done: true, payload: { response: `⚠️ Vision plan not supported for provider: ${providerType}.`, toolCalls: accumulatedToolCalls } };
         }
       } catch (err) {
-        if (isAborted() || err?.name === "AbortError") return finish(abortedReply());
+        if (isAborted() || err?.name === "AbortError") return { done: true, payload: abortedReply() };
         fastPlanFallbackMessages.push(`Vision plan call failed (${err.message}); continue with the normal tool loop.`);
-        break visionPlanFastPath;
+        return { done: false };
       }
 
       // Parse JSON — tolerate optional ```json fences just in case.
@@ -1868,15 +1864,15 @@ async function runAgentLoop({
       const steps = Array.isArray(plan?.steps) ? plan.steps : [];
       if (!steps.length) {
         fastPlanFallbackMessages.push("Vision plan returned no executable steps; continue with the normal tool loop.");
-        break visionPlanFastPath;
+        return { done: false };
       }
 
       for (let i = 0; i < steps.length; i++) {
-        if (isAborted()) return finish(abortedReply());
+        if (isAborted()) return { done: true, payload: abortedReply() };
         const step = steps[i] || {};
         if (!ALLOWED_PLAN_TOOLS.has(step.tool)) {
           fastPlanFallbackMessages.push(`Vision plan step ${i + 1} used disallowed tool '${step.tool}'; continue with the normal tool loop.`);
-          break visionPlanFastPath;
+          return { done: false };
         }
         const args = step.args && typeof step.args === "object" ? step.args : {};
         _streamAgentToolEvent(panelTabId, {
@@ -1891,45 +1887,17 @@ async function runAgentLoop({
         });
         if (!ok) {
           fastPlanFallbackMessages.push(`Vision plan stopped at step ${i + 1}/${steps.length} (${step.tool}): ${r?.error || "tool returned not-ok"}. Continue from the current page state.`);
-          break visionPlanFastPath;
+          return { done: false };
         }
       }
-      return finish({
+      return { done: true, payload: {
         response: `✅ Executed ${steps.length} step(s) via vision plan.`,
         toolCalls: accumulatedToolCalls,
-      });
+      } };
+    
     }
 
-    const activeText = fastPlanFallbackMessages.length
-      ? `${text}\n\n[Fast-plan fallback: ${fastPlanFallbackMessages.join(" ")}]`
-      : text;
-
-    // ── Quick Mode: compact command language, no tool schema ───────────────
-    // Triggered via /quick. Sends tools:[] + stop_sequences=["\n<<END>>"] so
-    // the model responds with single-letter commands that are parsed and
-    // replayed locally — no round-trips for JSON tool schemas. After each
-    // batch of commands, takes a screenshot and feeds it back as a user
-    // message. Loops until the model outputs no commands.
-    //
-    // Command format (one per line, "<<END>>" terminates the batch):
-    //   C x y           — left click
-    //   RC x y          — right click
-    //   DC x y          — double click
-    //   TC x y          — triple click
-    //   H x y           — hover
-    //   T text          — type text
-    //   K keys          — press keys (space-separated)
-    //   S dir amt x y   — scroll (dir=up|down|left|right)
-    //   D x1 y1 x2 y2  — drag
-    //   Z x1 y1 x2 y2  — zoom screenshot region (just takes screenshot)
-    //   N url           — navigate (or "back"/"forward")
-    //   J code          — execute JavaScript
-    //   W               — wait for network idle
-    //   ST tabId        — switch tab
-    //   NT url          — open new tab
-    //   LT              — list tabs
-    //   PL json         — present plan (emits update_plan event, awaits approval)
-    quickModeFastPath: if (mode === "quick") {
+    async function _runQuickModePath() {
       const QUICK_SYSTEM_PROMPT =
         "You are AutoDOM in Quick Mode. Respond ONLY with compact browser commands, one per line, then <<END>>.\n" +
         "Commands:\n" +
@@ -2073,9 +2041,9 @@ async function runAgentLoop({
       }
 
       for (let qTurn = 0; qTurn < AGENT_MAX_TURNS; qTurn++) {
-        if (isAborted()) return finish(abortedReply());
+        if (isAborted()) return { done: true, payload: abortedReply() };
         if (Date.now() - startedAt > AGENT_WALL_CLOCK_MS) {
-          return finish({ response: "⚠️ Quick mode timed out.", toolCalls: accumulatedToolCalls });
+          return { done: true, payload: { response: "⚠️ Quick mode timed out.", toolCalls: accumulatedToolCalls } };
         }
 
         let qResp;
@@ -2112,8 +2080,8 @@ async function runAgentLoop({
           }
         } catch (err) {
           discardTurnBuffer();
-          if (isAborted() || err?.name === "AbortError") return finish(abortedReply());
-          break quickModeFastPath;
+          if (isAborted() || err?.name === "AbortError") return { done: true, payload: abortedReply() };
+          return { done: false };
         }
 
         const rawText = qResp?.response || "";
@@ -2129,17 +2097,17 @@ async function runAgentLoop({
         if (qCommands.length === 0) {
           // No commands — model is done or needs user input
           finalizeStream();
-          return finish({
+          return { done: true, payload: {
             response: rawText.replace(/<<END>>/g, "").trim() || "✅ Quick mode: task complete.",
             toolCalls: accumulatedToolCalls,
-          });
+          } };
         }
 
         discardTurnBuffer();
 
         // Execute commands sequentially
         for (const qcmd of qCommands) {
-          if (isAborted()) return finish(abortedReply());
+          if (isAborted()) return { done: true, payload: abortedReply() };
           _streamAgentToolEvent(panelTabId, {
             phase: "start", runId: runHandle.runId, tool: `quick:${qcmd.cmd}`, args: qcmd,
           });
@@ -2151,7 +2119,7 @@ async function runAgentLoop({
           });
           // If a plan was rejected, stop the run
           if (qcmd.cmd === "present_plan" && !qResult?.approved) {
-            return finish({ response: "❌ Plan rejected by user.", toolCalls: accumulatedToolCalls });
+            return { done: true, payload: { response: "❌ Plan rejected by user.", toolCalls: accumulatedToolCalls } };
           }
         }
 
@@ -2178,14 +2146,14 @@ async function runAgentLoop({
           qMessages.push({ role: "user", content: feedback });
         }
       }
-      return finish({
+      return { done: true, payload: {
         response: "⚠️ Quick mode reached max turns.",
         toolCalls: accumulatedToolCalls,
-      });
+      } };
+    
     }
 
-    // ── OpenAI / Ollama style: messages = [{role, content/tool_calls/...}] ──
-    if (providerType === "openai" || providerType === "ollama") {
+    async function _runOpenAiOllamaPath() {
       const providerInfo = { model: _model, provider: providerType };
       const sys = _agentSystemPrompt(context, providerInfo, panelTabId, _styleOpts);
       const messages = [{ role: "system", content: sys }];
@@ -2213,13 +2181,13 @@ async function runAgentLoop({
       });
 
       for (let turn = 0; turn < AGENT_MAX_TURNS; turn++) {
-        if (isAborted()) return finish(abortedReply());
+        if (isAborted()) return { done: true, payload: abortedReply() };
         if (Date.now() - startedAt > AGENT_WALL_CLOCK_MS) {
-          return finish({
+          return { done: true, payload: {
             response:
               "⚠️ Agent timed out (wall-clock limit). Returning partial results.",
             toolCalls: accumulatedToolCalls,
-          });
+          } };
         }
         const callFn =
           providerType === "openai"
@@ -2242,7 +2210,7 @@ async function runAgentLoop({
         } catch (err) {
           discardTurnBuffer();
           if (isAborted() || err?.name === "AbortError") {
-            return finish(abortedReply());
+            return { done: true, payload: abortedReply() };
           }
           throw err;
         }
@@ -2256,12 +2224,12 @@ async function runAgentLoop({
         if (!resp.toolCalls || resp.toolCalls.length === 0) {
           // Final reply
           finalizeStream();
-          return finish({
+          return { done: true, payload: {
             response:
               resp.response ||
               "(Agent completed but returned no text response.)",
             toolCalls: accumulatedToolCalls,
-          });
+          } };
         }
 
         // This turn ended with tool_calls — discard any planner-text
@@ -2272,14 +2240,14 @@ async function runAgentLoop({
         // Execute each tool call sequentially (parallel disabled in OpenAI body)
         let _needsTabContextInjection = false;
         for (const tc of resp.toolCalls) {
-          if (isAborted()) return finish(abortedReply());
+          if (isAborted()) return { done: true, payload: abortedReply() };
           const args = _safeJsonParse(tc.arguments);
           // Special "respond_to_user" tool short-circuits the loop
           if (tc.name === "respond_to_user") {
-            return finish({
+            return { done: true, payload: {
               response: args.markdown || resp.response || "(no response)",
               toolCalls: accumulatedToolCalls,
-            });
+            } };
           }
           // update_plan: pause for user approval before continuing
           if (tc.name === "update_plan") {
@@ -2300,7 +2268,7 @@ async function runAgentLoop({
               content: planResultContent,
             });
             if (!decision.approved) {
-              return finish({ response: "❌ Plan rejected by user.", toolCalls: accumulatedToolCalls });
+              return { done: true, payload: { response: "❌ Plan rejected by user.", toolCalls: accumulatedToolCalls } };
             }
             continue;
           }
@@ -2311,14 +2279,14 @@ async function runAgentLoop({
               tool_call_id: tc.id,
               content: JSON.stringify({ ok: false, error: stuckMsg }),
             });
-            return finish({
+            return { done: true, payload: {
               response:
                 "⚠️ Agent stopped: detected a repeat-loop on tool `" +
                 tc.name +
                 "`. " +
                 "The page may not be in the expected state. Please refine your request or try again.",
               toolCalls: accumulatedToolCalls,
-            });
+            } };
           }
           _streamAgentToolEvent(panelTabId, {
             phase: "start",
@@ -2359,15 +2327,15 @@ async function runAgentLoop({
           }
         }
       }
-      return finish({
+      return { done: true, payload: {
         response:
           "⚠️ Agent reached the maximum tool-use turns. Returning what was gathered so far.",
         toolCalls: accumulatedToolCalls,
-      });
+      } };
+    
     }
 
-    // ── Anthropic style: messages = [{role:'user'|'assistant', content: blocks[]}] ──
-    if (providerType === "anthropic") {
+    async function _runAnthropicPath() {
       const providerInfo = { model: _model, provider: "anthropic" };
       const messages = [];
       // Compact + dedupe the prior turns — same JetBrains-AI style
@@ -2397,13 +2365,13 @@ async function runAgentLoop({
       const agentSystemPrompt = _agentSystemPrompt(agentContext, providerInfo, panelTabId, _styleOpts);
 
       for (let turn = 0; turn < AGENT_MAX_TURNS; turn++) {
-        if (isAborted()) return finish(abortedReply());
+        if (isAborted()) return { done: true, payload: abortedReply() };
         if (Date.now() - startedAt > AGENT_WALL_CLOCK_MS) {
-          return finish({
+          return { done: true, payload: {
             response:
               "⚠️ Agent timed out (wall-clock limit). Returning partial results.",
             toolCalls: accumulatedToolCalls,
-          });
+          } };
         }
         let resp;
         resetTurnBuffer();
@@ -2425,7 +2393,7 @@ async function runAgentLoop({
         } catch (err) {
           discardTurnBuffer();
           if (isAborted() || err?.name === "AbortError") {
-            return finish(abortedReply());
+            return { done: true, payload: abortedReply() };
           }
           throw err;
         }
@@ -2440,12 +2408,12 @@ async function runAgentLoop({
 
         if (!resp.toolCalls || resp.toolCalls.length === 0) {
           finalizeStream();
-          return finish({
+          return { done: true, payload: {
             response:
               resp.response ||
               "(Agent completed but returned no text response.)",
             toolCalls: accumulatedToolCalls,
-          });
+          } };
         }
 
         // Tool turn — drop streamed planner text from the panel.
@@ -2456,7 +2424,7 @@ async function runAgentLoop({
         let earlyReturn = null;
         let _anthropicNeedsTabContext = false;
         for (const tc of resp.toolCalls) {
-          if (isAborted()) return finish(abortedReply());
+          if (isAborted()) return { done: true, payload: abortedReply() };
           const args = _safeJsonParse(tc.arguments);
           if (tc.name === "respond_to_user") {
             earlyReturn = args.markdown || resp.response || "(no response)";
@@ -2525,10 +2493,10 @@ async function runAgentLoop({
           });
         }
         if (earlyReturn) {
-          return finish({
+          return { done: true, payload: {
             response: earlyReturn,
             toolCalls: accumulatedToolCalls,
-          });
+          } };
         }
         // Inject fresh tab context as a system-reminder after navigation
         if (_anthropicNeedsTabContext) {
@@ -2543,11 +2511,67 @@ async function runAgentLoop({
         }
         messages.push({ role: "user", content: toolResultBlocks });
       }
-      return finish({
+      return { done: true, payload: {
         response:
           "⚠️ Agent reached the maximum tool-use turns. Returning what was gathered so far.",
         toolCalls: accumulatedToolCalls,
-      });
+      } };
+    
+    }
+
+    // ── Vision-plan mode: one-shot plan from screenshot+snapshot, then replay ──
+    // Triggered via /auto. Skips the chatty per-step model loop entirely:
+    // 1 vision call → JSON action script → local replay. On any failure we
+    // surface a clear error and stop — caller can retry without /auto.
+    if (mode === "vision-plan") {
+      const _r = await _runVisionPlanPath();
+      if (_r.done) return finish(_r.payload);
+    }
+
+    const activeText = fastPlanFallbackMessages.length
+      ? `${text}\n\n[Fast-plan fallback: ${fastPlanFallbackMessages.join(" ")}]`
+      : text;
+
+    // ── Quick Mode: compact command language, no tool schema ───────────────
+    // Triggered via /quick. Sends tools:[] + stop_sequences=["\n<<END>>"] so
+    // the model responds with single-letter commands that are parsed and
+    // replayed locally — no round-trips for JSON tool schemas. After each
+    // batch of commands, takes a screenshot and feeds it back as a user
+    // message. Loops until the model outputs no commands.
+    //
+    // Command format (one per line, "<<END>>" terminates the batch):
+    //   C x y           — left click
+    //   RC x y          — right click
+    //   DC x y          — double click
+    //   TC x y          — triple click
+    //   H x y           — hover
+    //   T text          — type text
+    //   K keys          — press keys (space-separated)
+    //   S dir amt x y   — scroll (dir=up|down|left|right)
+    //   D x1 y1 x2 y2  — drag
+    //   Z x1 y1 x2 y2  — zoom screenshot region (just takes screenshot)
+    //   N url           — navigate (or "back"/"forward")
+    //   J code          — execute JavaScript
+    //   W               — wait for network idle
+    //   ST tabId        — switch tab
+    //   NT url          — open new tab
+    //   LT              — list tabs
+    //   PL json         — present plan (emits update_plan event, awaits approval)
+    if (mode === "quick") {
+      const _r = await _runQuickModePath();
+      if (_r.done) return finish(_r.payload);
+    }
+
+    // ── OpenAI / Ollama style: messages = [{role, content/tool_calls/...}] ──
+    if (providerType === "openai" || providerType === "ollama") {
+      const _r = await _runOpenAiOllamaPath();
+      return finish(_r.payload);
+    }
+
+    // ── Anthropic style: messages = [{role:'user'|'assistant', content: blocks[]}] ──
+    if (providerType === "anthropic") {
+      const _r = await _runAnthropicPath();
+      return finish(_r.payload);
     }
 
     throw new Error(`Agent loop not implemented for provider: ${providerType}`);
@@ -3107,6 +3131,403 @@ async function probeBridgePortMismatch(configuredPort) {
 
 // ─── WebSocket Management ────────────────────────────────────
 
+
+// --- ws.onmessage handlers (extracted from connectWebSocket) ---
+async function _onWsConn_CHECK_CLI_BINARY_RESPONSE(message) {
+    const pending = pendingCliChecks.get(message.id);
+    if (pending) {
+      pendingCliChecks.delete(message.id);
+      pending.resolve({
+        ok: !!message.ok,
+        version: message.version || "",
+        error: message.error || null,
+        notFound: message.notFound === true,
+        installCommand: message.installCommand || "",
+        npmPackage: message.npmPackage || "",
+      });
+    }
+    return;
+}
+
+async function _onWsConn_INSTALL_CLI_PACKAGE_RESPONSE(message) {
+    const pending = pendingCliInstalls.get(message.id);
+    if (pending) {
+      pendingCliInstalls.delete(message.id);
+      pending.resolve({
+        ok: !!message.ok,
+        error: message.error || null,
+        stdout: message.stdout || "",
+        stderr: message.stderr || "",
+        installCommand: message.installCommand || "",
+        binary: message.binary || "",
+        kind: message.kind || "",
+      });
+    }
+    return;
+}
+
+async function _onWsConn_AI_CHAT_DELTA(message) {
+    const pending = pendingAiRequests.get(message.id);
+    if (pending) {
+      if (!pending._runStarted) {
+        pending._runStarted = true;
+        _streamAgentToolEvent(pending.panelTabId, {
+          phase: "run-start",
+          runId: pending.runId,
+        });
+      }
+      _streamAgentToolEvent(pending.panelTabId, {
+        phase: "answer-delta",
+        runId: pending.runId,
+        chunk: typeof message.chunk === "string" ? message.chunk : "",
+      });
+    }
+    return;
+}
+
+async function _onWsConn_AI_CHAT_RESPONSE(message) {
+    _debugLog(
+      "[AutoDOM SW] AI_CHAT_RESPONSE received, id:",
+      message.id,
+      "hasResponse:",
+      !!message.response,
+      "hasError:",
+      !!message.error,
+    );
+    const pending = pendingAiRequests.get(message.id);
+    if (pending) {
+      pendingAiRequests.delete(message.id);
+      _streamBridgeRunEnd(pending, !!message.aborted);
+      pending.resolve({
+        type: "AI_CHAT_RESPONSE",
+        response: message.response,
+        toolCalls: message.toolCalls || [],
+        model: message.model || null,
+        error: message.error || null,
+      });
+    } else {
+      _debugWarn(
+        "[AutoDOM SW] No pending AI request for id:",
+        message.id,
+        "pendingCount:",
+        pendingAiRequests.size,
+      );
+    }
+    return;
+}
+
+async function _onWsConn_TOOL_LOGS_RESPONSE(message) {
+    if (_pendingToolLogResolve) {
+      const resolve = _pendingToolLogResolve;
+      _pendingToolLogResolve = null;
+      resolve({ serverLogs: message.logs || [], logFile: message.logFile });
+    }
+    return;
+}
+
+async function _onWsConn_TOOL_LOGS_CLEARED(message) {
+    if (_pendingToolLogClearResolve) {
+      const resolve = _pendingToolLogClearResolve;
+      _pendingToolLogClearResolve = null;
+      resolve({ logFile: message.logFile || null });
+    }
+    return;
+}
+
+async function _onWsConn_INACTIVITY_WARNING(message) {
+    broadcastStatus(
+      true,
+      `Idle ${message.idleMinutes}m — server will auto-close in ${message.remainingSeconds}s. Use any tool to keep alive.`,
+      "warn",
+    );
+    return;
+}
+
+async function _onWsConn_SESSION_TIMEOUT(message) {
+    _debugWarn("[AutoDOM] Server closed session:", message.message);
+    const keepRetrying = autoConnectEnabled;
+    if (!keepRetrying) {
+      // Mark as timed out BEFORE disconnect so onclose treats this as a final stop
+      _sessionTimedOut = true;
+      shouldRunMcp = false;
+      stopAutoConnect();
+    }
+    stopInactivityTimer();
+    disconnectWebSocket();
+    chrome.storage.local.set({ mcpRunning: keepRetrying });
+    // Explicitly hide border and chat on ALL tabs (including non-active)
+    broadcastToAllTabs([
+      { type: "HIDE_SESSION_BORDER" },
+      { type: "HIDE_CHAT_PANEL" },
+    ]);
+    if (keepRetrying) {
+      broadcastStatus(
+        false,
+        `${message.message} Auto-connect is retrying.`,
+        "warn",
+      );
+      startAutoConnect(getCurrentPort());
+    } else {
+      broadcastStatus(false, message.message, "warn");
+    }
+    // Also send explicit MCP stop to all tabs so chat-panel tears down
+    broadcastMcpStopToAllTabs();
+    return;
+}
+
+async function _onWsConn_TOOL_CALL(message) {
+    _debugLog(
+      "[AutoDOM SW] TOOL_CALL from bridge:",
+      message.tool,
+      "id:",
+      message.id,
+    );
+    // Bridge is actively driving tools => the agent is alive.
+    // Reset the idle timeout for any in-flight AI request so we
+    // don't surface a spurious "timed out" while automation runs.
+    refreshAiRequestActivity();
+    _streamBridgeToolEvent({
+      phase: "start",
+      tool: message.tool,
+      args: message.params || {},
+    });
+    // Serialize TOOL_CALL handling so per-clientId tab pins
+    // (see _clientPins) don't race on the shared _agentRunContext.
+    // Phase 1 trade-off: this means one slow tool can briefly
+    // delay another bridge's call. Phase 2 will replace this with
+    // clientId-aware getActiveTab so concurrency is restored.
+    _runSerializedToolCall(async () => {
+      const clientId = message.clientId || null;
+      const toolName = message.tool;
+      const params = message.params || {};
+
+      // Synthetic pin_tab / unpin_tab / get_pinned_tab — handled
+      // here because they need direct access to the calling
+      // clientId, which TOOL_HANDLERS entries don't see.
+      let result;
+      if (toolName === "__pin_tab" || toolName === "pin_tab") {
+        result = await _handlePinTabTool(clientId, params);
+      } else if (toolName === "__unpin_tab" || toolName === "unpin_tab") {
+        result = _handleUnpinTabTool(clientId);
+      } else if (
+        toolName === "__get_pinned_tab" ||
+        toolName === "get_pinned_tab"
+      ) {
+        result = _handleGetPinnedTabTool(clientId);
+      } else if (toolName === "__diagnostics") {
+        // Service-worker / extension half of autodom_diagnostics.
+        // Reports every per-client pin (so the agent can see whether
+        // a sibling IDE has the page pinned), basic tab metrics,
+        // and active-agent-run state.
+        const pins = [];
+        for (const [cid, pin] of _clientPins) {
+          pins.push({
+            clientId: cid,
+            tabId: pin.tabId,
+            windowId: pin.windowId,
+            url: pin.lastUrl,
+            title: pin.lastTitle,
+            pinnedAt: pin.pinnedAt,
+            gone: pin.tabId == null,
+          });
+        }
+        let tabCount = 0;
+        let activeTab = null;
+        try {
+          const all = await chrome.tabs.query({});
+          tabCount = all.length;
+          const [t] = await chrome.tabs.query({
+            active: true,
+            currentWindow: true,
+          });
+          if (t) {
+            activeTab = {
+              id: t.id,
+              windowId: t.windowId,
+              url: t.url,
+              title: t.title,
+            };
+          }
+        } catch (_) {}
+        result = {
+          pins,
+          tabCount,
+          activeTab,
+          callingClientId: clientId,
+          activeAgentRun: _activeAgentRun
+            ? {
+                runId: _activeAgentRun.runId,
+                panelTabId: _activeAgentRun.panelTabId,
+                toolRunning: !!_activeAgentRun.toolRunning,
+              }
+            : null,
+          agentRunContext: _agentRunContext,
+          bridgeToolChainPending:
+            // Heuristic: if the chain is currently a non-resolved
+            // promise (the queue has work), best-effort reflect that.
+            // We can't introspect Promise state directly; this is
+            // intentionally approximate.
+            undefined,
+        };
+      } else {
+        // Resolve pinned tab for this client (if any).
+        let pinCtx = null;
+        if (clientId) {
+          const resolved = await _resolveClientPin(clientId);
+          if (resolved?.gone) {
+            result = {
+              error: "PINNED_TAB_GONE",
+              clientId,
+              lastUrl: resolved.pin?.lastUrl || null,
+              lastTitle: resolved.pin?.lastTitle || null,
+              hint: "The tab this client was pinned to has been closed. Call pin_tab (or open_new_tab) before retrying.",
+            };
+          } else if (resolved?.tab) {
+            pinCtx = {
+              tabId: resolved.tab.id,
+              windowId: resolved.tab.windowId ?? null,
+            };
+          }
+        }
+
+        if (result === undefined) {
+          if (pinCtx) {
+            result = await _withAgentTabContext(pinCtx, () =>
+              handleToolCallWithRecording(toolName, params, message.id),
+            );
+          } else {
+            result = await handleToolCallWithRecording(
+              toolName,
+              params,
+              message.id,
+            );
+          }
+
+          // Auto-pin after a successful MCP-originated navigate /
+          // open_new_tab / switch_tab when this client has no pin
+          // yet. We never override an existing pin silently.
+          if (
+            clientId &&
+            !pinCtx &&
+            !result?.error &&
+            _AUTOPIN_TOOLS.has(toolName) &&
+            !_clientPins.has(clientId)
+          ) {
+            try {
+              let candidateTabId =
+                result?.tabId ??
+                result?.tab?.id ??
+                result?.id ??
+                null;
+              let candidate = null;
+              if (candidateTabId != null) {
+                candidate = await chrome.tabs
+                  .get(candidateTabId)
+                  .catch(() => null);
+              }
+              if (!candidate) {
+                const [active] = await chrome.tabs.query({
+                  active: true,
+                  currentWindow: true,
+                });
+                candidate = active || null;
+              }
+              if (candidate) {
+                const entry = _setClientPin(clientId, candidate);
+                if (entry && result && typeof result === "object") {
+                  result.autoPinned = true;
+                  result.pinnedTabId = entry.tabId;
+                }
+              }
+            } catch (pinErr) {
+              _debugWarn(
+                "[AutoDOM] auto-pin failed:",
+                pinErr?.message || pinErr,
+              );
+            }
+          }
+        }
+      }
+
+      _streamBridgeToolEvent({
+        phase: "end",
+        tool: toolName,
+        ok: !result?.error,
+        error: result?.error,
+        result: _compactBridgeToolResult(result),
+      });
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      ws.send(
+        JSON.stringify({
+          type: "TOOL_RESULT",
+          id: message.id,
+          result,
+        }),
+      );
+      // Notify popup
+      chrome.runtime
+        .sendMessage({
+          type: "TOOL_CALLED",
+          tool: toolName,
+        })
+        .catch(() => {});
+    }).catch((err) => {
+      // Final safety net: a throw inside the serialized block
+      // already gets caught by _runSerializedToolCall's .catch,
+      // but we still try to reply to the bridge so the call
+      // doesn't hang forever from FastMCP's perspective.
+      try {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              type: "TOOL_RESULT",
+              id: message.id,
+              result: { error: `Internal handler error: ${err?.message || err}` },
+            }),
+          );
+        }
+      } catch (_) {}
+    });
+}
+
+async function _onWsConn_SERVER_INFO(message) {
+    // Store the server's actual filesystem path for the Config tab
+    if (message.port) {
+      lastConnectedPort = Number(message.port) || lastConnectedPort;
+      chrome.storage.local.set({
+        serverPort: lastConnectedPort,
+        mcpLastConnectedPort: lastConnectedPort,
+      });
+    }
+    chrome.storage.local.set({
+      serverPath: message.serverPath,
+    });
+    _debugLog("[AutoDOM] Server path:", message.serverPath);
+}
+
+async function _onWsConn_PING(message) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "PONG" }));
+    }
+}
+
+const _WS_CONN_MESSAGE_HANDLERS = Object.freeze({
+  CHECK_CLI_BINARY_RESPONSE: _onWsConn_CHECK_CLI_BINARY_RESPONSE,
+  INSTALL_CLI_PACKAGE_RESPONSE: _onWsConn_INSTALL_CLI_PACKAGE_RESPONSE,
+  AI_CHAT_DELTA: _onWsConn_AI_CHAT_DELTA,
+  AI_CHAT_RESPONSE: _onWsConn_AI_CHAT_RESPONSE,
+  TOOL_LOGS_RESPONSE: _onWsConn_TOOL_LOGS_RESPONSE,
+  TOOL_LOGS_CLEARED: _onWsConn_TOOL_LOGS_CLEARED,
+  INACTIVITY_WARNING: _onWsConn_INACTIVITY_WARNING,
+  SESSION_TIMEOUT: _onWsConn_SESSION_TIMEOUT,
+  TOOL_CALL: _onWsConn_TOOL_CALL,
+  SERVER_INFO: _onWsConn_SERVER_INFO,
+  PING: _onWsConn_PING,
+});
+
+
 function connectWebSocket(port) {
   wsPort = port || getCurrentPort();
   if (
@@ -3154,398 +3575,9 @@ function connectWebSocket(port) {
     ws.onmessage = async (event) => {
       try {
         const message = JSON.parse(event.data);
-        // Track server liveness from any inbound message
         _lastPongTime = Date.now();
-
-        // Handle CLI presence-check responses from the bridge
-        if (message.type === "CHECK_CLI_BINARY_RESPONSE") {
-          const pending = pendingCliChecks.get(message.id);
-          if (pending) {
-            pendingCliChecks.delete(message.id);
-            pending.resolve({
-              ok: !!message.ok,
-              version: message.version || "",
-              error: message.error || null,
-              notFound: message.notFound === true,
-              installCommand: message.installCommand || "",
-              npmPackage: message.npmPackage || "",
-            });
-          }
-          return;
-        }
-
-        if (message.type === "INSTALL_CLI_PACKAGE_RESPONSE") {
-          const pending = pendingCliInstalls.get(message.id);
-          if (pending) {
-            pendingCliInstalls.delete(message.id);
-            pending.resolve({
-              ok: !!message.ok,
-              error: message.error || null,
-              stdout: message.stdout || "",
-              stderr: message.stderr || "",
-              installCommand: message.installCommand || "",
-              binary: message.binary || "",
-              kind: message.kind || "",
-            });
-          }
-          return;
-        }
-
-        // Streaming text deltas from the bridge server (CLI provider).
-        // Forward to the chat panel so it can paint tokens incrementally
-        // into a transient assistant bubble keyed by runId. The eventual
-        // AI_CHAT_RESPONSE arrives later and the panel skips a duplicate
-        // render via its rendered-runId set.
-        if (message.type === "AI_CHAT_DELTA") {
-          const pending = pendingAiRequests.get(message.id);
-          if (pending) {
-            if (!pending._runStarted) {
-              pending._runStarted = true;
-              _streamAgentToolEvent(pending.panelTabId, {
-                phase: "run-start",
-                runId: pending.runId,
-              });
-            }
-            _streamAgentToolEvent(pending.panelTabId, {
-              phase: "answer-delta",
-              runId: pending.runId,
-              chunk: typeof message.chunk === "string" ? message.chunk : "",
-            });
-          }
-          return;
-        }
-
-        // Handle AI chat responses from the bridge server
-        if (message.type === "AI_CHAT_RESPONSE") {
-          _debugLog(
-            "[AutoDOM SW] AI_CHAT_RESPONSE received, id:",
-            message.id,
-            "hasResponse:",
-            !!message.response,
-            "hasError:",
-            !!message.error,
-          );
-          const pending = pendingAiRequests.get(message.id);
-          if (pending) {
-            pendingAiRequests.delete(message.id);
-            _streamBridgeRunEnd(pending, !!message.aborted);
-            pending.resolve({
-              type: "AI_CHAT_RESPONSE",
-              response: message.response,
-              toolCalls: message.toolCalls || [],
-              model: message.model || null,
-              error: message.error || null,
-            });
-          } else {
-            _debugWarn(
-              "[AutoDOM SW] No pending AI request for id:",
-              message.id,
-              "pendingCount:",
-              pendingAiRequests.size,
-            );
-          }
-          return;
-        }
-
-        // Handle tool log responses from server
-        if (message.type === "TOOL_LOGS_RESPONSE") {
-          if (_pendingToolLogResolve) {
-            const resolve = _pendingToolLogResolve;
-            _pendingToolLogResolve = null;
-            resolve({ serverLogs: message.logs || [], logFile: message.logFile });
-          }
-          return;
-        }
-
-        // Confirmation that the server cleared its in-memory ring buffer
-        // and truncated the on-disk log file. The popup waits for this
-        // before claiming "cleared" — without it, a fast Refresh after
-        // Clear races ahead of the WS CLEAR and old logs reappear.
-        if (message.type === "TOOL_LOGS_CLEARED") {
-          if (_pendingToolLogClearResolve) {
-            const resolve = _pendingToolLogClearResolve;
-            _pendingToolLogClearResolve = null;
-            resolve({ logFile: message.logFile || null });
-          }
-          return;
-        }
-
-        // Handle inactivity warnings / session timeout from server
-        if (message.type === "INACTIVITY_WARNING") {
-          broadcastStatus(
-            true,
-            `Idle ${message.idleMinutes}m — server will auto-close in ${message.remainingSeconds}s. Use any tool to keep alive.`,
-            "warn",
-          );
-          return;
-        }
-        if (message.type === "SESSION_TIMEOUT") {
-          _debugWarn("[AutoDOM] Server closed session:", message.message);
-          const keepRetrying = autoConnectEnabled;
-          if (!keepRetrying) {
-            // Mark as timed out BEFORE disconnect so onclose treats this as a final stop
-            _sessionTimedOut = true;
-            shouldRunMcp = false;
-            stopAutoConnect();
-          }
-          stopInactivityTimer();
-          disconnectWebSocket();
-          chrome.storage.local.set({ mcpRunning: keepRetrying });
-          // Explicitly hide border and chat on ALL tabs (including non-active)
-          broadcastToAllTabs([
-            { type: "HIDE_SESSION_BORDER" },
-            { type: "HIDE_CHAT_PANEL" },
-          ]);
-          if (keepRetrying) {
-            broadcastStatus(
-              false,
-              `${message.message} Auto-connect is retrying.`,
-              "warn",
-            );
-            startAutoConnect(getCurrentPort());
-          } else {
-            broadcastStatus(false, message.message, "warn");
-          }
-          // Also send explicit MCP stop to all tabs so chat-panel tears down
-          broadcastMcpStopToAllTabs();
-          return;
-        }
-
-        if (message.type === "TOOL_CALL") {
-          _debugLog(
-            "[AutoDOM SW] TOOL_CALL from bridge:",
-            message.tool,
-            "id:",
-            message.id,
-          );
-          // Bridge is actively driving tools => the agent is alive.
-          // Reset the idle timeout for any in-flight AI request so we
-          // don't surface a spurious "timed out" while automation runs.
-          refreshAiRequestActivity();
-          _streamBridgeToolEvent({
-            phase: "start",
-            tool: message.tool,
-            args: message.params || {},
-          });
-          // Serialize TOOL_CALL handling so per-clientId tab pins
-          // (see _clientPins) don't race on the shared _agentRunContext.
-          // Phase 1 trade-off: this means one slow tool can briefly
-          // delay another bridge's call. Phase 2 will replace this with
-          // clientId-aware getActiveTab so concurrency is restored.
-          _runSerializedToolCall(async () => {
-            const clientId = message.clientId || null;
-            const toolName = message.tool;
-            const params = message.params || {};
-
-            // Synthetic pin_tab / unpin_tab / get_pinned_tab — handled
-            // here because they need direct access to the calling
-            // clientId, which TOOL_HANDLERS entries don't see.
-            let result;
-            if (toolName === "__pin_tab" || toolName === "pin_tab") {
-              result = await _handlePinTabTool(clientId, params);
-            } else if (toolName === "__unpin_tab" || toolName === "unpin_tab") {
-              result = _handleUnpinTabTool(clientId);
-            } else if (
-              toolName === "__get_pinned_tab" ||
-              toolName === "get_pinned_tab"
-            ) {
-              result = _handleGetPinnedTabTool(clientId);
-            } else if (toolName === "__diagnostics") {
-              // Service-worker / extension half of autodom_diagnostics.
-              // Reports every per-client pin (so the agent can see whether
-              // a sibling IDE has the page pinned), basic tab metrics,
-              // and active-agent-run state.
-              const pins = [];
-              for (const [cid, pin] of _clientPins) {
-                pins.push({
-                  clientId: cid,
-                  tabId: pin.tabId,
-                  windowId: pin.windowId,
-                  url: pin.lastUrl,
-                  title: pin.lastTitle,
-                  pinnedAt: pin.pinnedAt,
-                  gone: pin.tabId == null,
-                });
-              }
-              let tabCount = 0;
-              let activeTab = null;
-              try {
-                const all = await chrome.tabs.query({});
-                tabCount = all.length;
-                const [t] = await chrome.tabs.query({
-                  active: true,
-                  currentWindow: true,
-                });
-                if (t) {
-                  activeTab = {
-                    id: t.id,
-                    windowId: t.windowId,
-                    url: t.url,
-                    title: t.title,
-                  };
-                }
-              } catch (_) {}
-              result = {
-                pins,
-                tabCount,
-                activeTab,
-                callingClientId: clientId,
-                activeAgentRun: _activeAgentRun
-                  ? {
-                      runId: _activeAgentRun.runId,
-                      panelTabId: _activeAgentRun.panelTabId,
-                      toolRunning: !!_activeAgentRun.toolRunning,
-                    }
-                  : null,
-                agentRunContext: _agentRunContext,
-                bridgeToolChainPending:
-                  // Heuristic: if the chain is currently a non-resolved
-                  // promise (the queue has work), best-effort reflect that.
-                  // We can't introspect Promise state directly; this is
-                  // intentionally approximate.
-                  undefined,
-              };
-            } else {
-              // Resolve pinned tab for this client (if any).
-              let pinCtx = null;
-              if (clientId) {
-                const resolved = await _resolveClientPin(clientId);
-                if (resolved?.gone) {
-                  result = {
-                    error: "PINNED_TAB_GONE",
-                    clientId,
-                    lastUrl: resolved.pin?.lastUrl || null,
-                    lastTitle: resolved.pin?.lastTitle || null,
-                    hint: "The tab this client was pinned to has been closed. Call pin_tab (or open_new_tab) before retrying.",
-                  };
-                } else if (resolved?.tab) {
-                  pinCtx = {
-                    tabId: resolved.tab.id,
-                    windowId: resolved.tab.windowId ?? null,
-                  };
-                }
-              }
-
-              if (result === undefined) {
-                if (pinCtx) {
-                  result = await _withAgentTabContext(pinCtx, () =>
-                    handleToolCallWithRecording(toolName, params, message.id),
-                  );
-                } else {
-                  result = await handleToolCallWithRecording(
-                    toolName,
-                    params,
-                    message.id,
-                  );
-                }
-
-                // Auto-pin after a successful MCP-originated navigate /
-                // open_new_tab / switch_tab when this client has no pin
-                // yet. We never override an existing pin silently.
-                if (
-                  clientId &&
-                  !pinCtx &&
-                  !result?.error &&
-                  _AUTOPIN_TOOLS.has(toolName) &&
-                  !_clientPins.has(clientId)
-                ) {
-                  try {
-                    let candidateTabId =
-                      result?.tabId ??
-                      result?.tab?.id ??
-                      result?.id ??
-                      null;
-                    let candidate = null;
-                    if (candidateTabId != null) {
-                      candidate = await chrome.tabs
-                        .get(candidateTabId)
-                        .catch(() => null);
-                    }
-                    if (!candidate) {
-                      const [active] = await chrome.tabs.query({
-                        active: true,
-                        currentWindow: true,
-                      });
-                      candidate = active || null;
-                    }
-                    if (candidate) {
-                      const entry = _setClientPin(clientId, candidate);
-                      if (entry && result && typeof result === "object") {
-                        result.autoPinned = true;
-                        result.pinnedTabId = entry.tabId;
-                      }
-                    }
-                  } catch (pinErr) {
-                    _debugWarn(
-                      "[AutoDOM] auto-pin failed:",
-                      pinErr?.message || pinErr,
-                    );
-                  }
-                }
-              }
-            }
-
-            _streamBridgeToolEvent({
-              phase: "end",
-              tool: toolName,
-              ok: !result?.error,
-              error: result?.error,
-              result: _compactBridgeToolResult(result),
-            });
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-              return;
-            }
-            ws.send(
-              JSON.stringify({
-                type: "TOOL_RESULT",
-                id: message.id,
-                result,
-              }),
-            );
-            // Notify popup
-            chrome.runtime
-              .sendMessage({
-                type: "TOOL_CALLED",
-                tool: toolName,
-              })
-              .catch(() => {});
-          }).catch((err) => {
-            // Final safety net: a throw inside the serialized block
-            // already gets caught by _runSerializedToolCall's .catch,
-            // but we still try to reply to the bridge so the call
-            // doesn't hang forever from FastMCP's perspective.
-            try {
-              if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(
-                  JSON.stringify({
-                    type: "TOOL_RESULT",
-                    id: message.id,
-                    result: { error: `Internal handler error: ${err?.message || err}` },
-                  }),
-                );
-              }
-            } catch (_) {}
-          });
-        }
-        if (message.type === "SERVER_INFO") {
-          // Store the server's actual filesystem path for the Config tab
-          if (message.port) {
-            lastConnectedPort = Number(message.port) || lastConnectedPort;
-            chrome.storage.local.set({
-              serverPort: lastConnectedPort,
-              mcpLastConnectedPort: lastConnectedPort,
-            });
-          }
-          chrome.storage.local.set({
-            serverPath: message.serverPath,
-          });
-          _debugLog("[AutoDOM] Server path:", message.serverPath);
-        }
-        if (message.type === "PING") {
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: "PONG" }));
-          }
-        }
+        const _handler = _WS_CONN_MESSAGE_HANDLERS[message.type];
+        if (_handler) await _handler(message);
       } catch (err) {
         _debugError("[AutoDOM] Message handling error:", err);
       }
@@ -8915,6 +8947,237 @@ async function toolListIframes(params) {
 }
 
 // Execute an action inside a specific iframe
+
+function _runIframeInteractInPage(action, selector, text, value, fields, clearFirst, direction, pixels) {
+
+  // click
+  if (action === "click") {
+    let el;
+    if (selector) {
+      el = document.querySelector(selector);
+    } else if (text) {
+      const walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_TEXT,
+      );
+      while (walker.nextNode()) {
+        if (walker.currentNode.textContent.trim().includes(text)) {
+          el = walker.currentNode.parentElement;
+          break;
+        }
+      }
+    }
+    if (!el)
+      return { error: `Element not found in iframe: ${selector || text}` };
+    el.scrollIntoView({ behavior: "auto", block: "center" });
+    el.dispatchEvent(
+      new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+      }),
+    );
+    el.click();
+    return {
+      success: true,
+      tag: el.tagName,
+      text: el.textContent?.substring(0, 100),
+    };
+  }
+
+  // type
+  if (action === "type") {
+    const el = document.querySelector(selector);
+    if (!el)
+      return { error: `Element not found in iframe: ${selector}` };
+    el.focus();
+    if (clearFirst) {
+      el.value = "";
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    const nativeSetter =
+      Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )?.set ||
+      Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype,
+        "value",
+      )?.set;
+    const newVal = (clearFirst ? "" : el.value || "") + value;
+    if (nativeSetter) {
+      nativeSetter.call(el, newVal);
+    } else {
+      el.value = newVal;
+    }
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return { success: true, value: el.value };
+  }
+
+  // query — find elements
+  if (action === "query") {
+    const els = document.querySelectorAll(selector);
+    const limit = 20;
+    const items = [];
+    for (let i = 0; i < Math.min(limit, els.length); i++) {
+      const el = els[i];
+      items.push({
+        tag: el.tagName.toLowerCase(),
+        text: el.textContent?.trim().substring(0, 200),
+        id: el.id || undefined,
+        className: el.className || undefined,
+        href: el.getAttribute("href") || undefined,
+        value: el.value || undefined,
+        visible: el.offsetParent !== null,
+      });
+    }
+    return { count: els.length, items };
+  }
+
+  // extract_text
+  if (action === "extract_text") {
+    if (selector) {
+      const el = document.querySelector(selector);
+      if (!el)
+        return { error: `Element not found in iframe: ${selector}` };
+      return { text: el.innerText };
+    }
+    return { text: document.body.innerText };
+  }
+
+  // fill_form
+  if (action === "fill_form" && fields) {
+    const results = [];
+    for (const field of fields) {
+      const el = document.querySelector(field.selector);
+      if (!el) {
+        results.push({ selector: field.selector, error: "Not found" });
+        continue;
+      }
+      el.focus();
+      if (el.tagName === "SELECT") {
+        el.value = field.value;
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      } else {
+        el.value = field.value;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      results.push({ selector: field.selector, success: true });
+    }
+    return { success: true, results };
+  }
+
+  // get_dom_state inside iframe
+  if (action === "get_dom_state") {
+    const INTERACTIVE = [
+      "a[href]",
+      "button",
+      'input:not([type="hidden"])',
+      "textarea",
+      "select",
+      '[role="button"]',
+      '[role="link"]',
+      '[role="tab"]',
+      '[role="menuitem"]',
+      "[onclick]",
+      '[tabindex]:not([tabindex="-1"])',
+      "[contenteditable]",
+    ];
+    const seen = new Set();
+    const elements = [];
+    const allEls = document.querySelectorAll(INTERACTIVE.join(","));
+    for (const el of allEls) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      const style = window.getComputedStyle(el);
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        style.opacity === "0"
+      )
+        continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) continue;
+      if (el.closest("script, style, noscript")) continue;
+      const tag = el.tagName.toLowerCase();
+      const entry = { tag };
+      const t = (el.textContent || "").trim().substring(0, 80);
+      if (t) entry.text = t;
+      if (el.getAttribute("type")) entry.type = el.getAttribute("type");
+      if (el.getAttribute("name")) entry.name = el.getAttribute("name");
+      if (el.getAttribute("placeholder"))
+        entry.placeholder = el.getAttribute("placeholder");
+      if (el.getAttribute("href"))
+        entry.href = el.getAttribute("href").substring(0, 120);
+      if (el.id) entry.id = el.id;
+      if (el.value && tag !== "a")
+        entry.value = String(el.value).substring(0, 80);
+      elements.push(entry);
+      if (elements.length >= 200) break;
+    }
+    return {
+      title: document.title,
+      url: location.href,
+      elementCount: elements.length,
+      elements: Object.fromEntries(elements.entries()),
+    };
+  }
+
+  // select_option
+  if (action === "select_option") {
+    const el = document.querySelector(selector);
+    if (!el) return { error: `Element not found in iframe: ${selector}` };
+    const opt = Array.from(el.options || []).find(
+      (o) => o.value === value || o.textContent.trim() === value,
+    );
+    if (opt) el.value = opt.value;
+    else el.value = value;
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return { success: true, value: el.value };
+  }
+
+  // scroll
+  if (action === "scroll") {
+    const target = selector ? document.querySelector(selector) : document.scrollingElement || document.body;
+    if (!target) return { error: `Element not found in iframe: ${selector}` };
+    const px = (typeof pixels === "number" ? pixels : 300);
+    if (direction === "top") target.scrollTo({ top: 0, behavior: "auto" });
+    else if (direction === "bottom") target.scrollTo({ top: target.scrollHeight, behavior: "auto" });
+    else if (direction === "up") target.scrollBy({ top: -px, behavior: "auto" });
+    else target.scrollBy({ top: px, behavior: "auto" });
+    return { success: true };
+  }
+
+  // hover
+  if (action === "hover") {
+    const el = document.querySelector(selector);
+    if (!el) return { error: `Element not found in iframe: ${selector}` };
+    el.scrollIntoView({ behavior: "auto", block: "center" });
+    el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
+    el.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false, cancelable: false, view: window }));
+    return { success: true, tag: el.tagName.toLowerCase() };
+  }
+
+  // check_element_state
+  if (action === "check_element_state") {
+    const el = document.querySelector(selector);
+    if (!el) return { exists: false, selector };
+    const rect = el.getBoundingClientRect();
+    return {
+      exists: true,
+      visible: el.offsetParent !== null,
+      inViewport: rect.top >= 0 && rect.left >= 0 && rect.bottom <= window.innerHeight && rect.right <= window.innerWidth,
+      disabled: el.disabled || false,
+      checked: el.checked !== undefined ? el.checked : undefined,
+      value: el.value !== undefined ? el.value : undefined,
+    };
+  }
+
+  return { error: `Unknown iframe action: ${action}` };
+}
+
 async function toolIframeInteract(params) {
   const tab = await getActiveTab();
   const { frameId, action, selector, text, value, fields, clearFirst } = params;
@@ -8950,234 +9213,7 @@ async function toolIframeInteract(params) {
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id, frameIds: [targetFrameId] },
       world: "MAIN",
-      func: (action, selector, text, value, fields, clearFirst, direction, pixels) => {
-        // click
-        if (action === "click") {
-          let el;
-          if (selector) {
-            el = document.querySelector(selector);
-          } else if (text) {
-            const walker = document.createTreeWalker(
-              document.body,
-              NodeFilter.SHOW_TEXT,
-            );
-            while (walker.nextNode()) {
-              if (walker.currentNode.textContent.trim().includes(text)) {
-                el = walker.currentNode.parentElement;
-                break;
-              }
-            }
-          }
-          if (!el)
-            return { error: `Element not found in iframe: ${selector || text}` };
-          el.scrollIntoView({ behavior: "auto", block: "center" });
-          el.dispatchEvent(
-            new MouseEvent("click", {
-              bubbles: true,
-              cancelable: true,
-              view: window,
-            }),
-          );
-          el.click();
-          return {
-            success: true,
-            tag: el.tagName,
-            text: el.textContent?.substring(0, 100),
-          };
-        }
-
-        // type
-        if (action === "type") {
-          const el = document.querySelector(selector);
-          if (!el)
-            return { error: `Element not found in iframe: ${selector}` };
-          el.focus();
-          if (clearFirst) {
-            el.value = "";
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-          }
-          const nativeSetter =
-            Object.getOwnPropertyDescriptor(
-              window.HTMLInputElement.prototype,
-              "value",
-            )?.set ||
-            Object.getOwnPropertyDescriptor(
-              window.HTMLTextAreaElement.prototype,
-              "value",
-            )?.set;
-          const newVal = (clearFirst ? "" : el.value || "") + value;
-          if (nativeSetter) {
-            nativeSetter.call(el, newVal);
-          } else {
-            el.value = newVal;
-          }
-          el.dispatchEvent(new Event("input", { bubbles: true }));
-          el.dispatchEvent(new Event("change", { bubbles: true }));
-          return { success: true, value: el.value };
-        }
-
-        // query — find elements
-        if (action === "query") {
-          const els = document.querySelectorAll(selector);
-          const limit = 20;
-          const items = [];
-          for (let i = 0; i < Math.min(limit, els.length); i++) {
-            const el = els[i];
-            items.push({
-              tag: el.tagName.toLowerCase(),
-              text: el.textContent?.trim().substring(0, 200),
-              id: el.id || undefined,
-              className: el.className || undefined,
-              href: el.getAttribute("href") || undefined,
-              value: el.value || undefined,
-              visible: el.offsetParent !== null,
-            });
-          }
-          return { count: els.length, items };
-        }
-
-        // extract_text
-        if (action === "extract_text") {
-          if (selector) {
-            const el = document.querySelector(selector);
-            if (!el)
-              return { error: `Element not found in iframe: ${selector}` };
-            return { text: el.innerText };
-          }
-          return { text: document.body.innerText };
-        }
-
-        // fill_form
-        if (action === "fill_form" && fields) {
-          const results = [];
-          for (const field of fields) {
-            const el = document.querySelector(field.selector);
-            if (!el) {
-              results.push({ selector: field.selector, error: "Not found" });
-              continue;
-            }
-            el.focus();
-            if (el.tagName === "SELECT") {
-              el.value = field.value;
-              el.dispatchEvent(new Event("change", { bubbles: true }));
-            } else {
-              el.value = field.value;
-              el.dispatchEvent(new Event("input", { bubbles: true }));
-              el.dispatchEvent(new Event("change", { bubbles: true }));
-            }
-            results.push({ selector: field.selector, success: true });
-          }
-          return { success: true, results };
-        }
-
-        // get_dom_state inside iframe
-        if (action === "get_dom_state") {
-          const INTERACTIVE = [
-            "a[href]",
-            "button",
-            'input:not([type="hidden"])',
-            "textarea",
-            "select",
-            '[role="button"]',
-            '[role="link"]',
-            '[role="tab"]',
-            '[role="menuitem"]',
-            "[onclick]",
-            '[tabindex]:not([tabindex="-1"])',
-            "[contenteditable]",
-          ];
-          const seen = new Set();
-          const elements = [];
-          const allEls = document.querySelectorAll(INTERACTIVE.join(","));
-          for (const el of allEls) {
-            if (seen.has(el)) continue;
-            seen.add(el);
-            const style = window.getComputedStyle(el);
-            if (
-              style.display === "none" ||
-              style.visibility === "hidden" ||
-              style.opacity === "0"
-            )
-              continue;
-            const rect = el.getBoundingClientRect();
-            if (rect.width === 0 && rect.height === 0) continue;
-            if (el.closest("script, style, noscript")) continue;
-            const tag = el.tagName.toLowerCase();
-            const entry = { tag };
-            const t = (el.textContent || "").trim().substring(0, 80);
-            if (t) entry.text = t;
-            if (el.getAttribute("type")) entry.type = el.getAttribute("type");
-            if (el.getAttribute("name")) entry.name = el.getAttribute("name");
-            if (el.getAttribute("placeholder"))
-              entry.placeholder = el.getAttribute("placeholder");
-            if (el.getAttribute("href"))
-              entry.href = el.getAttribute("href").substring(0, 120);
-            if (el.id) entry.id = el.id;
-            if (el.value && tag !== "a")
-              entry.value = String(el.value).substring(0, 80);
-            elements.push(entry);
-            if (elements.length >= 200) break;
-          }
-          return {
-            title: document.title,
-            url: location.href,
-            elementCount: elements.length,
-            elements: Object.fromEntries(elements.entries()),
-          };
-        }
-
-        // select_option
-        if (action === "select_option") {
-          const el = document.querySelector(selector);
-          if (!el) return { error: `Element not found in iframe: ${selector}` };
-          const opt = Array.from(el.options || []).find(
-            (o) => o.value === value || o.textContent.trim() === value,
-          );
-          if (opt) el.value = opt.value;
-          else el.value = value;
-          el.dispatchEvent(new Event("change", { bubbles: true }));
-          return { success: true, value: el.value };
-        }
-
-        // scroll
-        if (action === "scroll") {
-          const target = selector ? document.querySelector(selector) : document.scrollingElement || document.body;
-          if (!target) return { error: `Element not found in iframe: ${selector}` };
-          const px = (typeof pixels === "number" ? pixels : 300);
-          if (direction === "top") target.scrollTo({ top: 0, behavior: "auto" });
-          else if (direction === "bottom") target.scrollTo({ top: target.scrollHeight, behavior: "auto" });
-          else if (direction === "up") target.scrollBy({ top: -px, behavior: "auto" });
-          else target.scrollBy({ top: px, behavior: "auto" });
-          return { success: true };
-        }
-
-        // hover
-        if (action === "hover") {
-          const el = document.querySelector(selector);
-          if (!el) return { error: `Element not found in iframe: ${selector}` };
-          el.scrollIntoView({ behavior: "auto", block: "center" });
-          el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
-          el.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false, cancelable: false, view: window }));
-          return { success: true, tag: el.tagName.toLowerCase() };
-        }
-
-        // check_element_state
-        if (action === "check_element_state") {
-          const el = document.querySelector(selector);
-          if (!el) return { exists: false, selector };
-          const rect = el.getBoundingClientRect();
-          return {
-            exists: true,
-            visible: el.offsetParent !== null,
-            inViewport: rect.top >= 0 && rect.left >= 0 && rect.bottom <= window.innerHeight && rect.right <= window.innerWidth,
-            disabled: el.disabled || false,
-            checked: el.checked !== undefined ? el.checked : undefined,
-            value: el.value !== undefined ? el.value : undefined,
-          };
-        }
-
-        return { error: `Unknown iframe action: ${action}` };
-      },
+      func: _runIframeInteractInPage,
       args: [action, selector, text, value, fields, clearFirst || false, params.direction, params.pixels],
     });
 
