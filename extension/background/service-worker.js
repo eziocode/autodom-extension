@@ -3738,6 +3738,22 @@ function disconnectWebSocket() {
   ]);
 }
 
+function _kickBridgeConnect(reason = "chat_request") {
+  try {
+    const port = getCurrentPort();
+    wsPort = port;
+    _requestedPort = port;
+    shouldRunMcp = true;
+    _startupRestoreOnly = false;
+    _sessionTimedOut = false;
+    chrome.storage.local.set({ mcpPort: port, mcpRunning: true });
+    void _syncOffscreenKeepalive(reason);
+    connectWebSocket(port);
+    // Keep retrying briefly even when auto-connect toggle is off.
+    startAutoConnect(port, { initialDelayMs: 1200, maxDelayMs: 4000 });
+  } catch (_) {}
+}
+
 // MV3 keep-alive: send a small message to keep the service worker alive
 // and detect dead connections via response timeout.
 let _lastPongTime = 0;
@@ -4509,8 +4525,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // pre-activation connection test). Without `enabled`, the chat
     // panel falls through to the IDE/MCP path.
     const isDirectProvider =
-      aiProviderSettings.enabled === true &&
-      (hasDirectKey || hasDirectAnthropic || isOllama);
+      providerType === "ollama" ||
+      ((providerType === "openai" || providerType === "gpt") &&
+        hasDirectKey) ||
+      ((providerType === "anthropic" || providerType === "claude") &&
+        hasDirectAnthropic);
 
     _debugLog(
       "[AutoDOM SW] CHAT_AI_MESSAGE: providerType =",
@@ -4627,14 +4646,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (!ws || ws.readyState !== WebSocket.OPEN) {
+      // CLI/IDE path needs the bridge. Try to bootstrap it from extension
+      // automatically so user can send chat without manually pressing Connect.
+      _kickBridgeConnect("chat_ai_message");
       _debugWarn(
         "[AutoDOM SW] CHAT_AI_MESSAGE: bridge unavailable for IDE mode",
       );
       sendResponse({
         fallback: true,
         error:
-          "Not connected to MCP AI. Local tool commands still work.\n\n" +
-          "Tip: Select a direct AI provider (GPT, Claude, or Ollama) in the extension settings to use AI chat without the bridge server.",
+          "Bridge is starting but not connected yet. Retry in a moment.\n\n" +
+          "Tip: API-key providers (OpenAI/Anthropic/Ollama) work without MCP bridge.",
         type: "AI_CHAT_RESPONSE",
       });
       return false;

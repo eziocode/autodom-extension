@@ -3638,7 +3638,11 @@
             providerSrc === "ollama" ||
             ((providerSrc === "openai" || providerSrc === "anthropic") &&
               hasDirectKey);
-          const connected = bridgeConnected || directProviderReady;
+          const bridgeBooting =
+            !bridgeConnected &&
+            response?.running === true &&
+            (providerSrc === "ide" || providerSrc === "cli");
+          const connected = bridgeConnected || directProviderReady || bridgeBooting;
           _lastKnownProvider = providerSrc;
           setConnectionStatus(connected);
           if (connected && !isMcpActive) {
