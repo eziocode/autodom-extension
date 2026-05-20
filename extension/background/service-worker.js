@@ -4725,10 +4725,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       provider: providerType,
       mode: mode || undefined,
       providerConfig: {
-        provider: aiProviderSettings.source || "ide",
+        provider: providerType || aiProviderSettings.source || "ide",
         cliBinary: aiProviderSettings.cliBinary || "",
         cliKind: aiProviderSettings.cliKind || "",
         cliExtraArgs: aiProviderSettings.cliExtraArgs || "",
+        ollamaBaseUrl: _normalizeOllamaBaseUrl(
+          aiProviderSettings.baseUrl || "http://localhost:11434",
+        ),
+        ollamaModel:
+          providerType === "ollama"
+            ? _effectiveConfiguredProviderModel(
+                { ...aiProviderSettings, source: "ollama" },
+                message.model || null,
+              ) || "llama3.2"
+            : "",
         // CLI providers own their model choice; passing a stale UI model
         // here makes CLIs fail with "model from --model flag is not available".
         // Direct providers use their provider-specific model fields instead.
