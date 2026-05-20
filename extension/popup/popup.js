@@ -26,6 +26,8 @@ const DOM = {
   connectBtn: $("#connectBtn"),
   autoConnectToggle: $("#autoConnectToggle"),
   autoUpdateToggle: $("#autoUpdateToggle"),
+  periodicUpdateCheckToggle: $("#periodicUpdateCheckToggle"),
+  clearExtensionCacheBtn: $("#clearExtensionCacheBtn"),
   aiChatBtn: $("#aiChatBtn"),
   providerSelect: $("#providerSelect"),
   providerApiKey: $("#providerApiKey"),
@@ -64,6 +66,7 @@ let isConnected = false;
 const REFRESH_GLYPH = "↻";
 const UPDATE_LABEL = "Update";
 const AUTO_UPDATE_STORAGE_KEY = "autodomAutoUpdateEnabled";
+const PERIODIC_UPDATE_CHECKS_STORAGE_KEY = "autodomPeriodicUpdateChecksEnabled";
 const AVAILABLE_UPDATE_STORAGE_KEY = "availableUpdate";
 
 // Render the ↻ button in idle, manifest-found, or ready-to-apply states.
@@ -494,6 +497,7 @@ const _secretAreaName =
     "serverPath",
     "autoConnect",
     AUTO_UPDATE_STORAGE_KEY,
+    PERIODIC_UPDATE_CHECKS_STORAGE_KEY,
     "aiProviderSource",
     "aiProviderApiKey",
     "aiProviderModel",
@@ -524,6 +528,8 @@ const _secretAreaName =
   const serverPath = stored.serverPath || null;
   const autoConnect = stored.autoConnect === true;
   const autoUpdate = stored[AUTO_UPDATE_STORAGE_KEY] === true;
+  const periodicUpdateChecks =
+    stored[PERIODIC_UPDATE_CHECKS_STORAGE_KEY] !== false;
 
   providerSettings = {
     source: stored.aiProviderSource || "ide",
@@ -553,6 +559,8 @@ const _secretAreaName =
   DOM.portInput.value = port;
   DOM.autoConnectToggle.checked = autoConnect;
   if (DOM.autoUpdateToggle) DOM.autoUpdateToggle.checked = autoUpdate;
+  if (DOM.periodicUpdateCheckToggle)
+    DOM.periodicUpdateCheckToggle.checked = periodicUpdateChecks;
   if (DOM.providerSelect) DOM.providerSelect.value = providerSettings.source;
   if (DOM.providerApiKey) DOM.providerApiKey.value = providerSettings.apiKey;
   if (DOM.providerModel) DOM.providerModel.value = providerSettings.model;
@@ -708,6 +716,48 @@ const _secretAreaName =
     });
   }
 
+  if (DOM.periodicUpdateCheckToggle) {
+    DOM.periodicUpdateCheckToggle.addEventListener("change", async (e) => {
+      const enabled = e.target.checked;
+      await chrome.storage.local.set({
+        [PERIODIC_UPDATE_CHECKS_STORAGE_KEY]: enabled,
+      });
+      const response = await sendRuntimeMessage({
+        type: "AUTODOM_SET_PERIODIC_UPDATE_CHECKS",
+        enabled,
+      });
+      if (response?.error || response?.ok === false || response?.success === false) {
+        addLog(
+          `Failed to update periodic checks: ${response?.error || "background worker unavailable"}`,
+          "error",
+        );
+        return;
+      }
+      addLog(
+        enabled
+          ? "Periodic extension update checks enabled."
+          : "Periodic extension update checks disabled.",
+        "info",
+      );
+    });
+  }
+
+  if (DOM.clearExtensionCacheBtn) {
+    DOM.clearExtensionCacheBtn.addEventListener("click", async () => {
+      const response = await sendRuntimeMessage({
+        type: "AUTODOM_CLEAR_EXTENSION_CACHE",
+      });
+      if (response?.error || response?.ok === false || response?.success === false) {
+        addLog(
+          `Failed to clear extension cache: ${response?.error || "background worker unavailable"}`,
+          "error",
+        );
+        return;
+      }
+      addLog("Extension cache cleared.", "success");
+    });
+  }
+
   // Listen for path/provider updates (both local and session areas)
   chrome.storage.onChanged.addListener((changes, areaName) => {
     if (changes.serverPath) {
@@ -728,6 +778,15 @@ const _secretAreaName =
     ) {
       DOM.autoUpdateToggle.checked =
         changes[AUTO_UPDATE_STORAGE_KEY].newValue === true;
+    }
+
+    if (
+      areaName === "local" &&
+      changes[PERIODIC_UPDATE_CHECKS_STORAGE_KEY] &&
+      DOM.periodicUpdateCheckToggle
+    ) {
+      DOM.periodicUpdateCheckToggle.checked =
+        changes[PERIODIC_UPDATE_CHECKS_STORAGE_KEY].newValue !== false;
     }
 
     if (changes[ACTIVITY_LOG_KEY]) {

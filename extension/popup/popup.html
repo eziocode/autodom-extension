@@ -118,11 +118,20 @@
                                 <input type="checkbox" id="autoUpdateToggle" />
                                 <span>Auto-apply updates</span>
                             </label>
+                            <label class="checkbox-row" for="periodicUpdateCheckToggle">
+                                <input type="checkbox" id="periodicUpdateCheckToggle" />
+                                <span>Periodic update checks</span>
+                            </label>
                             <p class="field-hint">
                                 AutoDOM checks every 5 hours; opening the side panel
                                 also checks when the last check is stale. Keep this
                                 off to review and click Update manually.
                             </p>
+                            <div class="inline-row">
+                                <button type="button" class="text-btn" id="clearExtensionCacheBtn">
+                                    Clear extension cache
+                                </button>
+                            </div>
                         </div>
                     </section>
 

@@ -55,6 +55,7 @@ const UPDATE_STORAGE_KEYS = {
   lastCheckSource: "autodomLastUpdateCheckSource",
   autoUpdateEnabled: "autodomAutoUpdateEnabled",
   autoUpdateApplyAttemptAt: "autodomAutoUpdateApplyAttemptAt",
+  periodicChecksEnabled: "autodomPeriodicUpdateChecksEnabled",
 };
 let _updateCheckInFlight = null;
 let _offscreenEnsureInFlight = null;
@@ -7865,6 +7866,33 @@ function _ensureUpdateCheckAlarm() {
   }
 }
 
+function _clearUpdateCheckAlarm() {
+  try {
+    if (!chrome.alarms || typeof chrome.alarms.clear !== "function") return;
+    chrome.alarms.clear(UPDATE_CHECK_ALARM_NAME, () => {
+      try { void chrome.runtime?.lastError; } catch (_) {}
+    });
+  } catch (_) {}
+}
+
+async function _isPeriodicUpdateChecksEnabled() {
+  const stored = await _readUpdateStorage(
+    [UPDATE_STORAGE_KEYS.periodicChecksEnabled],
+    "periodic update checks setting",
+  );
+  return stored[UPDATE_STORAGE_KEYS.periodicChecksEnabled] !== false;
+}
+
+async function _refreshPeriodicUpdateScheduler(source = "unknown") {
+  const enabled = await _isPeriodicUpdateChecksEnabled();
+  if (enabled) {
+    _ensureUpdateCheckAlarm();
+    return { enabled: true, source };
+  }
+  _clearUpdateCheckAlarm();
+  return { enabled: false, source };
+}
+
 if (chrome.runtime && chrome.runtime.onUpdateAvailable) {
   chrome.runtime.onUpdateAvailable.addListener((details) => {
     _setPendingUpdate(details && details.version, "runtime_update_available");
@@ -7872,19 +7900,20 @@ if (chrome.runtime && chrome.runtime.onUpdateAvailable) {
 }
 
 try {
-  _ensureUpdateCheckAlarm();
+  _refreshPeriodicUpdateScheduler("service_worker_startup");
   _sanitizeStoredUpdateState("service_worker_startup");
   _runExtensionUpdateCheck({ source: "service_worker_startup" });
   if (chrome.runtime && chrome.runtime.onStartup) {
     chrome.runtime.onStartup.addListener(() => {
-      _ensureUpdateCheckAlarm();
+      _refreshPeriodicUpdateScheduler("browser_startup");
       _runExtensionUpdateCheck({ source: "browser_startup" });
       void _syncOffscreenKeepalive("browser_startup");
     });
   }
   if (chrome.alarms && chrome.alarms.onAlarm) {
-    chrome.alarms.onAlarm.addListener((alarm) => {
+    chrome.alarms.onAlarm.addListener(async (alarm) => {
       if (alarm && alarm.name === UPDATE_CHECK_ALARM_NAME) {
+        if (!(await _isPeriodicUpdateChecksEnabled())) return;
         _runExtensionUpdateCheck({ source: "alarm" });
       }
     });
@@ -7932,6 +7961,44 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
       }
       sendResponse({ ok: true, enabled });
+    })();
+    return true;
+  }
+  if (msg && msg.type === "AUTODOM_SET_PERIODIC_UPDATE_CHECKS") {
+    (async () => {
+      const enabled = msg.enabled === true;
+      await _writeUpdateStorage(
+        { [UPDATE_STORAGE_KEYS.periodicChecksEnabled]: enabled },
+        "periodic update checks preference",
+      );
+      if (enabled) {
+        _ensureUpdateCheckAlarm();
+        await _runExtensionUpdateCheck({
+          force: false,
+          source: "periodic_toggle_enabled",
+        });
+      } else {
+        _clearUpdateCheckAlarm();
+      }
+      sendResponse({ ok: true, enabled });
+    })();
+    return true;
+  }
+  if (msg && msg.type === "AUTODOM_CLEAR_EXTENSION_CACHE") {
+    (async () => {
+      _providerModelCache.clear();
+      _pageCtxCache.clear();
+      await _writeUpdateStorage(
+        {
+          [UPDATE_STORAGE_KEYS.available]: null,
+          [UPDATE_STORAGE_KEYS.lastCheckStatus]: "cache_cleared",
+        },
+        "clear extension cache",
+      );
+      try {
+        chrome.storage.local.remove(["mcpDetectedPort"]);
+      } catch (_) {}
+      sendResponse({ ok: true });
     })();
     return true;
   }
