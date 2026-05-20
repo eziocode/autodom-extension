@@ -7661,12 +7661,23 @@ async function _runExtensionUpdateCheckNow(opts = {}) {
     }
 
     if (preflight && preflight.status === "new_release_found") {
+      // Surface the CTA as soon as we know a newer version is published,
+      // even if Chrome's runtime check hasn't downloaded the CRX yet
+      // (throttled, not-yet-fetched, etc.). chrome.runtime.reload() on
+      // apply will pick up the CRX once Chrome has it; until then the
+      // user at least sees that an update exists.
+      const pendingUpdate = await _setPendingUpdate(
+        (preflight.details && preflight.details.version) ||
+          (details && details.version),
+        source,
+      );
       return {
         ok: true,
         status: "new_release_found",
         details: preflight.details,
         runtimeStatus: status,
         runtimeDetails: details,
+        pendingUpdate,
         lastCheckAt: now,
         nextCheckAt: now + UPDATE_CHECK_INTERVAL_MS,
       };

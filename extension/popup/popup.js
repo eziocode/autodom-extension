@@ -181,6 +181,16 @@ async function runUpdateCheck() {
     }
 
     const status = (result && result.status) || "unknown";
+    // The service worker may also include pendingUpdate alongside any
+    // status once a newer published version is known (e.g. preflight
+    // detected it but the browser hasn't fetched the CRX yet). Surface
+    // the Update CTA whenever that pending payload is present.
+    if (result && result.pendingUpdate && result.pendingUpdate.version) {
+      btn.classList.remove("spin");
+      btn.disabled = false;
+      paintUpdateButton(result.pendingUpdate);
+      return;
+    }
     if (status === "update_available") {
       const v =
         (result.pendingUpdate && result.pendingUpdate.version) ||
@@ -196,7 +206,10 @@ async function runUpdateCheck() {
       setLabel("rate-limited");
     } else if (status === "new_release_found") {
       const v = (result.details && result.details.version) || "?";
-      setLabel(`v${v} found`);
+      btn.classList.remove("spin");
+      btn.disabled = false;
+      paintUpdateButton({ version: v });
+      return;
     } else if (status === "skipped" && result.reason === "not_due") {
       setLabel("checked recently");
     } else if (status === "unsupported") {
