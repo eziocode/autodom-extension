@@ -377,6 +377,17 @@ const WS_PORT = parseInt(getArgValue("--port") || "9876", 10);
 const STOP_ONLY = hasArg("--stop");
 const TOOL_TIMEOUT = parseInt(process.env.AUTODOM_TOOL_TIMEOUT || "30000", 10);
 const SHUTDOWN_GRACE_MS = 1500;
+// How long to wait for a flapping WebSocket (extension or proxy) to come
+// back before returning an error to the IDE. Without this, a 200ms blip
+// — e.g. extension service-worker recycle, Chromium tab discard, primary
+// bridge restart — surfaces in the IDE as a hard tool failure, which
+// some MCP hosts (notably IntelliJ AI Assistant) interpret as the entire
+// MCP server going "inactive" and stop calling it until the user manually
+// restarts it from Settings → Tools → MCP.
+const RECONNECT_GRACE_MS = parseInt(
+  process.env.AUTODOM_RECONNECT_GRACE || "5000",
+  10,
+);
 const INACTIVITY_TIMEOUT_MS = parseInt(
   process.env.AUTODOM_INACTIVITY_TIMEOUT || "600000",
   10,
@@ -514,6 +525,66 @@ const _TOOL_LOG_MAX = 50;
 let lastActivityTime = Date.now(); // Tracks last tool call or keepalive
 let inactivityTimer = null; // Reference to the inactivity check interval
 
+// ─── Reconnect-Grace Waiters ─────────────────────────────────
+// Resolved when the matching socket becomes ready (or the grace window
+// elapses). Used to absorb transient WS drops so an in-flight tool call
+// doesn't fail just because the extension service-worker recycled or
+// the primary bridge restarted in the middle of the call.
+const _extReadyWaiters = new Set(); // { resolve, timer }
+const _proxyReadyWaiters = new Set(); // { resolve, timer }
+
+function _isExtensionReady() {
+  return !!extensionSocket && extensionSocket.readyState === 1;
+}
+
+function _isProxyReady() {
+  return !!proxyClient && proxyClient.readyState === 1;
+}
+
+function _waitForExtensionReady(timeoutMs = RECONNECT_GRACE_MS) {
+  if (_isExtensionReady()) return Promise.resolve(true);
+  if (timeoutMs <= 0) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const entry = { resolve, timer: null };
+    entry.timer = setTimeout(() => {
+      _extReadyWaiters.delete(entry);
+      resolve(false);
+    }, timeoutMs);
+    entry.timer.unref?.();
+    _extReadyWaiters.add(entry);
+  });
+}
+
+function _waitForProxyReady(timeoutMs = RECONNECT_GRACE_MS) {
+  if (_isProxyReady() || isPrimaryServer) return Promise.resolve(true);
+  if (timeoutMs <= 0) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const entry = { resolve, timer: null };
+    entry.timer = setTimeout(() => {
+      _proxyReadyWaiters.delete(entry);
+      resolve(false);
+    }, timeoutMs);
+    entry.timer.unref?.();
+    _proxyReadyWaiters.add(entry);
+  });
+}
+
+function _signalExtensionReady() {
+  for (const entry of _extReadyWaiters) {
+    clearTimeout(entry.timer);
+    entry.resolve(true);
+  }
+  _extReadyWaiters.clear();
+}
+
+function _signalProxyReady() {
+  for (const entry of _proxyReadyWaiters) {
+    clearTimeout(entry.timer);
+    entry.resolve(true);
+  }
+  _proxyReadyWaiters.clear();
+}
+
 // ─── IDE AI Agent Routing ────────────────────────────────────
 // Tracks the active MCP session so we can use requestSampling to
 // route chat panel requests to the IDE's connected AI agent.
@@ -544,6 +615,9 @@ const TOOL_TIERS = new Map([
   ["get_network_requests", "read"],
   ["get_console_logs", "read"],
   ["list_tabs", "read"],
+  ["pin_tab", "read"],
+  ["unpin_tab", "read"],
+  ["get_pinned_tab", "read"],
   ["get_recording", "read"],
   ["get_session_summary", "read"],
   ["wait_for_text", "read"],
@@ -1453,6 +1527,7 @@ async function ensureProxyClientConnected() {
         process.stderr.write(
           "[AutoDOM] Proxy client connected to primary server.\n",
         );
+        _signalProxyReady();
         finish(true);
       });
 
@@ -1479,9 +1554,44 @@ async function ensureProxyClientConnected() {
         process.stderr.write(
           `[AutoDOM] Proxy client disconnected from primary server (code=${code}${suffix})\n`,
         );
-        rejectPendingProxyCalls(
-          "Proxy connection to primary AutoDOM server closed.",
-        );
+        // Don't immediately reject pending proxy calls. Give the system
+        // a RECONNECT_GRACE_MS window during which we try (in parallel):
+        //   1. Reconnect to the existing primary (if it just restarted).
+        //   2. Promote ourselves to primary (if the primary is gone for
+        //      good — this is the key fix for "IntelliJ MCP entry goes
+        //      inactive after Copilot CLI was killed").
+        // If either succeeds in time, in-flight calls naturally proceed
+        // because they re-resolve readiness on each retry path. If both
+        // fail, fall back to the original reject-pending behavior so
+        // the IDE still gets a definitive error instead of hanging.
+        const recoveryDeadline = setTimeout(() => {
+          if (!_isProxyReady() && !isPrimaryServer) {
+            rejectPendingProxyCalls(
+              "Proxy connection to primary AutoDOM server closed and recovery window expired.",
+            );
+          }
+        }, RECONNECT_GRACE_MS);
+        recoveryDeadline.unref?.();
+
+        // Eager recovery: kick off both paths concurrently. Whichever
+        // resolves readiness first wakes the waiters via _signalProxyReady.
+        (async () => {
+          try {
+            const recovered = await tryRecoverSecondaryAsPrimary();
+            if (recovered) {
+              clearTimeout(recoveryDeadline);
+              _signalProxyReady();
+              return;
+            }
+          } catch (_) {}
+          try {
+            const reconnected = await ensureProxyClientConnected();
+            if (reconnected) {
+              clearTimeout(recoveryDeadline);
+              _signalProxyReady();
+            }
+          } catch (_) {}
+        })();
       });
 
       ws.on("message", (data) => {
@@ -2457,6 +2567,9 @@ function _processWsMessage(socket, message) {
       extensionSocket = socket;
       // Start inactivity timer when extension connects
       startInactivityTimer();
+      // Wake any callExtensionTool() invocations that were waiting out
+      // a transient extension drop.
+      _signalExtensionReady();
       try {
         socket.send(
           JSON.stringify({
@@ -2544,6 +2657,14 @@ function callExtensionTool(tool, params) {
       (async () => {
         let connected = await ensureProxyClientConnected();
         if (!connected) {
+          // Wait briefly for an eager recovery (proxy close handler kicks
+          // off promotion + reconnect concurrently); if we became primary
+          // during the wait, recurse through the primary path.
+          await _waitForProxyReady();
+          if (isPrimaryServer) {
+            resolve(await callExtensionTool(tool, params));
+            return;
+          }
           const recoveredPrimary = await tryRecoverSecondaryAsPrimary();
           if (recoveredPrimary) {
             resolve(await callExtensionTool(tool, params));
@@ -2596,17 +2717,37 @@ function callExtensionTool(tool, params) {
     }
 
     // Primary server execution
-    if (!extensionSocket || extensionSocket.readyState !== 1) {
-      // Return error as resolved value instead of rejecting —
-      // this way FastMCP returns an error response to the IDE
-      // instead of crashing the process.
+    if (!_isExtensionReady()) {
+      // Don't error out immediately on a transient drop — the extension's
+      // service worker can recycle for sub-second windows, and the
+      // background reconnect logic typically re-attaches well within
+      // RECONNECT_GRACE_MS. Wait briefly; if the extension comes back,
+      // the call proceeds normally. If not, fall through to the same
+      // hard-error response as before so the IDE gets a definitive
+      // result instead of hanging.
       diagLog(
-        `toolCall FAIL tool=${tool} reason=extension_not_connected socketState=${extensionSocket ? extensionSocket.readyState : "null"}`,
+        `toolCall WAIT tool=${tool} reason=extension_reconnect_grace socketState=${extensionSocket ? extensionSocket.readyState : "null"}`,
       );
-      wrappedResolve({
-        error:
-          "Chrome extension is not connected. Open the extension popup and click Connect.",
-      });
+      // Note: we await inside a non-async Promise executor by switching
+      // to an IIFE so we can `await` without changing callExtensionTool's
+      // outer signature.
+      (async () => {
+        const ready = await _waitForExtensionReady();
+        if (!ready || !_isExtensionReady()) {
+          diagLog(
+            `toolCall FAIL tool=${tool} reason=extension_not_connected socketState=${extensionSocket ? extensionSocket.readyState : "null"}`,
+          );
+          wrappedResolve({
+            error:
+              "Chrome extension is not connected. Open the extension popup and click Connect.",
+          });
+          return;
+        }
+        // Re-enter the primary path now that the extension is back. The
+        // recursive call goes through the full guardrail / confirm-mode
+        // pipeline, so we don't have to duplicate that logic here.
+        resolve(await callExtensionTool(tool, params));
+      })();
       return;
     }
 
@@ -6125,6 +6266,63 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("list_tabs", params);
+    return stringifyToolResult(result);
+  },
+});
+
+// 16a. Pin tab to this MCP client (per-bridge tab pinning)
+// When multiple AI agents (IntelliJ AI Assistant, Copilot CLI, Codex,
+// Claude Code) share the same Chrome extension, each MCP bridge process
+// has its own clientId. Pinning the working tab to a clientId means the
+// user can switch Chrome tabs in the same window without the next tool
+// call accidentally retargeting the user's current tab.
+//
+// The extension auto-pins after a successful navigate/open_new_tab/
+// switch_tab if this client has no pin yet, so most users will never
+// need to call pin_tab manually. Use pin_tab explicitly to re-target
+// after the pinned tab is closed (PINNED_TAB_GONE error) or to pin
+// a different tab without navigating to it.
+server.addTool({
+  name: "pin_tab",
+  description:
+    "Pin a browser tab to this MCP client so subsequent tool calls always target it, even if the user clicks another tab in the same window. Auto-pinning happens after a successful navigate/open_new_tab; call this only to re-pin after PINNED_TAB_GONE or to pin a tab without navigating. Pass tabId to pin a specific tab, omit it to pin the currently active tab.",
+  parameters: z.object({
+    tabId: z
+      .number()
+      .optional()
+      .describe(
+        "Specific tab id (from list_tabs) to pin. Omit to pin whatever tab is currently active in the focused window.",
+      ),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("__pin_tab", params || {});
+    return stringifyToolResult(result);
+  },
+});
+
+// 16b. Unpin tab — release this client's pin so subsequent calls fall
+// back to chrome.tabs.query({active:true, currentWindow:true}) again.
+server.addTool({
+  name: "unpin_tab",
+  description:
+    "Release this MCP client's pinned tab. After unpin_tab, subsequent tool calls target whatever tab is currently active. Use this when you want AutoDOM to follow the user's focus again.",
+  parameters: z.object({}),
+  execute: async () => {
+    const result = await callExtensionTool("__unpin_tab", {});
+    return stringifyToolResult(result);
+  },
+});
+
+// 16c. Get the current pin for this client — useful for debugging when
+// a tool returns PINNED_TAB_GONE and the agent wants to know which URL
+// it was working on before the tab was closed.
+server.addTool({
+  name: "get_pinned_tab",
+  description:
+    "Report this MCP client's currently pinned tab (tabId, url, title), or { pinned: false } if no pin is set. If the pinned tab has been closed, returns { pinned: false, gone: true, url, title } so the agent can recover.",
+  parameters: z.object({}),
+  execute: async () => {
+    const result = await callExtensionTool("__get_pinned_tab", {});
     return stringifyToolResult(result);
   },
 });

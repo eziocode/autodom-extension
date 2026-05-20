@@ -1141,6 +1141,136 @@ function _maybeRepinAgentTab(toolName, rawResult) {
   }
 }
 
+// ─── Per-Client (per-IDE-bridge) Tab Pins ───────────────────
+// Each MCP bridge process (one per IDE — IntelliJ, Copilot CLI, Codex,
+// Claude) sends a `clientId` (its random MY_CLIENT_ID) on every TOOL_CALL
+// frame. We keep a per-clientId pin so that switching Chrome tabs in the
+// same window during automation does NOT hijack the target tab.
+//
+// Pin lifecycle:
+//   - Auto-pinned after a successful MCP-originated navigate/open_new_tab
+//     (only when no pin existed for that client — never silently overrides
+//     an explicit pin_tab call).
+//   - Explicit: pin_tab / unpin_tab / get_pinned_tab MCP tools.
+//   - On chrome.tabs.onRemoved, the entry is *kept* but tabId is set to
+//     null so subsequent calls return a structured PINNED_TAB_GONE error
+//     instead of silently grabbing the user's current tab.
+//   - Phase 1 limitation: tool-call dispatch is serialized globally below
+//     because all handlers still read the single `_agentRunContext` global.
+//     Phase 2 will introduce clientId-aware getActiveTab so concurrent
+//     bridges no longer block each other.
+const _clientPins = new Map();
+// clientId -> { tabId: number|null, windowId, lastUrl, lastTitle, pinnedAt }
+
+const _AUTOPIN_TOOLS = new Set([
+  "navigate",
+  "browser_navigate",
+  "open_new_tab",
+  "switch_tab",
+]);
+
+// Global serialization chain for bridge TOOL_CALLs. Each incoming call is
+// chained so the shared `_agentRunContext` swap is race-free across
+// clientIds. The chain is always re-armed (.catch(()=>{})) so a single
+// thrown handler can never poison the queue.
+let _bridgeToolChain = Promise.resolve();
+function _runSerializedToolCall(fn) {
+  const next = _bridgeToolChain.then(fn, fn);
+  _bridgeToolChain = next.catch(() => {});
+  return next;
+}
+
+function _getClientPin(clientId) {
+  if (!clientId) return null;
+  return _clientPins.get(clientId) || null;
+}
+
+function _setClientPin(clientId, tab) {
+  if (!clientId || !tab || tab.id == null) return null;
+  const entry = {
+    tabId: tab.id,
+    windowId: tab.windowId ?? null,
+    lastUrl: tab.url || tab.pendingUrl || null,
+    lastTitle: tab.title || null,
+    pinnedAt: Date.now(),
+  };
+  _clientPins.set(clientId, entry);
+  return entry;
+}
+
+// Resolve a pinned tab. Returns:
+//   { tab }                            - pin valid, tab still exists
+//   { gone: true, pin }                - had a pin but the tab is gone
+//   null                               - no pin for this client
+async function _resolveClientPin(clientId) {
+  const pin = _getClientPin(clientId);
+  if (!pin) return null;
+  if (pin.tabId == null) return { gone: true, pin };
+  try {
+    const tab = await chrome.tabs.get(pin.tabId);
+    pin.lastUrl = tab.url || pin.lastUrl;
+    pin.lastTitle = tab.title || pin.lastTitle;
+    pin.windowId = tab.windowId ?? pin.windowId;
+    return { tab };
+  } catch (_) {
+    pin.tabId = null;
+    return { gone: true, pin };
+  }
+}
+
+// Synthetic tool handlers for the pin_tab / unpin_tab / get_pinned_tab
+// MCP tools. These are dispatched in the TOOL_CALL handler below before
+// reaching TOOL_HANDLERS so they have direct access to the calling
+// clientId.
+async function _handlePinTabTool(clientId, params) {
+  if (!clientId) {
+    return { error: "pin_tab requires a clientId on the wire (bridge version mismatch?)" };
+  }
+  let tab = null;
+  if (params && params.tabId != null) {
+    try {
+      tab = await chrome.tabs.get(Number(params.tabId));
+    } catch (err) {
+      return { error: `pin_tab: tabId ${params.tabId} not found` };
+    }
+  } else {
+    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!active) return { error: "pin_tab: no active tab to pin" };
+    tab = active;
+  }
+  const entry = _setClientPin(clientId, tab);
+  return {
+    pinned: true,
+    clientId,
+    tabId: entry.tabId,
+    windowId: entry.windowId,
+    url: entry.lastUrl,
+    title: entry.lastTitle,
+  };
+}
+
+function _handleUnpinTabTool(clientId) {
+  if (!clientId) return { error: "unpin_tab requires a clientId" };
+  const had = _clientPins.delete(clientId);
+  return { unpinned: had, clientId };
+}
+
+function _handleGetPinnedTabTool(clientId) {
+  if (!clientId) return { error: "get_pinned_tab requires a clientId" };
+  const pin = _getClientPin(clientId);
+  if (!pin) return { pinned: false, clientId };
+  return {
+    pinned: pin.tabId != null,
+    gone: pin.tabId == null,
+    clientId,
+    tabId: pin.tabId,
+    windowId: pin.windowId,
+    url: pin.lastUrl,
+    title: pin.lastTitle,
+    pinnedAt: pin.pinnedAt,
+  };
+}
+
 // Acquire the pinned tab for this agent run. Falls back to active tab if
 // nothing pinned yet.
 async function _resolveAgentTab(initialTabId) {
@@ -2893,6 +3023,13 @@ chrome.tabs.onRemoved.addListener((tabId) => {
         ? { windowId: _agentRunContext.windowId }
         : null;
     }
+    // Per-clientId pins: keep the entry (so we can surface
+    // PINNED_TAB_GONE with lastUrl) but clear the live tabId.
+    for (const [cid, pin] of _clientPins) {
+      if (pin.tabId === tabId) {
+        pin.tabId = null;
+      }
+    }
   } catch (_) {}
 });
 
@@ -3190,35 +3327,150 @@ function connectWebSocket(port) {
             tool: message.tool,
             args: message.params || {},
           });
-          const result = await handleToolCallWithRecording(
-            message.tool,
-            message.params,
-            message.id,
-          );
-          _streamBridgeToolEvent({
-            phase: "end",
-            tool: message.tool,
-            ok: !result?.error,
-            error: result?.error,
-            result: _compactBridgeToolResult(result),
+          // Serialize TOOL_CALL handling so per-clientId tab pins
+          // (see _clientPins) don't race on the shared _agentRunContext.
+          // Phase 1 trade-off: this means one slow tool can briefly
+          // delay another bridge's call. Phase 2 will replace this with
+          // clientId-aware getActiveTab so concurrency is restored.
+          _runSerializedToolCall(async () => {
+            const clientId = message.clientId || null;
+            const toolName = message.tool;
+            const params = message.params || {};
+
+            // Synthetic pin_tab / unpin_tab / get_pinned_tab — handled
+            // here because they need direct access to the calling
+            // clientId, which TOOL_HANDLERS entries don't see.
+            let result;
+            if (toolName === "__pin_tab" || toolName === "pin_tab") {
+              result = await _handlePinTabTool(clientId, params);
+            } else if (toolName === "__unpin_tab" || toolName === "unpin_tab") {
+              result = _handleUnpinTabTool(clientId);
+            } else if (
+              toolName === "__get_pinned_tab" ||
+              toolName === "get_pinned_tab"
+            ) {
+              result = _handleGetPinnedTabTool(clientId);
+            } else {
+              // Resolve pinned tab for this client (if any).
+              let pinCtx = null;
+              if (clientId) {
+                const resolved = await _resolveClientPin(clientId);
+                if (resolved?.gone) {
+                  result = {
+                    error: "PINNED_TAB_GONE",
+                    clientId,
+                    lastUrl: resolved.pin?.lastUrl || null,
+                    lastTitle: resolved.pin?.lastTitle || null,
+                    hint: "The tab this client was pinned to has been closed. Call pin_tab (or open_new_tab) before retrying.",
+                  };
+                } else if (resolved?.tab) {
+                  pinCtx = {
+                    tabId: resolved.tab.id,
+                    windowId: resolved.tab.windowId ?? null,
+                  };
+                }
+              }
+
+              if (result === undefined) {
+                if (pinCtx) {
+                  result = await _withAgentTabContext(pinCtx, () =>
+                    handleToolCallWithRecording(toolName, params, message.id),
+                  );
+                } else {
+                  result = await handleToolCallWithRecording(
+                    toolName,
+                    params,
+                    message.id,
+                  );
+                }
+
+                // Auto-pin after a successful MCP-originated navigate /
+                // open_new_tab / switch_tab when this client has no pin
+                // yet. We never override an existing pin silently.
+                if (
+                  clientId &&
+                  !pinCtx &&
+                  !result?.error &&
+                  _AUTOPIN_TOOLS.has(toolName) &&
+                  !_clientPins.has(clientId)
+                ) {
+                  try {
+                    let candidateTabId =
+                      result?.tabId ??
+                      result?.tab?.id ??
+                      result?.id ??
+                      null;
+                    let candidate = null;
+                    if (candidateTabId != null) {
+                      candidate = await chrome.tabs
+                        .get(candidateTabId)
+                        .catch(() => null);
+                    }
+                    if (!candidate) {
+                      const [active] = await chrome.tabs.query({
+                        active: true,
+                        currentWindow: true,
+                      });
+                      candidate = active || null;
+                    }
+                    if (candidate) {
+                      const entry = _setClientPin(clientId, candidate);
+                      if (entry && result && typeof result === "object") {
+                        result.autoPinned = true;
+                        result.pinnedTabId = entry.tabId;
+                      }
+                    }
+                  } catch (pinErr) {
+                    _debugWarn(
+                      "[AutoDOM] auto-pin failed:",
+                      pinErr?.message || pinErr,
+                    );
+                  }
+                }
+              }
+            }
+
+            _streamBridgeToolEvent({
+              phase: "end",
+              tool: toolName,
+              ok: !result?.error,
+              error: result?.error,
+              result: _compactBridgeToolResult(result),
+            });
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+              return;
+            }
+            ws.send(
+              JSON.stringify({
+                type: "TOOL_RESULT",
+                id: message.id,
+                result,
+              }),
+            );
+            // Notify popup
+            chrome.runtime
+              .sendMessage({
+                type: "TOOL_CALLED",
+                tool: toolName,
+              })
+              .catch(() => {});
+          }).catch((err) => {
+            // Final safety net: a throw inside the serialized block
+            // already gets caught by _runSerializedToolCall's .catch,
+            // but we still try to reply to the bridge so the call
+            // doesn't hang forever from FastMCP's perspective.
+            try {
+              if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(
+                  JSON.stringify({
+                    type: "TOOL_RESULT",
+                    id: message.id,
+                    result: { error: `Internal handler error: ${err?.message || err}` },
+                  }),
+                );
+              }
+            } catch (_) {}
           });
-          if (!ws || ws.readyState !== WebSocket.OPEN) {
-            return;
-          }
-          ws.send(
-            JSON.stringify({
-              type: "TOOL_RESULT",
-              id: message.id,
-              result,
-            }),
-          );
-          // Notify popup
-          chrome.runtime
-            .sendMessage({
-              type: "TOOL_CALLED",
-              tool: message.tool,
-            })
-            .catch(() => {});
         }
         if (message.type === "SERVER_INFO") {
           // Store the server's actual filesystem path for the Config tab
