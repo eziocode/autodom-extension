@@ -47,6 +47,7 @@ const OFFSCREEN_KEEPALIVE_STORAGE_KEY = "autodomOffscreenKeepaliveEnabled";
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const UPDATE_STORAGE_KEYS = {
   pending: "pendingUpdate",
+  available: "availableUpdate",
   lastCheckAt: "autodomLastUpdateCheckAt",
   lastCheckStatus: "autodomLastUpdateCheckStatus",
   lastCheckSource: "autodomLastUpdateCheckSource",
@@ -7274,6 +7275,7 @@ chrome.runtime.onInstalled.addListener(() => {
   try {
     chrome.storage.local.remove([
       UPDATE_STORAGE_KEYS.pending,
+      UPDATE_STORAGE_KEYS.available,
       UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt,
     ]);
     if (chrome.action && chrome.action.setBadgeText) {
@@ -7527,6 +7529,44 @@ async function _maybeAutoApplyPendingUpdate(pending, source) {
   return true;
 }
 
+async function _setAvailableUpdate(details, runtimeStatus, source) {
+  const version = details && details.version ? details.version : "?";
+  const available = {
+    version,
+    detectedAt: Date.now(),
+    runtimeStatus: runtimeStatus || "unknown",
+    source: source || "unknown",
+  };
+  if (details && details.currentVersion) {
+    available.currentVersion = details.currentVersion;
+  }
+  if (details && details.codebase) {
+    available.codebase = details.codebase;
+  }
+  try {
+    chrome.storage.local.set({
+      [UPDATE_STORAGE_KEYS.available]: available,
+    });
+    if (chrome.action && chrome.action.setBadgeText) {
+      chrome.action.setBadgeText({ text: "•" });
+    }
+    if (chrome.action && chrome.action.setBadgeBackgroundColor) {
+      chrome.action.setBadgeBackgroundColor({ color: "#f97316" });
+    }
+    if (chrome.action && chrome.action.setTitle) {
+      chrome.action.setTitle({
+        title:
+          version && version !== "?"
+            ? `AutoDOM — v${version} found (open settings to update)`
+            : "AutoDOM — update found (open settings to update)",
+      });
+    }
+  } catch (err) {
+    _debugWarn("[AutoDOM SW] Failed to persist available update:", err?.message || err);
+  }
+  return available;
+}
+
 async function _setPendingUpdate(version, source) {
   const normalizedVersion = version || "?";
   const pending = {
@@ -7537,6 +7577,7 @@ async function _setPendingUpdate(version, source) {
     chrome.storage.local.set({
       [UPDATE_STORAGE_KEYS.pending]: pending,
     });
+    chrome.storage.local.remove(UPDATE_STORAGE_KEYS.available);
     if (chrome.action && chrome.action.setBadgeText) {
       chrome.action.setBadgeText({ text: "•" });
     }
@@ -7575,6 +7616,7 @@ async function _runExtensionUpdateCheckNow(opts = {}) {
   const stored = await _readUpdateStorage(
     [
       UPDATE_STORAGE_KEYS.pending,
+      UPDATE_STORAGE_KEYS.available,
       UPDATE_STORAGE_KEYS.lastCheckAt,
       UPDATE_STORAGE_KEYS.autoUpdateEnabled,
     ],
@@ -7598,6 +7640,7 @@ async function _runExtensionUpdateCheckNow(opts = {}) {
       ok: true,
       status: "skipped",
       reason: "not_due",
+      availableUpdate: stored[UPDATE_STORAGE_KEYS.available] || null,
       lastCheckAt,
       nextCheckAt: lastCheckAt + UPDATE_CHECK_INTERVAL_MS,
     };
@@ -7619,9 +7662,20 @@ async function _runExtensionUpdateCheckNow(opts = {}) {
         [UPDATE_STORAGE_KEYS.lastCheckAt]: now,
         [UPDATE_STORAGE_KEYS.lastCheckStatus]: "no_update",
         [UPDATE_STORAGE_KEYS.lastCheckSource]: source,
+        [UPDATE_STORAGE_KEYS.available]: null,
       },
       "update manifest preflight result",
     );
+    try {
+      if (chrome.action && chrome.action.setBadgeText) {
+        chrome.action.setBadgeText({ text: "" });
+      }
+      if (chrome.action && chrome.action.setTitle) {
+        const actionTitle =
+          chrome.runtime.getManifest()?.action?.default_title || "AutoDOM";
+        chrome.action.setTitle({ title: actionTitle });
+      }
+    } catch (_) {}
     return {
       ok: true,
       status: "no_update",
@@ -7661,14 +7715,12 @@ async function _runExtensionUpdateCheckNow(opts = {}) {
     }
 
     if (preflight && preflight.status === "new_release_found") {
-      // Surface the CTA as soon as we know a newer version is published,
-      // even if Chrome's runtime check hasn't downloaded the CRX yet
-      // (throttled, not-yet-fetched, etc.). chrome.runtime.reload() on
-      // apply will pick up the CRX once Chrome has it; until then the
-      // user at least sees that an update exists.
-      const pendingUpdate = await _setPendingUpdate(
-        (preflight.details && preflight.details.version) ||
-          (details && details.version),
+      // Surface the CTA as soon as we know a newer version is published.
+      // This is not a pending CRX yet, so the popup must force another
+      // runtime update check instead of reloading immediately.
+      const availableUpdate = await _setAvailableUpdate(
+        preflight.details || details,
+        status,
         source,
       );
       return {
@@ -7677,7 +7729,7 @@ async function _runExtensionUpdateCheckNow(opts = {}) {
         details: preflight.details,
         runtimeStatus: status,
         runtimeDetails: details,
-        pendingUpdate,
+        availableUpdate,
         lastCheckAt: now,
         nextCheckAt: now + UPDATE_CHECK_INTERVAL_MS,
       };
@@ -7781,7 +7833,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         if (pending && pending.version) {
           await _maybeAutoApplyPendingUpdate(pending, "auto_update_enabled");
         } else {
-          await _runExtensionUpdateCheck({ source: "auto_update_enabled" });
+          await _runExtensionUpdateCheck({
+            force: true,
+            source: "auto_update_enabled",
+          });
         }
       }
       sendResponse({ ok: true, enabled });

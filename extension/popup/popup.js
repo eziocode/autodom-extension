@@ -64,25 +64,34 @@ let isConnected = false;
 const REFRESH_GLYPH = "↻";
 const UPDATE_LABEL = "Update";
 const AUTO_UPDATE_STORAGE_KEY = "autodomAutoUpdateEnabled";
+const AVAILABLE_UPDATE_STORAGE_KEY = "availableUpdate";
 
-// Render the ↻ button in either its idle (refresh) state or its
-// "update available" CTA state. Driven by chrome.storage.local.pendingUpdate
-// which the service worker writes when chrome.runtime.onUpdateAvailable
-// fires (or when the popup itself surfaces an update_available result).
-function paintUpdateButton(pending) {
+// Render the ↻ button in idle, manifest-found, or ready-to-apply states.
+// The service worker stores availableUpdate after it sees a newer published
+// manifest and pendingUpdate after Chrome has downloaded a CRX to apply.
+function paintUpdateButton(pending, available) {
   const btn = DOM.checkUpdateBtn;
   const versionEl = DOM.appVersion;
   if (!btn) return;
-  if (pending && pending.version) {
+  const readyUpdate = pending && pending.version ? pending : null;
+  const foundUpdate = !readyUpdate && available && available.version ? available : null;
+  const update = readyUpdate || foundUpdate;
+  if (update) {
+    const state = readyUpdate ? "ready" : "found";
     btn.classList.add("has-update");
+    btn.dataset.updateState = state;
     btn.textContent = UPDATE_LABEL;
-    btn.title = `Update to v${pending.version} ready — click to apply`;
-    btn.setAttribute("aria-label", `Update to v${pending.version}`);
+    btn.title =
+      state === "ready"
+        ? `Update to v${update.version} ready — click to apply`
+        : `v${update.version} found — click to ask Chrome to install it`;
+    btn.setAttribute("aria-label", `Update to v${update.version}`);
     if (versionEl) {
-      versionEl.textContent = `v${chrome.runtime.getManifest().version} → v${pending.version}`;
+      versionEl.textContent = `v${chrome.runtime.getManifest().version} → v${update.version}`;
     }
   } else {
     btn.classList.remove("has-update");
+    delete btn.dataset.updateState;
     btn.textContent = REFRESH_GLYPH;
     btn.title = "Check for updates";
     btn.setAttribute("aria-label", "Check for updates");
@@ -109,16 +118,24 @@ async function readLocalStorage(keys, context) {
   }
 }
 
-async function readPendingUpdate() {
+async function readUpdateState() {
   try {
-    const { pendingUpdate } = await readLocalStorage(
-      "pendingUpdate",
-      "pending update",
+    const { pendingUpdate, availableUpdate } = await readLocalStorage(
+      ["pendingUpdate", AVAILABLE_UPDATE_STORAGE_KEY],
+      "update state",
     );
-    return pendingUpdate || null;
+    return {
+      pendingUpdate: pendingUpdate || null,
+      availableUpdate: availableUpdate || null,
+    };
   } catch (_) {
-    return null;
+    return { pendingUpdate: null, availableUpdate: null };
   }
+}
+
+async function readPendingUpdate() {
+  const { pendingUpdate } = await readUpdateState();
+  return pendingUpdate;
 }
 
 async function applyPendingUpdate() {
@@ -147,8 +164,9 @@ async function runUpdateCheck() {
   const versionEl = DOM.appVersion;
   if (!btn || !versionEl) return;
 
-  // If an update is already pending, this click means "apply it now".
-  if (btn.classList.contains("has-update")) {
+  // If Chrome has already downloaded the CRX, this click means "apply it now".
+  // A manifest-only "found" state still needs a forced runtime update check.
+  if (btn.dataset.updateState === "ready") {
     await applyPendingUpdate();
     return;
   }
@@ -159,8 +177,8 @@ async function runUpdateCheck() {
       setTimeout(async () => {
         // Re-read pending so the label reverts to the right state if an
         // update was discovered mid-check.
-        const pending = await readPendingUpdate();
-        paintUpdateButton(pending);
+        const { pendingUpdate, availableUpdate } = await readUpdateState();
+        paintUpdateButton(pendingUpdate, availableUpdate);
       }, ttl);
     }
   };
@@ -181,14 +199,13 @@ async function runUpdateCheck() {
     }
 
     const status = (result && result.status) || "unknown";
-    // The service worker may also include pendingUpdate alongside any
-    // status once a newer published version is known (e.g. preflight
-    // detected it but the browser hasn't fetched the CRX yet). Surface
-    // the Update CTA whenever that pending payload is present.
+    // Pending means Chrome has downloaded the CRX and a reload can apply it.
+    // Available means the published manifest is newer, so clicking Update
+    // should keep asking Chrome to fetch/install it rather than reloading.
     if (result && result.pendingUpdate && result.pendingUpdate.version) {
       btn.classList.remove("spin");
       btn.disabled = false;
-      paintUpdateButton(result.pendingUpdate);
+      paintUpdateButton(result.pendingUpdate, null);
       return;
     }
     if (status === "update_available") {
@@ -198,7 +215,7 @@ async function runUpdateCheck() {
         "?";
       btn.classList.remove("spin");
       btn.disabled = false;
-      paintUpdateButton({ version: v });
+      paintUpdateButton(result.pendingUpdate || { version: v }, null);
       return;
     } else if (status === "no_update") {
       setLabel("up to date");
@@ -208,7 +225,7 @@ async function runUpdateCheck() {
       const v = (result.details && result.details.version) || "?";
       btn.classList.remove("spin");
       btn.disabled = false;
-      paintUpdateButton({ version: v });
+      paintUpdateButton(null, result.availableUpdate || result.details || { version: v });
       return;
     } else if (status === "skipped" && result.reason === "not_due") {
       setLabel("checked recently");
@@ -232,8 +249,8 @@ async function requestDueUpdateCheck(source) {
       force: false,
       source,
     });
-    if (result?.pendingUpdate) {
-      paintUpdateButton(result.pendingUpdate);
+    if (result?.pendingUpdate || result?.availableUpdate) {
+      paintUpdateButton(result.pendingUpdate, result.availableUpdate);
     }
   } catch (err) {
     console.warn(
@@ -425,17 +442,25 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   if (DOM.checkUpdateBtn) {
     DOM.checkUpdateBtn.addEventListener("click", () => runUpdateCheck());
-    // Initial paint: if the service worker has already detected a pending
-    // update on a previous popup-less browser session, show the CTA state
-    // immediately.
-    readPendingUpdate().then((pending) => paintUpdateButton(pending));
+    // Initial paint: if the service worker has already detected or downloaded
+    // an update on a previous popup-less browser session, show the CTA state.
+    readUpdateState().then(({ pendingUpdate, availableUpdate }) => {
+      paintUpdateButton(pendingUpdate, availableUpdate);
+    });
     // Live updates: react to onUpdateAvailable arriving while the popup
     // is open (e.g. the user opens it just before the browser's scheduled
     // check fires).
     try {
       chrome.storage.onChanged.addListener((changes, area) => {
-        if (area !== "local" || !changes.pendingUpdate) return;
-        paintUpdateButton(changes.pendingUpdate.newValue || null);
+        if (
+          area !== "local" ||
+          (!changes.pendingUpdate && !changes[AVAILABLE_UPDATE_STORAGE_KEY])
+        ) {
+          return;
+        }
+        readUpdateState().then(({ pendingUpdate, availableUpdate }) => {
+          paintUpdateButton(pendingUpdate, availableUpdate);
+        });
       });
     } catch (_) {}
     requestDueUpdateCheck("popup_open");

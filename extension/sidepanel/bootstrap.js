@@ -3,6 +3,29 @@
 // injecting into a host page. Must run before chat-panel.js loads.
 window.__AUTODOM_SIDE_PANEL_MODE__ = true;
 
+// Chrome built-in Prompt API sometimes emits a global unhandled
+// rejection in extension pages when its backend service is asleep.
+// We already handle this path in chat logic, so suppress only this
+// specific noise and leave all other errors visible.
+(function suppressKnownChromeBuiltInAiStartupNoise() {
+  const isKnownStartupError = (value) => {
+    const message = String(
+      (value && (value.message || value.reason?.message || value.reason)) ||
+        value ||
+        "",
+    ).toLowerCase();
+    return (
+      message.includes("unable to create a text session") &&
+      message.includes("service is not running")
+    );
+  };
+
+  self.addEventListener("unhandledrejection", (event) => {
+    if (!isKnownStartupError(event?.reason)) return;
+    event.preventDefault();
+  });
+})();
+
 // Liveness + close channel with the service worker. The SW uses the
 // presence of this port to know the side panel is open in this
 // window, and posts AUTODOM_SIDEPANEL_CLOSE on a second Cmd/Ctrl+
