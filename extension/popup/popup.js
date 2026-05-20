@@ -140,6 +140,7 @@ async function readPendingUpdate() {
 
 async function applyPendingUpdate() {
   const btn = DOM.checkUpdateBtn;
+  const versionEl = DOM.appVersion;
   if (btn) {
     btn.disabled = true;
     btn.textContent = "updating…";
@@ -148,7 +149,18 @@ async function applyPendingUpdate() {
     // Asks the service worker to call chrome.runtime.reload(), which unloads
     // the SW and applies the pre-downloaded CRX. The popup will then close
     // automatically as the extension reloads.
-    await chrome.runtime.sendMessage({ type: "AUTODOM_APPLY_UPDATE" });
+    const result = await chrome.runtime.sendMessage({ type: "AUTODOM_APPLY_UPDATE" });
+    if (result && result.ok === false) {
+      const { pendingUpdate, availableUpdate } = await readUpdateState();
+      paintUpdateButton(pendingUpdate, availableUpdate);
+      if (versionEl) {
+        versionEl.textContent = "no pending update to apply";
+        setTimeout(async () => {
+          const state = await readUpdateState();
+          paintUpdateButton(state.pendingUpdate, state.availableUpdate);
+        }, 3500);
+      }
+    }
   } catch (err) {
     // sendMessage can throw if the SW just woke up; fall back to direct
     // reload from the popup context.
@@ -209,13 +221,15 @@ async function runUpdateCheck() {
       return;
     }
     if (status === "update_available") {
-      const v =
-        (result.pendingUpdate && result.pendingUpdate.version) ||
-        (result.details && result.details.version) ||
-        "?";
+      const pendingVersion = result?.pendingUpdate?.version || "";
+      const detailVersion = result?.details?.version || "";
       btn.classList.remove("spin");
       btn.disabled = false;
-      paintUpdateButton(result.pendingUpdate || { version: v }, null);
+      if (pendingVersion) {
+        paintUpdateButton(result.pendingUpdate, null);
+      } else {
+        paintUpdateButton(null, { version: detailVersion || "?" });
+      }
       return;
     } else if (status === "no_update") {
       setLabel("up to date");

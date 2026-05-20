@@ -48,6 +48,8 @@ const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const UPDATE_STORAGE_KEYS = {
   pending: "pendingUpdate",
   available: "availableUpdate",
+  applyRequestedVersion: "autodomApplyRequestedVersion",
+  applyRequestedAt: "autodomApplyRequestedAt",
   lastCheckAt: "autodomLastUpdateCheckAt",
   lastCheckStatus: "autodomLastUpdateCheckStatus",
   lastCheckSource: "autodomLastUpdateCheckSource",
@@ -7281,6 +7283,8 @@ chrome.runtime.onInstalled.addListener(() => {
     chrome.storage.local.remove([
       UPDATE_STORAGE_KEYS.pending,
       UPDATE_STORAGE_KEYS.available,
+      UPDATE_STORAGE_KEYS.applyRequestedVersion,
+      UPDATE_STORAGE_KEYS.applyRequestedAt,
       UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt,
     ]);
     if (chrome.action && chrome.action.setBadgeText) {
@@ -7439,6 +7443,81 @@ function _compareExtensionVersions(a, b) {
   return 0;
 }
 
+function _isVersionNewerThanCurrent(version) {
+  const currentVersion = chrome.runtime.getManifest?.().version || "";
+  if (!version || version === "?") return false;
+  return _compareExtensionVersions(version, currentVersion) > 0;
+}
+
+async function _sanitizeStoredUpdateState(source) {
+  const currentVersion = chrome.runtime.getManifest?.().version || "";
+  const stored = await _readUpdateStorage(
+    [
+      UPDATE_STORAGE_KEYS.pending,
+      UPDATE_STORAGE_KEYS.available,
+      UPDATE_STORAGE_KEYS.applyRequestedVersion,
+      UPDATE_STORAGE_KEYS.applyRequestedAt,
+    ],
+    "sanitize update state",
+  );
+  const pending = stored[UPDATE_STORAGE_KEYS.pending] || null;
+  const available = stored[UPDATE_STORAGE_KEYS.available] || null;
+  const requestedVersion = stored[UPDATE_STORAGE_KEYS.applyRequestedVersion] || "";
+  const requestedAt = Number(stored[UPDATE_STORAGE_KEYS.applyRequestedAt]) || 0;
+  const toRemove = [];
+  let nextAvailable = null;
+
+  if (pending?.version && !_isVersionNewerThanCurrent(pending.version)) {
+    toRemove.push(UPDATE_STORAGE_KEYS.pending);
+  }
+  if (available?.version && !_isVersionNewerThanCurrent(available.version)) {
+    toRemove.push(UPDATE_STORAGE_KEYS.available);
+  }
+  if (requestedVersion && !_isVersionNewerThanCurrent(requestedVersion)) {
+    toRemove.push(
+      UPDATE_STORAGE_KEYS.applyRequestedVersion,
+      UPDATE_STORAGE_KEYS.applyRequestedAt,
+    );
+  }
+
+  if (
+    requestedVersion &&
+    pending?.version === requestedVersion &&
+    _compareExtensionVersions(requestedVersion, currentVersion) > 0 &&
+    requestedAt > 0 &&
+    Date.now() - requestedAt > 3000
+  ) {
+    toRemove.push(
+      UPDATE_STORAGE_KEYS.pending,
+      UPDATE_STORAGE_KEYS.applyRequestedVersion,
+      UPDATE_STORAGE_KEYS.applyRequestedAt,
+    );
+    nextAvailable = {
+      version: requestedVersion,
+      detectedAt: Date.now(),
+      runtimeStatus: "apply_not_effective",
+      source: source || "sanitize",
+      currentVersion,
+    };
+  }
+
+  if (nextAvailable) {
+    await _writeUpdateStorage(
+      { [UPDATE_STORAGE_KEYS.available]: nextAvailable },
+      "sanitize available update",
+    );
+  }
+  if (toRemove.length) {
+    await new Promise((resolve) => {
+      try {
+        chrome.storage.local.remove([...new Set(toRemove)], resolve);
+      } catch (_) {
+        resolve();
+      }
+    });
+  }
+}
+
 function _readUpdateXmlAttr(tag, name) {
   const match = String(tag || "").match(
     new RegExp(`${name}\\s*=\\s*(['"])(.*?)\\1`, "i"),
@@ -7574,6 +7653,12 @@ async function _setAvailableUpdate(details, runtimeStatus, source) {
 
 async function _setPendingUpdate(version, source) {
   const normalizedVersion = version || "?";
+  if (!_isVersionNewerThanCurrent(normalizedVersion)) {
+    try {
+      chrome.storage.local.remove(UPDATE_STORAGE_KEYS.pending);
+    } catch (_) {}
+    return null;
+  }
   const pending = {
     version: normalizedVersion,
     detectedAt: Date.now(),
@@ -7615,6 +7700,7 @@ async function _runExtensionUpdateCheck(opts = {}) {
 }
 
 async function _runExtensionUpdateCheckNow(opts = {}) {
+  await _sanitizeStoredUpdateState(opts.source || "update_check");
   const force = opts.force === true;
   const source = opts.source || "background";
   const now = Date.now();
@@ -7787,6 +7873,7 @@ if (chrome.runtime && chrome.runtime.onUpdateAvailable) {
 
 try {
   _ensureUpdateCheckAlarm();
+  _sanitizeStoredUpdateState("service_worker_startup");
   _runExtensionUpdateCheck({ source: "service_worker_startup" });
   if (chrome.runtime && chrome.runtime.onStartup) {
     chrome.runtime.onStartup.addListener(() => {
@@ -7863,11 +7950,42 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // chrome.runtime.reload() unloads the service worker and applies the
     // pending CRX. The new version's onInstalled handler will clear the
     // pendingUpdate flag and the badge.
-    sendResponse({ ok: true });
-    setTimeout(() => {
-      try { chrome.runtime.reload(); } catch (_) {}
-    }, 50);
-    return false;
+    (async () => {
+      const currentVersion = chrome.runtime.getManifest?.().version || "";
+      const stored = await _readUpdateStorage(
+        [UPDATE_STORAGE_KEYS.pending],
+        "apply update precheck",
+      );
+      const pending = stored[UPDATE_STORAGE_KEYS.pending];
+      const pendingVersion = pending?.version || "";
+      if (!pendingVersion || !_isVersionNewerThanCurrent(pendingVersion)) {
+        try {
+          chrome.storage.local.remove([
+            UPDATE_STORAGE_KEYS.pending,
+            UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt,
+          ]);
+        } catch (_) {}
+        sendResponse({
+          ok: false,
+          reason: "no_new_pending_update",
+          currentVersion,
+          pendingVersion: pendingVersion || null,
+        });
+        return;
+      }
+      await _writeUpdateStorage(
+        {
+          [UPDATE_STORAGE_KEYS.applyRequestedVersion]: pendingVersion,
+          [UPDATE_STORAGE_KEYS.applyRequestedAt]: Date.now(),
+        },
+        "apply update marker",
+      );
+      sendResponse({ ok: true, pendingVersion, currentVersion });
+      setTimeout(() => {
+        try { chrome.runtime.reload(); } catch (_) {}
+      }, 50);
+    })();
+    return true;
   }
 });
 // ─── Emulation & Performance Tools (Advanced) ────────────────
