@@ -368,10 +368,7 @@ async function _testProviderConnection(p) {
     }
 
     if (source === "ollama") {
-      const base = (baseUrlRaw || "http://localhost:11434").replace(
-        /\/+$/,
-        "",
-      );
+      const base = _normalizeOllamaBaseUrl(baseUrlRaw || "http://localhost:11434");
       const resp = await fetch(`${base}/api/tags`, {
         method: "GET",
         signal: ac.signal,
@@ -451,9 +448,8 @@ function _providerModelCacheKey(p) {
       .replace(/\/+$/, "");
     parts.push(base, _providerModelCacheFingerprint(p?.apiKey || ""));
   } else if (source === "ollama") {
-    const base = (baseUrlRaw || "http://localhost:11434")
-      .toLowerCase()
-      .replace(/\/+$/, "");
+    const base = _normalizeOllamaBaseUrl(baseUrlRaw || "http://localhost:11434")
+      .toLowerCase();
     parts.push(base);
   } else if (source === "ide" || source === "cli") {
     parts.push(cliKind || "custom");
@@ -487,6 +483,14 @@ function _isOllamaCloudTag(tag) {
   return name.endsWith(":cloud") || remoteHost.includes("ollama.com");
 }
 
+function _normalizeOllamaBaseUrl(raw) {
+  const base = String(raw || "http://localhost:11434").trim() || "http://localhost:11434";
+  return base
+    .replace(/\/+$/, "")
+    .replace(/\/api\/(?:tags|chat)$/i, "")
+    .replace(/\/v1\/chat\/completions$/i, "");
+}
+
 async function _fetchProviderModels(p) {
   const TIMEOUT_MS = 6000;
   const source = (p?.source || "ide").toLowerCase();
@@ -517,7 +521,7 @@ async function _fetchProviderModels(p) {
     }
 
     if (source === "ollama") {
-      const base = (baseUrlRaw || "http://localhost:11434").replace(/\/+$/, "");
+      const base = _normalizeOllamaBaseUrl(baseUrlRaw || "http://localhost:11434");
       const resp = await fetch(`${base}/api/tags`, {
         method: "GET",
         signal: ac.signal,
@@ -667,7 +671,17 @@ function _modelLooksCompatibleWithSettings(model, settings) {
 
 function _effectiveConfiguredProviderModel(settings, override = null) {
   const chosen = String(override || "").trim();
-  if (chosen) return chosen;
+  if (chosen && _modelLooksCompatibleWithSettings(chosen, settings)) {
+    if (
+      (settings?.source || "").toLowerCase() === "ollama" &&
+      chosen.toLowerCase().endsWith(":cloud")
+    ) {
+      // Ignore stale chat-panel override that points at Ollama cloud tags.
+      // Direct provider path targets local Ollama API.
+    } else {
+      return chosen;
+    }
+  }
   const configured = String(settings?.model || "").trim();
   return _modelLooksCompatibleWithSettings(configured, settings) ? configured : "";
 }
@@ -4244,18 +4258,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             : `${aiProviderSettings.source === "openai" ? "GPT" : aiProviderSettings.source === "anthropic" ? "Claude" : "Provider"} selected — add API key to enable direct AI`,
     });
 
-    chrome.runtime.sendMessage({
-      type: "AI_PROVIDER_STATUS",
-      provider: _providerStatusPayload(aiProviderSettings, effectiveModel),
-      statusText:
-        aiProviderSettings.source === "ide"
-          ? isConnected
-            ? "Using IDE Agent over MCP"
-            : "IDE Agent selected — connect MCP to enable full AI"
-          : aiProviderSettings.apiKey
-            ? `${aiProviderSettings.source === "openai" ? "GPT" : aiProviderSettings.source === "anthropic" ? "Claude" : "Provider"} ready${effectiveModel ? ` · ${effectiveModel}` : ""}`
-            : `${aiProviderSettings.source === "openai" ? "GPT" : aiProviderSettings.source === "anthropic" ? "Claude" : "Provider"} selected — add API key to enable direct AI`,
-    });
+    chrome.runtime.sendMessage(
+      {
+        type: "AI_PROVIDER_STATUS",
+        provider: _providerStatusPayload(aiProviderSettings, effectiveModel),
+        statusText:
+          aiProviderSettings.source === "ide"
+            ? isConnected
+              ? "Using IDE Agent over MCP"
+              : "IDE Agent selected — connect MCP to enable full AI"
+            : aiProviderSettings.apiKey
+              ? `${aiProviderSettings.source === "openai" ? "GPT" : aiProviderSettings.source === "anthropic" ? "Claude" : "Provider"} ready${effectiveModel ? ` · ${effectiveModel}` : ""}`
+              : `${aiProviderSettings.source === "openai" ? "GPT" : aiProviderSettings.source === "anthropic" ? "Claude" : "Provider"} selected — add API key to enable direct AI`,
+      },
+      () => {
+        try { void chrome.runtime.lastError; } catch (_) {}
+      },
+    );
 
     return false;
   }
@@ -6910,11 +6929,18 @@ async function injectInteractionTracker(tabId) {
     func: () => {
       window.addEventListener("message", (e) => {
         if (e.data?.__bmcp) {
-          chrome.runtime.sendMessage({
-            type: "USER_ACTION",
-            action: e.data,
-            url: location.href,
-          });
+          try {
+            chrome.runtime.sendMessage(
+              {
+                type: "USER_ACTION",
+                action: e.data,
+                url: location.href,
+              },
+              () => {
+                try { void chrome.runtime.lastError; } catch (_) {}
+              },
+            );
+          } catch (_) {}
         }
       });
     },

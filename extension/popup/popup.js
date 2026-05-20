@@ -153,7 +153,11 @@ async function applyPendingUpdate() {
     // Asks the service worker to call chrome.runtime.reload(), which unloads
     // the SW and applies the pre-downloaded CRX. The popup will then close
     // automatically as the extension reloads.
-    const result = await chrome.runtime.sendMessage({ type: "AUTODOM_APPLY_UPDATE" });
+    const result = await sendRuntimeMessage({ type: "AUTODOM_APPLY_UPDATE" });
+    if (result?.error || result?.success === false) {
+      try { chrome.runtime.reload(); } catch (_) {}
+      return;
+    }
     if (result && result.ok === false) {
       const { pendingUpdate, availableUpdate } = await readUpdateState();
       paintUpdateButton(pendingUpdate, availableUpdate);
@@ -445,18 +449,31 @@ function showPopupToast(message, tone = "info", durationMs = 2200) {
 
 function sendRuntimeMessage(message) {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage(message, (response) => {
-      if (chrome.runtime.lastError) {
-        resolve({ success: false, error: chrome.runtime.lastError.message });
-        return;
-      }
-      resolve(
-        response ?? {
-          success: false,
-          error: "No response from extension background worker.",
-        },
-      );
-    });
+    try {
+      chrome.runtime.sendMessage(message, (response) => {
+        let runtimeError = "";
+        try {
+          runtimeError = chrome.runtime.lastError?.message || "";
+        } catch (err) {
+          runtimeError = err?.message || String(err);
+        }
+        if (runtimeError) {
+          resolve({ success: false, error: runtimeError });
+          return;
+        }
+        resolve(
+          response ?? {
+            success: false,
+            error: "No response from extension background worker.",
+          },
+        );
+      });
+    } catch (err) {
+      resolve({
+        success: false,
+        error: err?.message || String(err) || "Extension background worker unavailable.",
+      });
+    }
   });
 }
 
@@ -1556,6 +1573,10 @@ async function saveProviderSettings(opts) {
     enabled: !!DOM.providerEnabledToggle?.checked,
     preset: DOM.providerPreset?.value || "custom",
   };
+  if (providerSettings.source === "ollama") {
+    providerSettings.baseUrl = _normalizeOllamaBaseUrl(providerSettings.baseUrl);
+    if (DOM.providerBaseUrl) DOM.providerBaseUrl.value = providerSettings.baseUrl;
+  }
 
   // ── Pre-activation gating ─────────────────────────────────
   // If the user wants to enable a direct (network) provider, run a
@@ -1685,6 +1706,10 @@ async function testProviderConnection() {
     model: DOM.providerModel?.value?.trim() || "",
     baseUrl: DOM.providerBaseUrl?.value?.trim() || "",
   };
+  if (settings.source === "ollama") {
+    settings.baseUrl = _normalizeOllamaBaseUrl(settings.baseUrl);
+    if (DOM.providerBaseUrl) DOM.providerBaseUrl.value = settings.baseUrl;
+  }
   if (settings.source === "ide" || settings.source === "cli") {
     updateProviderUI(
       "Test connection only applies to OpenAI / Anthropic / Ollama providers.",
@@ -2198,6 +2223,14 @@ function _isBareOllamaBaseUrl(url) {
   return /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):11434$/.test(
     _normalizedProviderBaseUrl(url),
   );
+}
+
+function _normalizeOllamaBaseUrl(raw) {
+  const base = String(raw || "http://localhost:11434").trim() || "http://localhost:11434";
+  return base
+    .replace(/\/+$/, "")
+    .replace(/\/api\/(?:tags|chat)$/i, "")
+    .replace(/\/v1\/chat\/completions$/i, "");
 }
 
 function _modelLooksCompatibleWithProvider(model, source, baseUrl, cliKind = "") {

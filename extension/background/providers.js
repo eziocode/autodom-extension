@@ -17,6 +17,14 @@
  * this file.
  */
 (function () {
+  function normalizeOllamaBaseUrl(raw) {
+    const base = String(raw || "http://localhost:11434").trim() || "http://localhost:11434";
+    return base
+      .replace(/\/+$/, "")
+      .replace(/\/api\/(?:tags|chat)$/i, "")
+      .replace(/\/v1\/chat\/completions$/i, "");
+  }
+
   const ACCOUNT_CONTEXT_ID_RE =
     /\b(?:IC|CB)(?=[A-Z0-9_.-])(?:[A-Za-z0-9_.-]{1,})\b/g;
 
@@ -546,7 +554,7 @@
     responseStyle, // "concise" | "jetbrains" | "chatbar"
     onDelta, // (chunk) => void — when present, request streams via NDJSON
   }) {
-    const cleanBase = (baseUrl || "http://localhost:11434").replace(/\/+$/, "");
+    const cleanBase = normalizeOllamaBaseUrl(baseUrl || "http://localhost:11434");
     const m = model || "llama3.2";
     const messages =
       messagesOverride ||
