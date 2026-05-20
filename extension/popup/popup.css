@@ -660,6 +660,19 @@ select.config-input {
     background: var(--bg-raised);
 }
 
+.text-btn.cli-install-btn {
+    color: var(--text-secondary);
+    background: color-mix(in oklch, var(--accent) 7%, transparent);
+    border: 1px solid color-mix(in oklch, var(--accent) 22%, var(--border));
+    padding: 2px 8px;
+}
+
+.text-btn.cli-install-btn:hover:not(:disabled) {
+    color: var(--text);
+    background: color-mix(in oklch, var(--accent) 11%, var(--bg-raised));
+    border-color: color-mix(in oklch, var(--accent) 34%, var(--border-strong));
+}
+
 .text-btn:focus-visible,
 .log-clear:focus-visible {
     outline: none;

@@ -3156,12 +3156,17 @@ async function _onWsConn_INSTALL_CLI_PACKAGE_RESPONSE(message) {
       pendingCliInstalls.delete(message.id);
       pending.resolve({
         ok: !!message.ok,
+        launched: message.launched === true,
+        terminalLabel: message.terminalLabel || "",
         error: message.error || null,
         stdout: message.stdout || "",
         stderr: message.stderr || "",
         installCommand: message.installCommand || "",
         binary: message.binary || "",
         kind: message.kind || "",
+        exitCode: message.exitCode ?? null,
+        permissionDenied: message.permissionDenied === true,
+        manualInstall: message.manualInstall === true,
       });
     }
     return;

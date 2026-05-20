@@ -1643,6 +1643,27 @@ function _resetPresetIfManualEdit() {
 // user can verify the chosen CLI is installed and reachable on PATH
 // before sending real chat messages. Requires the MCP bridge to be
 // connected (CLI execution itself happens server-side).
+function hasNpmPermissionError(response) {
+  if (response?.permissionDenied) return true;
+  const output = `${response?.error || ""}\n${response?.stderr || ""}\n${response?.stdout || ""}`;
+  return (
+    /\bEACCES\b/i.test(output) ||
+    /permission denied/i.test(output) ||
+    /\/(?:usr|opt)\/.*node_modules/i.test(output)
+  );
+}
+
+function formatCliInstallFailure(response) {
+  if (hasNpmPermissionError(response)) {
+    return 'Permission denied by npm global install. Click "Copy command" and run it in your terminal, or fix your npm prefix.';
+  }
+  if (response?.manualInstall) {
+    return 'Could not open a terminal for the install. Click "Copy command" and run it yourself.';
+  }
+  const err = response?.error || "CLI install failed";
+  return `${err.substring(0, 120)} — try "Copy command" and run it yourself.`;
+}
+
 async function installDefaultCliPackage() {
   const kind = DOM.providerCliKind?.value || "claude";
   const info = getCliKindInfo(kind);
@@ -1716,12 +1737,17 @@ async function installDefaultCliPackage() {
         await checkCliBinary();
       }
     } else {
-      const err = response?.error || "CLI install failed";
-      DOM.providerStatus.textContent = `✕ ${err.substring(0, 120)} — try "Copy command" and run it yourself.`;
-      addLog(`CLI install failed: ${err}`, "error");
+      const message = formatCliInstallFailure(response);
+      DOM.providerStatus.textContent = `✕ ${message}`;
+      addLog(
+        `CLI install failed: ${response?.error || message}${
+          response?.stderr ? ` · ${response.stderr}` : ""
+        }`,
+        "error",
+      );
     }
   } catch (err) {
-    DOM.providerStatus.textContent = `✕ ${err.message || err}`;
+    DOM.providerStatus.textContent = `✕ ${err.message || err} — try "Copy command" and run it yourself.`;
     addLog(`CLI install error: ${err.message || err}`, "error");
   } finally {
     if (DOM.cliPromptInstallBtn) DOM.cliPromptInstallBtn.disabled = false;

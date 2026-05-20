@@ -85,9 +85,11 @@ function launchInstallInTerminal(installCommand) {
   try {
     if (platform === "darwin") {
       // Wrap in `bash -lc` so PATH/nvm/asdf shims load the way an
-      // interactive Terminal would.
+      // interactive Terminal would. Do not activate Terminal first: when
+      // Terminal is not already running, activate opens a blank window and
+      // do script opens a second one.
       const inner = `${installCommand}; echo; echo '[AutoDOM] install finished — press any key to close.'; read -n 1 -s`;
-      const script = `tell application "Terminal" to activate\ntell application "Terminal" to do script ${_appleScriptQuote(inner)}`;
+      const script = `tell application "Terminal"\n  do script ${_appleScriptQuote(inner)}\n  activate\nend tell`;
       const proc = spawn("osascript", ["-e", script], {
         stdio: "ignore",
         detached: true,
@@ -164,6 +166,15 @@ function tailInstallOutput(text, limit = 1200) {
   return normalized.length > limit
     ? normalized.slice(normalized.length - limit)
     : normalized;
+}
+
+function isNpmGlobalPermissionError(text) {
+  const output = String(text || "");
+  return (
+    /\bEACCES\b/i.test(output) ||
+    /permission denied/i.test(output) ||
+    /(?:mkdir|access|open).*\/(?:usr|opt)\/.*node_modules/i.test(output)
+  );
 }
 
 // ─── Wire-Protocol Logger ────────────────────────────────────
@@ -1933,13 +1944,20 @@ function _handleInstallCliPackage(socket, message) {
     if (code === 0) {
       send({ ok: true, stdout, stderr });
     } else {
+      const combinedOutput = `${stderr}\n${stdout}`;
+      const permissionDenied = isNpmGlobalPermissionError(combinedOutput);
       send({
         ok: false,
         stdout,
         stderr,
-        error: `${installInfo.installCommand} exited ${code}.${
-          stderr ? " " + stderr.substring(0, 240) : ""
-        }`,
+        exitCode: code,
+        permissionDenied,
+        manualInstall: permissionDenied,
+        error: permissionDenied
+          ? "npm global install needs write permission for your npm prefix. Copy the command and run it in your own terminal, or configure npm to use a user-writable prefix."
+          : `${installInfo.installCommand} exited ${code}.${
+              stderr ? " " + stderr.substring(0, 240) : ""
+            }`,
       });
     }
   });
