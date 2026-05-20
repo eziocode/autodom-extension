@@ -252,6 +252,8 @@ node server/index.js --stop      # graceful shutdown
 | IDE says **Transport closed** | Kill orphan processes on port `9876`, restart IDE |
 | Popup shows **Disconnected** | Click *Connect*; reload extension; verify port matches server |
 | **No tools** in IDE | Ensure MCP path is absolute; restart IDE; check `node -v` ≥ 18 |
+| AI chat shows `Ollama 403` | Ollama is blocking browser-extension origin. Run `OLLAMA_ORIGINS="chrome-extension://*,http://localhost,http://127.0.0.1" ollama serve`, then retry. |
+| AI chat shows `model 'llama3.2' not found` | Open provider settings and select an installed model (for example `gemma4:latest`), save, then retry. |
 | Tools fail on `chrome://` pages | Extensions can't inject into `chrome://` or Web Store pages |
 | Update status or bridge-port hint looks stale | Popup → **Updates** → **Clear extension cache**, then click again to confirm |
 | Port `9876` in use | `lsof -ti:9876 \| xargs kill -9` or use `--port 9877` |

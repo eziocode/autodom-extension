@@ -11,6 +11,20 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## [4.0.3] — 2026-05-20
+
+### Fixed
+- Fixed Ollama model routing on MCP bridge path so selected popup model is forwarded as `ollamaModel` (prevents fallback to missing `llama3.2`).
+- Fixed stale chat model override handling so incompatible/old overrides no longer bypass active provider model.
+- Fixed Ollama base URL normalization across popup, service worker, and provider client (`/api/tags`/`/api/chat` suffixes are stripped safely).
+
+### Improved
+- Added clearer Ollama 4xx diagnostics in chat errors, including request context for faster debugging.
+- Added explicit 403 guidance for browser-origin blocks and `OLLAMA_ORIGINS` setup.
+- Preferred local Ollama models in model list and guarded against `:cloud` tags in direct local path.
+
+---
+
 ## [3.0.8] — 2026-05-06
 
 ### Improved
