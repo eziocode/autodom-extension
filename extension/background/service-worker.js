@@ -3350,6 +3350,61 @@ function connectWebSocket(port) {
               toolName === "get_pinned_tab"
             ) {
               result = _handleGetPinnedTabTool(clientId);
+            } else if (toolName === "__diagnostics") {
+              // Service-worker / extension half of autodom_diagnostics.
+              // Reports every per-client pin (so the agent can see whether
+              // a sibling IDE has the page pinned), basic tab metrics,
+              // and active-agent-run state.
+              const pins = [];
+              for (const [cid, pin] of _clientPins) {
+                pins.push({
+                  clientId: cid,
+                  tabId: pin.tabId,
+                  windowId: pin.windowId,
+                  url: pin.lastUrl,
+                  title: pin.lastTitle,
+                  pinnedAt: pin.pinnedAt,
+                  gone: pin.tabId == null,
+                });
+              }
+              let tabCount = 0;
+              let activeTab = null;
+              try {
+                const all = await chrome.tabs.query({});
+                tabCount = all.length;
+                const [t] = await chrome.tabs.query({
+                  active: true,
+                  currentWindow: true,
+                });
+                if (t) {
+                  activeTab = {
+                    id: t.id,
+                    windowId: t.windowId,
+                    url: t.url,
+                    title: t.title,
+                  };
+                }
+              } catch (_) {}
+              result = {
+                pins,
+                tabCount,
+                activeTab,
+                callingClientId: clientId,
+                activeAgentRun: _activeAgentRun
+                  ? {
+                      runId: _activeAgentRun.runId,
+                      panelTabId: _activeAgentRun.panelTabId,
+                      toolRunning: !!_activeAgentRun.toolRunning,
+                    }
+                  : null,
+                agentRunContext: _agentRunContext,
+                bridgeToolChainPending:
+                  // Heuristic: if the chain is currently a non-resolved
+                  // promise (the queue has work), best-effort reflect that.
+                  // We can't introspect Promise state directly; this is
+                  // intentionally approximate.
+                  undefined,
+              };
             } else {
               // Resolve pinned tab for this client (if any).
               let pinCtx = null;

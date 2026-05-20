@@ -524,6 +524,7 @@ let _toolLogIndex = 0;
 const _TOOL_LOG_MAX = 50;
 let lastActivityTime = Date.now(); // Tracks last tool call or keepalive
 let inactivityTimer = null; // Reference to the inactivity check interval
+const _serverStartTime = Date.now(); // For diagnostics uptime reporting
 
 // ─── Reconnect-Grace Waiters ─────────────────────────────────
 // Resolved when the matching socket becomes ready (or the grace window
@@ -618,6 +619,7 @@ const TOOL_TIERS = new Map([
   ["pin_tab", "read"],
   ["unpin_tab", "read"],
   ["get_pinned_tab", "read"],
+  ["autodom_diagnostics", "read"],
   ["get_recording", "read"],
   ["get_session_summary", "read"],
   ["wait_for_text", "read"],
@@ -6324,6 +6326,58 @@ server.addTool({
   execute: async () => {
     const result = await callExtensionTool("__get_pinned_tab", {});
     return stringifyToolResult(result);
+  },
+});
+
+// 16d. Diagnostics — a single-call health snapshot covering both this
+// bridge process and the connected Chrome extension. Designed to be the
+// first tool an agent calls when AutoDOM is misbehaving (e.g. IntelliJ
+// reports the MCP entry as inactive, tools time out unexpectedly,
+// PINNED_TAB_GONE appears after multi-agent collisions). Returns enough
+// detail to decide between: "retry", "call pin_tab", "ask user to
+// reconnect the extension", or "restart the bridge".
+server.addTool({
+  name: "autodom_diagnostics",
+  description:
+    "Return a health snapshot for the AutoDOM bridge: pid, uptime, primary/proxy role, WS connection state, in-flight tool calls, recent tool errors, all per-client pinned tabs, and extension service-worker info. Call this first whenever AutoDOM behaves unexpectedly.",
+  parameters: z.object({}),
+  execute: async () => {
+    const snapshot = {
+      bridge: {
+        pid: process.pid,
+        clientId: MY_CLIENT_ID,
+        uptimeMs: Date.now() - _serverStartTime,
+        role: isPrimaryServer ? "primary" : "proxy",
+        wsPort: WS_PORT,
+        extensionConnected: _isExtensionReady(),
+        proxyConnected: !isPrimaryServer && _isProxyReady(),
+        pendingCalls: pendingCalls.size,
+        reconnectGraceMs: RECONNECT_GRACE_MS,
+        toolTimeoutMs: TOOL_TIMEOUT,
+        nodeVersion: process.version,
+        lockFile: lockFilePath,
+        lastActivityAgoMs: Date.now() - lastActivityTime,
+      },
+      recentToolErrors: _toolErrorBuf.slice(-10),
+      recentToolCalls: toolCallLog.slice(-10),
+      extension: null,
+    };
+    // Reach into the extension for its pin map + service-worker state.
+    // This is best-effort — if the extension is gone, the bridge half
+    // of the snapshot is still useful for debugging.
+    if (_isExtensionReady() || (!isPrimaryServer && _isProxyReady())) {
+      try {
+        const extResult = await callExtensionTool("__diagnostics", {});
+        if (extResult && !extResult.error) {
+          snapshot.extension = extResult;
+        } else if (extResult?.error) {
+          snapshot.extension = { error: extResult.error };
+        }
+      } catch (err) {
+        snapshot.extension = { error: err?.message || String(err) };
+      }
+    }
+    return stringifyToolResult(snapshot);
   },
 });
 
