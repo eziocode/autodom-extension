@@ -58,6 +58,7 @@ const DOM = {
   rateLimitWindow: $("#rateLimitWindow"),
   rateLimitSettings: $("#rateLimitSettings"),
   confirmSubmitToggle: $("#confirmSubmitToggle"),
+  popupToast: $("#popupToast"),
 };
 
 let isRunning = false;
@@ -421,6 +422,26 @@ function getEffectiveProviderSource() {
 
 let activityLogs = [];
 let activityFilter = "all";
+let popupToastTimer = null;
+
+function showPopupToast(message, tone = "info", durationMs = 2200) {
+  const toast = DOM.popupToast;
+  if (!toast) return;
+  toast.textContent = message;
+  toast.classList.remove(
+    "toast-info",
+    "toast-success",
+    "toast-error",
+    "toast-warn",
+  );
+  toast.classList.add(`toast-${tone}`, "is-visible");
+  toast.setAttribute("aria-hidden", "false");
+  if (popupToastTimer) clearTimeout(popupToastTimer);
+  popupToastTimer = setTimeout(() => {
+    toast.classList.remove("is-visible");
+    toast.setAttribute("aria-hidden", "true");
+  }, durationMs);
+}
 
 function sendRuntimeMessage(message) {
   return new Promise((resolve) => {
@@ -743,17 +764,58 @@ const _secretAreaName =
   }
 
   if (DOM.clearExtensionCacheBtn) {
+    let clearCacheConfirmTimer = null;
+    let clearCacheConfirming = false;
+    const clearCacheDefaultText =
+      DOM.clearExtensionCacheBtn.textContent.trim() || "Clear extension cache";
+    const resetClearCacheConfirm = () => {
+      clearCacheConfirming = false;
+      if (clearCacheConfirmTimer) {
+        clearTimeout(clearCacheConfirmTimer);
+        clearCacheConfirmTimer = null;
+      }
+      DOM.clearExtensionCacheBtn.classList.remove("confirming");
+      DOM.clearExtensionCacheBtn.textContent = clearCacheDefaultText;
+    };
+
     DOM.clearExtensionCacheBtn.addEventListener("click", async () => {
-      const response = await sendRuntimeMessage({
-        type: "AUTODOM_CLEAR_EXTENSION_CACHE",
-      });
+      if (!clearCacheConfirming) {
+        clearCacheConfirming = true;
+        DOM.clearExtensionCacheBtn.classList.add("confirming");
+        DOM.clearExtensionCacheBtn.textContent = "Click again to clear";
+        showPopupToast("Click again to clear extension cache.", "warn");
+        clearCacheConfirmTimer = setTimeout(resetClearCacheConfirm, 3500);
+        return;
+      }
+
+      resetClearCacheConfirm();
+      DOM.clearExtensionCacheBtn.disabled = true;
+      DOM.clearExtensionCacheBtn.textContent = "Clearing...";
+      let response;
+      try {
+        response = await sendRuntimeMessage({
+          type: "AUTODOM_CLEAR_EXTENSION_CACHE",
+        });
+      } catch (err) {
+        showPopupToast("Could not clear extension cache.", "error", 3200);
+        addLog(
+          `Failed to clear extension cache: ${err?.message || err || "background worker unavailable"}`,
+          "error",
+        );
+        return;
+      } finally {
+        DOM.clearExtensionCacheBtn.disabled = false;
+        DOM.clearExtensionCacheBtn.textContent = clearCacheDefaultText;
+      }
       if (response?.error || response?.ok === false || response?.success === false) {
+        showPopupToast("Could not clear extension cache.", "error", 3200);
         addLog(
           `Failed to clear extension cache: ${response?.error || "background worker unavailable"}`,
           "error",
         );
         return;
       }
+      showPopupToast("Extension cache cleared.", "success");
       addLog("Extension cache cleared.", "success");
     });
   }

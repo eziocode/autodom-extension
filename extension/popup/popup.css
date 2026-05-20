@@ -673,6 +673,17 @@ select.config-input {
     border-color: color-mix(in oklch, var(--accent) 34%, var(--border-strong));
 }
 
+.text-btn.confirming {
+    color: var(--warn);
+    background: color-mix(in oklch, var(--warn) 14%, transparent);
+}
+
+.text-btn:disabled,
+.log-clear:disabled {
+    opacity: 0.55;
+    cursor: progress;
+}
+
 .text-btn:focus-visible,
 .log-clear:focus-visible {
     outline: none;
@@ -815,6 +826,50 @@ select.config-input {
 .log-entry.log-error {
     border-left: 3px solid var(--danger);
     background: var(--danger-bg);
+}
+
+/* ─── Popup Toast ───────────────────────── */
+.popup-toast {
+    position: fixed;
+    left: 14px;
+    right: 14px;
+    bottom: 14px;
+    z-index: 100;
+    padding: 9px 11px;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--border-strong);
+    border-radius: var(--radius);
+    background: var(--bg-raised);
+    color: var(--text);
+    box-shadow: 0 8px 24px oklch(0% 0 0 / 14%);
+    font-size: 12px;
+    line-height: 1.35;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(8px);
+    transition:
+        opacity 0.16s ease,
+        transform 0.16s ease;
+}
+
+.popup-toast.is-visible {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+.popup-toast.toast-success {
+    border-left-color: var(--success);
+    background: var(--success-bg);
+}
+
+.popup-toast.toast-error {
+    border-left-color: var(--danger);
+    background: var(--danger-bg);
+}
+
+.popup-toast.toast-warn {
+    border-left-color: var(--warn);
+    background: color-mix(in oklch, var(--bg-raised) 76%, var(--warn) 24%);
 }
 
 /* ── Security tab ─────────────────────────────────────────── */

@@ -4,6 +4,13 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## Unreleased
+
+### Improved
+- Added a click-again confirmation and accessible popup toast feedback for **Clear extension cache**, including visible success and error states instead of only an activity log entry.
+
+---
+
 ## [3.0.8] — 2026-05-06
 
 ### Improved

@@ -253,6 +253,7 @@ node server/index.js --stop      # graceful shutdown
 | Popup shows **Disconnected** | Click *Connect*; reload extension; verify port matches server |
 | **No tools** in IDE | Ensure MCP path is absolute; restart IDE; check `node -v` ≥ 18 |
 | Tools fail on `chrome://` pages | Extensions can't inject into `chrome://` or Web Store pages |
+| Update status or bridge-port hint looks stale | Popup → **Updates** → **Clear extension cache**, then click again to confirm |
 | Port `9876` in use | `lsof -ti:9876 \| xargs kill -9` or use `--port 9877` |
 
 > Full troubleshooting guide → [INSTALL.md](INSTALL.md#troubleshooting)
@@ -266,7 +267,7 @@ node server/index.js --stop      # graceful shutdown
 | **[INSTALL.md](INSTALL.md)** | Manual install, per-IDE setup, ports, uninstall |
 | **[CHANGELOG.md](CHANGELOG.md)** | Version history and release notes |
 | **[AUTOMATION.md](AUTOMATION.md)** | Local browser automation without AI |
-| **[UPDATES.md](UPDATES.md)** | Release channel and enterprise rollout |
+| **[UPDATES.md](UPDATES.md)** | Release channel, popup update controls, and enterprise rollout |
 | **[SECURITY.md](SECURITY.md)** | Auth tokens, secret storage, permissions |
 
 ---

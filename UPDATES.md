@@ -116,6 +116,21 @@ results:
 
 ---
 
+## Popup update controls
+
+The popup's **Updates** panel also includes:
+
+- **Auto-apply updates** — lets downloaded updates apply automatically when the
+  browser reports one is ready.
+- **Periodic update checks** — keeps the extension's five-hour background update
+  checks enabled; turn it off if you only want manual checks.
+- **Clear extension cache** — clears cached provider model lists, repeated page
+  context fingerprints, stale update availability, and stale bridge-port hints.
+  The button asks for a second click and shows a toast for confirmation, success,
+  or failure.
+
+---
+
 ## How updates flow end-to-end
 
 ```

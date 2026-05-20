@@ -480,6 +480,13 @@ function _setCachedProviderModels(p, models) {
   });
 }
 
+function _isOllamaCloudTag(tag) {
+  if (!tag || typeof tag !== "object") return false;
+  const name = String(tag.name || "").toLowerCase();
+  const remoteHost = String(tag.remote_host || "").toLowerCase();
+  return name.endsWith(":cloud") || remoteHost.includes("ollama.com");
+}
+
 async function _fetchProviderModels(p) {
   const TIMEOUT_MS = 6000;
   const source = (p?.source || "ide").toLowerCase();
@@ -518,7 +525,9 @@ async function _fetchProviderModels(p) {
       if (!resp.ok) return [];
       const data = await resp.json().catch(() => ({}));
       const tags = Array.isArray(data?.models) ? data.models : [];
-      return tags
+      const localTags = tags.filter((t) => !_isOllamaCloudTag(t));
+      const pick = localTags.length ? localTags : tags;
+      return pick
         .filter((t) => typeof t?.name === "string")
         .map((t) => ({ id: t.name, label: t.name, description: "Local · Ollama" }));
     }
@@ -4586,6 +4595,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               ? `Configured model "${configured}" is not compatible with provider "${normalizedProvider}". Please pick a matching model in the popup.`
               : `No model configured for provider "${normalizedProvider}". Please pick a model in the popup.`;
             throw new Error(reason);
+          }
+          if (
+            normalizedProvider === "ollama" &&
+            String(effectiveModel).toLowerCase().endsWith(":cloud")
+          ) {
+            throw new Error(
+              `Ollama cloud model "${effectiveModel}" is not supported for this direct local chat path. Pick a local model (for example, gemma4:latest).`,
+            );
           }
           const result = await runAgentLoop({
             providerType: normalizedProvider,
