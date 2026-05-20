@@ -4548,12 +4548,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       (providerType === "anthropic" || providerType === "claude") &&
       !!(aiProviderSettings.apiKey || "").trim();
     const isOllama = providerType === "ollama";
+    const hasBridge = !!(ws && ws.readyState === 1);
     // Only take the direct path when the user has explicitly enabled
     // the network provider via the popup toggle (and it passed the
     // pre-activation connection test). Without `enabled`, the chat
     // panel falls through to the IDE/MCP path.
     const isDirectProvider =
-      providerType === "ollama" ||
+      (providerType === "ollama" &&
+        aiProviderSettings.enabled === true &&
+        !hasBridge) ||
       ((providerType === "openai" || providerType === "gpt") &&
         hasDirectKey) ||
       ((providerType === "anthropic" || providerType === "claude") &&
@@ -4564,6 +4567,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       providerType,
       "| isDirectProvider =",
       isDirectProvider,
+      "| hasBridge =",
+      hasBridge,
       "| aiProviderSettings =",
       JSON.stringify({
         source: aiProviderSettings.source,
