@@ -18,7 +18,7 @@ import { FastMCP, imageContent } from "fastmcp";
 import { WebSocketServer, WebSocket } from "ws";
 import { z } from "zod";
 import { fileURLToPath } from "url";
-import { execFile, spawn } from "child_process";
+import { execFile, spawn, spawnSync } from "child_process";
 import { promises as fs, readFileSync, rmSync, createWriteStream } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -57,6 +57,106 @@ function getDefaultCliInstall(kind) {
         installCommand: `npm install -g ${info.npmPackage}`,
       }
     : null;
+}
+
+// ─── Visible-terminal launcher for CLI installs ─────────────
+// Spawns a real OS terminal window running the install command so the
+// user can see progress and respond to any auth / sudo prompts. The
+// install ran inside the bridge process before, which made it look
+// "stuck" to the user (no output surfaced in the popup) and broke
+// CLIs that prompt interactively. Returns { launched, label } on
+// success, or null on platforms where no suitable terminal launcher
+// could be spawned (caller should fall back to a headless install).
+function _shellQuoteSingle(s) {
+  // POSIX-safe single-quoting: close, escape any embedded ', reopen.
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+function _appleScriptQuote(s) {
+  // Inside AppleScript double-quoted strings, only " and \ need escaping.
+  return `"${String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function launchInstallInTerminal(installCommand) {
+  // Build a shell snippet that runs the install and pauses so the user
+  // can read the result before the window closes. Keep it tiny —
+  // any heavy logic must live in the install command itself.
+  const platform = process.platform;
+  try {
+    if (platform === "darwin") {
+      // Wrap in `bash -lc` so PATH/nvm/asdf shims load the way an
+      // interactive Terminal would.
+      const inner = `${installCommand}; echo; echo '[AutoDOM] install finished — press any key to close.'; read -n 1 -s`;
+      const script = `tell application "Terminal" to activate\ntell application "Terminal" to do script ${_appleScriptQuote(inner)}`;
+      const proc = spawn("osascript", ["-e", script], {
+        stdio: "ignore",
+        detached: true,
+        env: process.env,
+      });
+      proc.unref();
+      return { launched: true, label: "Terminal.app" };
+    }
+
+    if (platform === "win32") {
+      // `start "<title>" cmd /k "<cmd>"` opens a new cmd window that
+      // stays open after the install finishes. Quotes inside the inner
+      // command must be escaped for cmd; npm package names contain none
+      // of the dangerous chars, so a straight pass-through is safe.
+      const title = "AutoDOM CLI install";
+      const inner = `${installCommand} && echo. && echo [AutoDOM] install finished. && pause`;
+      const proc = spawn(
+        "cmd.exe",
+        ["/c", "start", `"${title}"`, "cmd", "/k", inner],
+        {
+          stdio: "ignore",
+          detached: true,
+          windowsHide: false,
+          env: process.env,
+        },
+      );
+      proc.unref();
+      return { launched: true, label: "Command Prompt" };
+    }
+
+    // Linux / other unix — try common terminal emulators in order.
+    const inner = `${installCommand}; echo; echo '[AutoDOM] install finished — press Enter to close.'; read _`;
+    const bashInvocation = ["bash", "-lc", inner];
+    const candidates = [
+      // [binary, argsBeforeCommand] — argument list is binary-specific.
+      ["x-terminal-emulator", ["-e", ...bashInvocation]],
+      ["gnome-terminal", ["--", ...bashInvocation]],
+      ["konsole", ["-e", ...bashInvocation]],
+      ["xfce4-terminal", ["-e", `bash -lc ${_shellQuoteSingle(inner)}`]],
+      ["xterm", ["-e", ...bashInvocation]],
+      ["alacritty", ["-e", ...bashInvocation]],
+      ["kitty", ["bash", "-lc", inner]],
+    ];
+    // Spawning a missing binary doesn't fail synchronously — it emits
+    // an 'error' event later. Probe each candidate with `which` first
+    // so we only commit to one that actually exists. Skip the whole
+    // path when there's no graphical session at all.
+    if (!process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+      return null;
+    }
+    for (const [bin, args] of candidates) {
+      const probe = spawnSync("which", [bin], { stdio: "ignore" });
+      if (probe.status !== 0) continue;
+      try {
+        const proc = spawn(bin, args, {
+          stdio: "ignore",
+          detached: true,
+          env: process.env,
+        });
+        proc.unref();
+        return { launched: true, label: bin };
+      } catch (_) {
+        // try the next candidate
+      }
+    }
+  } catch (_) {
+    // Fall through to null — caller will use headless install.
+  }
+  return null;
 }
 
 function tailInstallOutput(text, limit = 1200) {
@@ -326,6 +426,7 @@ const BLOCKED_DOMAINS = (
 //      user can read it. Clients send it via `?token=` query string.
 const AUTH_TOKEN =
   process.env.AUTODOM_TOKEN || randomBytes(32).toString("hex");
+const MY_CLIENT_ID = "mcp_" + randomBytes(8).toString("hex");
 const ALLOWED_ORIGIN_PREFIXES = ["chrome-extension://", "moz-extension://"];
 
 function isAllowedOrigin(origin) {
@@ -1659,6 +1760,25 @@ function _processWsMessage(socket, message) {
       return;
     }
 
+    // Prefer launching a visible terminal so the user can see install
+    // progress and respond to interactive prompts (npm sudo, GitHub
+    // device-login, etc.). The bridge process has no TTY of its own,
+    // so a silent in-process spawn looked broken to users. Fall back
+    // to the headless spawn only when no terminal could be opened
+    // (e.g. headless Linux without DISPLAY, CI containers).
+    const terminal = launchInstallInTerminal(installInfo.installCommand);
+    if (terminal && terminal.launched) {
+      process.stderr.write(
+        `[AutoDOM] CLI install launched in ${terminal.label}: ${installInfo.installCommand}\n`,
+      );
+      send({
+        ok: true,
+        launched: true,
+        terminalLabel: terminal.label,
+      });
+      return;
+    }
+
     const npmBinary = process.platform === "win32" ? "npm.cmd" : "npm";
     const args = ["install", "-g", installInfo.npmPackage];
     process.stderr.write(
@@ -2298,6 +2418,7 @@ function _processWsMessage(socket, message) {
 
       sendToExtensionImmediate({
         type: "TOOL_CALL",
+        clientId: message.clientId || "proxy_unknown",
         id: internalId,
         tool: message.tool,
         params: message.params,
@@ -2453,6 +2574,7 @@ function callExtensionTool(tool, params) {
           proxyClient.send(
             JSON.stringify({
               type: "INTERNAL_PROXY_CALL",
+              clientId: MY_CLIENT_ID,
               id,
               tool,
               params,
@@ -2565,6 +2687,7 @@ function callExtensionTool(tool, params) {
       // micro-batch window (e.g. inside batch_actions processing).
       sendToExtensionImmediate({
         type: "TOOL_CALL",
+        clientId: MY_CLIENT_ID,
         id,
         tool,
         params,

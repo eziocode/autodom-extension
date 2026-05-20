@@ -165,8 +165,20 @@
                             <span class="provider-badge" id="providerBadge"></span>
                         </div>
                         <div class="provider-form">
-                            <div class="field-group">
-                                <label class="field-label" for="providerPreset">Preset</label>
+                            <div class="field-group" id="providerModeGroup">
+                                <label class="field-label" for="providerMode">Mode</label>
+                                <select id="providerMode" class="config-input">
+                                    <option value="api">AI Agent — API key</option>
+                                    <option value="cli">Local CLI</option>
+                                    <option value="ide">IDE Agent (MCP, default)</option>
+                                </select>
+                                <span class="field-hint" id="providerModeHint">
+                                    Pick how AutoDOM talks to the model. API mode uses a hosted provider; CLI mode runs a local CLI on your machine.
+                                </span>
+                            </div>
+
+                            <div class="field-group" id="providerPresetGroup">
+                                <label class="field-label" for="providerPreset">Provider</label>
                                 <select id="providerPreset" class="config-input">
                                     <option value="custom">Custom / Advanced</option>
                                     <optgroup label="Official">
@@ -184,7 +196,7 @@
                                 </select>
                             </div>
 
-                            <div class="field-group" id="providerSelectGroup">
+                            <div class="field-group" id="providerSelectGroup" style="display: none">
                                 <label class="field-label" for="providerSelect">Protocol</label>
                                 <select id="providerSelect" class="config-input">
                                     <option value="ide">IDE Agent (MCP)</option>
@@ -193,6 +205,9 @@
                                     <option value="ollama">Ollama (Local API)</option>
                                     <option value="cli">Local CLI (Claude / Codex)</option>
                                 </select>
+                                <span class="field-hint">
+                                    Only required for "Custom / Advanced" providers.
+                                </span>
                             </div>
 
                             <div class="field-group" id="providerCliKindGroup" style="display: none">
@@ -230,7 +245,8 @@
                                 <pre class="config-code" id="cliPromptInstall"></pre>
                                 <div class="inline-row">
                                     <button id="cliPromptUseDefault" class="text-btn">Use default</button>
-                                    <button id="cliPromptInstallBtn" class="text-btn">Install with npm</button>
+                                    <button id="cliPromptInstallBtn" class="text-btn" title="Open a terminal on the bridge host and run the install command">Open install in terminal</button>
+                                    <button id="cliPromptCopyBtn" class="text-btn" title="Copy the install command so you can run it yourself">Copy command</button>
                                     <button id="cliPromptDocsBtn" class="text-btn">Open docs</button>
                                 </div>
                             </div>

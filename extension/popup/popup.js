@@ -36,6 +36,10 @@ const DOM = {
   providerCliExtraArgs: $("#providerCliExtraArgs"),
   providerEnabledToggle: $("#providerEnabledToggle"),
   providerPreset: $("#providerPreset"),
+  providerMode: $("#providerMode"),
+  providerModeHint: $("#providerModeHint"),
+  providerPresetGroup: $("#providerPresetGroup"),
+  providerSelectGroup: $("#providerSelectGroup"),
   saveProviderBtn: $("#saveProviderBtn"),
   testProviderBtn: $("#testProviderBtn"),
   checkCliBtn: $("#checkCliBtn"),
@@ -45,6 +49,7 @@ const DOM = {
   cliPromptInstall: $("#cliPromptInstall"),
   cliPromptUseDefault: $("#cliPromptUseDefault"),
   cliPromptInstallBtn: $("#cliPromptInstallBtn"),
+  cliPromptCopyBtn: $("#cliPromptCopyBtn"),
   cliPromptDocsBtn: $("#cliPromptDocsBtn"),
   rateLimitToggle: $("#rateLimitToggle"),
   rateLimitMax: $("#rateLimitMax"),
@@ -336,6 +341,37 @@ function getCliKindInfo(kind) {
   return CLI_KIND_INFO[kind] || CLI_KIND_INFO.claude;
 }
 
+// ─── Mode <-> source mapping ──────────────────────────────────
+// The legacy storage key `aiProviderSource` is the canonical runtime
+// config (read by the service worker, chat panel, server, etc.). The
+// new `Mode` selector is purely a UI grouping that decides which
+// fields the user sees; we always keep `providerSelect` (and therefore
+// the persisted `aiProviderSource`) in sync.
+const PROVIDER_MODES = ["api", "cli", "ide"];
+
+function deriveModeFromSource(source) {
+  if (source === "ide") return "ide";
+  if (source === "cli") return "cli";
+  return "api"; // openai / anthropic / ollama / openai-compatible
+}
+
+function resolveSourceForMode(mode, presetKey) {
+  if (mode === "ide") return "ide";
+  if (mode === "cli") return "cli";
+  // api mode — derive from preset, fall back to existing select / openai
+  const preset = PROVIDER_PRESETS[presetKey];
+  if (preset && preset.source) return preset.source;
+  const existing = DOM.providerSelect?.value;
+  if (existing && existing !== "ide" && existing !== "cli") return existing;
+  return "openai";
+}
+
+// Single source of truth: read the effective protocol source from the
+// hidden providerSelect, which Mode + Preset always keep in sync.
+function getEffectiveProviderSource() {
+  return DOM.providerSelect?.value || providerSettings.source || "ide";
+}
+
 let activityLogs = [];
 let activityFilter = "all";
 
@@ -415,6 +451,7 @@ const _secretAreaName =
     "aiProviderCliExtraArgs",
     "aiProviderEnabled",
     "aiProviderPreset",
+    "aiProviderMode",
   ], "startup settings");
   const secretStored = await new Promise((resolve) => {
     try {
@@ -446,6 +483,7 @@ const _secretAreaName =
     cliExtraArgs: stored.aiProviderCliExtraArgs || "",
     enabled: stored.aiProviderEnabled === true,
     preset: stored.aiProviderPreset || "custom",
+    mode: stored.aiProviderMode || deriveModeFromSource(stored.aiProviderSource || "ide"),
   };
 
   // One-shot migration: CLI/IDE providers should not persist a model in
@@ -477,6 +515,8 @@ const _secretAreaName =
     DOM.providerEnabledToggle.checked = !!providerSettings.enabled;
   if (DOM.providerPreset)
     DOM.providerPreset.value = providerSettings.preset || "custom";
+  if (DOM.providerMode)
+    DOM.providerMode.value = providerSettings.mode || "ide";
   updateProviderUI();
 
   const storedActivity = await activityStorage.get([ACTIVITY_LOG_KEY]);
@@ -661,6 +701,7 @@ const _secretAreaName =
       changes.aiProviderBaseUrl
     ) {
       providerSettings = {
+        ...providerSettings,
         source: changes.aiProviderSource
           ? changes.aiProviderSource.newValue
           : providerSettings.source,
@@ -674,9 +715,13 @@ const _secretAreaName =
           ? changes.aiProviderBaseUrl.newValue
           : providerSettings.baseUrl,
       };
+      // Keep the UI-only mode in sync with whichever source ends up active.
+      providerSettings.mode = deriveModeFromSource(providerSettings.source);
 
       if (DOM.providerSelect)
         DOM.providerSelect.value = providerSettings.source;
+      if (DOM.providerMode)
+        DOM.providerMode.value = providerSettings.mode;
       if (DOM.providerApiKey)
         DOM.providerApiKey.value = providerSettings.apiKey || "";
       if (DOM.providerModel)
@@ -686,6 +731,52 @@ const _secretAreaName =
       updateProviderUI();
     }
   });
+
+  if (DOM.providerMode) {
+    DOM.providerMode.addEventListener("change", () => {
+      if (_suppressFieldEvents) return;
+      const mode = DOM.providerMode.value || "ide";
+      providerSettings.mode = mode;
+      // Switching modes resets to a sensible source for that mode and
+      // (for API mode) re-applies the current preset so the protocol
+      // dropdown stays consistent.
+      if (mode === "ide") {
+        providerSettings.source = "ide";
+        if (DOM.providerSelect) DOM.providerSelect.value = "ide";
+        // The Enable Direct Provider checkbox must not stay ticked when
+        // we're no longer using a direct provider.
+        if (DOM.providerEnabledToggle?.checked) {
+          DOM.providerEnabledToggle.checked = false;
+          providerSettings.enabled = false;
+        }
+      } else if (mode === "cli") {
+        providerSettings.source = "cli";
+        if (DOM.providerSelect) DOM.providerSelect.value = "cli";
+        if (DOM.providerEnabledToggle?.checked) {
+          DOM.providerEnabledToggle.checked = false;
+          providerSettings.enabled = false;
+        }
+      } else {
+        // api mode — re-apply preset to pick a real protocol/baseUrl/model
+        const presetKey = DOM.providerPreset?.value || providerSettings.preset || "openai-official";
+        if (presetKey === "custom") {
+          // Custom + api: surface the protocol picker so the user can
+          // disambiguate (it defaults to whatever was last selected, or
+          // openai). Don't silently clobber an existing direct setting.
+          const existing = DOM.providerSelect?.value;
+          const next = existing && existing !== "ide" && existing !== "cli" ? existing : "openai";
+          providerSettings.source = next;
+          if (DOM.providerSelect) DOM.providerSelect.value = next;
+        } else {
+          // Non-custom preset: applyPreset writes source + baseUrl + model.
+          applyPreset(presetKey);
+        }
+      }
+      try { chrome.storage.local.set({ aiProviderMode: mode }); } catch (_) {}
+      updateProviderUI();
+      saveProviderSettings({ skipTest: true });
+    });
+  }
 
   if (DOM.providerSelect) {
     DOM.providerSelect.addEventListener("change", () => {
@@ -781,6 +872,28 @@ const _secretAreaName =
 
   if (DOM.cliPromptInstallBtn) {
     DOM.cliPromptInstallBtn.addEventListener("click", installDefaultCliPackage);
+  }
+
+  if (DOM.cliPromptCopyBtn) {
+    DOM.cliPromptCopyBtn.addEventListener("click", async () => {
+      const kind = DOM.providerCliKind?.value || "claude";
+      const info = getCliKindInfo(kind);
+      const cmd = info.install || (info.npmPackage ? `npm install -g ${info.npmPackage}` : "");
+      if (!cmd) {
+        updateProviderUI("No default install command for this CLI — see docs.");
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(cmd);
+        updateProviderUI(`✓ Copied: ${cmd}`);
+        addLog(`Copied CLI install command: ${cmd}`, "info");
+      } catch (err) {
+        // Clipboard write can fail in some embedded iframe contexts —
+        // surface the command inline so the user can copy it manually.
+        updateProviderUI(`Copy failed — run: ${cmd}`);
+        addLog(`Clipboard copy failed: ${err?.message || err}`, "warn");
+      }
+    });
   }
 
   if (DOM.cliPromptDocsBtn) {
@@ -1457,6 +1570,12 @@ function applyPreset(presetKey) {
     providerSettings.source = preset.source;
     providerSettings.baseUrl = preset.baseUrl || "";
     providerSettings.model = preset.model || "";
+    // A non-custom preset always implies API-key mode (its source is a
+    // direct network protocol). Keep the UI mode and persisted value
+    // aligned so future loads land on the right tab.
+    providerSettings.mode = "api";
+    if (DOM.providerMode) DOM.providerMode.value = "api";
+    try { chrome.storage.local.set({ aiProviderMode: "api" }); } catch (_) {}
   } finally {
     _suppressFieldEvents = false;
   }
@@ -1511,7 +1630,7 @@ async function installDefaultCliPackage() {
   if (!isEmbedded) {
     try {
       approved = window.confirm(
-        `Install ${info.label}?\n\nThis will run on the local AutoDOM bridge host:\n${installCommand}\n\nContinue?`,
+        `Install ${info.label}?\n\nAutoDOM will open a terminal on this machine and run:\n${installCommand}\n\nContinue?`,
       );
     } catch (_) {
       approved = true;
@@ -1529,7 +1648,7 @@ async function installDefaultCliPackage() {
 
   if (DOM.cliPromptInstallBtn) DOM.cliPromptInstallBtn.disabled = true;
   if (DOM.checkCliBtn) DOM.checkCliBtn.disabled = true;
-  DOM.providerStatus.textContent = `Installing ${info.label} with npm…`;
+  DOM.providerStatus.textContent = `Opening a terminal to install ${info.label}…`;
   addLog(`Installing ${info.label}: ${installCommand}`, "info");
 
   try {
@@ -1540,12 +1659,27 @@ async function installDefaultCliPackage() {
       npmPackage: info.npmPackage,
     });
     if (response?.ok) {
-      DOM.providerStatus.textContent = `✓ Installed ${info.label}. Checking CLI…`;
-      addLog(`Installed ${info.label}: ${installCommand}`, "success");
-      await checkCliBinary();
+      // The bridge can either (a) launch a visible terminal and return
+      // immediately (`launched: true`), or (b) run the install headlessly
+      // and return when complete. Treat each differently — terminal
+      // launches mean the install is still in progress.
+      if (response.launched) {
+        const terminalHint = response.terminalLabel
+          ? ` (${response.terminalLabel})`
+          : "";
+        DOM.providerStatus.textContent = `→ Install opened in terminal${terminalHint}. Run "Check CLI" once it finishes.`;
+        addLog(
+          `Opened ${info.label} install in a terminal: ${installCommand}`,
+          "info",
+        );
+      } else {
+        DOM.providerStatus.textContent = `✓ Installed ${info.label}. Checking CLI…`;
+        addLog(`Installed ${info.label}: ${installCommand}`, "success");
+        await checkCliBinary();
+      }
     } else {
       const err = response?.error || "CLI install failed";
-      DOM.providerStatus.textContent = `✕ ${err.substring(0, 120)}`;
+      DOM.providerStatus.textContent = `✕ ${err.substring(0, 120)} — try "Copy command" and run it yourself.`;
       addLog(`CLI install failed: ${err}`, "error");
     }
   } catch (err) {
@@ -1919,30 +2053,37 @@ function updateProviderUI(statusOverride) {
   const source = providerSettings.source || "ide";
   const label = formatProviderLabel(source);
   const isCli = source === "cli";
+  const isIde = source === "ide";
+  const mode = providerSettings.mode || deriveModeFromSource(source);
+  const isApiMode = mode === "api";
+  const isCliMode = mode === "cli";
+  const isIdeMode = mode === "ide";
 
   // Surface the active provider as a compact badge in the panel header
   // so the user can tell at a glance which path is wired up.
   const badge = document.getElementById("providerBadge");
   if (badge) badge.textContent = label;
 
-  // ─── Field visibility per provider ─────────────────────
-  // CLI mode hides model/apiKey/baseUrl (irrelevant) and shows CLI inputs.
-  _setFieldVisible(DOM.providerModel, !isCli);
-  _setFieldVisible(DOM.providerApiKey, !isCli);
-  _setFieldVisible(DOM.providerBaseUrl, !isCli);
-  _setFieldVisible(DOM.providerCliKind, isCli);
-  _setFieldVisible(DOM.providerCliBinary, isCli);
-  _setFieldVisible(DOM.providerCliExtraArgs, isCli);
-  // The protocol/source dropdown is redundant when a non-custom preset
-  // is active — the preset already determines the underlying API
-  // protocol. Hide it to avoid confusing labels (e.g. "OpenAI-compatible
-  // API" showing for a DeepSeek preset).
+  // ─── Field visibility by Mode ─────────────────────────
+  // API mode → preset + model + apiKey + baseUrl. CLI mode → CLI fields.
+  // IDE mode → only the mode selector itself.
+  _setFieldVisible(DOM.providerPresetGroup, isApiMode);
+  _setFieldVisible(DOM.providerModel, isApiMode);
+  _setFieldVisible(DOM.providerApiKey, isApiMode);
+  _setFieldVisible(DOM.providerBaseUrl, isApiMode);
+  _setFieldVisible(DOM.providerCliKind, isCliMode);
+  _setFieldVisible(DOM.providerCliBinary, isCliMode);
+  _setFieldVisible(DOM.providerCliExtraArgs, isCliMode);
+  // Protocol picker is only needed in API mode + Custom preset (when
+  // the user wants to point at a non-listed OpenAI-compatible endpoint).
   const presetKey = providerSettings.preset || "custom";
-  _setFieldVisible(DOM.providerSelect, presetKey === "custom");
-  // The "Enable direct provider" checkbox is meaningless for IDE/CLI
+  _setFieldVisible(
+    DOM.providerSelectGroup,
+    isApiMode && presetKey === "custom",
+  );
+  // The "Enable direct provider" checkbox only makes sense in API mode.
   if (DOM.providerEnabledToggle?.parentElement) {
-    DOM.providerEnabledToggle.parentElement.style.display =
-      source === "ide" || isCli ? "none" : "";
+    DOM.providerEnabledToggle.parentElement.style.display = isApiMode ? "" : "none";
   }
 
   if (DOM.providerApiKey) {
