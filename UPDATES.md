@@ -110,6 +110,7 @@ results:
 |---|---|
 | `up to date` | The browser already has the latest published version. |
 | `update → vX.Y.Z` | A newer version exists; the browser will install it on its next pass (Chromium usually within a minute). |
+| `auto-install blocked` warning | A newer version was found, but the browser did not apply it. Re-run `./setup.sh` to refresh policy enrollment or update manually from the browser extensions page. |
 | `rate-limited` | The browser throttles update checks. Try again in a few minutes. |
 | `not supported` | This browser does not expose a programmatic update check. Use the browser's built-in flow instead (`chrome://extensions` → *Update*). |
 | `error: …` | Update endpoint unreachable, or the browser refused the request. |
@@ -124,6 +125,9 @@ The popup's **Updates** panel also includes:
   browser reports one is ready.
 - **Periodic update checks** — keeps the extension's five-hour background update
   checks enabled; turn it off if you only want manual checks.
+- **Blocked-install prompt** — if Chromium reports that an available update could
+  not be applied, the popup shows a one-time warning for that version with setup
+  and manual-update guidance.
 - **Clear extension cache** — clears cached provider model lists, repeated page
   context fingerprints, stale update availability, and stale bridge-port hints.
   The button asks for a second click and shows a toast for confirmation, success,
