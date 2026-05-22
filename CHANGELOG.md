@@ -7,6 +7,7 @@ All notable changes to AutoDOM are documented in this file.
 ## Unreleased
 
 ### Added
+- **Sticky tab restriction** — Lock AutoDOM operations to selected tabs from the popup so agents cannot drift to unrelated browser tabs.
 - **`double_click`** — Double-click an element by CSS selector or visible text. Exposes the existing `dblClick` path as a first-class tool.
 - **`middle_click`** — Middle-click (button 1) an element; opens links in a new tab without needing `target=_blank`.
 - **`force_click`** — Click an element bypassing visibility and interactability checks.
@@ -21,7 +22,16 @@ All notable changes to AutoDOM are documented in this file.
 - **`emulate_media`** — Override CSS media type and features via CDP: dark/light mode, print layout, `prefers-reduced-motion`, `prefers-contrast`, `forced-colors`.
 
 ### Improved
+- Hardened the local WebSocket bridge by pinning the packaged extension origin, supporting explicit dev/fork extension ID allowlists, preserving bearer-token proxy auth, and rejecting oversized or malformed messages before routing.
+- Wrapped direct-provider page/tab context in nonce-delimited untrusted-data blocks and scrubbed account identifiers plus internal marker tags from AI-facing and user-facing strings.
+- Reclassified arbitrary-code and sensitive export/reset tools (`execute_code`, `evaluate_script`, `execute_async_script`, `run_automation_script`, `clear_cookies`, `print_to_pdf`) as destructive where applicable.
+- Added a popup warning when a browser reports that an available update could not be auto-installed, with guidance to re-run setup or update manually.
 - Added a click-again confirmation and accessible popup toast feedback for **Clear extension cache**, including visible success and error states instead of only an activity log entry.
+
+### Fixed
+- Kept debugger attachment tracking in sync when Chrome reports an existing debugger session or detach happens outside AutoDOM.
+- Escaped Security-tab load errors before rendering them in the popup.
+- Awaited the update-intervention marker write so storage failures do not cause repeated prompts.
 
 ---
 

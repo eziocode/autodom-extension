@@ -10,14 +10,14 @@ The bridge process (`server/index.js`) listens on `ws://127.0.0.1:<port>`
 incoming connection:
 
 1. **Origin allowlist.** Browser-attached clients always include an
-   `Origin` header. The AutoDOM extension's service worker sends
-   `chrome-extension://<id>` and is accepted. A malicious web page would
-   send its own origin (`https://example.com`) and is rejected. This
-   blocks **page-based attacks** — a hostile page that tries to drive
-   the browser via `new WebSocket("ws://127.0.0.1:9876")`.
+   `Origin` header. The packaged AutoDOM extension sends the canonical
+   origin `chrome-extension://kpjdffgogiajnkajnjneiboaincnaokf` and is
+   accepted. Other `chrome-extension://` or `moz-extension://` origins are
+   rejected unless explicitly configured, so another installed extension
+   cannot borrow AutoDOM's browser permissions through the local bridge.
 
 2. **Bearer token.** Non-browser local clients (the proxy-client mode,
-   the `server/test/e2e.cjs` smoke test, and any future CLI) must
+   server regression tests, and any future CLI) must
    present a token. The token is generated at server startup with
    `crypto.randomBytes(32)` (256 bits) and written to a lockfile in the
    OS temp directory with mode `0600` (owner read/write only). Clients
@@ -27,10 +27,16 @@ incoming connection:
 
 You can override the auto-generated token with the `AUTODOM_TOKEN`
 environment variable if you need a deterministic value (CI, integration
-tests).
+tests). For local forks or development builds with a different extension
+ID, add exact IDs/origins with `AUTODOM_ALLOWED_EXTENSION_IDS` or
+`AUTODOM_ALLOWED_EXTENSION_ORIGINS`.
 
 Connections that satisfy neither layer receive **HTTP 401 Unauthorized**
 and the rejection is logged to stderr.
+
+WebSocket messages are also capped and minimally schema-checked before
+dispatch. Unknown message types, malformed IDs, and oversized payloads are
+ignored or rejected before they reach tool routing.
 
 ## API key storage
 
@@ -62,26 +68,39 @@ with the feature that needs it.
 | `cookies`         | `get_cookies` / `set_cookie` tools. |
 | `clipboardWrite`  | Copy-to-clipboard from the chat panel. |
 | `webNavigation`   | `chrome.webNavigation.getAllFrames` for cross-frame tools. |
+| `sidePanel`       | Opens the bundled side-panel UI. |
+| `downloads`       | Saves user-requested artifacts such as generated exports. |
+| `offscreen`       | Keeps MV3 service-worker state alive during active sessions. |
 | `host_permissions: ["<all_urls>"]` | Tools must operate on any page the user opens. |
-
-Permissions that were previously requested but have been **removed** as
-of this hardening pass: `nativeMessaging` and `sidePanel` (neither was
-ever called from extension code).
 
 ## Tools that execute arbitrary JavaScript
 
-Two tools intentionally accept arbitrary JS strings and run them with
-extension privileges via `new Function(script)`:
+Some tools intentionally accept arbitrary JS strings and run them with
+extension privileges via `eval` / `new Function(script)`:
 
+- `execute_code`
 - `evaluate_script`
 - `execute_async_script`
+- `browser_evaluate`
 
 These exist so AI agents can perform DOM operations the typed tools do
 not cover. Combined with the WebSocket auth layers above, only the
 authenticated extension (or a token-bearing local client) can submit
-them. If you want to disable these tools entirely, remove them from
+them. They are classified as **destructive** in both the server tier map
+and the in-extension ActionGate so site-level write approval is not enough
+to run arbitrary code. If you want to disable these tools entirely, remove
+them from
 `TOOL_HANDLERS` in `extension/background/service-worker.js` — the
-agent will simply lose those two capabilities.
+agent will simply lose those capabilities.
+
+## Prompt-injection and context scrubbing
+
+Direct-provider chat can include page-derived title, URL, outline, visible
+text, and post-navigation tab context. These values are wrapped in
+nonce-delimited `UNTRUSTED_PAGE_DATA` blocks and the system prompt
+explicitly says they are observations, not instructions. Account-like
+identifiers (`IC...`, `CB...`) and internal marker tags are scrubbed before
+AI-facing prompts or user-facing chat output.
 
 ## Reporting a vulnerability
 

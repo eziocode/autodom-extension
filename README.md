@@ -35,7 +35,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server + Chromium ex
 <tr>
 <td width="50%">
 
-### 🧰 67+ Browser Tools
+### 🧰 70+ Browser Tools
 DOM queries, navigation, network logs, cookies, tabs, JS eval, screenshots, Playwright-compatible aliases — all exposed over MCP.
 
 </td>
@@ -85,12 +85,12 @@ GPO / plist / JSON policy templates for force-install across macOS, Windows, and
   │                 │                            │                 │                                │                 │
   │   IDE / Agent   │◀──────────────────────────▶│  AutoDOM Server │◀──────────────────────────────▶│    Extension    │
   │                 │                            │                 │                                │                 │
-  │  Copilot, Claude│   JSON-RPC over stdin/out  │  Node.js bridge │   WebSocket + bearer token     │  Chromium MV3   │
+  │  Copilot, Claude│   JSON-RPC over stdin/out  │  Node.js bridge │ pinned origin / bearer token   │  Chromium MV3   │
   │  Cursor, Gemini │                            │  fastmcp + ws   │                                │  service worker │
   └─────────────────┘                            └─────────────────┘                                └─────────────────┘
 ```
 
-> **The IDE never talks to the browser directly.** The bridge mediates every call, enforces auth tokens, and streams results back.
+> **The IDE never talks to the browser directly.** The bridge mediates every call, pins browser-extension origins or verifies auth tokens, validates message shape/size, and streams results back.
 
 ---
 
@@ -188,6 +188,7 @@ Pass these via `env` in your MCP config block.
 |:---|:---|:---|
 | `WS_PORT` | `9876` | Local WebSocket bridge port |
 | `AUTODOM_TOKEN` | *random* | Override the auto-generated auth token |
+| `AUTODOM_ALLOWED_EXTENSION_ORIGINS` / `AUTODOM_ALLOWED_EXTENSION_IDS` | canonical AutoDOM Chrome ID | Comma-separated extra extension origins or IDs for dev/fork builds |
 | `AUTODOM_HEARTBEAT_MS` | `15000` | WebSocket ping interval (ms) |
 | `AUTODOM_TOOL_TIMEOUT` | `30000` | Per-tool-call timeout (ms) |
 | `AUTODOM_INACTIVITY_TIMEOUT` | `600000` | Idle session timeout; `0` disables |
@@ -251,6 +252,7 @@ node server/index.js --stop      # graceful shutdown
 |:---|:---|
 | IDE says **Transport closed** | Kill orphan processes on port `9876`, restart IDE |
 | Popup shows **Disconnected** | Click *Connect*; reload extension; verify port matches server |
+| Custom/forked extension cannot connect | Add its exact ID or origin via `AUTODOM_ALLOWED_EXTENSION_IDS` / `AUTODOM_ALLOWED_EXTENSION_ORIGINS` |
 | **No tools** in IDE | Ensure MCP path is absolute; restart IDE; check `node -v` ≥ 18 |
 | AI chat shows `Ollama 403` | Ollama is blocking browser-extension origin. Run `OLLAMA_ORIGINS="chrome-extension://*,http://localhost,http://127.0.0.1" ollama serve`, then retry. |
 | AI chat shows `model 'llama3.2' not found` | Open provider settings and select an installed model (for example `gemma4:latest`), save, then retry. |
@@ -294,7 +296,7 @@ This section describes the internal design for contributors and anyone who wants
 │                                │       │            │         │         │          │           │ │
 │                                │  ┌────▼────────────▼──────┐  │         │  ┌───────▼────────┐  │ │
 │                                │  │    Tool Dispatcher     │  │         │  │ Content Scripts │  │ │
-│                                │  │  67 tools · 3 tiers    │  │         │  │  Chat · Border  │  │ │
+│                                │  │  70+ tools · 3 tiers   │  │         │  │  Chat · Border  │  │ │
 │                                │  │  read / write / destr. │  │         │  └───────┬────────┘  │ │
 │                                │  └────────────────────────┘  │         │          │           │ │
 │                                │                              │         │  ┌───────▼────────┐  │ │
@@ -339,7 +341,7 @@ A Manifest V3 Chromium extension with four main layers:
 ```
   Extension ──▶ WS Bridge
                   │
-                  ├─ 1. Origin check: only chrome-extension:// origins accepted
+                  ├─ 1. Origin check: canonical extension ID, plus configured dev/fork IDs
                   │
                   └─ 2. Bearer token: auto-generated 32-byte hex
                         (or AUTODOM_TOKEN override)
@@ -348,7 +350,10 @@ A Manifest V3 Chromium extension with four main layers:
 
 - **API keys** (OpenAI, Anthropic) are stored in `chrome.storage.session` — RAM only, cleared when the browser closes
 - Legacy keys are auto-migrated from `chrome.storage.local` → `session` on first run
-- Powerful tools (`evaluate_script`, `execute_async_script`) are gated behind bridge auth — no unauthenticated caller can reach them
+- Browser-extension origins are not wildcarded; unknown extensions must present the bearer token or be explicitly allowlisted
+- WebSocket payloads are capped and routed only after basic type/id validation
+- Page/tab context sent to direct AI providers is wrapped as untrusted data, and account/internal identifiers are scrubbed before display or model use
+- Powerful tools (`execute_code`, `evaluate_script`, `execute_async_script`, `browser_evaluate`) are classified as destructive and gated behind bridge auth
 
 > Full details → [SECURITY.md](SECURITY.md)
 
@@ -377,13 +382,13 @@ A Manifest V3 Chromium extension with four main layers:
 
 #### 🟠 Tool tiers
 
-All 67 tools are classified into three tiers for access control:
+All 70+ tools are classified into three tiers for access control:
 
 | Tier | Examples | Behavior |
 |:---|:---|:---|
 | **Read** | `get_page_html`, `screenshot`, `get_cookies`, `get_console_logs`, `list_tabs`, `get_bounding_box`, `get_computed_style` | Safe, no side effects |
 | **Write** | `click`, `type_text`, `scroll`, `set_viewport`, `double_click`, `middle_click`, `force_click`, `click_at_coordinates`, `key_down`, `key_up`, `set_geolocation`, `delete_cookie`, `emulate_media` | Modifies page state |
-| **Destructive** | `navigate`, `fill_form`, `batch_actions`, `close_tab`, `clear_cookies`, `print_to_pdf` | Navigation / data loss risk — gated by `AUTODOM_CONFIRM_MODE` |
+| **Destructive** | `navigate`, `fill_form`, `batch_actions`, `execute_code`, `evaluate_script`, `execute_async_script`, `close_tab`, `clear_cookies`, `print_to_pdf` | Navigation / data loss / arbitrary-code risk — gated by `AUTODOM_CONFIRM_MODE` |
 
 #### 🏢 Enterprise deployment (`enterprise/`)
 
