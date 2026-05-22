@@ -7,6 +7,9 @@
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
+// Single source of truth — bump this when tools are added/removed.
+const MCP_TOOL_COUNT = "70+";
+
 const DOM = {
   appVersion: $("#appVersion"),
   checkUpdateBtn: $("#checkUpdateBtn"),
@@ -494,6 +497,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (DOM.appVersion) {
     DOM.appVersion.textContent = `v${chrome.runtime.getManifest().version}`;
   }
+
+  const toolCountEls = document.querySelectorAll("#configToolCount, #footerToolCount");
+  toolCountEls.forEach((el) => { el.textContent = MCP_TOOL_COUNT; });
 
   if (DOM.checkUpdateBtn) {
     DOM.checkUpdateBtn.addEventListener("click", () => runUpdateCheck());
