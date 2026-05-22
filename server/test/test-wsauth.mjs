@@ -5,10 +5,17 @@ import { tmpdir } from "os";
 import { join } from "path";
 
 const PORT = 19876;
+const PACKAGED_CHROME_ORIGIN = "chrome-extension://kpjdffgogiajnkajnjneiboaincnaokf";
+const CONFIGURED_MOZ_ORIGIN =
+  "moz-extension://11111111-1111-1111-1111-111111111111";
 const proc = spawn("node", ["index.js", "--port", String(PORT)], {
   cwd: new URL("..", import.meta.url),
   stdio: ["pipe", "pipe", "pipe"],
-  env: { ...process.env, AUTODOM_INACTIVITY_TIMEOUT: "0" },
+  env: {
+    ...process.env,
+    AUTODOM_INACTIVITY_TIMEOUT: "0",
+    AUTODOM_ALLOWED_EXTENSION_ORIGINS: CONFIGURED_MOZ_ORIGIN,
+  },
 });
 proc.stderr.on("data", (d) => process.stderr.write("[srv] " + d));
 proc.on("exit", (c) => console.log("[srv exited]", c));
@@ -37,8 +44,10 @@ const mode = (st.mode & 0o777).toString(8);
 const results = [];
 results.push(await tryConnect({}, "no-origin-no-token"));
 results.push(await tryConnect({ headers: { Origin: "https://evil.example" } }, "evil-origin"));
-results.push(await tryConnect({ headers: { Origin: "chrome-extension://abc123" } }, "chrome-ext-origin"));
-results.push(await tryConnect({ headers: { Origin: "moz-extension://abc" } }, "moz-ext-origin"));
+results.push(await tryConnect({ headers: { Origin: PACKAGED_CHROME_ORIGIN } }, "packaged-chrome-origin"));
+results.push(await tryConnect({ headers: { Origin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } }, "unknown-chrome-origin"));
+results.push(await tryConnect({ headers: { Origin: CONFIGURED_MOZ_ORIGIN } }, "configured-moz-origin"));
+results.push(await tryConnect({ headers: { Origin: "moz-extension://22222222-2222-2222-2222-222222222222" } }, "unknown-moz-origin"));
 results.push(await tryConnect({ path: `/?token=${lock.token}` }, "valid-token"));
 results.push(await tryConnect({ path: `/?token=wrongtoken` }, "wrong-token"));
 
@@ -48,8 +57,10 @@ for (const r of results) console.log(JSON.stringify(r));
 const expected = {
   "no-origin-no-token": false,
   "evil-origin": false,
-  "chrome-ext-origin": true,
-  "moz-ext-origin": true,
+  "packaged-chrome-origin": true,
+  "unknown-chrome-origin": false,
+  "configured-moz-origin": true,
+  "unknown-moz-origin": false,
   "valid-token": true,
   "wrong-token": false,
 };

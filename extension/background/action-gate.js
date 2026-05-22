@@ -73,6 +73,7 @@
     "evaluate_script",
     "execute_async_script",
     "execute_code",
+    "run_automation_script",
     "set_cookie",
     "set_storage",
     "upload_file",
@@ -93,6 +94,8 @@
     "browser_handle_dialog",
     "browser_evaluate",
     "browser_close",
+    "clear_cookies",
+    "print_to_pdf",
   ]);
 
   function classify(toolName, params = {}) {

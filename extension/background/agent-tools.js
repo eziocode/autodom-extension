@@ -861,7 +861,7 @@
           url: { type: "string", description: "URL scope (defaults to active tab URL)" },
         },
       },
-      danger: "write",
+      danger: "destructive",
     },
     {
       name: "print_to_pdf",
@@ -877,6 +877,7 @@
         },
         additionalProperties: false,
       },
+      danger: "destructive",
     },
     {
       name: "emulate_media",

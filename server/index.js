@@ -439,21 +439,77 @@ const BLOCKED_DOMAINS = (
 
 // ─── WebSocket Auth ──────────────────────────────────────────
 // Two layers of defence:
-//   1. Origin allowlist — browser-attached WebSocket clients always send an
-//      Origin header. The extension service worker sends `chrome-extension://`
-//      or `moz-extension://`; a malicious web page would send its own origin
-//      and be rejected. This blocks page-based attacks.
+//   1. Origin allowlist — the packaged Chrome extension has a stable ID from
+//      manifest.json "key"; dev/Firefox IDs must be explicitly configured.
 //   2. Bearer token — for non-browser local clients (proxy mode, CLI, tests).
 //      The token is written to the mode-0600 lockfile so only the current
 //      user can read it. Clients send it via `?token=` query string.
 const AUTH_TOKEN =
   process.env.AUTODOM_TOKEN || randomBytes(32).toString("hex");
 const MY_CLIENT_ID = "mcp_" + randomBytes(8).toString("hex");
-const ALLOWED_ORIGIN_PREFIXES = ["chrome-extension://", "moz-extension://"];
+const WS_MAX_MESSAGE_BYTES = 32 * 1024 * 1024;
+const DEFAULT_CHROME_EXTENSION_ID = "kpjdffgogiajnkajnjneiboaincnaokf";
+
+function normalizeExtensionOrigin(originOrId) {
+  const raw = String(originOrId || "").trim();
+  if (!raw) return null;
+  const lower = raw.replace(/\/+$/, "").toLowerCase();
+  if (/^[a-p]{32}$/.test(lower)) return `chrome-extension://${lower}`;
+  if (
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+      lower,
+    )
+  ) {
+    return `moz-extension://${lower}`;
+  }
+  if (
+    lower.startsWith("chrome-extension://") ||
+    lower.startsWith("moz-extension://")
+  ) {
+    return lower;
+  }
+  return null;
+}
+
+const ALLOWED_EXTENSION_ORIGINS = new Set(
+  [
+    `chrome-extension://${DEFAULT_CHROME_EXTENSION_ID}`,
+    ...(process.env.AUTODOM_ALLOWED_EXTENSION_ORIGINS ||
+      process.env.AUTODOM_ALLOWED_EXTENSION_IDS ||
+      getArgValue("--allowed-extension-origins") ||
+      getArgValue("--allowed-extension-ids") ||
+      "")
+      .split(",")
+      .map(normalizeExtensionOrigin)
+      .filter(Boolean),
+  ].map(normalizeExtensionOrigin),
+);
 
 function isAllowedOrigin(origin) {
-  if (!origin) return false;
-  return ALLOWED_ORIGIN_PREFIXES.some((p) => origin.startsWith(p));
+  const normalized = normalizeExtensionOrigin(origin);
+  return !!normalized && ALLOWED_EXTENSION_ORIGINS.has(normalized);
+}
+
+function getWsDataSize(data) {
+  if (typeof data === "string") return Buffer.byteLength(data);
+  if (Buffer.isBuffer(data)) return data.length;
+  if (ArrayBuffer.isView(data)) return data.byteLength;
+  if (data instanceof ArrayBuffer) return data.byteLength;
+  if (Array.isArray(data)) {
+    return data.reduce((sum, chunk) => sum + getWsDataSize(chunk), 0);
+  }
+  return Buffer.byteLength(String(data || ""));
+}
+
+function wsDataToString(data) {
+  return Buffer.isBuffer(data) ? data.toString("utf8") : String(data || "");
+}
+
+function readWsJsonPayload(data) {
+  if (getWsDataSize(data) > WS_MAX_MESSAGE_BYTES) {
+    throw new Error("WebSocket message exceeds size limit");
+  }
+  return wsDataToString(data);
 }
 
 function tokenFromRequest(req) {
@@ -638,9 +694,6 @@ const TOOL_TIERS = new Map([
   ["wait_for_navigation", "read"],
   ["wait_for_new_tab", "read"],
   ["wait_for_network_idle", "read"],
-  ["execute_code", "read"], // can be write, but we can't know statically
-  ["evaluate_script", "read"],
-  ["execute_async_script", "read"],
   ["performance_analyze_insight", "read"],
   ["get_pending_chat_requests", "read"],
   ["browser_snapshot", "read"],
@@ -697,6 +750,9 @@ const TOOL_TIERS = new Map([
   ["fill_form", "destructive"],
   ["batch_actions", "destructive"],
   ["respond_to_chat", "destructive"],
+  ["execute_code", "destructive"],
+  ["evaluate_script", "destructive"],
+  ["execute_async_script", "destructive"],
   ["browser_navigate", "destructive"],
   ["browser_navigate_back", "destructive"],
   ["browser_tabs", "destructive"],
@@ -1622,8 +1678,11 @@ async function ensureProxyClientConnected() {
 
       ws.on("message", (data) => {
         try {
-          const message = JSON.parse(data.toString());
-          if (message.type === "TOOL_RESULT" && message.id != null) {
+          const message = JSON.parse(readWsJsonPayload(data));
+          if (
+            message?.type === "TOOL_RESULT" &&
+            (typeof message.id === "string" || typeof message.id === "number")
+          ) {
             const pending = pendingCalls.get(message.id);
             if (pending) {
               clearTimeout(pending.timer);
@@ -1709,7 +1768,7 @@ function setupWssConnection(wss) {
 
     socket.on("message", (data) => {
       try {
-        const raw = data.toString();
+        const raw = readWsJsonPayload(data);
         // Support batched messages: if the payload is a JSON array,
         // process each element as a separate message.
         let messages;
@@ -2680,8 +2739,18 @@ const _WS_MESSAGE_HANDLERS = Object.freeze({
 });
 
 function _processWsMessage(socket, message) {
-  const handler = _WS_MESSAGE_HANDLERS[message?.type];
-  if (handler) handler(socket, message);
+  const handler =
+    message &&
+    typeof message === "object" &&
+    !Array.isArray(message) &&
+    typeof message.type === "string" &&
+    (message.id == null ||
+      typeof message.id === "string" ||
+      typeof message.id === "number")
+      ? _WS_MESSAGE_HANDLERS[message.type]
+      : null;
+  if (!handler) return;
+  handler(socket, message);
 }
 
 process.on("exit", removeLockFileIfOwnedSync);

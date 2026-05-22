@@ -102,7 +102,7 @@ async function maybeShowUpdateInstallInterventionPrompt(availableUpdate) {
       "warn",
       5200,
     );
-    chrome.storage.local.set({
+    await chrome.storage.local.set({
       [UPDATE_INSTALL_INTERVENTION_VERSION_KEY]: version,
     });
   } catch (_) {}
@@ -2803,7 +2803,7 @@ function initSecurityTab() {
   async function loadState() {
     const resp = await sendRuntimeMessage({ type: "ACTION_GATE_GET_STATE" });
     if (!resp?.ok) {
-      permTable.innerHTML = `<div class="log-entry log-error">Failed to load: ${resp?.error || "unknown"}</div>`;
+      permTable.innerHTML = `<div class="log-entry log-error">Failed to load: ${escapeHtml(resp?.error || "unknown")}</div>`;
       return;
     }
     enabled.checked = !!resp.settings?.enabled;
