@@ -1417,8 +1417,17 @@
       html.__autodom_panel_resizing,
       html.__autodom_panel_resizing.__autodom_panel_open {
         margin-right: 0 !important;
-        overflow-x: visible !important;
+        overflow-x: hidden !important;
         cursor: auto !important;
+      }
+      /* Prevent horizontal swipe from shifting panel content. */
+      html, body {
+        overscroll-behavior-x: none !important;
+        touch-action: pan-y !important;
+      }
+      #${PANEL_ID}, .autodom-chat-settings-overlay {
+        overscroll-behavior: none !important;
+        touch-action: pan-y !important;
       }
       #${PANEL_ID} {
         position: absolute !important;
