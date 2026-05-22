@@ -1047,6 +1047,8 @@ function _broadcastAgentRunState() {
 // helpers route through this so user clicking a different tab mid-run
 // doesn't hijack the agent.
 let _agentRunContext = null; // { tabId, windowId } | null
+// Tab IDs the extension is restricted to. Empty = no restriction.
+let _stickyTabIds = new Set();
 function _withAgentTabContext(ctx, fn) {
   const prev = _agentRunContext;
   _agentRunContext = ctx;
@@ -1312,6 +1314,11 @@ async function _resolveAgentTab(initialTabId) {
     try {
       return await chrome.tabs.get(initialTabId);
     } catch (_) {}
+  }
+  if (_stickyTabIds.size > 0) {
+    for (const tabId of _stickyTabIds) {
+      try { return await chrome.tabs.get(tabId); } catch (_) {}
+    }
   }
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab;
@@ -2671,6 +2678,14 @@ let rateLimitConfig = {
 // domainCallLog: Map<domain, Array<timestamp>>
 const domainCallLog = new Map();
 
+// Load sticky tab restriction from storage on startup
+chrome.storage.local.get(["__autodom_sticky_tabs"], (stored) => {
+  const r = _storageResult(stored, "__autodom_sticky_tabs");
+  if (Array.isArray(r.__autodom_sticky_tabs) && r.__autodom_sticky_tabs.length > 0) {
+    _stickyTabIds = new Set(r.__autodom_sticky_tabs.map(Number));
+  }
+});
+
 // Load rate limit config from storage on startup
 chrome.storage.local.get(["rateLimitConfig"], (stored) => {
   const result = _storageResult(stored, "rateLimitConfig");
@@ -3080,6 +3095,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       if (pin.tabId === tabId) {
         pin.tabId = null;
       }
+    }
+    // Remove from sticky set; persist update.
+    if (_stickyTabIds.has(tabId)) {
+      _stickyTabIds.delete(tabId);
+      chrome.storage.local.set({ "__autodom_sticky_tabs": [..._stickyTabIds] });
     }
   } catch (_) {}
 });
@@ -4169,6 +4189,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       bridgeConnected: isConnected,
       hasApiKey: !!(aiProviderSettings.apiKey || "").trim(),
     });
+    return false;
+  }
+
+  if (message.type === "GET_STICKY_TABS") {
+    sendResponse({ tabIds: [..._stickyTabIds] });
+    return false;
+  }
+
+  if (message.type === "SET_STICKY_TABS") {
+    const ids = Array.isArray(message.tabIds)
+      ? message.tabIds.map(Number).filter((n) => !isNaN(n) && n > 0)
+      : [];
+    _stickyTabIds = new Set(ids);
+    chrome.storage.local.set({ "__autodom_sticky_tabs": ids });
+    sendResponse({ success: true, tabIds: ids });
     return false;
   }
 
@@ -5400,6 +5435,12 @@ async function getActiveTab() {
     } catch (_) {
       _agentRunContext =
         pinnedWindowId != null ? { windowId: pinnedWindowId } : null;
+    }
+  }
+  // Sticky tab restriction: no agent context → use first live sticky tab
+  if (_stickyTabIds.size > 0 && _agentRunContext == null) {
+    for (const tabId of _stickyTabIds) {
+      try { return await chrome.tabs.get(tabId); } catch (_) {}
     }
   }
   const [tab] = await chrome.tabs.query(

@@ -338,6 +338,21 @@
                             </select>
                             <div class="info-url" id="tabUrl">—</div>
                         </div>
+                        <div class="sticky-tab-section" id="stickyTabSection" style="margin-top:10px">
+                            <div class="sticky-tab-header" style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+                                <label class="toggle-row" for="stickyTabToggle" style="flex:1;margin:0">
+                                    <input type="checkbox" id="stickyTabToggle" />
+                                    <span>Stick to tab(s)</span>
+                                </label>
+                                <button type="button" class="text-btn" id="stickyCurrentTabBtn" title="Lock extension to currently active tab only">
+                                    Stick current
+                                </button>
+                            </div>
+                            <div class="sticky-tab-list" id="stickyTabList" style="display:none;max-height:120px;overflow-y:auto;padding:4px 0;margin-bottom:4px">
+                                <!-- populated by popup.js -->
+                            </div>
+                            <p class="field-hint" id="stickyTabStatus" style="margin:0"></p>
+                        </div>
                     </section>
 
                     <section class="panel log-section">

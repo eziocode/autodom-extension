@@ -1167,6 +1167,7 @@ const _secretAreaName =
   initSecurityTab();
   initChatSettingsTab();
   initChatAppearanceTab();
+  initStickyTabs();
 });
 
 // ─── Chat panel appearance (theme + accent colour) ───
@@ -1405,6 +1406,111 @@ function initChatSettingsTab() {
       applyToUI(changes[STORAGE_KEY].newValue);
     });
   }
+}
+
+// ─── Sticky Tab Restriction ──────────────────────────────────
+function initStickyTabs() {
+  const toggle = document.getElementById("stickyTabToggle");
+  const listEl = document.getElementById("stickyTabList");
+  const statusEl = document.getElementById("stickyTabStatus");
+  const stickCurrentBtn = document.getElementById("stickyCurrentTabBtn");
+  if (!toggle || !listEl || !statusEl || !stickCurrentBtn) return;
+
+  let currentStickyIds = new Set();
+
+  function updateStatus() {
+    if (currentStickyIds.size === 0) {
+      statusEl.textContent = "No restriction — extension operates on any tab.";
+      toggle.checked = false;
+      listEl.style.display = "none";
+    } else {
+      statusEl.textContent = `Locked to ${currentStickyIds.size} tab(s).`;
+      toggle.checked = true;
+      listEl.style.display = "";
+    }
+  }
+
+  function sendStickyIds(ids) {
+    chrome.runtime.sendMessage(
+      { type: "SET_STICKY_TABS", tabIds: [...ids] },
+      () => {},
+    );
+  }
+
+  async function renderTabList() {
+    let tabs = [];
+    try {
+      tabs = await chrome.tabs.query({ currentWindow: true });
+    } catch (_) {}
+    listEl.innerHTML = "";
+    tabs.forEach((tab) => {
+      const row = document.createElement("label");
+      row.className = "checkbox-row";
+      row.style.cssText = "padding:2px 0;font-size:12px;gap:6px";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = tab.id;
+      cb.checked = currentStickyIds.has(tab.id);
+      const title = tab.title
+        ? tab.title.length > 40 ? tab.title.slice(0, 38) + "…" : tab.title
+        : "(Untitled)";
+      const span = document.createElement("span");
+      span.textContent = title;
+      span.title = tab.url || "";
+      cb.addEventListener("change", () => {
+        if (cb.checked) {
+          currentStickyIds.add(tab.id);
+        } else {
+          currentStickyIds.delete(tab.id);
+        }
+        sendStickyIds(currentStickyIds);
+        updateStatus();
+      });
+      row.appendChild(cb);
+      row.appendChild(span);
+      listEl.appendChild(row);
+    });
+  }
+
+  // Load current state from service worker
+  chrome.runtime.sendMessage({ type: "GET_STICKY_TABS" }, (res) => {
+    if (res && Array.isArray(res.tabIds)) {
+      currentStickyIds = new Set(res.tabIds);
+    }
+    updateStatus();
+    if (currentStickyIds.size > 0) renderTabList();
+  });
+
+  // Toggle on/off
+  toggle.addEventListener("change", async () => {
+    if (toggle.checked) {
+      await renderTabList();
+      listEl.style.display = "";
+      statusEl.textContent = "Select tabs below to lock the extension to them.";
+    } else {
+      currentStickyIds = new Set();
+      sendStickyIds(currentStickyIds);
+      listEl.style.display = "none";
+      updateStatus();
+    }
+  });
+
+  // "Stick current tab" quick button
+  stickCurrentBtn.addEventListener("click", async () => {
+    try {
+      const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!active) return;
+      currentStickyIds = new Set([active.id]);
+      sendStickyIds(currentStickyIds);
+      await renderTabList();
+      updateStatus();
+    } catch (_) {}
+  });
+
+  // Refresh list when popup's tab list changes
+  document.getElementById("refreshTabsBtn")?.addEventListener("click", () => {
+    if (toggle.checked) renderTabList();
+  });
 }
 
 // ─── Tab Switching ───────────────────────────────────────────
