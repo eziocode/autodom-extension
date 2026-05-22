@@ -72,6 +72,41 @@ const UPDATE_LABEL = "Update";
 const AUTO_UPDATE_STORAGE_KEY = "autodomAutoUpdateEnabled";
 const PERIODIC_UPDATE_CHECKS_STORAGE_KEY = "autodomPeriodicUpdateChecksEnabled";
 const AVAILABLE_UPDATE_STORAGE_KEY = "availableUpdate";
+const UPDATE_INSTALL_INTERVENTION_VERSION_KEY =
+  "autodomUpdateInstallInterventionVersion";
+
+function shouldPromptUpdateInstallIntervention(availableUpdate) {
+  if (!availableUpdate || !availableUpdate.version) return false;
+  const runtimeStatus = String(availableUpdate.runtimeStatus || "").toLowerCase();
+  return (
+    runtimeStatus === "apply_not_effective" ||
+    runtimeStatus === "throttled" ||
+    runtimeStatus === "error" ||
+    runtimeStatus === "unknown" ||
+    runtimeStatus === "no_update"
+  );
+}
+
+async function maybeShowUpdateInstallInterventionPrompt(availableUpdate) {
+  if (!shouldPromptUpdateInstallIntervention(availableUpdate)) return;
+  const version = String(availableUpdate?.version || "").trim();
+  if (!version || version === "?") return;
+  try {
+    const stored = await chrome.storage.local.get(
+      UPDATE_INSTALL_INTERVENTION_VERSION_KEY,
+    );
+    const alreadyShown = stored?.[UPDATE_INSTALL_INTERVENTION_VERSION_KEY] || "";
+    if (alreadyShown === version) return;
+    showPopupToast(
+      "Update found but auto-install blocked. Run ./setup.sh and allow sudo policy step, or update manually in browser.",
+      "warn",
+      5200,
+    );
+    chrome.storage.local.set({
+      [UPDATE_INSTALL_INTERVENTION_VERSION_KEY]: version,
+    });
+  } catch (_) {}
+}
 
 // Render the ↻ button in idle, manifest-found, or ready-to-apply states.
 // The service worker stores availableUpdate after it sees a newer published
@@ -94,7 +129,13 @@ function paintUpdateButton(pending, available) {
         : `v${update.version} found — click to ask Chrome to install it`;
     btn.setAttribute("aria-label", `Update to v${update.version}`);
     if (versionEl) {
-      versionEl.textContent = `v${chrome.runtime.getManifest().version} → v${update.version}`;
+      const blocked = state === "found" && shouldPromptUpdateInstallIntervention(foundUpdate);
+      versionEl.textContent = blocked
+        ? `v${chrome.runtime.getManifest().version} → v${update.version} (needs setup permission)`
+        : `v${chrome.runtime.getManifest().version} → v${update.version}`;
+    }
+    if (state === "found") {
+      void maybeShowUpdateInstallInterventionPrompt(foundUpdate);
     }
   } else {
     btn.classList.remove("has-update");
