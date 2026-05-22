@@ -5270,6 +5270,20 @@ const TOOL_HANDLERS = new Map([
   // ─── Download Tools ────────────────────────────────────────
   ["list_downloads", toolListDownloads],
   ["wait_for_download", toolWaitForDownload],
+  // ─── New Interaction Tools ─────────────────────────────────
+  ["double_click", toolDoubleClick],
+  ["middle_click", toolMiddleClick],
+  ["force_click", toolForceClick],
+  ["click_at_coordinates", toolClickAtCoordinates],
+  ["key_down", toolKeyDown],
+  ["key_up", toolKeyUp],
+  ["get_bounding_box", toolGetBoundingBox],
+  ["get_computed_style", toolGetComputedStyle],
+  ["set_geolocation", toolSetGeolocation],
+  ["delete_cookie", toolDeleteCookie],
+  ["clear_cookies", toolClearCookies],
+  ["print_to_pdf", toolPrintToPdf],
+  ["emulate_media", toolEmulateMedia],
   // ─── Playwright MCP compatibility aliases ─────────────────
   ["browser_snapshot", toolBrowserSnapshot],
   ["browser_click", toolBrowserClick],
@@ -10146,4 +10160,305 @@ async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter } 
 
     chrome.downloads.onCreated.addListener(onCreated);
   });
+}
+
+// ─── New Interaction Tools ──────────────────────────────────
+
+// 49. Double-click
+async function toolDoubleClick(params) {
+  return toolClick({ ...params, dblClick: true });
+}
+
+// 50. Middle-click (opens links in new tab, etc.)
+async function toolMiddleClick(params) {
+  const tab = await getActiveTab();
+  const { selector } = params;
+  return await executeInTab(
+    tab.id,
+    (selector) => {
+      const el = document.querySelector(selector);
+      if (!el) return { error: `Element not found: ${selector}` };
+      el.scrollIntoView({ behavior: "auto", block: "center" });
+      el.dispatchEvent(
+        new MouseEvent("auxclick", {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          button: 1,
+        }),
+      );
+      return { success: true, tag: el.tagName };
+    },
+    [selector],
+  );
+}
+
+// 51. Force-click — dispatches events without visibility/scroll checks
+async function toolForceClick(params) {
+  const tab = await getActiveTab();
+  const { selector } = params;
+  return await executeInTab(
+    tab.id,
+    (selector) => {
+      const el = document.querySelector(selector);
+      if (!el) return { error: `Element not found: ${selector}` };
+      el.dispatchEvent(
+        new MouseEvent("click", { bubbles: true, cancelable: true, view: window }),
+      );
+      if (typeof el.click === "function") el.click();
+      return { success: true, tag: el.tagName };
+    },
+    [selector],
+  );
+}
+
+// 52. Click at absolute viewport coordinates
+async function toolClickAtCoordinates(params) {
+  const tab = await getActiveTab();
+  const { x, y, button = "left", double = false } = params;
+  return await executeInTab(
+    tab.id,
+    (x, y, button, double) => {
+      const btnNum = button === "right" ? 2 : button === "middle" ? 1 : 0;
+      const el = document.elementFromPoint(x, y);
+      const opts = {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX: x,
+        clientY: y,
+        button: btnNum,
+      };
+      if (btnNum === 2) {
+        (el || document.body).dispatchEvent(new MouseEvent("contextmenu", opts));
+      } else if (btnNum === 1) {
+        (el || document.body).dispatchEvent(new MouseEvent("auxclick", opts));
+      } else if (double) {
+        (el || document.body).dispatchEvent(new MouseEvent("dblclick", opts));
+      } else {
+        (el || document.body).dispatchEvent(new MouseEvent("mousedown", opts));
+        (el || document.body).dispatchEvent(new MouseEvent("mouseup", opts));
+        (el || document.body).dispatchEvent(new MouseEvent("click", opts));
+      }
+      return { success: true, tag: el?.tagName, id: el?.id || null };
+    },
+    [x, y, button, double],
+  );
+}
+
+// 53. Key down — hold a key (useful for Shift/Ctrl modifier combos)
+async function toolKeyDown(params) {
+  const tab = await getActiveTab();
+  const { key, selector } = params;
+  return await executeInTab(
+    tab.id,
+    (key, selector) => {
+      const target = selector
+        ? document.querySelector(selector)
+        : document.activeElement || document.body;
+      if (!target) return { error: "No target element" };
+      target.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key,
+          code: key.length === 1 ? `Key${key.toUpperCase()}` : key,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      return { success: true, key };
+    },
+    [key, selector || null],
+  );
+}
+
+// 54. Key up — release a held key
+async function toolKeyUp(params) {
+  const tab = await getActiveTab();
+  const { key, selector } = params;
+  return await executeInTab(
+    tab.id,
+    (key, selector) => {
+      const target = selector
+        ? document.querySelector(selector)
+        : document.activeElement || document.body;
+      if (!target) return { error: "No target element" };
+      target.dispatchEvent(
+        new KeyboardEvent("keyup", {
+          key,
+          code: key.length === 1 ? `Key${key.toUpperCase()}` : key,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      return { success: true, key };
+    },
+    [key, selector || null],
+  );
+}
+
+// 55. Get bounding box — element position and size in viewport
+async function toolGetBoundingBox(params) {
+  const tab = await getActiveTab();
+  const { selector } = params;
+  return await executeInTab(
+    tab.id,
+    (selector) => {
+      const el = document.querySelector(selector);
+      if (!el) return { error: `Element not found: ${selector}` };
+      const r = el.getBoundingClientRect();
+      return {
+        x: r.x,
+        y: r.y,
+        width: r.width,
+        height: r.height,
+        top: r.top,
+        right: r.right,
+        bottom: r.bottom,
+        left: r.left,
+      };
+    },
+    [selector],
+  );
+}
+
+// 56. Get computed style — resolved CSS properties for an element
+async function toolGetComputedStyle(params) {
+  const tab = await getActiveTab();
+  const { selector, properties } = params;
+  return await executeInTab(
+    tab.id,
+    (selector, properties) => {
+      const el = document.querySelector(selector);
+      if (!el) return { error: `Element not found: ${selector}` };
+      const style = window.getComputedStyle(el);
+      const props =
+        properties && properties.length > 0
+          ? properties
+          : [
+              "display",
+              "visibility",
+              "opacity",
+              "color",
+              "background-color",
+              "font-size",
+              "font-weight",
+              "width",
+              "height",
+              "padding",
+              "margin",
+              "position",
+              "z-index",
+              "overflow",
+              "cursor",
+            ];
+      const result = {};
+      for (const p of props) {
+        result[p] = style.getPropertyValue(p);
+      }
+      return { styles: result };
+    },
+    [selector, properties || null],
+  );
+}
+
+// 57. Set geolocation override (CDP)
+async function toolSetGeolocation(params) {
+  const tab = await getActiveTab();
+  const tabId = tab.id;
+  await ensureDebugger(tabId);
+  const { latitude, longitude, accuracy = 1, clear = false } = params;
+  if (clear) {
+    await chrome.debugger.sendCommand(
+      { tabId },
+      "Emulation.clearGeolocationOverride",
+    );
+    return { success: true, note: "Geolocation override cleared." };
+  }
+  if (latitude === undefined || longitude === undefined) {
+    return { error: "latitude and longitude required (or set clear:true)" };
+  }
+  await chrome.debugger.sendCommand(
+    { tabId },
+    "Emulation.setGeolocationOverride",
+    { latitude, longitude, accuracy },
+  );
+  return { success: true, latitude, longitude, accuracy };
+}
+
+// 58. Delete a single cookie
+async function toolDeleteCookie(params) {
+  const tab = await getActiveTab();
+  const { name, url } = params;
+  const targetUrl = url || tab.url;
+  try {
+    await chrome.cookies.remove({ url: targetUrl, name });
+    return { success: true, name, url: targetUrl };
+  } catch (err) {
+    return { error: `Delete cookie failed: ${err.message}` };
+  }
+}
+
+// 59. Clear all cookies for the current (or given) URL
+async function toolClearCookies(params) {
+  const tab = await getActiveTab();
+  const url = params?.url || tab.url;
+  const cookies = await chrome.cookies.getAll({ url });
+  const results = await Promise.allSettled(
+    cookies.map((c) => chrome.cookies.remove({ url, name: c.name })),
+  );
+  const failed = results.filter((r) => r.status === "rejected").length;
+  return { success: true, cleared: cookies.length - failed, failed, url };
+}
+
+// 60. Print page to PDF (CDP)
+async function toolPrintToPdf(params) {
+  const tab = await getActiveTab();
+  const tabId = tab.id;
+  await ensureDebugger(tabId);
+  try {
+    const result = await chrome.debugger.sendCommand(
+      { tabId },
+      "Page.printToPDF",
+      {
+        landscape: params?.landscape || false,
+        printBackground: params?.printBackground !== false,
+        scale: params?.scale || 1,
+        paperWidth: params?.paperWidth || 8.5,
+        paperHeight: params?.paperHeight || 11,
+        marginTop: params?.marginTop ?? 0.4,
+        marginBottom: params?.marginBottom ?? 0.4,
+        marginLeft: params?.marginLeft ?? 0.4,
+        marginRight: params?.marginRight ?? 0.4,
+      },
+    );
+    return {
+      success: true,
+      data: result.data,
+      note: "Base64-encoded PDF. Decode and save as .pdf file.",
+    };
+  } finally {
+    detachDebuggerSafe(tabId).catch(() => {});
+  }
+}
+
+// 61. Emulate media type and/or CSS media features (CDP)
+async function toolEmulateMedia(params) {
+  const tab = await getActiveTab();
+  const tabId = tab.id;
+  await ensureDebugger(tabId);
+  const { media, colorScheme, reducedMotion, contrast, forcedColors } = params;
+  const features = [];
+  if (colorScheme)
+    features.push({ name: "prefers-color-scheme", value: colorScheme });
+  if (reducedMotion)
+    features.push({ name: "prefers-reduced-motion", value: reducedMotion });
+  if (contrast)
+    features.push({ name: "prefers-contrast", value: contrast });
+  if (forcedColors)
+    features.push({ name: "forced-colors", value: forcedColors });
+  await chrome.debugger.sendCommand({ tabId }, "Emulation.setEmulatedMedia", {
+    ...(media !== undefined ? { media } : {}),
+    features,
+  });
+  return { success: true, media: media || "(unchanged)", features };
 }

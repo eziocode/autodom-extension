@@ -6,6 +6,20 @@ All notable changes to AutoDOM are documented in this file.
 
 ## Unreleased
 
+### Added
+- **`double_click`** — Double-click an element by CSS selector or visible text. Exposes the existing `dblClick` path as a first-class tool.
+- **`middle_click`** — Middle-click (button 1) an element; opens links in a new tab without needing `target=_blank`.
+- **`force_click`** — Click an element bypassing visibility and interactability checks.
+- **`click_at_coordinates`** — Click at absolute viewport `(x, y)` pixel coordinates with support for left/middle/right button and double-click. Pairs with `get_bounding_box`.
+- **`key_down`** / **`key_up`** — Dispatch isolated keydown/keyup events to hold and release modifier keys (Shift, Control, Alt, Meta) around other actions.
+- **`get_bounding_box`** — Return viewport position and size (`x`, `y`, `width`, `height`, `top/right/bottom/left`) for any element.
+- **`get_computed_style`** — Return resolved CSS property values for an element; accepts a `properties` array or returns sensible defaults (display, color, font-size, etc.).
+- **`set_geolocation`** — Override browser geolocation via CDP (`Emulation.setGeolocationOverride`); pass `clear:true` to remove the override.
+- **`delete_cookie`** — Remove a single named cookie for the current or given URL.
+- **`clear_cookies`** — Remove all cookies for the current or given URL (full session reset).
+- **`print_to_pdf`** — Export the active page to PDF via CDP (`Page.printToPDF`); returns base64-encoded data.
+- **`emulate_media`** — Override CSS media type and features via CDP: dark/light mode, print layout, `prefers-reduced-motion`, `prefers-contrast`, `forced-colors`.
+
 ### Improved
 - Added a click-again confirmation and accessible popup toast feedback for **Clear extension cache**, including visible success and error states instead of only an activity log entry.
 

@@ -381,9 +381,9 @@ All 67 tools are classified into three tiers for access control:
 
 | Tier | Examples | Behavior |
 |:---|:---|:---|
-| **Read** | `get_page_html`, `screenshot`, `get_cookies`, `get_console_logs`, `list_tabs` | Safe, no side effects |
-| **Write** | `click_element`, `type_text`, `scroll`, `set_viewport`, `start_recording` | Modifies page state |
-| **Destructive** | `navigate`, `fill_form`, `batch_actions`, `close_tab`, `clear_cookies` | Navigation / data loss risk — gated by `AUTODOM_CONFIRM_MODE` |
+| **Read** | `get_page_html`, `screenshot`, `get_cookies`, `get_console_logs`, `list_tabs`, `get_bounding_box`, `get_computed_style` | Safe, no side effects |
+| **Write** | `click`, `type_text`, `scroll`, `set_viewport`, `double_click`, `middle_click`, `force_click`, `click_at_coordinates`, `key_down`, `key_up`, `set_geolocation`, `delete_cookie`, `emulate_media` | Modifies page state |
+| **Destructive** | `navigate`, `fill_form`, `batch_actions`, `close_tab`, `clear_cookies`, `print_to_pdf` | Navigation / data loss risk — gated by `AUTODOM_CONFIRM_MODE` |
 
 #### 🏢 Enterprise deployment (`enterprise/`)
 

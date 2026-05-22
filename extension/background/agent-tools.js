@@ -239,6 +239,14 @@
                     "canvas_interact",
                     "iframe_interact",
                     "shadow_interact",
+                    "double_click",
+                    "middle_click",
+                    "force_click",
+                    "click_at_coordinates",
+                    "key_down",
+                    "key_up",
+                    "get_bounding_box",
+                    "get_computed_style",
                   ],
                 },
                 args: { type: "object", additionalProperties: true },
@@ -716,6 +724,175 @@
         },
         additionalProperties: false,
       },
+    },
+
+    // ── New Interaction Tools ──
+    {
+      name: "double_click",
+      description: "Double-click an element by CSS selector. Use for inline-rename, expanding nodes, or any UI that requires dblclick.",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: { type: "string", description: "CSS selector" },
+          text: { type: "string", description: "Match element by visible text (fallback)" },
+        },
+      },
+      danger: "write",
+    },
+    {
+      name: "middle_click",
+      description: "Middle-click (button 1) an element — opens links in a new tab without needing target=_blank.",
+      parameters: {
+        type: "object",
+        properties: { selector: { type: "string" } },
+        required: ["selector"],
+      },
+      danger: "write",
+    },
+    {
+      name: "force_click",
+      description: "Click an element bypassing visibility and interactability checks. Use when a normal click fails due to the element being hidden or overlapped.",
+      parameters: {
+        type: "object",
+        properties: { selector: { type: "string" } },
+        required: ["selector"],
+      },
+      danger: "write",
+    },
+    {
+      name: "click_at_coordinates",
+      description: "Click at absolute viewport (x, y) pixel coordinates. Use for canvas, map UIs, or visual targets with no CSS selector.",
+      parameters: {
+        type: "object",
+        properties: {
+          x: { type: "number", description: "Viewport X coordinate (pixels from left)" },
+          y: { type: "number", description: "Viewport Y coordinate (pixels from top)" },
+          button: { type: "string", enum: ["left", "middle", "right"], description: "Mouse button (default: left)" },
+          double: { type: "boolean", description: "Double-click instead of single click (default: false)" },
+        },
+        required: ["x", "y"],
+      },
+      danger: "write",
+    },
+    {
+      name: "key_down",
+      description: "Dispatch a keydown event — useful for holding modifier keys (Shift, Control, Alt) before another action.",
+      parameters: {
+        type: "object",
+        properties: {
+          key: { type: "string", description: "Key name e.g. 'Shift', 'Control', 'a'" },
+          selector: { type: "string", description: "Optional CSS selector for target element" },
+        },
+        required: ["key"],
+      },
+      danger: "write",
+    },
+    {
+      name: "key_up",
+      description: "Dispatch a keyup event — releases a key held with key_down.",
+      parameters: {
+        type: "object",
+        properties: {
+          key: { type: "string", description: "Key name e.g. 'Shift', 'Control', 'a'" },
+          selector: { type: "string", description: "Optional CSS selector for target element" },
+        },
+        required: ["key"],
+      },
+      danger: "write",
+    },
+    {
+      name: "get_bounding_box",
+      description: "Return the viewport position and size of an element: x, y, width, height, top, right, bottom, left. Use for coordinate-based interactions or layout assertions.",
+      parameters: {
+        type: "object",
+        properties: { selector: { type: "string" } },
+        required: ["selector"],
+      },
+    },
+    {
+      name: "get_computed_style",
+      description: "Return resolved CSS property values for an element. Specify properties array for targeted lookup or omit for common defaults (display, color, font-size, etc.).",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: { type: "string" },
+          properties: {
+            type: "array",
+            items: { type: "string" },
+            description: "CSS property names to return (e.g. ['color', 'display']). Omit for defaults.",
+          },
+        },
+        required: ["selector"],
+      },
+    },
+    {
+      name: "set_geolocation",
+      description: "Override the browser geolocation for the active tab (CDP). Pass latitude/longitude to spoof location; set clear:true to remove the override.",
+      parameters: {
+        type: "object",
+        properties: {
+          latitude: { type: "number", description: "Decimal degrees latitude" },
+          longitude: { type: "number", description: "Decimal degrees longitude" },
+          accuracy: { type: "number", description: "Accuracy in meters (default 1)" },
+          clear: { type: "boolean", description: "Remove the geolocation override" },
+        },
+      },
+      danger: "write",
+    },
+    {
+      name: "delete_cookie",
+      description: "Remove a single cookie by name for the current (or given) URL.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Cookie name" },
+          url: { type: "string", description: "URL scope (defaults to active tab URL)" },
+        },
+        required: ["name"],
+      },
+      danger: "write",
+    },
+    {
+      name: "clear_cookies",
+      description: "Remove all cookies for the current (or given) URL. Use to reset auth state or clear session data.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "URL scope (defaults to active tab URL)" },
+        },
+      },
+      danger: "write",
+    },
+    {
+      name: "print_to_pdf",
+      description: "Export the current page as a PDF via CDP. Returns base64-encoded PDF data. Decode and write to a .pdf file.",
+      parameters: {
+        type: "object",
+        properties: {
+          landscape: { type: "boolean", description: "Landscape orientation (default false)" },
+          printBackground: { type: "boolean", description: "Include background graphics (default true)" },
+          scale: { type: "number", description: "Scale factor 0.1–2 (default 1)" },
+          paperWidth: { type: "number", description: "Paper width in inches (default 8.5)" },
+          paperHeight: { type: "number", description: "Paper height in inches (default 11)" },
+        },
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "emulate_media",
+      description: "Override CSS media type and/or media features (CDP). Use to test dark mode, print layout, reduced-motion, etc. Pass media='print' or media='screen'; set colorScheme, reducedMotion, contrast, forcedColors as needed.",
+      parameters: {
+        type: "object",
+        properties: {
+          media: { type: "string", enum: ["screen", "print", ""], description: "Media type — empty string resets" },
+          colorScheme: { type: "string", enum: ["light", "dark", "no-preference"], description: "prefers-color-scheme override" },
+          reducedMotion: { type: "string", enum: ["reduce", "no-preference"], description: "prefers-reduced-motion override" },
+          contrast: { type: "string", enum: ["more", "less", "no-preference"], description: "prefers-contrast override" },
+          forcedColors: { type: "string", enum: ["active", "none"], description: "forced-colors override" },
+        },
+        additionalProperties: false,
+      },
+      danger: "write",
     },
 
     // ── Final answer ──

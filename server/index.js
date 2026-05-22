@@ -648,6 +648,8 @@ const TOOL_TIERS = new Map([
   ["browser_network_requests", "read"],
   ["browser_take_screenshot", "read"],
   ["browser_wait_for", "read"],
+  ["get_bounding_box", "read"],
+  ["get_computed_style", "read"],
 
   // Write tools — modify page state but are generally reversible
   ["click", "write"],
@@ -680,6 +682,15 @@ const TOOL_TIERS = new Map([
   ["browser_press_key", "write"],
   ["browser_select_option", "write"],
   ["browser_drag", "write"],
+  ["double_click", "write"],
+  ["middle_click", "write"],
+  ["force_click", "write"],
+  ["click_at_coordinates", "write"],
+  ["key_down", "write"],
+  ["key_up", "write"],
+  ["set_geolocation", "write"],
+  ["delete_cookie", "write"],
+  ["emulate_media", "write"],
 
   // Destructive tools — irreversible actions (navigation, form submission)
   ["navigate", "destructive"],
@@ -693,6 +704,8 @@ const TOOL_TIERS = new Map([
   ["browser_handle_dialog", "destructive"],
   ["browser_evaluate", "destructive"],
   ["browser_close", "destructive"],
+  ["clear_cookies", "destructive"],
+  ["print_to_pdf", "destructive"],
 ]);
 
 function getToolTier(toolName, params = {}) {
@@ -7338,6 +7351,280 @@ server.addTool({
   }),
   execute: async (params) => {
     const result = await callExtensionTool("deep_query", params);
+    return stringifyToolResult(result);
+  },
+});
+
+// ─── New Interaction Tools ────────────────────────────────────
+
+server.addTool({
+  name: "double_click",
+  description:
+    "Double-click an element by CSS selector or visible text. " +
+    "Use for inline rename, expanding tree nodes, or any UI that requires dblclick.",
+  parameters: z.object({
+    selector: z.string().optional().describe("CSS selector"),
+    text: z.string().optional().describe("Match element by visible text (fallback)"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("double_click", params);
+    return stringifyToolResult(result);
+  },
+});
+
+server.addTool({
+  name: "middle_click",
+  description:
+    "Middle-click (button 1) an element by CSS selector. " +
+    "Opens links in a new background tab without needing target=_blank.",
+  parameters: z.object({
+    selector: z.string().describe("CSS selector"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("middle_click", params);
+    return stringifyToolResult(result);
+  },
+});
+
+server.addTool({
+  name: "force_click",
+  description:
+    "Click an element bypassing visibility and interactability checks. " +
+    "Use when a normal click fails because the element is hidden or overlapped.",
+  parameters: z.object({
+    selector: z.string().describe("CSS selector"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("force_click", params);
+    return stringifyToolResult(result);
+  },
+});
+
+server.addTool({
+  name: "click_at_coordinates",
+  description:
+    "Click at absolute viewport (x, y) pixel coordinates. " +
+    "Use for canvas, map UIs, datepickers, or visual targets with no CSS selector. " +
+    "Combine with get_bounding_box to derive coordinates from an element.",
+  parameters: z.object({
+    x: z.number().describe("Viewport X coordinate (pixels from left)"),
+    y: z.number().describe("Viewport Y coordinate (pixels from top)"),
+    button: z
+      .enum(["left", "middle", "right"])
+      .optional()
+      .default("left")
+      .describe("Mouse button"),
+    double: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Double-click instead of single"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("click_at_coordinates", params);
+    return stringifyToolResult(result);
+  },
+});
+
+server.addTool({
+  name: "key_down",
+  description:
+    "Dispatch a keydown event on the page or a specific element. " +
+    "Use to hold modifier keys (Shift, Control, Alt, Meta) before another action, " +
+    "then release with key_up.",
+  parameters: z.object({
+    key: z.string().describe("Key name e.g. 'Shift', 'Control', 'Alt', 'a'"),
+    selector: z
+      .string()
+      .optional()
+      .describe("CSS selector for target (defaults to focused element)"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("key_down", params);
+    return stringifyToolResult(result);
+  },
+});
+
+server.addTool({
+  name: "key_up",
+  description:
+    "Dispatch a keyup event — releases a key previously held with key_down.",
+  parameters: z.object({
+    key: z.string().describe("Key name e.g. 'Shift', 'Control', 'Alt', 'a'"),
+    selector: z
+      .string()
+      .optional()
+      .describe("CSS selector for target (defaults to focused element)"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("key_up", params);
+    return stringifyToolResult(result);
+  },
+});
+
+server.addTool({
+  name: "get_bounding_box",
+  description:
+    "Return the viewport position and size of an element: x, y, width, height, top, right, bottom, left. " +
+    "Use before click_at_coordinates to derive pixel targets, or for layout assertions.",
+  parameters: z.object({
+    selector: z.string().describe("CSS selector"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("get_bounding_box", params);
+    return stringifyToolResult(result);
+  },
+});
+
+server.addTool({
+  name: "get_computed_style",
+  description:
+    "Return resolved CSS property values for an element. " +
+    "Pass a properties array for targeted lookup, or omit for common defaults " +
+    "(display, visibility, color, background-color, font-size, etc.).",
+  parameters: z.object({
+    selector: z.string().describe("CSS selector"),
+    properties: z
+      .array(z.string())
+      .optional()
+      .describe("CSS property names to return e.g. ['color', 'display']"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("get_computed_style", params);
+    return stringifyToolResult(result);
+  },
+});
+
+server.addTool({
+  name: "set_geolocation",
+  description:
+    "Override the browser geolocation for the active tab using CDP. " +
+    "Pass latitude and longitude to spoof location. Set clear:true to remove the override. " +
+    "Useful for testing location-gated features and maps.",
+  parameters: z.object({
+    latitude: z.number().optional().describe("Decimal degrees latitude"),
+    longitude: z.number().optional().describe("Decimal degrees longitude"),
+    accuracy: z
+      .number()
+      .optional()
+      .default(1)
+      .describe("Accuracy in metres (default 1)"),
+    clear: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Remove the geolocation override"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("set_geolocation", params);
+    return stringifyToolResult(result);
+  },
+});
+
+server.addTool({
+  name: "delete_cookie",
+  description:
+    "Remove a single cookie by name for the current (or given) URL.",
+  parameters: z.object({
+    name: z.string().describe("Cookie name to remove"),
+    url: z
+      .string()
+      .optional()
+      .describe("URL scope (defaults to active tab URL)"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("delete_cookie", params);
+    return stringifyToolResult(result);
+  },
+});
+
+server.addTool({
+  name: "clear_cookies",
+  description:
+    "Remove all cookies for the current (or given) URL. " +
+    "Use to reset authentication state or clear a session completely.",
+  parameters: z.object({
+    url: z
+      .string()
+      .optional()
+      .describe("URL scope (defaults to active tab URL)"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("clear_cookies", params);
+    return stringifyToolResult(result);
+  },
+});
+
+server.addTool({
+  name: "print_to_pdf",
+  description:
+    "Export the current page as a PDF using CDP Page.printToPDF. " +
+    "Returns base64-encoded PDF data. Decode and save as a .pdf file. " +
+    "Note: Chrome must not be in headless mode for this to work.",
+  parameters: z.object({
+    landscape: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Landscape orientation"),
+    printBackground: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe("Include background graphics"),
+    scale: z
+      .number()
+      .optional()
+      .default(1)
+      .describe("Scale factor 0.1–2"),
+    paperWidth: z
+      .number()
+      .optional()
+      .default(8.5)
+      .describe("Paper width in inches"),
+    paperHeight: z
+      .number()
+      .optional()
+      .default(11)
+      .describe("Paper height in inches"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("print_to_pdf", params);
+    return stringifyToolResult(result);
+  },
+});
+
+server.addTool({
+  name: "emulate_media",
+  description:
+    "Override CSS media type and/or media features via CDP. " +
+    "Use to test dark mode (colorScheme:'dark'), print layout (media:'print'), " +
+    "reduced motion (reducedMotion:'reduce'), high-contrast (contrast:'more'), " +
+    "or forced-colors mode. Pass empty string to reset any field.",
+  parameters: z.object({
+    media: z
+      .enum(["screen", "print", ""])
+      .optional()
+      .describe("Media type — empty string resets"),
+    colorScheme: z
+      .enum(["light", "dark", "no-preference"])
+      .optional()
+      .describe("prefers-color-scheme override"),
+    reducedMotion: z
+      .enum(["reduce", "no-preference"])
+      .optional()
+      .describe("prefers-reduced-motion override"),
+    contrast: z
+      .enum(["more", "less", "no-preference"])
+      .optional()
+      .describe("prefers-contrast override"),
+    forcedColors: z
+      .enum(["active", "none"])
+      .optional()
+      .describe("forced-colors override"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("emulate_media", params);
     return stringifyToolResult(result);
   },
 });
