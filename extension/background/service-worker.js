@@ -1582,7 +1582,13 @@ function _wrapUntrustedPageDataForPrompt(value, maxChars) {
     return globalThis.AutoDOMProviders.wrapUntrustedPageData(value, maxChars);
   }
   const limit = Number.isFinite(maxChars) ? maxChars : 1200;
-  const text = String(value || "").substring(0, limit);
+  const text = String(value || "")
+    .replace(/\u0000(?:IC|CB)\d+\u0000/g, "")
+    .replace(
+      /\b(?:IC|CB)(?=[A-Z0-9_.-])(?:[A-Za-z0-9_.-]{1,})\b/g,
+      "[account identifier omitted]",
+    )
+    .substring(0, limit);
   if (!text) return "";
   const nonce = _localUntrustedNonce();
   return (
