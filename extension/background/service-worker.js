@@ -144,6 +144,7 @@ async function _ensureOffscreenKeepalive(reason = "unknown") {
     if (await _hasOffscreenDocumentOpen()) return true;
 
     const workerReason = chrome.offscreen?.Reason?.WORKERS;
+    const userMediaReason = chrome.offscreen?.Reason?.USER_MEDIA;
     if (!workerReason) {
       _debugWarn(
         "[AutoDOM SW] Offscreen keepalive unavailable: missing WORKERS reason enum",
@@ -154,9 +155,9 @@ async function _ensureOffscreenKeepalive(reason = "unknown") {
     try {
       await chrome.offscreen.createDocument({
         url: OFFSCREEN_DOCUMENT_PATH,
-        reasons: [workerReason],
+        reasons: [workerReason, userMediaReason].filter(Boolean),
         justification:
-          "Keep the MV3 service worker warm for active MCP automation sessions.",
+          "Keep the MV3 service worker warm and host tab recording getUserMedia calls.",
       });
       _debugLog("[AutoDOM SW] Offscreen keepalive document created:", reason);
       return true;
@@ -5481,39 +5482,48 @@ try {
 
 // Offscreen recorder bridge. The offscreen document owns the MediaStream
 // and MediaRecorder; the SW just relays start/stop/status messages and
-// waits for the response. We re-use the existing offscreen document but
-// add the USER_MEDIA reason on first recorder use.
+// waits for the response. Chrome requires the offscreen document to be
+// created with USER_MEDIA before it can call navigator.mediaDevices.getUserMedia.
 let _offscreenRecorderReady = false;
 async function _ensureOffscreenRecorder() {
   if (_offscreenRecorderReady) return true;
   if (!chrome.offscreen?.createDocument) {
     throw new Error("chrome.offscreen unavailable in this build");
   }
-  // If an offscreen document with USER_MEDIA wasn't opened, try to add it.
-  // (Chrome lets a single offscreen doc declare multiple reasons.)
-  try {
-    await chrome.offscreen.createDocument({
+
+  const userMediaReason = chrome.offscreen.Reason?.USER_MEDIA;
+  const workerReason = chrome.offscreen.Reason?.WORKERS;
+  if (!userMediaReason) {
+    throw new Error("chrome.offscreen USER_MEDIA reason unavailable in this Chrome build");
+  }
+  const createRecorderDocument = () =>
+    chrome.offscreen.createDocument({
       url: OFFSCREEN_DOCUMENT_PATH,
-      reasons: [
-        chrome.offscreen.Reason?.USER_MEDIA,
-        chrome.offscreen.Reason?.WORKERS,
-      ].filter(Boolean),
+      reasons: [userMediaReason, workerReason].filter(Boolean),
       justification: "Capture MediaStream from chrome.tabCapture for AutoDOM tab recording.",
     });
+
+  try {
+    await createRecorderDocument();
   } catch (err) {
     const msg = String(err?.message || err || "");
     if (!msg.includes("Only a single offscreen document") && !msg.includes("already exists")) {
       throw err;
     }
-    // Already exists with some reason set — that's fine, we'll just message it.
+    // A keepalive-only offscreen document from an older run cannot be upgraded
+    // in-place. Preserve an active recording if there is one; otherwise recreate
+    // the document with USER_MEDIA so tabCapture getUserMedia will succeed.
+    const status = await _sendRawOffscreenRecorderMessage({ type: "AUTODOM_REC_STATUS" });
+    if (!status?.recording) {
+      await chrome.offscreen.closeDocument();
+      await createRecorderDocument();
+    }
   }
   _offscreenRecorderReady = true;
   return true;
 }
 
-async function _sendToOffscreenRecorder(message) {
-  await _ensureOffscreenRecorder();
-  // Tag the message so the offscreen doc only handles recorder traffic.
+async function _sendRawOffscreenRecorderMessage(message) {
   const tagged = { ...message, __autodom_recorder: true };
   return await new Promise((resolve) => {
     try {
@@ -5528,6 +5538,11 @@ async function _sendToOffscreenRecorder(message) {
       resolve({ ok: false, error: String(err && err.message) });
     }
   });
+}
+
+async function _sendToOffscreenRecorder(message) {
+  await _ensureOffscreenRecorder();
+  return await _sendRawOffscreenRecorderMessage(message);
 }
 
 async function handleToolCall(tool, params, id) {
