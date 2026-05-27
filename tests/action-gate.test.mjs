@@ -63,6 +63,26 @@ test("classify defaults unknown tools to mutating (conservative)", () => {
   assert.equal(Gate.classify("totally_made_up_tool"), "mutating");
 });
 
+test("classify covers new media / image / recorder tools", () => {
+  const { Gate } = loadGate();
+  // Reads
+  assert.equal(Gate.classify("media_list"), "safe-read");
+  assert.equal(Gate.classify("media_get_captions"), "safe-read");
+  assert.equal(Gate.classify("media_capture_frame"), "safe-read");
+  assert.equal(Gate.classify("media_sample_frames"), "safe-read");
+  assert.equal(Gate.classify("image_list"), "safe-read");
+  assert.equal(Gate.classify("image_get_data"), "safe-read");
+  assert.equal(Gate.classify("macro_record_stop"), "safe-read");
+  assert.equal(Gate.classify("tab_recording_status"), "safe-read");
+  // Mutating (control falls through to default)
+  assert.equal(Gate.classify("media_control"), "mutating");
+  // Destructive (require confirmation each time)
+  assert.equal(Gate.classify("macro_record_start"), "destructive");
+  assert.equal(Gate.classify("macro_replay"), "destructive");
+  assert.equal(Gate.classify("tab_recording_start"), "destructive");
+  assert.equal(Gate.classify("tab_recording_stop"), "destructive");
+});
+
 test("resolveDecision: master toggle off → allow everything", () => {
   const { Gate } = loadGate();
   const s = { enabled: false, silentReads: false };

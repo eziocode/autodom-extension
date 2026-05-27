@@ -1294,6 +1294,19 @@
       <button class="autodom-chat-quick-btn" type="button" data-prompt="__explain__"><span class="prompt-spark" aria-hidden="true">✨</span>What can I do?</button>
       <button class="autodom-chat-quick-btn" type="button" data-prompt="__key_controls__"><span class="prompt-spark" aria-hidden="true">✨</span>Key controls</button>
       <button class="autodom-chat-quick-btn" type="button" data-prompt="__a11y__"><span class="prompt-spark" aria-hidden="true">✨</span>A11y audit</button>
+      <span class="autodom-chat-quick-divider" aria-hidden="true"></span>
+      <button class="autodom-chat-icon-btn" type="button" data-action="media_list" title="List videos/audio on this page" aria-label="List media">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="8,5 19,12 8,19"/></svg>
+      </button>
+      <button class="autodom-chat-icon-btn" type="button" data-action="describe_images" title="Send page images to AI for description" aria-label="Describe images">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M21 17l-5-5-7 7"/></svg>
+      </button>
+      <button class="autodom-chat-icon-btn" type="button" data-action="tab_record_toggle" title="Record this tab to WebM" aria-label="Record tab">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6"/></svg>
+      </button>
+      <button class="autodom-chat-icon-btn" type="button" data-action="macro_record_toggle" title="Record / replay a macro of your interactions" aria-label="Record macro">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="3"/><circle cx="18" cy="12" r="3"/><path d="M6 12h12"/></svg>
+      </button>
     </div>
     <div class="autodom-chat-toast" id="__autodom_chat_toast" role="status" aria-live="polite" aria-hidden="true"></div>
 
@@ -7293,6 +7306,130 @@
   }
 
   // ─── Execute Tool Command ──────────────────────────────────
+  // ─── Media / Image / Recorder helpers (toolbar actions) ─────
+  // Toolbar wiring is in the data-action switch further down. State is
+  // tracked on globalThis so the same button can toggle start/stop.
+
+  async function _autodomDescribeImagesFlow() {
+    try {
+      const listRes = await callTool("image_list", { limit: 12 });
+      if (!listRes || listRes.error || !Array.isArray(listRes.images) || listRes.images.length === 0) {
+        _showChatToast("No images found on this page");
+        return;
+      }
+      // Take the first up to 4 visible images, fetch their bytes, attach.
+      const picks = listRes.images.filter((i) => i.naturalWidth > 32 && i.naturalHeight > 32).slice(0, 4);
+      if (picks.length === 0) { _showChatToast("No analysable images"); return; }
+      let attached = 0;
+      for (const img of picks) {
+        if (pendingAttachments.length >= ATTACHMENT_MAX_COUNT) break;
+        const r = await callTool("image_get_data", { index: img.index });
+        if (r && r.ok && r.dataUrl) {
+          pendingAttachments.push({
+            id: _genAttachmentId(),
+            name: `page-image-${img.index}`,
+            mime: r.dataUrl.slice(5, r.dataUrl.indexOf(";")) || "image/png",
+            size: Math.round(r.dataUrl.length * 0.75),
+            dataUrl: r.dataUrl,
+          });
+          attached++;
+        }
+      }
+      if (attached === 0) {
+        _showChatToast("Could not fetch images (CORS?)");
+        return;
+      }
+      _renderAttachmentChips();
+      _refreshSendBtnEnabled();
+      const input = document.getElementById("__autodom_chat_input");
+      if (input && !input.value.trim()) {
+        input.value = "Describe each of the attached images from this page.";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      _showChatToast(`Attached ${attached} image${attached === 1 ? "" : "s"} — press send`);
+    } catch (err) {
+      _showChatToast("Image describe failed: " + (err && err.message || err));
+    }
+  }
+
+  // Tab recording — pure UI shell over tab_recording_start/stop tools.
+  globalThis.__autodomTabRec = globalThis.__autodomTabRec || { active: false, lastUrl: null };
+  async function _autodomToggleTabRecording(btn) {
+    const state = globalThis.__autodomTabRec;
+    try {
+      if (!state.active) {
+        const r = await callTool("tab_recording_start", {});
+        if (r && r.ok) {
+          state.active = true;
+          btn && btn.classList.add("autodom-recording");
+          btn && btn.setAttribute("title", "Stop tab recording");
+          _showChatToast("🔴 Recording this tab… click again to stop");
+        } else {
+          _showChatToast("Could not start recording: " + (r && (r.error || r.reason) || "unknown"));
+        }
+      } else {
+        const r = await callTool("tab_recording_stop", {});
+        state.active = false;
+        btn && btn.classList.remove("autodom-recording");
+        btn && btn.setAttribute("title", "Record this tab to WebM");
+        if (r && r.ok) {
+          state.lastUrl = r.objectUrl;
+          const kb = Math.round((r.sizeBytes || 0) / 1024);
+          const secs = Math.round((r.durationMs || 0) / 1000);
+          _showChatToast(`Recording saved (${secs}s · ${kb} KB) — downloading…`);
+          // Trigger save via SW.
+          try {
+            chrome.runtime.sendMessage({
+              type: "DOWNLOAD_LAST_RECORDING",
+              objectUrl: r.objectUrl,
+              filename: `autodom-${Date.now()}.webm`,
+              saveAs: true,
+            }, () => {});
+          } catch (_) {}
+        } else {
+          _showChatToast("Stop failed: " + (r && (r.error || r.reason) || "unknown"));
+        }
+      }
+    } catch (err) {
+      _showChatToast("Recording error: " + (err && err.message || err));
+    }
+  }
+
+  // Macro recording — start/stop, persist the captured event array under
+  // chrome.storage.local["autodomMacros.last"] and offer immediate replay.
+  globalThis.__autodomMacroRec = globalThis.__autodomMacroRec || { active: false };
+  async function _autodomToggleMacroRecording(btn) {
+    const state = globalThis.__autodomMacroRec;
+    try {
+      if (!state.active) {
+        const r = await callTool("macro_record_start", {});
+        if (r && (r.ok || r.started || r.success)) {
+          state.active = true;
+          btn && btn.classList.add("autodom-recording");
+          btn && btn.setAttribute("title", "Stop macro recording");
+          _showChatToast("⏺ Recording macro… interact with the page, click again to stop");
+        } else {
+          _showChatToast("Could not start macro: " + (r && (r.error || r.reason) || "unknown"));
+        }
+        return;
+      }
+      const r = await callTool("macro_record_stop", {});
+      state.active = false;
+      btn && btn.classList.remove("autodom-recording");
+      btn && btn.setAttribute("title", "Record / replay a macro of your interactions");
+      if (r && r.ok && Array.isArray(r.events)) {
+        try {
+          chrome.storage.local.set({ "autodomMacros.last": { events: r.events, savedAt: Date.now() } });
+        } catch (_) {}
+        _showChatToast(`Macro saved (${r.events.length} steps). Type "replay macro" to run it.`);
+      } else {
+        _showChatToast("Macro stop failed: " + (r && (r.error || r.reason) || "unknown"));
+      }
+    } catch (err) {
+      _showChatToast("Macro error: " + (err && err.message || err));
+    }
+  }
+
   async function executeToolCommand(command) {
     _log(
       "executeToolCommand:",
@@ -7959,6 +8096,26 @@
           },
         };
         break;
+      case "media_list":
+        displayText = "/media";
+        command = {
+          tool: "media_list",
+          params: {},
+          displayName: "Media on page",
+        };
+        break;
+      case "describe_images":
+        // Custom flow — list images, attach a few as image attachments, then
+        // queue a "Describe each of these images" user turn so vision-capable
+        // models analyse them on the next send.
+        await _autodomDescribeImagesFlow();
+        return;
+      case "tab_record_toggle":
+        await _autodomToggleTabRecording(btn);
+        return;
+      case "macro_record_toggle":
+        await _autodomToggleMacroRecording(btn);
+        return;
       default:
         return;
     }

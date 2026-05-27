@@ -14,6 +14,11 @@ try {
   if (typeof importScripts === "function" && !globalThis.AutoDOMProviders) {
     importScripts("providers.js");
   }
+  // media-tools.js must load BEFORE agent-tools.js so its catalog entries
+  // can be spliced into the global TOOL_CATALOG at module-init time.
+  if (typeof importScripts === "function" && !globalThis.AutoDOMMediaTools) {
+    importScripts("media-tools.js");
+  }
   if (typeof importScripts === "function" && !globalThis.AutoDOMAgent) {
     importScripts("agent-tools.js");
   }
@@ -3910,6 +3915,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  // Recorder messages (tagged with __autodom_recorder) are handled by the
+  // offscreen document — let them pass through to that listener.
+  if (message && message.__autodom_recorder) return false;
+
+  // Trigger a chrome.downloads save of the last recorded blob (objectUrl
+  // generated inside the offscreen document and returned via tab_recording_stop).
+  if (message.type === "DOWNLOAD_LAST_RECORDING") {
+    const url = message.objectUrl;
+    const filename = message.filename || `autodom-recording-${Date.now()}.webm`;
+    if (!url) { sendResponse({ ok: false, error: "missing objectUrl" }); return false; }
+    try {
+      chrome.downloads.download({ url, filename, saveAs: !!message.saveAs }, (id) => {
+        if (chrome.runtime.lastError) {
+          sendResponse({ ok: false, error: chrome.runtime.lastError.message });
+        } else {
+          sendResponse({ ok: true, downloadId: id });
+        }
+      });
+    } catch (err) {
+      sendResponse({ ok: false, error: String(err && err.message) });
+    }
+    return true; // async
+  }
+
   if (message.type !== "USER_ACTION") {
     _debugLog(
       "[AutoDOM SW] onMessage:",
@@ -5431,6 +5460,75 @@ const TOOL_HANDLERS = new Map([
   ["browser_evaluate", toolBrowserEvaluate],
   ["browser_close", toolBrowserClose],
 ]);
+
+// ─── Register Media / Image / Recorder tools (from media-tools.js) ──
+// Bound to SW helpers via a context object. Offscreen messaging is used
+// for tab recording (MediaRecorder lives in the offscreen document).
+try {
+  if (globalThis.AutoDOMMediaTools && typeof globalThis.AutoDOMMediaTools.makeHandlers === "function") {
+    const mediaHandlers = globalThis.AutoDOMMediaTools.makeHandlers({
+      getActiveTab,
+      executeInTab,
+      sendToOffscreen: (msg) => _sendToOffscreenRecorder(msg),
+    });
+    for (const [name, fn] of Object.entries(mediaHandlers)) {
+      TOOL_HANDLERS.set(name, fn);
+    }
+  }
+} catch (mtErr) {
+  _debugWarn("[AutoDOM SW] Failed to wire media tools:", mtErr && mtErr.message);
+}
+
+// Offscreen recorder bridge. The offscreen document owns the MediaStream
+// and MediaRecorder; the SW just relays start/stop/status messages and
+// waits for the response. We re-use the existing offscreen document but
+// add the USER_MEDIA reason on first recorder use.
+let _offscreenRecorderReady = false;
+async function _ensureOffscreenRecorder() {
+  if (_offscreenRecorderReady) return true;
+  if (!chrome.offscreen?.createDocument) {
+    throw new Error("chrome.offscreen unavailable in this build");
+  }
+  // If an offscreen document with USER_MEDIA wasn't opened, try to add it.
+  // (Chrome lets a single offscreen doc declare multiple reasons.)
+  try {
+    await chrome.offscreen.createDocument({
+      url: OFFSCREEN_DOCUMENT_PATH,
+      reasons: [
+        chrome.offscreen.Reason?.USER_MEDIA,
+        chrome.offscreen.Reason?.WORKERS,
+      ].filter(Boolean),
+      justification: "Capture MediaStream from chrome.tabCapture for AutoDOM tab recording.",
+    });
+  } catch (err) {
+    const msg = String(err?.message || err || "");
+    if (!msg.includes("Only a single offscreen document") && !msg.includes("already exists")) {
+      throw err;
+    }
+    // Already exists with some reason set — that's fine, we'll just message it.
+  }
+  _offscreenRecorderReady = true;
+  return true;
+}
+
+async function _sendToOffscreenRecorder(message) {
+  await _ensureOffscreenRecorder();
+  // Tag the message so the offscreen doc only handles recorder traffic.
+  const tagged = { ...message, __autodom_recorder: true };
+  return await new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(tagged, (response) => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, error: chrome.runtime.lastError.message });
+        } else {
+          resolve(response || { ok: false, error: "no response from offscreen recorder" });
+        }
+      });
+    } catch (err) {
+      resolve({ ok: false, error: String(err && err.message) });
+    }
+  });
+}
 
 async function handleToolCall(tool, params, id) {
   // Reset inactivity timer on every real tool call

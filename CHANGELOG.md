@@ -4,6 +4,33 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 4.1.0
+
+### Added — Media, image and recorder tools
+- **`media_list`** — Enumerate `<video>` and `<audio>` elements on the active page with state (currentTime, paused, duration, dimensions, mute/volume, indexes).
+- **`media_control`** — Play / pause / toggle / seek (`seekTo`, `seekBy`), set `playbackRate`, volume, mute / unmute, enter fullscreen or picture-in-picture. Addresses the previous inability to drive HTML5 video players.
+- **`media_get_captions`** — Read active `TextTrack` cues; falls back to scraping YouTube DOM caption segments when no programmatic tracks are exposed.
+- **`media_capture_frame`** — Grab the current `<video>` frame as a base64 PNG/JPEG dataURL.
+- **`media_sample_frames`** — Sample N evenly-spaced frames between two timestamps (pauses, seeks, captures, restores play state) for vision-model summarisation.
+- **`image_list`** — Enumerate `<img>` elements with src, alt, natural dimensions and bounding box.
+- **`image_get_data`** — Fetch a page image's bytes as a base64 dataURL (fetch with credentials, canvas fallback). Reports clear CORS errors for cross-origin images without CORS headers.
+- **`macro_record_start` / `macro_record_stop` / `macro_replay`** — Record user-style interactions on the active tab (clicks, inputs, key presses, scroll) and replay them at adjustable speed.
+- **`tab_recording_start` / `tab_recording_stop` / `tab_recording_status`** — Record the active tab to a WebM video via `chrome.tabCapture` + `MediaRecorder` running inside the offscreen document. Stop returns an `objectUrl` that the chat panel downloads via `chrome.downloads`.
+
+### Added — Chat panel UI
+- Toolbar quick-actions for **List media**, **Describe images** (auto-attaches up to 4 page images to the next vision-model turn), **Record tab** (toggling WebM capture with a pulsing red ring), and **Record macro** (toggling JSON capture saved to `chrome.storage.local`).
+
+### Changed
+- `extension/manifest.json` now requests the `tabCapture` permission required by the tab recorder.
+- `extension/offscreen.html` / `offscreen.js` now host the MediaRecorder in addition to the existing keepalive heartbeat; the SW relays recorder messages tagged with `__autodom_recorder: true`.
+- `action-gate.js` classifies the new tools: reads (`media_list`, `media_get_captions`, `media_capture_frame`, `media_sample_frames`, `image_list`, `image_get_data`, `macro_record_stop`, `tab_recording_status`) are safe-read; recorders (`macro_record_start`, `macro_replay`, `tab_recording_start`, `tab_recording_stop`) are destructive and always confirm. `media_control` falls through to mutating.
+
+### Tests
+- New `tests/media-tools.test.mjs` covering catalog/tiers shape, handler surface, and the macro install/stop helper.
+- Extended `tests/action-gate.test.mjs` with classification assertions for every new tool.
+
+---
+
 ## Unreleased
 
 ### Added

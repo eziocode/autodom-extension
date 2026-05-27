@@ -915,6 +915,16 @@
     },
   ];
 
+  // Splice in media/image/recorder tools (defined in media-tools.js).
+  // Loaded via a separate file to keep this catalog scannable.
+  try {
+    if (globalThis.AutoDOMMediaTools && Array.isArray(globalThis.AutoDOMMediaTools.catalog)) {
+      for (const t of globalThis.AutoDOMMediaTools.catalog) TOOL_CATALOG.push(t);
+    }
+  } catch (_) {
+    // media-tools.js not loaded — catalog stays as-is.
+  }
+
   // ─── Per-provider formatters ────────────────────────────
 
   function formatToolsForOpenAI(catalog) {

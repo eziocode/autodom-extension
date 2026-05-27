@@ -3564,3 +3564,16 @@
   content-visibility: visible;
   contain: none;
 }
+
+/* Recording indicator — pulsing red ring on toolbar buttons that are
+   currently recording (tab capture or macro). */
+#__autodom_chat_panel .autodom-chat-icon-btn.autodom-recording {
+  color: #ff3b30;
+  box-shadow: 0 0 0 0 rgba(255, 59, 48, 0.6);
+  animation: __autodom_rec_pulse 1.4s ease-out infinite;
+}
+@keyframes __autodom_rec_pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0.55); }
+  70%  { box-shadow: 0 0 0 8px rgba(255, 59, 48, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0); }
+}

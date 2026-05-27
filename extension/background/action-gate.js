@@ -63,6 +63,15 @@
     "browser_network_requests",
     "browser_take_screenshot",
     "browser_wait_for",
+    // Media / image reads (additive tier set merged below).
+    "media_list",
+    "media_get_captions",
+    "media_capture_frame",
+    "media_sample_frames",
+    "image_list",
+    "image_get_data",
+    "macro_record_stop",
+    "tab_recording_status",
   ]);
 
   // Anything in this list bypasses a site's "allow mutating" rule and is
@@ -96,6 +105,12 @@
     "browser_close",
     "clear_cookies",
     "print_to_pdf",
+    // Macro + tab recorders persist data and (for tab recording) capture
+    // off-screen state. Always confirm.
+    "macro_record_start",
+    "macro_replay",
+    "tab_recording_start",
+    "tab_recording_stop",
   ]);
 
   function classify(toolName, params = {}) {
