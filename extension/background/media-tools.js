@@ -545,6 +545,33 @@
       },
       tab_recording_start: async (params) => {
         const tab = await getActiveTab();
+        // `tabCapture` is an optional permission (declared in
+        // optional_permissions) so that adding it never forces a
+        // disable-on-update re-authorization prompt for existing installs.
+        // It must be granted at runtime from a user gesture via the popup
+        // ("Enable tab recording"). The service-worker MCP path has no user
+        // gesture, so we only check — never request — here.
+        const hasTabCapture = await new Promise((resolve) => {
+          try {
+            chrome.permissions.contains(
+              { permissions: ["tabCapture"] },
+              (granted) => {
+                if (chrome.runtime.lastError) resolve(false);
+                else resolve(granted === true);
+              },
+            );
+          } catch (_) {
+            resolve(false);
+          }
+        });
+        if (!hasTabCapture) {
+          return {
+            ok: false,
+            error:
+              "Tab recording permission not granted. Open the AutoDOM extension popup and click \"Enable tab recording\" to grant the tabCapture permission, then retry.",
+            permissionRequired: "tabCapture",
+          };
+        }
         // chrome.tabCapture.getMediaStreamId must be invoked from a user
         // gesture context in the page; from the SW we use targetTabId.
         const streamId = await new Promise((resolve, reject) => {

@@ -31,6 +31,8 @@ const DOM = {
   autoUpdateToggle: $("#autoUpdateToggle"),
   periodicUpdateCheckToggle: $("#periodicUpdateCheckToggle"),
   clearExtensionCacheBtn: $("#clearExtensionCacheBtn"),
+  enableTabRecordingBtn: $("#enableTabRecordingBtn"),
+  tabRecordingPermStatus: $("#tabRecordingPermStatus"),
   aiChatBtn: $("#aiChatBtn"),
   providerSelect: $("#providerSelect"),
   providerApiKey: $("#providerApiKey"),
@@ -881,6 +883,70 @@ const _secretAreaName =
       }
       showPopupToast("Extension cache cleared.", "success");
       addLog("Extension cache cleared.", "success");
+    });
+  }
+
+  if (DOM.enableTabRecordingBtn) {
+    const recBtnDefaultText =
+      DOM.enableTabRecordingBtn.textContent.trim() || "Enable tab recording";
+    const refreshTabRecordingPermStatus = () => {
+      try {
+        chrome.permissions.contains(
+          { permissions: ["tabCapture"] },
+          (granted) => {
+            const ok = granted === true && !chrome.runtime.lastError;
+            if (DOM.tabRecordingPermStatus) {
+              DOM.tabRecordingPermStatus.textContent = ok
+                ? "Granted"
+                : "Not granted";
+            }
+            DOM.enableTabRecordingBtn.disabled = ok;
+            DOM.enableTabRecordingBtn.textContent = ok
+              ? "Tab recording enabled"
+              : recBtnDefaultText;
+          },
+        );
+      } catch (_) {}
+    };
+    refreshTabRecordingPermStatus();
+
+    // `chrome.permissions.request` must run from a user gesture, which a
+    // click handler provides. This grants the optional tabCapture permission
+    // without forcing a disable-on-update re-authorization for every install.
+    DOM.enableTabRecordingBtn.addEventListener("click", () => {
+      try {
+        chrome.permissions.request(
+          { permissions: ["tabCapture"] },
+          (granted) => {
+            if (chrome.runtime.lastError) {
+              showPopupToast(
+                "Could not enable tab recording.",
+                "error",
+                3200,
+              );
+              addLog(
+                `Tab recording permission request failed: ${chrome.runtime.lastError.message}`,
+                "error",
+              );
+              return;
+            }
+            if (granted) {
+              showPopupToast("Tab recording enabled.", "success");
+              addLog("tabCapture permission granted.", "success");
+            } else {
+              showPopupToast("Tab recording permission denied.", "warn");
+              addLog("tabCapture permission denied by user.", "warn");
+            }
+            refreshTabRecordingPermStatus();
+          },
+        );
+      } catch (err) {
+        showPopupToast("Could not enable tab recording.", "error", 3200);
+        addLog(
+          `Tab recording permission request failed: ${err?.message || err}`,
+          "error",
+        );
+      }
     });
   }
 

@@ -21,7 +21,7 @@ All notable changes to AutoDOM are documented in this file.
 - Toolbar quick-actions for **List media**, **Describe images** (auto-attaches up to 4 page images to the next vision-model turn), **Record tab** (toggling WebM capture with a pulsing red ring), and **Record macro** (toggling JSON capture saved to `chrome.storage.local`).
 
 ### Changed
-- `extension/manifest.json` now requests the `tabCapture` permission required by the tab recorder.
+- `extension/manifest.json` declares `tabCapture` as an **optional** permission (`optional_permissions`). It is requested at runtime — via the popup's "Enable tab recording" button — so adding the tab recorder never forces a disable-on-update re-authorization prompt for existing installs. `tab_recording_start` checks the grant with `chrome.permissions.contains` and returns an actionable error when it is missing.
 - `extension/offscreen.html` / `offscreen.js` now host the MediaRecorder in addition to the existing keepalive heartbeat; the SW relays recorder messages tagged with `__autodom_recorder: true`.
 - `action-gate.js` classifies the new tools: reads (`media_list`, `media_get_captions`, `media_capture_frame`, `media_sample_frames`, `image_list`, `image_get_data`, `macro_record_stop`, `tab_recording_status`) are safe-read; recorders (`macro_record_start`, `macro_replay`, `tab_recording_start`, `tab_recording_stop`) are destructive and always confirm. `media_control` falls through to mutating.
 

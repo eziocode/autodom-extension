@@ -17,7 +17,9 @@
     "webNavigation",
     "sidePanel",
     "downloads",
-    "offscreen",
+    "offscreen"
+  ],
+  "optional_permissions": [
     "tabCapture"
   ],
   "host_permissions": [

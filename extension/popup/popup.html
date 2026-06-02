@@ -136,6 +136,25 @@
                     </section>
 
                     <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Permissions</span>
+                        </div>
+                        <div class="field-stack">
+                            <div class="inline-row">
+                                <button type="button" class="text-btn" id="enableTabRecordingBtn">
+                                    Enable tab recording
+                                </button>
+                                <span id="tabRecordingPermStatus" class="field-hint" style="margin-left: 6px"></span>
+                            </div>
+                            <p class="field-hint">
+                                Tab recording uses the optional <code>tabCapture</code>
+                                permission. Grant it here once to allow the
+                                <code>tab_recording_*</code> tools to capture the active tab.
+                            </p>
+                        </div>
+                    </section>
+
+                    <section class="panel">
                         <div class="button-stack">
                             <button class="action-btn" id="connectBtn">
                                 <span id="connectBtnText">Connect</span>
