@@ -34,11 +34,22 @@
       description:
         "Snapshot interactive elements on the current page with stable indexes. " +
         "Use the returned indexes with click_by_index / type_by_index. Fast and token-efficient. " +
-        "Call this before any click/type if you don't already have a fresh snapshot.",
+        "Call this before any click/type if you don't already have a fresh snapshot. " +
+        "Pass autoScroll:true to scroll through lazy-loaded/virtualized lists and capture off-screen rows.",
       parameters: {
         type: "object",
         properties: {
           maxElements: { type: "integer", description: "Cap (default 60)" },
+          autoScroll: {
+            type: "boolean",
+            description:
+              "Scroll to reveal lazy/virtualized off-screen elements, then reposition (default false)",
+          },
+          maxScrolls: { type: "integer", description: "Max scroll steps (default 12)" },
+          scrollDelayMs: {
+            type: "integer",
+            description: "Delay per scroll step in ms (default 350)",
+          },
         },
         additionalProperties: false,
       },
@@ -106,11 +117,22 @@
       name: "take_snapshot",
       description:
         "Capture a structured DOM/accessibility snapshot of the page (tag, role, aria-label, key attributes, text). " +
-        "More structural than get_dom_state; better for navigation/aria-driven layouts (Playwright-style snapshot).",
+        "More structural than get_dom_state; better for navigation/aria-driven layouts (Playwright-style snapshot). " +
+        "Pass autoScroll:true to render lazy/append-style content before snapshotting.",
       parameters: {
         type: "object",
         properties: {
           maxDepth: { type: "integer", description: "Max recursion depth (default 10)" },
+          autoScroll: {
+            type: "boolean",
+            description:
+              "Sweep-scroll to trigger lazy rendering before snapshotting, then reposition (default false)",
+          },
+          maxScrolls: { type: "integer", description: "Max scroll steps (default 12)" },
+          scrollDelayMs: {
+            type: "integer",
+            description: "Delay per scroll step in ms (default 350)",
+          },
         },
         additionalProperties: false,
       },

@@ -3994,13 +3994,13 @@ const CLI_AGENT_TOOLS = [
   {
     name: "get_dom_state",
     description:
-      "Snapshot interactive elements with numeric indexes. Call before clicking or typing unless you have a fresh index map.",
+      "Snapshot interactive elements with numeric indexes. Call before clicking or typing unless you have a fresh index map. Pass autoScroll:true to capture lazy-loaded/virtualized off-screen rows when a list looks truncated.",
     params: { maxElements: 60 },
   },
   {
     name: "take_snapshot",
     description:
-      "Read a structured DOM/accessibility snapshot with roles, names, text, and hierarchy. Use for semantic target finding and verification.",
+      "Read a structured DOM/accessibility snapshot with roles, names, text, and hierarchy. Use for semantic target finding and verification. Pass autoScroll:true to render lazy/append-style content first.",
     params: { maxDepth: 6 },
   },
   {
@@ -5817,6 +5817,8 @@ server.addTool({
     "textareas, clickable elements) with their index, tag, text, type, name, placeholder, " +
     "href, and value. Use the index with click_by_index or type_by_index for precise " +
     "interaction. This is 50-200x smaller than a full DOM snapshot. " +
+    "Set autoScroll:true to scroll through lazy-loaded / virtualized lists, collect " +
+    "off-screen rows, then reposition the page — use this when a list looks truncated. " +
     "If you mention an index in a user-facing answer, call it element #7 (or similar), not IC7. " +
     "Always call this before interacting with page elements to discover what's available.",
   parameters: z.object({
@@ -5830,6 +5832,28 @@ server.addTool({
       .optional()
       .default(200)
       .describe("Maximum number of elements to return"),
+    autoScroll: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "Scroll through the page (or inner scroll container) to reveal lazy-loaded/virtualized off-screen elements, then restore the original scroll position",
+      ),
+    maxScrolls: z
+      .number()
+      .optional()
+      .default(12)
+      .describe("Max scroll steps when autoScroll is true"),
+    scrollDelayMs: z
+      .number()
+      .optional()
+      .default(350)
+      .describe("Delay after each scroll step to let lazy content render (ms)"),
+    maxDurationMs: z
+      .number()
+      .optional()
+      .default(8000)
+      .describe("Overall time budget for autoScroll collection (ms)"),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("get_dom_state", params);
@@ -6206,13 +6230,38 @@ server.addTool({
 server.addTool({
   name: "take_snapshot",
   description:
-    "Get a structured DOM snapshot of the page (element tree with attributes, text, roles). Lightweight and fast.",
+    "Get a structured DOM snapshot of the page (element tree with attributes, text, roles). Lightweight and fast. " +
+    "Set autoScroll:true to sweep the page first so lazy-loaded/append-style content renders before the snapshot, " +
+    "then it repositions to the original scroll offset. (For virtualized lists where off-screen rows are unmounted, " +
+    "prefer get_dom_state with autoScroll:true to collect the full set.)",
   parameters: z.object({
     maxDepth: z
       .number()
       .optional()
       .default(6)
       .describe("Maximum DOM tree depth to capture"),
+    autoScroll: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        "Scroll through the page to trigger lazy/append-style rendering before snapshotting, then restore the scroll position",
+      ),
+    maxScrolls: z
+      .number()
+      .optional()
+      .default(12)
+      .describe("Max scroll steps when autoScroll is true"),
+    scrollDelayMs: z
+      .number()
+      .optional()
+      .default(350)
+      .describe("Delay after each scroll step to let lazy content render (ms)"),
+    maxDurationMs: z
+      .number()
+      .optional()
+      .default(8000)
+      .describe("Overall time budget for the autoScroll sweep (ms)"),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("take_snapshot", params);

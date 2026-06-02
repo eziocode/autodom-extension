@@ -5949,9 +5949,17 @@ async function toolScreenshot(params) {
 // 5. Take snapshot (DOM/a11y tree)
 async function toolSnapshot(params) {
   const tab = await getActiveTab();
+  const autoScroll = params?.autoScroll || false;
+  const maxScrolls = Number.isFinite(params?.maxScrolls) ? params.maxScrolls : 12;
+  const scrollDelayMs = Number.isFinite(params?.scrollDelayMs)
+    ? params.scrollDelayMs
+    : 350;
+  const maxDurationMs = Number.isFinite(params?.maxDurationMs)
+    ? params.maxDurationMs
+    : 8000;
   return await executeInTab(
     tab.id,
-    (maxDepth) => {
+    async (maxDepth, autoScroll, maxScrolls, scrollDelayMs, maxDurationMs) => {
       function buildTree(node, depth = 0) {
         if (depth > maxDepth) return null;
         const result = {
@@ -6000,13 +6008,56 @@ async function toolSnapshot(params) {
         return result;
       }
 
+      // Auto-scroll: sweep the page to trigger lazy/append-style rendering,
+      // then reposition before snapshotting. Note: helps lazy-append layouts;
+      // for true virtualization (off-screen rows unmounted) the final tree may
+      // still be partial — use get_dom_state with autoScroll for full lists.
+      async function lazyScrollSweep() {
+        const startUrl = location.href;
+        const winStartX = window.scrollX || 0;
+        const winStartY = window.scrollY || 0;
+        const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+        const docEl = document.scrollingElement || document.documentElement;
+        const startTime = Date.now();
+        let prev = -1;
+        window.scrollTo({ top: 0, left: winStartX, behavior: "auto" });
+        await delay(scrollDelayMs);
+        for (let i = 0; i < maxScrolls; i++) {
+          if (location.href !== startUrl) break;
+          if (Date.now() - startTime > maxDurationMs) break;
+          const max = docEl.scrollHeight - window.innerHeight;
+          const top = window.scrollY || docEl.scrollTop || 0;
+          if (top >= max - 1) {
+            await delay(scrollDelayMs);
+            break;
+          }
+          window.scrollTo({
+            top: Math.min(max, top + Math.max(120, Math.floor(window.innerHeight * 0.85))),
+            left: winStartX,
+            behavior: "auto",
+          });
+          await delay(scrollDelayMs);
+          const nowTop = window.scrollY || docEl.scrollTop || 0;
+          if (nowTop <= prev + 1) break;
+          prev = nowTop;
+        }
+        if (location.href === startUrl) {
+          window.scrollTo({ top: winStartY, left: winStartX, behavior: "auto" });
+        }
+      }
+
+      if (autoScroll) {
+        await lazyScrollSweep();
+      }
+
       return {
         title: document.title,
         url: location.href,
         tree: buildTree(document.body, 0),
+        autoScrolled: !!autoScroll,
       };
     },
-    [params?.maxDepth || 6],
+    [params?.maxDepth || 6, autoScroll, maxScrolls, scrollDelayMs, maxDurationMs],
   );
 }
 
@@ -8695,10 +8746,25 @@ async function toolGetDomState(params) {
   const tab = await getActiveTab();
   const includeHidden = params?.includeHidden || false;
   const maxElements = params?.maxElements || 60;
+  const autoScroll = params?.autoScroll || false;
+  const maxScrolls = Number.isFinite(params?.maxScrolls) ? params.maxScrolls : 12;
+  const scrollDelayMs = Number.isFinite(params?.scrollDelayMs)
+    ? params.scrollDelayMs
+    : 350;
+  const maxDurationMs = Number.isFinite(params?.maxDurationMs)
+    ? params.maxDurationMs
+    : 8000;
 
   const result = await executeInTab(
     tab.id,
-    (includeHidden, maxElements) => {
+    async (
+      includeHidden,
+      maxElements,
+      autoScroll,
+      maxScrolls,
+      scrollDelayMs,
+      maxDurationMs,
+    ) => {
       const INTERACTIVE_SELECTORS = [
         "a[href]",
         "button",
@@ -8939,6 +9005,208 @@ async function toolGetDomState(params) {
         return best;
       }
 
+      // ── Auto-scroll mode: reveal lazy-loaded / virtualized off-screen
+      // elements by scrolling through the page, then reposition. Opt-in so
+      // the default fast/cheap single-pass behavior is unchanged.
+      if (autoScroll) {
+        const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        const chooseScrollRoot = () => {
+          const overlay = pickVisibleOverlay();
+          if (overlay) {
+            return {
+              root: overlay,
+              excludeChrome: false,
+              scope: describeRoot(overlay, "visible-overlay"),
+            };
+          }
+          const pref = pickPreferredRoot();
+          if (pref) {
+            return {
+              root: pref,
+              excludeChrome: true,
+              scope: describeRoot(pref, "main-root"),
+            };
+          }
+          return {
+            root: document,
+            excludeChrome: true,
+            scope: { strategy: "document-filtered", label: "document body" },
+          };
+        };
+
+        const isScrollable = (el) => {
+          if (!el || el.nodeType !== 1) return false;
+          const st = window.getComputedStyle(el);
+          const oy = st.overflowY;
+          return (
+            (oy === "auto" || oy === "scroll" || oy === "overlay") &&
+            el.scrollHeight > el.clientHeight + 8 &&
+            el.clientHeight > 40
+          );
+        };
+
+        const findScroller = (root) => {
+          let cur = root && root !== document ? root : null;
+          while (cur && cur !== document.body && cur !== document.documentElement) {
+            if (isScrollable(cur)) return { type: "el", el: cur };
+            cur = cur.parentElement;
+          }
+          const searchScope = root && root !== document ? root : document;
+          let best = null;
+          let bestScore = 0;
+          searchScope.querySelectorAll("*").forEach((el) => {
+            if (!isScrollable(el)) return;
+            const rect = el.getBoundingClientRect();
+            const score =
+              Math.max(0, rect.width) *
+              Math.max(0, rect.height) *
+              (el.scrollHeight - el.clientHeight);
+            if (score > bestScore) {
+              best = el;
+              bestScore = score;
+            }
+          });
+          if (best) return { type: "el", el: best };
+          return { type: "win" };
+        };
+
+        const startUrl = location.href;
+        const sel = chooseScrollRoot();
+        let scopeInfo = sel.scope;
+        const sc = findScroller(sel.root);
+        const winStartX = window.scrollX || 0;
+        const winStartY = window.scrollY || 0;
+        const elStartTop = sc.type === "el" ? sc.el.scrollTop : 0;
+
+        const getTop = () =>
+          sc.type === "el"
+            ? sc.el.scrollTop
+            : window.scrollY || document.documentElement.scrollTop || 0;
+        const getMax = () =>
+          sc.type === "el"
+            ? sc.el.scrollHeight - sc.el.clientHeight
+            : (document.scrollingElement || document.documentElement)
+                .scrollHeight - window.innerHeight;
+        const viewport =
+          sc.type === "el" ? sc.el.clientHeight : window.innerHeight;
+        const setTop = (to) => {
+          if (sc.type === "el") sc.el.scrollTop = to;
+          else window.scrollTo({ top: to, left: winStartX, behavior: "auto" });
+        };
+
+        const seen = new Set();
+        const mergedEls = [];
+        const mergedRefs = [];
+        const mergedMeta = [];
+
+        const mergeNow = () => {
+          const { elements: passEls, refs: passRefs } = collectElements(
+            sel.root,
+            sel.excludeChrome,
+          );
+          const curTop = getTop();
+          const srTop =
+            sc.type === "el" ? sc.el.getBoundingClientRect().top : 0;
+          for (let i = 0; i < passEls.length; i++) {
+            const e = passEls[i];
+            const ref = passRefs[i] || null;
+            let docY = 0;
+            if (ref) {
+              const r = ref.getBoundingClientRect();
+              docY =
+                sc.type === "el"
+                  ? Math.round((r.top - srTop + curTop) / 4) * 4
+                  : Math.round((r.top + curTop) / 4) * 4;
+            }
+            const sig = [
+              e.tag,
+              e.text || "",
+              e.href || "",
+              e.name || "",
+              e.ariaLabel || "",
+              e.placeholder || "",
+              e.value || "",
+              docY,
+            ].join("|");
+            if (seen.has(sig)) continue;
+            seen.add(sig);
+            mergedEls.push({ ...e, index: mergedEls.length });
+            mergedRefs.push(ref);
+            mergedMeta.push({
+              selector: e.selector || null,
+              sig,
+              captureScrollTop: curTop,
+            });
+            if (mergedEls.length >= maxElements) break;
+          }
+        };
+
+        setTop(0);
+        await delay(scrollDelayMs);
+        mergeNow();
+
+        // If the chosen root yielded almost nothing, widen to the document.
+        if (mergedEls.length < 4 && sel.root !== document) {
+          sel.root = document;
+          sel.excludeChrome = true;
+          scopeInfo = { strategy: "document-filtered", label: "document body" };
+          mergeNow();
+        }
+
+        const startTime = Date.now();
+        let stalls = 0;
+        let prevTop = getTop();
+        let prevCount = mergedEls.length;
+        for (let i = 0; i < maxScrolls && mergedEls.length < maxElements; i++) {
+          if (location.href !== startUrl) break;
+          if (Date.now() - startTime > maxDurationMs) break;
+          const target = Math.min(
+            getMax(),
+            getTop() + Math.max(120, Math.floor(viewport * 0.85)),
+          );
+          setTop(target);
+          await delay(scrollDelayMs);
+          mergeNow();
+          const nowTop = getTop();
+          const grew = mergedEls.length > prevCount;
+          const advanced = nowTop > prevTop + 1;
+          if (!advanced && !grew) {
+            stalls++;
+            if (stalls >= 2 || nowTop >= getMax() - 1) {
+              await delay(scrollDelayMs);
+              mergeNow();
+              break;
+            }
+          } else {
+            stalls = 0;
+          }
+          prevTop = nowTop;
+          prevCount = mergedEls.length;
+        }
+
+        // Reposition: restore the original scroll offsets.
+        if (location.href === startUrl) {
+          if (sc.type === "el") sc.el.scrollTop = elStartTop;
+          window.scrollTo({ top: winStartY, left: winStartX, behavior: "auto" });
+        }
+
+        window.__autodomIndexedElements = mergedRefs;
+        window.__autodomIndexMeta = {
+          source: "auto-scroll",
+          items: mergedMeta,
+        };
+
+        return {
+          title: document.title,
+          url: location.href,
+          scope: scopeInfo,
+          elementCount: mergedEls.length,
+          elements: mergedEls,
+          autoScrolled: true,
+        };
+      }
+
       let scope = { strategy: "document-filtered", label: "document body" };
       let elements = [];
       let indexRefs = [];
@@ -8978,6 +9246,7 @@ async function toolGetDomState(params) {
       }
 
       window.__autodomIndexedElements = indexRefs;
+      window.__autodomIndexMeta = null;
 
       return {
         title: document.title,
@@ -8987,7 +9256,14 @@ async function toolGetDomState(params) {
         elements,
       };
     },
-    [includeHidden, maxElements],
+    [
+      includeHidden,
+      maxElements,
+      autoScroll,
+      maxScrolls,
+      scrollDelayMs,
+      maxDurationMs,
+    ],
   );
 
   // Cache the index map for click_by_index / type_by_index
@@ -9048,6 +9324,28 @@ async function toolClickByIndex(params) {
         ? window.__autodomIndexedElements[index]
         : null;
       if (isUsable(cached)) return clickElement(cached);
+
+      // Auto-scroll snapshots accumulate elements across scroll positions, so
+      // the positional re-discovery below would target the wrong element once
+      // a virtualized row has scrolled out. Recover via the stored selector, or
+      // fail with guidance instead of clicking the wrong thing.
+      const __meta = window.__autodomIndexMeta;
+      if (__meta && __meta.source === "auto-scroll") {
+        const m = __meta.items && __meta.items[index];
+        if (m) {
+          if (m.selector) {
+            try {
+              const bySel = document.querySelector(m.selector);
+              if (isUsable(bySel)) return { ...clickElement(bySel), cached: false };
+            } catch (_) {}
+          }
+          return {
+            error:
+              `Element #${index} came from an auto-scroll snapshot and is no longer rendered. ` +
+              `Scroll near it (scrollTop ~${m.captureScrollTop}px) and run get_dom_state again before clicking.`,
+          };
+        }
+      }
 
       // Re-discover interactive elements in the same order as get_dom_state
       const INTERACTIVE_SELECTORS = [
@@ -9155,6 +9453,28 @@ async function toolTypeByIndex(params) {
         ? window.__autodomIndexedElements[index]
         : null;
       if (isUsable(cached)) return typeIntoElement(cached);
+
+      // Auto-scroll snapshots accumulate elements across scroll positions, so
+      // the positional re-discovery below would target the wrong element once
+      // a virtualized row has scrolled out. Recover via the stored selector, or
+      // fail with guidance instead of typing into the wrong field.
+      const __meta = window.__autodomIndexMeta;
+      if (__meta && __meta.source === "auto-scroll") {
+        const m = __meta.items && __meta.items[index];
+        if (m) {
+          if (m.selector) {
+            try {
+              const bySel = document.querySelector(m.selector);
+              if (isUsable(bySel)) return { ...typeIntoElement(bySel), cached: false };
+            } catch (_) {}
+          }
+          return {
+            error:
+              `Element #${index} came from an auto-scroll snapshot and is no longer rendered. ` +
+              `Scroll near it (scrollTop ~${m.captureScrollTop}px) and run get_dom_state again before typing.`,
+          };
+        }
+      }
 
       const INTERACTIVE_SELECTORS = [
         "a[href]",
