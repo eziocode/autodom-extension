@@ -21,7 +21,7 @@ import { fileURLToPath } from "url";
 import { execFile, spawn, spawnSync } from "child_process";
 import { promises as fs, readFileSync, rmSync, createWriteStream } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join, isAbsolute, resolve as resolvePath } from "path";
 import { promisify } from "util";
 import { randomBytes, timingSafeEqual } from "crypto";
 
@@ -1036,11 +1036,58 @@ async function getProcessCommand(pid) {
   }
 }
 
+async function getProcessCwd(pid) {
+  try {
+    const { stdout } = await execFileAsync("lsof", [
+      "-a",
+      "-p",
+      String(pid),
+      "-d",
+      "cwd",
+      "-Fn",
+    ]);
+    const line = stdout.split("\n").find((l) => l.startsWith("n"));
+    return line ? line.slice(1).trim() : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 async function isBridgeProcess(pid) {
   if (!pid || pid === process.pid) return false;
   if (!(await isProcessRunning(pid))) return false;
   const command = await getProcessCommand(pid);
-  return command.includes(serverPath);
+  if (!command) return false;
+  // Fast path: the command embeds our absolute server path (how IDEs and
+  // most launchers invoke us).
+  if (command.includes(serverPath)) return true;
+  // Robust path: a sibling launched with a relative script path (e.g.
+  // `node index.js --port 9876` from the server directory) won't contain
+  // the absolute serverPath. Resolve the script argument against the
+  // process's working directory and compare. Without this, a healthy
+  // sibling bridge is misclassified as a foreign process and wrongly
+  // killed during pre-startup cleanup — a root cause of the intermittent
+  // "secondary can't reach primary" failures.
+  const match = command.match(/(?:^|\s)("?)([^\s"]*index\.js)\1(?=\s|$)/);
+  if (match) {
+    const scriptArg = match[2];
+    if (isAbsolute(scriptArg)) {
+      try {
+        return resolvePath(scriptArg) === serverPath;
+      } catch (_) {
+        return false;
+      }
+    }
+    const cwd = await getProcessCwd(pid);
+    if (cwd) {
+      try {
+        return resolvePath(cwd, scriptArg) === serverPath;
+      } catch (_) {
+        return false;
+      }
+    }
+  }
+  return false;
 }
 
 async function getListeningBridgePid() {
@@ -1281,14 +1328,22 @@ async function cleanupStaleProcesses() {
 
         const isBridge = await isBridgeProcess(pid);
         if (isBridge) {
-          // Check if this bridge has a live IDE parent before killing it.
-          // Multiple MCP clients (Copilot Chat, AI Assistant) each spawn
-          // their own autodom process.  If we kill a healthy instance that
-          // another client is using, that client gets "Transport closed"
-          // and cannot recover without a full IDE restart.  Instead, let
-          // startWebSocketServer() fall through to proxy mode so both
-          // clients share the same WebSocket bridge.
-          let hasIdeParent = false;
+          // Decide whether this listening bridge is healthy before killing
+          // it. Multiple MCP clients (Copilot Chat, AI Assistant, Codex,
+          // terminal sessions) each spawn their own autodom process. If we
+          // kill a healthy instance that another client is using, that
+          // client gets "Transport closed" and cannot recover without a
+          // full IDE restart — and any secondaries proxying through it lose
+          // their primary ("secondary can't reach primary").
+          //
+          // Health test: is the bridge's launching parent still alive? A
+          // live parent means a live client is depending on this bridge, so
+          // we leave it running and fall through to proxy mode. We do NOT
+          // gate on the parent's *name* (the old IDE-regex check): bridges
+          // are legitimately launched from terminals, npx, wrappers, and
+          // IDEs whose process name we don't recognize, and that misfiring
+          // check killed healthy bridges during concurrent startup.
+          let parentAlive = false;
           try {
             const { stdout: psOut } = await execFileAsync("ps", [
               "-p",
@@ -1298,19 +1353,23 @@ async function cleanupStaleProcesses() {
             ]);
             const ppid = Number.parseInt(psOut.trim(), 10);
             if (ppid && ppid !== 1) {
-              const parentCmd = await getProcessCommand(ppid);
-              hasIdeParent =
-                /intellij|codex|webstorm|pycharm|idea|goland|rider|clion|cursor|vscode|code|copilot/i.test(
-                  parentCmd,
-                );
+              try {
+                process.kill(ppid, 0);
+                parentAlive = true;
+              } catch (err) {
+                // EPERM means the parent exists but we can't signal it.
+                parentAlive = err.code === "EPERM";
+              }
             }
           } catch (_) {
             // If we can't determine the parent, assume it might be healthy
+            // and prefer proxy mode over killing a possibly-live bridge.
+            parentAlive = true;
           }
 
-          if (hasIdeParent) {
+          if (parentAlive) {
             process.stderr.write(
-              `[AutoDOM] Existing bridge (PID ${pid}) on port ${WS_PORT} has a live IDE parent — will use proxy mode\n`,
+              `[AutoDOM] Existing bridge (PID ${pid}) on port ${WS_PORT} has a live parent — will use proxy mode\n`,
             );
             // Don't kill it — let startWebSocketServer() detect the port
             // conflict and fall through to proxy mode instead.
@@ -1318,28 +1377,29 @@ async function cleanupStaleProcesses() {
           }
 
           process.stderr.write(
-            `[AutoDOM] Found existing bridge (PID ${pid}) on port ${WS_PORT}, stopping it...\n`,
+            `[AutoDOM] Found orphaned bridge (PID ${pid}, parent gone) on port ${WS_PORT}, stopping it...\n`,
           );
-          await stopBridgeProcess(pid, "Pre-startup cleanup: stopping");
+          await stopBridgeProcess(
+            pid,
+            "Pre-startup cleanup: stopping orphaned",
+          );
           continue;
         }
 
         const cmd = await getProcessCommand(pid);
+        // The port is held by a process we could NOT positively identify as
+        // one of our own bridges. Killing it here is what knocked out
+        // healthy siblings (e.g. a bridge launched via a relative path or a
+        // launcher we don't recognize) and produced the intermittent
+        // "secondary can't reach primary" failures. A false kill is far more
+        // damaging than a false proxy: do NOT kill. Fall through and let
+        // startWebSocketServer() hit EADDRINUSE and switch to proxy mode. If
+        // the holder really is foreign, the proxy handshake fails with a
+        // clear, recoverable error instead of us terminating a user process.
         process.stderr.write(
-          `[AutoDOM] Stale process (PID ${pid}) occupying port ${WS_PORT}: ${cmd.substring(0, 120)}\n`,
+          `[AutoDOM] Port ${WS_PORT} held by unrecognized process (PID ${pid}): ${cmd.substring(0, 120)} — will use proxy mode\n`,
         );
-        try {
-          process.kill(pid, "SIGTERM");
-          if (!(await waitForExit(pid, 1000))) {
-            process.kill(pid, "SIGKILL");
-            await waitForExit(pid, 500);
-          }
-          process.stderr.write(`[AutoDOM] Killed stale process ${pid}\n`);
-        } catch (e) {
-          process.stderr.write(
-            `[AutoDOM] Could not kill PID ${pid}: ${e.message}\n`,
-          );
-        }
+        continue;
       }
     } catch (err) {
       if (err.code !== 1 && err.status !== 1) {
@@ -1397,34 +1457,44 @@ async function cleanupStaleProcesses() {
         }),
       );
 
+      // Only reap GENUINELY orphaned bridges. A process whose launching
+      // parent is still alive is a healthy concurrent instance (another
+      // IDE/MCP client, or a secondary proxy that doesn't listen on the
+      // port) — killing it is exactly what produced the intermittent
+      // "secondary can't reach primary" failures during concurrent startup
+      // and MCP restarts. We deliberately drop the old CPU>50 and
+      // parent-name heuristics: startup CPU spikes and unrecognized-but-
+      // valid launchers (terminals, npx, wrappers) caused false positives
+      // that killed live bridges.
+      const lockForScan = await readLockFile().catch(() => null);
+      const lockOwnerPid =
+        lockForScan?.pid && lockForScan.port === WS_PORT
+          ? lockForScan.pid
+          : null;
+
       for (const result of candidateInfos) {
         if (result.status !== "fulfilled") continue;
-        const { pid, ppid, cpu } = result.value;
+        const { pid, ppid } = result.value;
+
+        // Never reap the active bridge recorded in the lock file.
+        if (lockOwnerPid && pid === lockOwnerPid) continue;
 
         let shouldKill = false;
         let reason = "";
 
         if (ppid === 1) {
           shouldKill = true;
-          reason = `orphaned (PPID=1, CPU=${cpu}%)`;
-        } else if (cpu > 50) {
-          shouldKill = true;
-          reason = `high CPU zombie (PPID=${ppid}, CPU=${cpu}%)`;
+          reason = "orphaned (PPID=1)";
         } else {
           try {
             process.kill(ppid, 0);
-            const parentCmd = await getProcessCommand(ppid);
-            const isIdeParent =
-              /intellij|codex|webstorm|pycharm|idea|goland|rider|clion|cursor|vscode|code/i.test(
-                parentCmd,
-              );
-            if (!isIdeParent) {
+            // Parent is alive → healthy concurrent instance; leave it be.
+          } catch (err) {
+            // ESRCH → parent is gone. EPERM → parent exists (keep alive).
+            if (err.code !== "EPERM") {
               shouldKill = true;
-              reason = `parent (PID=${ppid}) is not an IDE process: ${parentCmd.substring(0, 80)}`;
+              reason = `parent (PID=${ppid}) is dead`;
             }
-          } catch (_) {
-            shouldKill = true;
-            reason = `parent (PID=${ppid}) is dead`;
           }
         }
 
@@ -2615,19 +2685,22 @@ async function _routeViaIdeSamplingOrQueue({
 // A secondary IDE instance is sending a tool call; forward it to
 // the real Chrome extension and map the result back.
 function _handleInternalProxyCall(socket, message) {
-  if (extensionSocket && extensionSocket.readyState === 1) {
+  // Send a TOOL_RESULT back to the secondary, but only if its socket is
+  // still open — it may have closed while we were waiting on the extension.
+  const sendResult = (result) => {
+    if (!socket || socket.readyState !== 1) return;
+    try {
+      socket.send(
+        JSON.stringify({ type: "TOOL_RESULT", id: message.id, result }),
+      );
+    } catch (_) {}
+  };
+
+  const dispatch = () => {
     // We hijack the ID to map it back
     const internalId = ++callIdCounter;
     pendingCalls.set(internalId, {
-      resolve: (res) => {
-        socket.send(
-          JSON.stringify({
-            type: "TOOL_RESULT",
-            id: message.id,
-            result: res,
-          }),
-        );
-      },
+      resolve: (res) => sendResult(res),
       reject: () => {},
       timer: setTimeout(() => pendingCalls.delete(internalId), TOOL_TIMEOUT),
     });
@@ -2639,19 +2712,33 @@ function _handleInternalProxyCall(socket, message) {
       tool: message.tool,
       params: message.params,
     });
-  } else {
-    try {
-      socket.send(
-        JSON.stringify({
-          type: "TOOL_RESULT",
-          id: message.id,
-          result: {
-            error: "Chrome extension is not connected to the primary server.",
-          },
-        }),
-      );
-    } catch (_) {}
+  };
+
+  if (_isExtensionReady()) {
+    dispatch();
+    return;
   }
+
+  // Absorb a transient extension drop (browser close/reopen, service-worker
+  // recycle, tab discard) exactly like the primary's own tool path does via
+  // _waitForExtensionReady(). Without this, a momentary blip surfaces in a
+  // SECONDARY IDE as a hard "Chrome extension is not connected" failure even
+  // though the primary would have waited it out — the asymmetry behind
+  // "secondary can't reach primary after closing the browser".
+  (async () => {
+    const ready = await _waitForExtensionReady();
+    if (ready && _isExtensionReady()) {
+      dispatch();
+    } else {
+      sendResult({
+        error: "Chrome extension is not connected to the primary server.",
+      });
+    }
+  })().catch(() => {
+    sendResult({
+      error: "Chrome extension is not connected to the primary server.",
+    });
+  });
 }
 
 // ── TOOL_RESULT ──────────────────────────────────────────────

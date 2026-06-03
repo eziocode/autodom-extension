@@ -4,6 +4,20 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## Unreleased
+
+### Fixed — Multi-IDE bridge reliability ("secondary server can't reach primary")
+- **Pre-startup cleanup no longer kills healthy sibling bridges.** During concurrent startup or an MCP restart, a newly launched instance could terminate another IDE's running bridge, orphaning every secondary that proxied through it. Root causes removed:
+  - `phase1` only reclaimed the port from a listener whose **parent process name** matched a hardcoded IDE regex; bridges launched from terminals, `npx`, wrappers, or unrecognized IDEs were SIGKILLed. It now keeps any bridge whose **launching parent is still alive** (proxy mode) and only stops genuinely orphaned ones.
+  - `phase1` also SIGKILLed any port holder it could not positively identify as its own bridge. It now never kills unidentified processes — it falls through to proxy mode / `EADDRINUSE` instead, so a false identification can no longer take down a user's process.
+  - `phase3` zombie scan dropped the `CPU>50%` heuristic (startup spikes were false positives) and the "parent is not an IDE → kill" heuristic; it now reaps only truly orphaned bridges (parent dead / `PPID=1`) and never the lock-file owner.
+  - `isBridgeProcess` now recognizes siblings launched with a **relative** script path (`node index.js`) by resolving the script argument against the process's working directory, instead of only matching the absolute server path.
+- **Secondary tool calls now absorb a transient extension drop.** `_handleInternalProxyCall` (the primary's handler for proxied calls) waited zero time for the Chrome extension: closing/reopening the browser or a service-worker recycle made a secondary IDE hard-fail with "Chrome extension is not connected," even though the primary's own tool path waited it out. It now awaits `_waitForExtensionReady()` (the `RECONNECT_GRACE_MS` window) before erroring, and guards the result send against a closed secondary socket.
+
+### Tests
+- New `server/test/test-proxy-reconnect.cjs` — a secondary's proxied call survives an extension drop + reconnect within the grace window.
+- `server/test/test-concurrency.cjs` now passes deterministically (previously failed ~50% of runs due to siblings killing each other at startup).
+
 ## 4.1.0
 
 ### Added — Media, image and recorder tools
