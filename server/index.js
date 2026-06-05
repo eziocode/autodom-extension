@@ -1771,13 +1771,26 @@ async function ensureProxyClientConnected() {
 }
 
 function setupProxyClient(resolve) {
-  ensureProxyClientConnected()
-    .catch((err) => {
+  (async () => {
+    let connected = false;
+    try {
+      connected = await ensureProxyClientConnected();
+    } catch (err) {
       process.stderr.write(
         `[AutoDOM] Proxy setup failed: ${err?.message || err}\n`,
       );
-    })
-    .finally(resolve);
+    }
+
+    if (!connected && !isPrimaryServer) {
+      try {
+        await tryRecoverSecondaryAsPrimary();
+      } catch (err) {
+        process.stderr.write(
+          `[AutoDOM] Proxy startup recovery failed: ${err?.message || err}\n`,
+        );
+      }
+    }
+  })().finally(resolve);
 }
 
 async function tryRecoverSecondaryAsPrimary() {
