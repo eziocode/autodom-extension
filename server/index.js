@@ -1803,6 +1803,18 @@ async function tryRecoverSecondaryAsPrimary() {
   return false;
 }
 
+async function ensureBridgeReadyForDiagnostics() {
+  if (isPrimaryServer || _isProxyReady()) return;
+
+  try {
+    if (await ensureProxyClientConnected()) return;
+  } catch (_) {}
+
+  try {
+    await tryRecoverSecondaryAsPrimary();
+  } catch (_) {}
+}
+
 function setupWssConnection(wss) {
   wss.on("connection", (socket) => {
     // Use WebSocket-level pings for faster keepalive detection.
@@ -6612,6 +6624,7 @@ server.addTool({
     "Return a health snapshot for the AutoDOM bridge: pid, uptime, primary/proxy role, WS connection state, in-flight tool calls, recent tool errors, all per-client pinned tabs, and extension service-worker info. Call this first whenever AutoDOM behaves unexpectedly.",
   parameters: z.object({}),
   execute: async () => {
+    await ensureBridgeReadyForDiagnostics();
     const snapshot = {
       bridge: {
         pid: process.pid,
