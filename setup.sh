@@ -381,10 +381,90 @@ fi
 # ─── Step 5: Verify server starts ─────────────────────────────
 echo -e "${BLUE}[5/6]${NC} Verifying server..."
 
-VERIFY_OUTPUT="$(printf '{}\n' | node "${SERVER_ARGS[@]}" 2>&1 || true)"
+VERIFY_OUTPUT="$(SERVER_ARGS_JSON="$SERVER_ARGS_JSON" node <<'NODE' 2>&1 || true
+const { spawn } = require("child_process");
 
-if ! printf '%s\n' "$VERIFY_OUTPUT" | grep -Eq 'Bridge Server Started|Proxy client connected|MCP server running on stdio transport'; then
-    echo -e "${RED}✗ Server failed to start${NC}"
+const serverArgs = JSON.parse(process.env.SERVER_ARGS_JSON || "[]");
+const child = spawn("node", serverArgs, { stdio: ["pipe", "pipe", "pipe"] });
+let stdout = "";
+let stderr = "";
+let ok = false;
+let toolsCount = 0;
+
+function send(message) {
+  child.stdin.write(JSON.stringify(message) + "\n");
+}
+
+function inspectOutput() {
+  const messages = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+
+  for (const msg of messages) {
+    if (msg.id === 2 && Array.isArray(msg.result?.tools)) {
+      toolsCount = msg.result.tools.length;
+      if (toolsCount > 0) ok = true;
+    }
+  }
+}
+
+child.stderr.on("data", (chunk) => {
+  stderr += chunk.toString("utf8");
+});
+child.stdout.on("data", (chunk) => {
+  stdout += chunk.toString("utf8");
+  inspectOutput();
+  if (ok) {
+    child.stdin.end();
+    child.kill("SIGTERM");
+  }
+});
+
+child.on("spawn", () => {
+  send({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "autodom-setup", version: "1.0.0" },
+    },
+  });
+  send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+});
+
+const timer = setTimeout(() => {
+  inspectOutput();
+  child.stdin.end();
+  child.kill("SIGTERM");
+}, 8000);
+
+child.on("close", () => {
+  clearTimeout(timer);
+  inspectOutput();
+  if (ok) {
+    console.log(`MCP tools/list returned ${toolsCount} tools`);
+    process.exit(0);
+  }
+  console.error(stderr.trim() || stdout.trim() || "No MCP response from server");
+  process.exit(1);
+});
+NODE
+)"
+
+if ! printf '%s\n' "$VERIFY_OUTPUT" | grep -Eq '^MCP tools/list returned [1-9][0-9]* tools$'; then
+    echo -e "${RED}✗ Server failed MCP tools/list verification${NC}"
     printf '%s\n' "$VERIFY_OUTPUT"
     exit 1
 fi
