@@ -5363,6 +5363,7 @@ const TOOL_HANDLERS = new Map([
   ["get_storage", toolGetStorage],
   ["set_storage", toolSetStorage],
   ["get_html", toolGetHtml],
+  ["fetch_page_source", toolFetchPageSource],
   ["set_attribute", toolSetAttribute],
   ["check_element_state", toolCheckElementState],
   ["drag_and_drop", toolDragAndDrop],
@@ -6754,6 +6755,66 @@ async function toolGetHtml(params) {
     },
     [selector || null, outer || false],
   );
+}
+
+// Fetch the raw HTML of any URL directly via HTTP without navigating a tab.
+// Useful as a fallback when JS-rendered artifact or report pages return no
+// structured text through the DOM tools. The extension's <all_urls> host
+// permission allows cross-origin fetches with credentials.
+async function toolFetchPageSource(params) {
+  const { url, extractLinks = true, maxBytes = 30000 } = params || {};
+  if (!url || typeof url !== "string") return { ok: false, error: "url is required" };
+
+  const ac = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = ac ? setTimeout(() => ac.abort(), 15000) : null;
+  try {
+    const response = await fetch(url, {
+      credentials: "include",
+      signal: ac ? ac.signal : undefined,
+    });
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: `HTTP ${response.status} ${response.statusText}`,
+        status: response.status,
+        url,
+      };
+    }
+    let html = await response.text();
+    const fullLength = html.length;
+    const cap = Number(maxBytes) > 0 ? Number(maxBytes) : 30000;
+    if (html.length > cap) {
+      html =
+        html.substring(0, cap) +
+        `\n…[truncated ${fullLength - cap} chars of full HTML]`;
+    }
+    const result = {
+      ok: true,
+      url,
+      status: response.status,
+      html,
+      truncated: fullLength > cap,
+      fullLength,
+    };
+    if (extractLinks !== false) {
+      const links = [];
+      const linkRe = /<a\b[^>]*?\shref=(['"])(.*?)\1/gi;
+      let m;
+      while ((m = linkRe.exec(html)) !== null) {
+        const href = m[2].trim();
+        if (!href || href.startsWith("#")) continue;
+        try {
+          links.push(new URL(href, url).href);
+        } catch (_) {
+          links.push(href);
+        }
+      }
+      result.links = [...new Set(links)];
+    }
+    return result;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 // 30. Set attribute on element

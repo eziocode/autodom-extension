@@ -80,13 +80,9 @@ const UPDATE_INSTALL_INTERVENTION_VERSION_KEY =
 function shouldPromptUpdateInstallIntervention(availableUpdate) {
   if (!availableUpdate || !availableUpdate.version) return false;
   const runtimeStatus = String(availableUpdate.runtimeStatus || "").toLowerCase();
-  return (
-    runtimeStatus === "apply_not_effective" ||
-    runtimeStatus === "throttled" ||
-    runtimeStatus === "error" ||
-    runtimeStatus === "unknown" ||
-    runtimeStatus === "no_update"
-  );
+  // Only truly blocked when a reload was requested but the version did not change.
+  // Transient states (throttled, error, unknown, no_update) are not permission issues.
+  return runtimeStatus === "apply_not_effective";
 }
 
 async function maybeShowUpdateInstallInterventionPrompt(availableUpdate) {
@@ -100,7 +96,7 @@ async function maybeShowUpdateInstallInterventionPrompt(availableUpdate) {
     const alreadyShown = stored?.[UPDATE_INSTALL_INTERVENTION_VERSION_KEY] || "";
     if (alreadyShown === version) return;
     showPopupToast(
-      "Update found but auto-install blocked. Run ./setup.sh and allow sudo policy step, or update manually in browser.",
+      `v${version} is available but couldn't apply automatically. Re-run setup.sh, or update manually via your browser's Extensions page.`,
       "warn",
       5200,
     );
@@ -133,7 +129,7 @@ function paintUpdateButton(pending, available) {
     if (versionEl) {
       const blocked = state === "found" && shouldPromptUpdateInstallIntervention(foundUpdate);
       versionEl.textContent = blocked
-        ? `v${chrome.runtime.getManifest().version} → v${update.version} (needs setup permission)`
+        ? `v${chrome.runtime.getManifest().version} → v${update.version} (auto-apply blocked)`
         : `v${chrome.runtime.getManifest().version} → v${update.version}`;
     }
     if (state === "found") {

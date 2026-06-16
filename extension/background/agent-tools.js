@@ -108,6 +108,30 @@
       },
     },
     {
+      name: "fetch_page_source",
+      description:
+        "Fetch the raw HTML of any URL directly via HTTP without navigating the tab. " +
+        "Returns the HTML source and, when extractLinks is true (default), all href links found in <a> tags. " +
+        "Use this as a fallback when get_html / take_snapshot return no useful text from a JS-rendered artifact or report page — " +
+        "the raw HTML often contains linked DOM and API-detail URLs that screenshots cannot expose.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "Absolute URL to fetch" },
+          extractLinks: {
+            type: "boolean",
+            description: "Return all <a href> links extracted from the HTML (default true)",
+          },
+          maxBytes: {
+            type: "integer",
+            description: "Maximum HTML characters to return (default 30000)",
+          },
+        },
+        required: ["url"],
+        additionalProperties: false,
+      },
+    },
+    {
       name: "take_screenshot",
       description:
         "Capture a PNG screenshot of the current viewport. Returns a small reference id; the bytes are not fed back to you.",
