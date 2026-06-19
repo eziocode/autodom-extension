@@ -77,8 +77,29 @@ const AVAILABLE_UPDATE_STORAGE_KEY = "availableUpdate";
 const UPDATE_INSTALL_INTERVENTION_VERSION_KEY =
   "autodomUpdateInstallInterventionVersion";
 
+function compareExtensionVersions(a, b) {
+  const left = String(a || "").split(".");
+  const right = String(b || "").split(".");
+  const length = Math.max(left.length, right.length);
+  for (let i = 0; i < length; i += 1) {
+    const l = Number.parseInt(left[i] || "0", 10) || 0;
+    const r = Number.parseInt(right[i] || "0", 10) || 0;
+    if (l !== r) return l > r ? 1 : -1;
+  }
+  return 0;
+}
+
+function isVersionNewerThanCurrent(version) {
+  const normalized = String(version || "").trim();
+  if (!normalized || normalized === "?") return false;
+  const currentVersion = chrome.runtime.getManifest?.().version || "";
+  return compareExtensionVersions(normalized, currentVersion) > 0;
+}
+
 function shouldPromptUpdateInstallIntervention(availableUpdate) {
-  if (!availableUpdate || !availableUpdate.version) return false;
+  if (!availableUpdate || !isVersionNewerThanCurrent(availableUpdate.version)) {
+    return false;
+  }
   const runtimeStatus = String(availableUpdate.runtimeStatus || "").toLowerCase();
   // Only truly blocked when a reload was requested but the version did not change.
   // Transient states (throttled, error, unknown, no_update) are not permission issues.
@@ -113,8 +134,12 @@ function paintUpdateButton(pending, available) {
   const btn = DOM.checkUpdateBtn;
   const versionEl = DOM.appVersion;
   if (!btn) return;
-  const readyUpdate = pending && pending.version ? pending : null;
-  const foundUpdate = !readyUpdate && available && available.version ? available : null;
+  const readyUpdate =
+    pending && isVersionNewerThanCurrent(pending.version) ? pending : null;
+  const foundUpdate =
+    !readyUpdate && available && isVersionNewerThanCurrent(available.version)
+      ? available
+      : null;
   const update = readyUpdate || foundUpdate;
   if (update) {
     const state = readyUpdate ? "ready" : "found";
@@ -2018,14 +2043,27 @@ function _resetPresetIfManualEdit() {
 // user can verify the chosen CLI is installed and reachable on PATH
 // before sending real chat messages. Requires the MCP bridge to be
 // connected (CLI execution itself happens server-side).
+function getCliInstallOutput(response) {
+  return `${response?.error || ""}\n${response?.stderr || ""}\n${response?.stdout || ""}`;
+}
+
+function hasExplicitNpmPermissionError(output) {
+  return (
+    /\b(?:EACCES|EPERM)\b/i.test(output) ||
+    /permission denied/i.test(output) ||
+    /(?:mkdir|access|open).*\/(?:usr|opt)\/.*node_modules/i.test(output)
+  );
+}
+
 function hasNpmPermissionError(response) {
   if (response?.permissionDenied) return true;
-  const output = `${response?.error || ""}\n${response?.stderr || ""}\n${response?.stdout || ""}`;
-  return (
-    /\bEACCES\b/i.test(output) ||
-    /permission denied/i.test(output) ||
-    /\/(?:usr|opt)\/.*node_modules/i.test(output)
-  );
+  return hasExplicitNpmPermissionError(getCliInstallOutput(response));
+}
+
+function isNpmInstallAlreadySatisfied(response) {
+  const output = getCliInstallOutput(response);
+  if (hasExplicitNpmPermissionError(output)) return false;
+  return /\b(?:already\s+)?up to date\b/i.test(output);
 }
 
 function formatCliInstallFailure(response) {
@@ -2112,14 +2150,20 @@ async function installDefaultCliPackage() {
         await checkCliBinary();
       }
     } else {
-      const message = formatCliInstallFailure(response);
-      DOM.providerStatus.textContent = `✕ ${message}`;
-      addLog(
-        `CLI install failed: ${response?.error || message}${
-          response?.stderr ? ` · ${response.stderr}` : ""
-        }`,
-        "error",
-      );
+      if (isNpmInstallAlreadySatisfied(response)) {
+        DOM.providerStatus.textContent = `✓ ${info.label} is already up to date. Checking CLI…`;
+        addLog(`${info.label} is already up to date: ${installCommand}`, "success");
+        await checkCliBinary();
+      } else {
+        const message = formatCliInstallFailure(response);
+        DOM.providerStatus.textContent = `✕ ${message}`;
+        addLog(
+          `CLI install failed: ${response?.error || message}${
+            response?.stderr ? ` · ${response.stderr}` : ""
+          }`,
+          "error",
+        );
+      }
     }
   } catch (err) {
     DOM.providerStatus.textContent = `✕ ${err.message || err} — try "Copy command" and run it yourself.`;
