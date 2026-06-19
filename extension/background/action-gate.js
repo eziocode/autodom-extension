@@ -43,6 +43,8 @@
     "get_console_logs",
     "get_network_requests",
     "list_tabs",
+    "list_downloads",
+    "wait_for_download",
     "list_iframes",
     "list_shadow_roots",
     "list_popups",
@@ -116,6 +118,12 @@
   function classify(toolName, params = {}) {
     // Parameter-aware classification for compatibility tools that can represent
     // both read and state-changing operations.
+    if (toolName === "fetch_page_source" || toolName === "browser_fetch_raw") {
+      const method = String(params?.method || "GET").toUpperCase();
+      return (method === "GET" || method === "HEAD") && params?.body === undefined
+        ? "safe-read"
+        : "destructive";
+    }
     if (toolName === "browser_tabs") {
       const action = String(params?.action || "list").toLowerCase();
       if (action === "list") return "safe-read";

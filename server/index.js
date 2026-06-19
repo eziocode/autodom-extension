@@ -680,9 +680,13 @@ const TOOL_TIERS = new Map([
   ["check_element_state", "read"],
   ["get_cookies", "read"],
   ["get_storage", "read"],
+  ["fetch_page_source", "read"],
+  ["browser_fetch_raw", "read"],
   ["get_network_requests", "read"],
   ["get_console_logs", "read"],
   ["list_tabs", "read"],
+  ["list_downloads", "read"],
+  ["wait_for_download", "read"],
   ["pin_tab", "read"],
   ["unpin_tab", "read"],
   ["get_pinned_tab", "read"],
@@ -766,6 +770,12 @@ const TOOL_TIERS = new Map([
 
 function getToolTier(toolName, params = {}) {
   // Parameter-aware tiering for composite compatibility tools.
+  if (toolName === "fetch_page_source" || toolName === "browser_fetch_raw") {
+    const method = String(params?.method || "GET").toUpperCase();
+    return (method === "GET" || method === "HEAD") && params?.body === undefined
+      ? "read"
+      : "destructive";
+  }
   if (toolName === "browser_tabs") {
     const action = String(params?.action || "list").toLowerCase();
     if (action === "list") return "read";
@@ -2722,6 +2732,46 @@ function _handleInternalProxyCall(socket, message) {
   };
 
   const dispatch = () => {
+    const params = message.params || {};
+    const tier = getToolTier(message.tool, params);
+    const isRawFetchTool = message.tool === "fetch_page_source" || message.tool === "browser_fetch_raw";
+    if (CONFIRM_MODE && tier === "destructive") {
+      sendResult({
+        error: `${message.tool} cannot be proxied from a secondary server in confirm mode`,
+        blocked: true,
+        tier,
+      });
+      return;
+    }
+    if (isRawFetchTool && tier !== "read") {
+      let checkDomain = null;
+      try {
+        const targetUrl = new URL(params.url);
+        if (targetUrl.protocol === "http:" || targetUrl.protocol === "https:") {
+          checkDomain = targetUrl.hostname;
+        }
+      } catch {}
+      if (!checkDomain) {
+        sendResult({
+          error: `${message.tool} requires a valid URL for ${tier} requests`,
+          blocked: true,
+          domain: null,
+          tier,
+        });
+        return;
+      }
+      const domainCheck = isDomainAllowed(checkDomain, tier);
+      if (!domainCheck.allowed) {
+        sendResult({
+          error: domainCheck.error,
+          blocked: true,
+          domain: checkDomain,
+          tier,
+        });
+        return;
+      }
+    }
+
     // We hijack the ID to map it back
     const internalId = ++callIdCounter;
     pendingCalls.set(internalId, {
@@ -2735,7 +2785,7 @@ function _handleInternalProxyCall(socket, message) {
       clientId: message.clientId || "proxy_unknown",
       id: internalId,
       tool: message.tool,
-      params: message.params,
+      params,
     });
   };
 
@@ -2869,7 +2919,8 @@ process.on("exit", removeLockFileIfOwnedSync);
 
 // ─── Bridge: Send tool call to extension ─────────────────────
 
-function callExtensionTool(tool, params) {
+function callExtensionTool(tool, params, options = {}) {
+  const confirmedExecution = options?.confirmed === true;
   // Reset inactivity timer on every tool call
   touchActivity();
   const callStart = Date.now();
@@ -2910,12 +2961,12 @@ function callExtensionTool(tool, params) {
           // during the wait, recurse through the primary path.
           await _waitForProxyReady();
           if (isPrimaryServer) {
-            resolve(await callExtensionTool(tool, params));
+            resolve(await callExtensionTool(tool, params, options));
             return;
           }
           const recoveredPrimary = await tryRecoverSecondaryAsPrimary();
           if (recoveredPrimary) {
-            resolve(await callExtensionTool(tool, params));
+            resolve(await callExtensionTool(tool, params, options));
             return;
           }
           connected = await ensureProxyClientConnected();
@@ -2994,7 +3045,7 @@ function callExtensionTool(tool, params) {
         // Re-enter the primary path now that the extension is back. The
         // recursive call goes through the full guardrail / confirm-mode
         // pipeline, so we don't have to duplicate that logic here.
-        resolve(await callExtensionTool(tool, params));
+        resolve(await callExtensionTool(tool, params, options));
       })();
       return;
     }
@@ -3004,9 +3055,17 @@ function callExtensionTool(tool, params) {
     // We check against the last-known URL from the extension state.
     const tier = getToolTier(tool, params);
     if (tier !== "read") {
-      // Extract domain from params if available (navigate has url param)
+      // Extract domain from params when the tool targets an explicit URL.
       let checkDomain = null;
-      if (tool === "navigate" && params.url) {
+      const isRawFetchTool = tool === "fetch_page_source" || tool === "browser_fetch_raw";
+      if (isRawFetchTool && params.url) {
+        try {
+          const targetUrl = new URL(params.url);
+          if (targetUrl.protocol === "http:" || targetUrl.protocol === "https:") {
+            checkDomain = targetUrl.hostname;
+          }
+        } catch {}
+      } else if (tool === "navigate" && params.url) {
         try {
           checkDomain = new URL(
             params.url.startsWith("http")
@@ -3014,6 +3073,15 @@ function callExtensionTool(tool, params) {
               : "https://" + params.url,
           ).hostname;
         } catch {}
+      }
+      if (isRawFetchTool && !checkDomain) {
+        wrappedResolve({
+          error: `${tool} requires a valid URL for ${tier} requests`,
+          blocked: true,
+          domain: null,
+          tier,
+        });
+        return;
       }
       // For other tools, we rely on the extension reporting the current tab URL
       // which comes through in tool results. Domain check uses what we have.
@@ -3034,7 +3102,7 @@ function callExtensionTool(tool, params) {
 
       // ─── Confirm Mode ───────────────────────────────────────
       // For destructive tools in confirm mode, return a confirmation request
-      if (CONFIRM_MODE && tier === "destructive") {
+      if (CONFIRM_MODE && tier === "destructive" && !confirmedExecution) {
         const confirmId = ++confirmIdCounter;
         pendingConfirmations.set(confirmId, {
           tool,
@@ -3736,6 +3804,7 @@ const BROWSER_AGENT_PROTOCOL =
   "- Observe first: use page context, get_dom_state, take_snapshot, and richer search/traversal tools before answering from guesswork.\n" +
   "- Identify targets by visible text, role/name, index, selector, frame/shadow context, and state; do not rely on brittle selectors when better evidence exists.\n" +
   "- Handle iframes, shadow DOM, popups/windows, tabs, dialogs, downloads, and SPA network-idle states before declaring something unavailable.\n" +
+  "- For .gz artifacts, report pages, and API response-shape evidence, prefer browser_fetch_raw/fetch_page_source over trying to render the payload in a browser tab.\n" +
   "- Act in short verified batches: perform the browser step, wait for the page to settle, then verify with state/text/URL/title/snapshot evidence.\n" +
   "- Ask before destructive, payment, account, credential, or irreversible actions unless the user has already clearly authorized the exact action.\n";
 
@@ -5606,6 +5675,13 @@ function _playwrightTarget(params = {}) {
 async function _callPlaywrightCompatTool(toolName, params = {}) {
   const p = params || {};
   switch (toolName) {
+    case "browser_fetch_raw":
+    case "fetch_page_source":
+      return callExtensionTool("fetch_page_source", p);
+    case "list_downloads":
+      return callExtensionTool("list_downloads", p);
+    case "wait_for_download":
+      return callExtensionTool("wait_for_download", p);
     case "browser_snapshot":
       return callExtensionTool("take_snapshot", {
         selector: p.target || p.selector || "",
@@ -5687,8 +5763,8 @@ function _registerPlaywrightCompatTool({ name, description, parameters }) {
   server.addTool({
     name,
     description:
-      `${description} Playwright MCP-compatible alias backed by AutoDOM's active-tab browser tools. ` +
-      "Prefer browser_snapshot/get_dom_state before acting so element targets are deterministic.",
+      `${description} MCP browser tool backed by AutoDOM. ` +
+      "Prefer raw fetch tools for artifact/report/API payload evidence, and browser_snapshot/get_dom_state before UI actions so element targets are deterministic.",
     parameters,
     execute: async (params) =>
       stringifyToolResult(await _callPlaywrightCompatTool(name, params)),
@@ -5701,6 +5777,84 @@ const PLAYWRIGHT_TARGET_PARAM = z
   .describe("CSS selector or AutoDOM snapshot target for the element");
 
 const PLAYWRIGHT_COMPAT_TOOLS = [
+  {
+    name: "browser_fetch_raw",
+    description:
+      "Fetch a raw URL with browser credentials without navigating a tab. Use this for .gz artifacts, report evidence, and API response-shape inspection when tab rendering is unreliable.",
+    parameters: z.object({
+      url: z.string().describe("Absolute URL to fetch"),
+      method: z.string().optional().describe("HTTP method, default GET"),
+      headers: z.record(z.string()).optional().describe("Optional request headers"),
+      body: z.string().optional().describe("Optional string request body"),
+      credentials: z
+        .enum(["include", "omit", "same-origin"])
+        .optional()
+        .describe("Fetch credentials mode, default include"),
+      responseType: z
+        .enum(["auto", "text", "json", "base64"])
+        .optional()
+        .describe("Body mode. auto returns text/json/html when safe and base64 for binary/compressed payloads."),
+      decompress: z
+        .boolean()
+        .optional()
+        .describe("Try to decompress gzip-like payloads when possible; default true"),
+      parseJson: z.boolean().optional().describe("Parse JSON responses into a json field; default true"),
+      extractLinks: z.boolean().optional().describe("Extract links from HTML responses; default true"),
+      maxBytes: z.number().optional().describe("Maximum text characters or binary bytes to return"),
+    }),
+  },
+  {
+    name: "fetch_page_source",
+    description:
+      "Fetch raw page or artifact payload source with browser credentials without navigating a tab. Alias of browser_fetch_raw for existing AutoDOM workflows.",
+    parameters: z.object({
+      url: z.string().describe("Absolute URL to fetch"),
+      method: z.string().optional().describe("HTTP method, default GET"),
+      headers: z.record(z.string()).optional().describe("Optional request headers"),
+      body: z.string().optional().describe("Optional string request body"),
+      credentials: z
+        .enum(["include", "omit", "same-origin"])
+        .optional()
+        .describe("Fetch credentials mode, default include"),
+      responseType: z
+        .enum(["auto", "text", "json", "base64"])
+        .optional()
+        .describe("Body mode. auto returns text/json/html when safe and base64 for binary/compressed payloads."),
+      decompress: z
+        .boolean()
+        .optional()
+        .describe("Try to decompress gzip-like payloads when possible; default true"),
+      parseJson: z.boolean().optional().describe("Parse JSON responses into a json field; default true"),
+      extractLinks: z.boolean().optional().describe("Extract links from HTML responses; default true"),
+      maxBytes: z.number().optional().describe("Maximum text characters or binary bytes to return"),
+    }),
+  },
+  {
+    name: "list_downloads",
+    description:
+      "List recent browser downloads for artifact evidence without opening the downloaded file in a tab.",
+    parameters: z.object({
+      limit: z.number().optional().describe("Maximum downloads to return, default 10"),
+      state: z
+        .enum(["in_progress", "interrupted", "complete"])
+        .optional()
+        .describe("Optional download state filter"),
+    }),
+  },
+  {
+    name: "wait_for_download",
+    description:
+      "Wait for a new browser download to start and optionally complete, returning filename, URL, and state.",
+    parameters: z.object({
+      timeout: z.number().optional().describe("Maximum wait in milliseconds, default 15000"),
+      waitForComplete: z.boolean().optional().describe("Wait until complete or interrupted"),
+      filenameFilter: z.string().optional().describe("Only match downloads whose filename or URL includes this text"),
+      lookbackMs: z
+        .number()
+        .optional()
+        .describe("Also match recent downloads started before this call; defaults to 10000 only when filenameFilter is set"),
+    }),
+  },
   {
     name: "browser_snapshot",
     description: "Capture a structured accessibility-style snapshot of the current page.",
@@ -5825,7 +5979,7 @@ const PLAYWRIGHT_COMPAT_TOOLS = [
   },
   {
     name: "browser_tabs",
-    description: "List, open, select, or close browser tabs.",
+    description: "List tabs across all browser windows by default, or open, select, and close tabs.",
     parameters: z.object({
       action: z
         .enum(["list", "new", "select", "close"])
@@ -5834,7 +5988,10 @@ const PLAYWRIGHT_COMPAT_TOOLS = [
         .describe("Tab operation to perform"),
       url: z.string().optional().describe("URL for action=new"),
       tabId: z.number().optional().describe("Tab id for select/close"),
-      index: z.number().optional().describe("Window-local tab index for select/close"),
+      listIndex: z.number().optional().describe("Global index from the all-window tab list for select/close"),
+      index: z.number().optional().describe("Window-local tab index; pair with windowId or currentWindow=true"),
+      windowId: z.number().optional().describe("Window id for window-local index select/close"),
+      currentWindow: z.boolean().optional().describe("When listing, restrict results to the current window"),
     }),
   },
   {
@@ -6165,7 +6322,9 @@ server.addTool({
     pendingConfirmations.delete(confirmId);
 
     try {
-      const result = await callExtensionTool(pending.tool, pending.params);
+      const result = await callExtensionTool(pending.tool, pending.params, {
+        confirmed: true,
+      });
       return JSON.stringify(
         {
           confirmed: true,

@@ -110,21 +110,45 @@
     {
       name: "fetch_page_source",
       description:
-        "Fetch the raw HTML of any URL directly via HTTP without navigating the tab. " +
-        "Returns the HTML source and, when extractLinks is true (default), all href links found in <a> tags. " +
-        "Use this as a fallback when get_html / take_snapshot return no useful text from a JS-rendered artifact or report page — " +
-        "the raw HTML often contains linked DOM and API-detail URLs that screenshots cannot expose.",
+        "Fetch the raw response of any URL directly via HTTP without navigating the tab. " +
+        "Use this for .gz artifacts, report evidence, and API response-shape checks when tab rendering is unreliable. " +
+        "Returns status, finalUrl, headers, content metadata, text/json/html when safe, and base64 fallback for binary or compressed payloads.",
       parameters: {
         type: "object",
         properties: {
           url: { type: "string", description: "Absolute URL to fetch" },
+          method: { type: "string", description: "HTTP method, default GET" },
+          headers: {
+            type: "object",
+            additionalProperties: { type: "string" },
+            description: "Optional request headers",
+          },
+          body: { type: "string", description: "Optional string request body" },
+          credentials: {
+            type: "string",
+            enum: ["include", "omit", "same-origin"],
+            description: "Fetch credentials mode, default include",
+          },
+          responseType: {
+            type: "string",
+            enum: ["auto", "text", "json", "base64"],
+            description: "Body mode. auto returns text/json/html when safe and base64 for binary/compressed payloads.",
+          },
+          decompress: {
+            type: "boolean",
+            description: "Try to decompress gzip-like payloads when possible (default true)",
+          },
+          parseJson: {
+            type: "boolean",
+            description: "Parse JSON responses into a json field (default true)",
+          },
           extractLinks: {
             type: "boolean",
-            description: "Return all <a href> links extracted from the HTML (default true)",
+            description: "Return all <a href> links extracted from HTML responses (default true)",
           },
           maxBytes: {
             type: "integer",
-            description: "Maximum HTML characters to return (default 30000)",
+            description: "Maximum text characters or binary bytes to return (default 30000)",
           },
         },
         required: ["url"],
@@ -767,6 +791,10 @@
           timeout: { type: "integer", description: "Max wait in ms (default 15000)" },
           waitForComplete: { type: "boolean", description: "Also wait until download finishes (default false)" },
           filenameFilter: { type: "string", description: "Substring the filename must contain" },
+          lookbackMs: {
+            type: "integer",
+            description: "Also match recent downloads started before this call; defaults to 10000 only when filenameFilter is set",
+          },
         },
         additionalProperties: false,
       },

@@ -5300,20 +5300,38 @@ async function toolBrowserWaitFor(params = {}) {
 
 async function toolBrowserTabs(params = {}) {
   const action = String(params.action || "list").toLowerCase();
-  if (action === "list") return toolListTabs({ currentWindow: true });
+  if (action === "list") return toolListTabs({ currentWindow: params.currentWindow === true });
   if (action === "new") {
     return toolOpenNewTab({ url: params.url || "about:blank", active: true });
   }
-  if (action === "select") return toolSwitchTab({ tabId: params.tabId, index: params.index });
+  const resolveTabForIndex = async () => {
+    if (typeof params.listIndex === "number") {
+      const tabs = await chrome.tabs.query({});
+      return tabs[params.listIndex] || null;
+    }
+    if (typeof params.index === "number" && typeof params.windowId === "number") {
+      const tabs = await chrome.tabs.query({ windowId: params.windowId });
+      return tabs.find((t) => t.index === params.index) || null;
+    }
+    if (typeof params.index === "number" && params.currentWindow === true) {
+      const tabs = await chrome.tabs.query({ currentWindow: true });
+      return tabs[params.index] || null;
+    }
+    return null;
+  };
+  if (action === "select") {
+    if (params.tabId) return toolSwitchTab({ tabId: params.tabId });
+    const tab = await resolveTabForIndex();
+    if (tab) return toolSwitchTab({ tabId: tab.id });
+    return { error: "browser_tabs select requires tabId, listIndex, or windowId + index" };
+  }
   if (action === "close") {
     if (params.tabId) return toolCloseTab({ tabId: params.tabId });
-    if (typeof params.index === "number") {
-      const tabs = await chrome.tabs.query({ currentWindow: true });
-      const tab = tabs[params.index];
-      return tab ? toolCloseTab({ tabId: tab.id }) : { error: "Tab not found" };
-    }
-    const tab = await getActiveTab();
-    return toolCloseTab({ tabId: tab.id });
+    const tab = await resolveTabForIndex();
+    if (tab) return toolCloseTab({ tabId: tab.id });
+    if (typeof params.listIndex === "number" || typeof params.index === "number") return { error: "Tab not found" };
+    const activeTab = await getActiveTab();
+    return toolCloseTab({ tabId: activeTab.id });
   }
   return { error: `Unsupported browser_tabs action: ${action}` };
 }
@@ -5364,6 +5382,7 @@ const TOOL_HANDLERS = new Map([
   ["set_storage", toolSetStorage],
   ["get_html", toolGetHtml],
   ["fetch_page_source", toolFetchPageSource],
+  ["browser_fetch_raw", toolFetchPageSource],
   ["set_attribute", toolSetAttribute],
   ["check_element_state", toolCheckElementState],
   ["drag_and_drop", toolDragAndDrop],
@@ -6345,12 +6364,15 @@ async function toolGetConsoleLogs(params) {
 
 // 16. List all tabs
 async function toolListTabs(params) {
-  const queryOpts = {};
-  if (params?.currentWindow !== false) queryOpts.currentWindow = true;
-  const tabs = await chrome.tabs.query(queryOpts);
+  const allTabs = await chrome.tabs.query({});
+  const listIndexById = new Map(allTabs.map((t, listIndex) => [t.id, listIndex]));
+  const tabs = params?.currentWindow === false
+    ? allTabs
+    : await chrome.tabs.query({ currentWindow: true });
   return {
     tabs: tabs.map((t) => ({
       id: t.id,
+      listIndex: listIndexById.get(t.id),
       index: t.index,
       title: t.title,
       url: t.url,
@@ -6757,59 +6779,281 @@ async function toolGetHtml(params) {
   );
 }
 
-// Fetch the raw HTML of any URL directly via HTTP without navigating a tab.
-// Useful as a fallback when JS-rendered artifact or report pages return no
-// structured text through the DOM tools. The extension's <all_urls> host
-// permission allows cross-origin fetches with credentials.
+function _bytesToBase64(bytes) {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return btoa(binary);
+}
+
+function _looksLikeGzip(url, headers) {
+  const contentType = String(headers["content-type"] || "").toLowerCase();
+  const contentEncoding = String(headers["content-encoding"] || "").toLowerCase();
+  const pathname = (() => {
+    try {
+      return new URL(url).pathname.toLowerCase();
+    } catch (_) {
+      return String(url || "").toLowerCase();
+    }
+  })();
+  return (
+    pathname.endsWith(".gz") ||
+    contentType.includes("gzip") ||
+    contentType.includes("x-gzip") ||
+    contentEncoding.includes("gzip")
+  );
+}
+
+function _isTextualResponse(url, contentType) {
+  const lowerType = String(contentType || "").toLowerCase();
+  if (
+    lowerType.startsWith("text/") ||
+    lowerType.includes("json") ||
+    lowerType.includes("xml") ||
+    lowerType.includes("javascript") ||
+    lowerType.includes("html") ||
+    lowerType.includes("csv") ||
+    lowerType.includes("yaml") ||
+    lowerType.includes("x-www-form-urlencoded")
+  ) {
+    return true;
+  }
+  const pathname = (() => {
+    try {
+      return new URL(url).pathname.toLowerCase();
+    } catch (_) {
+      return String(url || "").toLowerCase();
+    }
+  })();
+  return /\.(txt|json|ndjson|html|htm|xml|csv|yaml|yml|js|css|log)$/.test(pathname);
+}
+
+async function _decompressGzipBytes(bytes, maxBytes) {
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error("DecompressionStream is not available in this browser");
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return _readStreamBytes(stream, maxBytes);
+}
+
+function _concatByteChunks(chunks, totalLength) {
+  const out = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
+}
+
+async function _readStreamBytes(stream, maxBytes) {
+  const cap = Number(maxBytes) > 0 ? Number(maxBytes) : 30000;
+  const limit = cap + 1;
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  let truncated = false;
+  try {
+    while (total < limit) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value || value.length === 0) continue;
+      const remaining = limit - total;
+      if (value.length > remaining) {
+        chunks.push(value.subarray(0, remaining));
+        total += remaining;
+        truncated = true;
+        await reader.cancel().catch(() => {});
+        break;
+      }
+      chunks.push(value);
+      total += value.length;
+      if (total >= limit) {
+        truncated = true;
+        await reader.cancel().catch(() => {});
+        break;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return {
+    bytes: _concatByteChunks(chunks, total),
+    truncated,
+  };
+}
+
+function _truncateText(text, cap) {
+  if (text.length <= cap) {
+    return { text, truncated: false, fullLength: text.length };
+  }
+  return {
+    text: text.substring(0, cap),
+    truncated: true,
+    fullLength: text.length,
+  };
+}
+
+function _extractLinksFromHtml(html, url) {
+  const links = [];
+  const linkRe = /<a\b[^>]*?\shref=(['"])(.*?)\1/gi;
+  let m;
+  while ((m = linkRe.exec(html)) !== null) {
+    const href = m[2].trim();
+    if (!href || href.startsWith("#")) continue;
+    try {
+      links.push(new URL(href, url).href);
+    } catch (_) {
+      links.push(href);
+    }
+  }
+  return [...new Set(links)];
+}
+
+// Fetch the raw response of any URL directly via HTTP without navigating a tab.
+// Useful as a fallback when artifact/report pages, including .gz payloads,
+// do not render cleanly through tab-based DOM tools.
 async function toolFetchPageSource(params) {
-  const { url, extractLinks = true, maxBytes = 30000 } = params || {};
+  const {
+    url,
+    method = "GET",
+    headers: requestHeaders,
+    body,
+    credentials = "include",
+    extractLinks = true,
+    maxBytes = 30000,
+    responseType = "auto",
+    decompress = true,
+    parseJson = true,
+  } = params || {};
   if (!url || typeof url !== "string") return { ok: false, error: "url is required" };
 
+  const cap = Number(maxBytes) > 0 ? Number(maxBytes) : 30000;
+  const methodUpper = String(method || "GET").toUpperCase();
+  const canFollowRedirects = (methodUpper === "GET" || methodUpper === "HEAD") && body === undefined;
   const ac = typeof AbortController !== "undefined" ? new AbortController() : null;
   const timer = ac ? setTimeout(() => ac.abort(), 15000) : null;
   try {
     const response = await fetch(url, {
-      credentials: "include",
+      method,
+      headers: requestHeaders && typeof requestHeaders === "object" ? requestHeaders : undefined,
+      body: body === undefined ? undefined : body,
+      credentials,
+      redirect: canFollowRedirects ? "follow" : "manual",
       signal: ac ? ac.signal : undefined,
     });
-    if (!response.ok) {
+    const finalUrl = response.url || url;
+    const responseHeaders = {};
+    response.headers.forEach((value, key) => {
+      responseHeaders[key] = value;
+    });
+    const contentType = responseHeaders["content-type"] || "";
+    const contentEncoding = responseHeaders["content-encoding"] || "";
+    if (!response.body) {
       return {
-        ok: false,
-        error: `HTTP ${response.status} ${response.statusText}`,
-        status: response.status,
+        ok: response.ok,
+        ...(response.ok ? {} : { error: `HTTP ${response.status} ${response.statusText}` }),
         url,
+        finalUrl,
+        status: response.status,
+        statusText: response.statusText,
+        responseType: response.type,
+        headers: responseHeaders,
+        contentType,
+        contentEncoding,
+        contentLength: responseHeaders["content-length"],
+        bodyLength: 0,
+        bodyTruncated: false,
+        maxBytes: cap,
+        truncated: false,
       };
     }
-    let html = await response.text();
-    const fullLength = html.length;
-    const cap = Number(maxBytes) > 0 ? Number(maxBytes) : 30000;
-    if (html.length > cap) {
-      html =
-        html.substring(0, cap) +
-        `\n…[truncated ${fullLength - cap} chars of full HTML]`;
-    }
+    const rawRead = await _readStreamBytes(response.body, cap);
+    const bytes = rawRead.bytes;
+    const gzipLike = _looksLikeGzip(finalUrl, responseHeaders);
+    const wantsBase64 = responseType === "base64";
+    const wantsJson = responseType === "json";
+    const wantsText = responseType === "text";
+    const textual = _isTextualResponse(finalUrl, contentType);
+
     const result = {
-      ok: true,
+      ok: response.ok,
       url,
+      finalUrl,
       status: response.status,
-      html,
-      truncated: fullLength > cap,
-      fullLength,
+      statusText: response.statusText,
+      responseType: response.type,
+      redirected: response.redirected,
+      redirectPolicy: canFollowRedirects ? "follow" : "manual",
+      headers: responseHeaders,
+      contentType,
+      contentEncoding,
+      contentLength: responseHeaders["content-length"],
+      bodyLength: bytes.byteLength,
+      bodyTruncated: rawRead.truncated,
+      maxBytes: cap,
+      truncated: false,
     };
-    if (extractLinks !== false) {
-      const links = [];
-      const linkRe = /<a\b[^>]*?\shref=(['"])(.*?)\1/gi;
-      let m;
-      while ((m = linkRe.exec(html)) !== null) {
-        const href = m[2].trim();
-        if (!href || href.startsWith("#")) continue;
+
+    let textBytes = bytes;
+    if (gzipLike && decompress !== false && !wantsBase64) {
+      result.decompression = { attempted: true, ok: false, format: "gzip" };
+      if (rawRead.truncated) {
+        result.decompression.error = "Compressed body exceeds maxBytes; skipped decompression";
+      } else {
         try {
-          links.push(new URL(href, url).href);
-        } catch (_) {
-          links.push(href);
+          const decompressed = await _decompressGzipBytes(bytes, cap);
+          textBytes = decompressed.bytes;
+          result.decompression.ok = true;
+          result.decompression.truncated = decompressed.truncated;
+          result.decompressedLength = textBytes.byteLength;
+        } catch (err) {
+          result.decompression.error = err && err.message ? err.message : String(err);
         }
       }
-      result.links = [...new Set(links)];
+    }
+
+    const canReturnText =
+      wantsText ||
+      wantsJson ||
+      (responseType === "auto" && (textual || result.decompression?.ok));
+
+    if (canReturnText) {
+      const decoded = new TextDecoder("utf-8").decode(textBytes);
+      const truncated = _truncateText(decoded, cap);
+      result.text = truncated.text;
+      result.fullLength = truncated.fullLength;
+      result.truncated = truncated.truncated || rawRead.truncated || result.decompression?.truncated === true;
+      if (contentType.toLowerCase().includes("html")) {
+        result.html = result.text;
+      }
+      if (parseJson !== false && (wantsJson || contentType.toLowerCase().includes("json"))) {
+        if (result.truncated) {
+          result.jsonOmitted = true;
+          result.jsonOmitReason = "Response body exceeds maxBytes";
+        } else {
+          try {
+            result.json = JSON.parse(decoded);
+          } catch (err) {
+            result.jsonParseError = err && err.message ? err.message : String(err);
+          }
+        }
+      }
+      if (extractLinks !== false && contentType.toLowerCase().includes("html")) {
+        result.links = _extractLinksFromHtml(result.text, finalUrl);
+      }
+    } else {
+      const binaryBytes = bytes.byteLength > cap ? bytes.subarray(0, cap) : bytes;
+      result.base64 = _bytesToBase64(binaryBytes);
+      result.encoding = "base64";
+      result.truncated = bytes.byteLength > cap || rawRead.truncated;
+    }
+
+    if (!response.ok) {
+      result.error = `HTTP ${response.status} ${response.statusText}`;
     }
     return result;
   } finally {
@@ -10730,34 +10974,77 @@ async function toolListDownloads({ limit, state } = {}) {
   };
 }
 
-async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter } = {}) {
+async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter, lookbackMs } = {}) {
   const maxWait = timeout || 15000;
   const start = Date.now();
+  const explicitLookbackMs = Number(lookbackMs);
+  const recentWindowMs = explicitLookbackMs > 0 ? explicitLookbackMs : (filenameFilter ? 10000 : 0);
 
-  // Snapshot existing download IDs so we only watch for new ones
-  const existing = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 50 });
-  const existingIds = new Set(existing.map((d) => d.id));
+  const matchesDownload = (item) => {
+    if (!filenameFilter) return true;
+    const filename = item.filename || "";
+    const url = item.url || "";
+    return filename.includes(filenameFilter) || url.includes(filenameFilter);
+  };
+
+  const formatDownload = (item, state = item.state) => ({
+    id: item.id,
+    filename: item.filename,
+    url: item.url?.substring(0, 200),
+    state,
+  });
+
+  const waitForExistingToFinish = (item) =>
+    new Promise((resolve) => {
+      if (!waitForComplete || item.state === "complete" || item.state === "interrupted") {
+        resolve(formatDownload(item));
+        return;
+      }
+      const remaining = Math.max(0, maxWait - (Date.now() - start));
+      const completeTimer = setTimeout(() => {
+        chrome.downloads.onChanged.removeListener(onChanged);
+        resolve({ ...formatDownload(item), state: "timeout_waiting_for_complete" });
+      }, remaining);
+
+      function onChanged(delta) {
+        if (delta.id !== item.id) return;
+        if (delta.state && (delta.state.current === "complete" || delta.state.current === "interrupted")) {
+          clearTimeout(completeTimer);
+          chrome.downloads.onChanged.removeListener(onChanged);
+          resolve(formatDownload(item, delta.state.current));
+        }
+      }
+      chrome.downloads.onChanged.addListener(onChanged);
+    });
+
+  if (recentWindowMs > 0) {
+    const existing = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 50 });
+    const recentCutoff = start - recentWindowMs;
+    const recent = existing.find((d) => {
+      const startedAt = d.startTime ? Date.parse(d.startTime) : 0;
+      return startedAt >= recentCutoff && matchesDownload(d);
+    });
+    if (recent) return waitForExistingToFinish(recent);
+  }
 
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       chrome.downloads.onCreated.removeListener(onCreated);
       resolve({ error: `No new download started within ${maxWait}ms` });
     }, maxWait);
-
     async function onCreated(item) {
-      if (existingIds.has(item.id)) return;
-      if (filenameFilter && !item.filename.includes(filenameFilter) && !item.url.includes(filenameFilter)) return;
+      if (!matchesDownload(item)) return;
       clearTimeout(timer);
       chrome.downloads.onCreated.removeListener(onCreated);
 
       if (!waitForComplete) {
-        return resolve({ id: item.id, filename: item.filename, url: item.url?.substring(0, 200), state: item.state });
+        return resolve(formatDownload(item));
       }
 
       // Wait for completion
       const completeTimer = setTimeout(() => {
         chrome.downloads.onChanged.removeListener(onChanged);
-        resolve({ id: item.id, filename: item.filename, state: "timeout_waiting_for_complete" });
+        resolve({ ...formatDownload(item), state: "timeout_waiting_for_complete" });
       }, Math.max(0, maxWait - (Date.now() - start)));
 
       function onChanged(delta) {
@@ -10765,7 +11052,7 @@ async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter } 
         if (delta.state && (delta.state.current === "complete" || delta.state.current === "interrupted")) {
           clearTimeout(completeTimer);
           chrome.downloads.onChanged.removeListener(onChanged);
-          resolve({ id: item.id, filename: item.filename, url: item.url?.substring(0, 200), state: delta.state.current });
+          resolve(formatDownload(item, delta.state.current));
         }
       }
       chrome.downloads.onChanged.addListener(onChanged);
