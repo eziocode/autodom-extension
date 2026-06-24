@@ -4181,9 +4181,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const timer = setTimeout(() => {
       if (pendingSelfUpdates.has(id)) {
         pendingSelfUpdates.delete(id);
-        sendResponse({ ok: false, error: "Bridge did not finish the update in time (60s)" });
+        sendResponse({ ok: false, error: "Bridge did not finish the update in time (5m)" });
       }
-    }, 60000);
+    }, 300000);
     pendingSelfUpdates.set(id, {
       resolve: (r) => {
         clearTimeout(timer);

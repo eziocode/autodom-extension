@@ -116,6 +116,8 @@ function loadPopup(overrides = {}) {
     location: { search: "" },
     setTimeout,
     clearTimeout,
+    setInterval,
+    clearInterval,
     console,
     URLSearchParams,
     ...overrides,

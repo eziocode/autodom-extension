@@ -346,11 +346,21 @@ async function runUpdateCheck() {
   if (btn.dataset.updateState === "found" && await isUnpackedInstall()) {
     btn.textContent = "Downloading…";
     versionEl.textContent = "downloading update via bridge…";
+    let elapsed = 0;
+    const progressTimer = setInterval(() => {
+      elapsed += 1;
+      const elapsedText = elapsed < 60
+        ? `${elapsed}s`
+        : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
+      versionEl.textContent = `downloading update via bridge… (${elapsedText})`;
+    }, 1000);
     let result;
     try {
       result = await sendRuntimeMessage({ type: "AUTODOM_SELF_UPDATE" });
     } catch (_) {
       result = { ok: false, error: "Bridge unavailable" };
+    } finally {
+      clearInterval(progressTimer);
     }
     if (result?.ok) {
       btn.textContent = "Reloading…";
