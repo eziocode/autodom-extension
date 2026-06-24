@@ -79,6 +79,7 @@ const OFFICIAL_EXTENSION_ID = "kpjdffgogiajnkajnjneiboaincnaokf";
 const AUTO_UPDATE_STORAGE_KEY = "autodomAutoUpdateEnabled";
 const PERIODIC_UPDATE_CHECKS_STORAGE_KEY = "autodomPeriodicUpdateChecksEnabled";
 const AVAILABLE_UPDATE_STORAGE_KEY = "availableUpdate";
+const SELF_UPDATE_STORAGE_KEY = "selfUpdateStatus";
 const UPDATE_INSTALL_INTERVENTION_VERSION_KEY =
   "autodomUpdateInstallInterventionVersion";
 
@@ -322,6 +323,65 @@ async function applyPendingUpdate() {
   }
 }
 
+// ── Bridge self-update progress tracker ─────────────────────
+// Called after the SW acknowledges an AUTODOM_SELF_UPDATE request, and also
+// on popup open when a download is already running in the background.
+// Registers a chrome.storage.onChanged listener and immediately applies the
+// current state, then reacts to every future storage change until settled.
+async function _attachSelfUpdateTracker(btn, versionEl) {
+  let settled = false;
+
+  const applyStatus = async (status) => {
+    if (!status || settled) return;
+    if (status.state === "complete" || status.state === "failed") settled = true;
+
+    if (status.state === "downloading") {
+      versionEl.textContent = status.status
+        ? `${status.status}  (${status.progress || 0}%)`
+        : (status.progress > 0
+            ? `downloading via bridge… ${status.progress}%`
+            : "downloading update via bridge…");
+    } else if (status.state === "complete") {
+      try { chrome.storage.onChanged.removeListener(onStorageChange); } catch (_) {}
+      // Guard against a stale "complete" entry left over from a previous update.
+      if (!isVersionNewerThanCurrent(status.version)) {
+        try { chrome.storage.local.remove(SELF_UPDATE_STORAGE_KEY); } catch (_) {}
+        btn.disabled = false;
+        const { pendingUpdate, availableUpdate } = await readUpdateState();
+        paintUpdateButton(pendingUpdate, availableUpdate);
+        return;
+      }
+      btn.textContent = "Reloading…";
+      versionEl.textContent = `Updated to v${status.version} — reloading…`;
+      // Belt-and-suspenders: SW also triggers reload; first one wins.
+      setTimeout(() => { try { chrome.runtime.reload(); } catch (_) {} }, 800);
+    } else if (status.state === "failed") {
+      try { chrome.storage.onChanged.removeListener(onStorageChange); } catch (_) {}
+      btn.disabled = false;
+      const { availableUpdate } = await readUpdateState();
+      paintUpdateButton(null, availableUpdate);
+      showUpdatePolicyNotice(
+        availableUpdate?.version || "?",
+        status.error || "Update failed — check the bridge logs",
+      );
+    }
+  };
+
+  function onStorageChange(changes, area) {
+    if (area !== "local" || !changes[SELF_UPDATE_STORAGE_KEY]) return;
+    applyStatus(changes[SELF_UPDATE_STORAGE_KEY].newValue);
+  }
+
+  try { chrome.storage.onChanged.addListener(onStorageChange); } catch (_) {}
+
+  // Apply current state immediately in case the download already completed
+  // (or was already in progress) before we registered the listener.
+  const current = await readLocalStorage(SELF_UPDATE_STORAGE_KEY, "self-update status");
+  if (current[SELF_UPDATE_STORAGE_KEY]) {
+    await applyStatus(current[SELF_UPDATE_STORAGE_KEY]);
+  }
+}
+
 // Runs Chromium / Firefox's built-in extension update check against the
 // configured `update_url`. Browsers throttle this to a few times per hour,
 // so failures with status="throttled" are normal and surfaced to the user.
@@ -345,37 +405,29 @@ async function runUpdateCheck() {
   // is not connected or reports an error.
   if (btn.dataset.updateState === "found" && await isUnpackedInstall()) {
     btn.textContent = "Downloading…";
-    versionEl.textContent = "downloading update via bridge…";
-    let elapsed = 0;
-    const progressTimer = setInterval(() => {
-      elapsed += 1;
-      const elapsedText = elapsed < 60
-        ? `${elapsed}s`
-        : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
-      versionEl.textContent = `downloading update via bridge… (${elapsedText})`;
-    }, 1000);
-    let result;
+    versionEl.textContent = "starting download via bridge…";
+    let startResult;
     try {
-      result = await sendRuntimeMessage({ type: "AUTODOM_SELF_UPDATE" });
+      startResult = await sendRuntimeMessage({ type: "AUTODOM_SELF_UPDATE" });
     } catch (_) {
-      result = { ok: false, error: "Bridge unavailable" };
-    } finally {
-      clearInterval(progressTimer);
+      startResult = { ok: false, error: "Bridge unavailable" };
     }
-    if (result?.ok) {
-      btn.textContent = "Reloading…";
-      versionEl.textContent = `Updated to v${result.version} — reloading…`;
-      setTimeout(() => { try { chrome.runtime.reload(); } catch (_) {} }, 600);
+
+    if (!startResult?.ok) {
+      // Bridge not connected or immediate send failure
+      btn.disabled = false;
+      const { availableUpdate } = await readUpdateState();
+      paintUpdateButton(null, availableUpdate);
+      showUpdatePolicyNotice(
+        availableUpdate?.version || "?",
+        startResult?.error || "bridge not connected — start the MCP bridge first, or ask an admin",
+      );
       return;
     }
-    // Server not running or failed — show the persistent policy notice
-    btn.disabled = false;
-    const { availableUpdate } = await readUpdateState();
-    paintUpdateButton(null, availableUpdate);
-    showUpdatePolicyNotice(
-      availableUpdate?.version || "?",
-      result?.error || "bridge not connected — start the MCP bridge first, or ask an admin",
-    );
+
+    // The SW accepted the request and the bridge is downloading in the background.
+    // Track progress and completion via chrome.storage changes (survives popup close + reopen).
+    await _attachSelfUpdateTracker(btn, versionEl);
     return;
   }
 
@@ -720,6 +772,26 @@ document.addEventListener("DOMContentLoaded", async () => {
     // an update on a previous popup-less browser session, show the CTA state.
     readUpdateState().then(({ pendingUpdate, availableUpdate }) => {
       paintUpdateButton(pendingUpdate, availableUpdate);
+      // If a download was already started by a previous popup session, re-attach
+      // the progress tracker so the user sees live progress and the button stays
+      // disabled (preventing a duplicate download).
+      try {
+        chrome.storage.local.get(SELF_UPDATE_STORAGE_KEY, (result) => {
+          const status = result?.[SELF_UPDATE_STORAGE_KEY];
+          if (!status || status.state !== "downloading") return;
+          // Stale entries older than 10 minutes are dead (bridge likely disconnected).
+          if (status.startedAt && Date.now() - status.startedAt > 10 * 60 * 1000) {
+            try { chrome.storage.local.remove(SELF_UPDATE_STORAGE_KEY); } catch (_) {}
+            return;
+          }
+          const btn = DOM.checkUpdateBtn;
+          const versionEl = DOM.appVersion;
+          if (!btn || !versionEl) return;
+          btn.disabled = true;
+          btn.textContent = "Downloading…";
+          _attachSelfUpdateTracker(btn, versionEl);
+        });
+      } catch (_) {}
     });
     // Live updates: react to onUpdateAvailable arriving while the popup
     // is open (e.g. the user opens it just before the browser's scheduled

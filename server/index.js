@@ -2889,14 +2889,23 @@ function _handleClearToolLogs(socket) {
 // PONG is aliased to the keepalive handler so we don't duplicate the
 // extension-identification logic.
 
-async function _handleSelfUpdate(socket, message) {
-  const { id } = message;
+function _handleSelfUpdate(socket, message) {
+  // Kick off the download as a background task so the WebSocket message
+  // handler returns immediately. Progress and completion are reported via
+  // separate SELF_UPDATE_PROGRESS / SELF_UPDATE_RESULT messages.
+  _runSelfUpdateInBackground(socket, message.id).catch(() => {});
+}
+
+async function _runSelfUpdateInBackground(socket, id) {
+  const DOWNLOAD_TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes
+
   const reply = (payload) => {
     try { socket.send(JSON.stringify({ type: "SELF_UPDATE_RESULT", id, ...payload })); } catch (_) {}
   };
-  // Server-side deadline: stay well under the extension's 5-minute timeout
-  // so any error message reaches the extension before it gives up.
-  const SELF_UPDATE_TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes
+  const sendProgress = (progress, bytes, total, status) => {
+    try { socket.send(JSON.stringify({ type: "SELF_UPDATE_PROGRESS", id, progress, bytes, total, status })); } catch (_) {}
+  };
+
   let tmpZip = null;
   try {
     const extDir = resolvePath(serverPath, "..", "..", "extension");
@@ -2906,7 +2915,8 @@ async function _handleSelfUpdate(socket, message) {
       reply({ ok: false, error: `Extension folder not found at ${extDir}. Start the bridge from the AutoDOM share folder.` });
       return;
     }
-    // Fetch updates.xml — short timeout, it's a tiny file
+
+    sendProgress(2, 0, 0, "Fetching latest version info…");
     const xmlRes = await fetchWithTimeout(
       "https://eziocode.github.io/autodom-extension/updates.xml",
       {},
@@ -2922,26 +2932,84 @@ async function _handleSelfUpdate(socket, message) {
     const latestVersion = verMatch[1];
     const zipUrl = `https://github.com/eziocode/autodom-extension/releases/download/v${latestVersion}/autodom-chrome-${latestVersion}.zip`;
     tmpZip = join(tmpdir(), `autodom-update-${Date.now()}.zip`);
-    // Download zip — allow up to the full server deadline
-    const zipRes = await fetchWithTimeout(zipUrl, {}, SELF_UPDATE_TIMEOUT_MS);
-    if (!zipRes.ok) throw new Error(`Zip download HTTP ${zipRes.status}`);
-    const buf = Buffer.from(await zipRes.arrayBuffer());
+
+    sendProgress(5, 0, 0, `Starting download of v${latestVersion}…`);
+
+    // Use AbortController so the timeout applies to the full body stream, not just headers.
+    const controller = new AbortController();
+    const downloadTimer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+
+    let zipRes;
+    try {
+      zipRes = await fetch(zipUrl, { signal: controller.signal });
+    } catch (err) {
+      clearTimeout(downloadTimer);
+      throw err;
+    }
+    if (!zipRes.ok) {
+      clearTimeout(downloadTimer);
+      throw new Error(`Zip download HTTP ${zipRes.status}`);
+    }
+
+    const contentLength = parseInt(zipRes.headers.get("content-length") || "0", 10);
+    const reader = zipRes.body.getReader();
+    const chunks = [];
+    let downloaded = 0;
+    let lastReportedPct = 5;
+    let lastReportedBytes = 0;
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        downloaded += value.length;
+        if (contentLength > 0) {
+          // Accurate percentage: map body progress to 5–85 % range, report every 5 %
+          const pct = Math.min(85, Math.round(5 + (downloaded / contentLength) * 80));
+          if (pct >= lastReportedPct + 5) {
+            lastReportedPct = pct;
+            const mb = (downloaded / 1048576).toFixed(1);
+            const totalMb = (contentLength / 1048576).toFixed(1);
+            sendProgress(pct, downloaded, contentLength, `Downloading… ${mb} / ${totalMb} MB`);
+          }
+        } else {
+          // No Content-Length (GitHub CDN chunked transfer) — report every 512 KB
+          if (downloaded - lastReportedBytes >= 512 * 1024) {
+            lastReportedBytes = downloaded;
+            const mb = (downloaded / 1048576).toFixed(1);
+            // Rough visual: ~5 % per MB, capped at 85
+            const pct = Math.min(85, 5 + Math.round((downloaded / 1048576) * 5));
+            sendProgress(pct, downloaded, 0, `Downloading… ${mb} MB`);
+          }
+        }
+      }
+    } finally {
+      clearTimeout(downloadTimer);
+    }
+
+    const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
     await fs.writeFile(tmpZip, buf);
-    // Extract using system unzip — cap at 60 s to prevent a hung child process
+
+    sendProgress(88, downloaded, contentLength, "Extracting…");
+
     await new Promise((resolve, reject) => {
+      let unzipTimer;
       const child = execFile("unzip", ["-q", "-o", tmpZip, "-d", extDir], (err) => {
+        clearTimeout(unzipTimer);
         if (err) reject(err); else resolve();
       });
-      setTimeout(() => {
+      unzipTimer = setTimeout(() => {
         try { child.kill(); } catch (_) {}
-        reject(new Error("unzip timed out"));
+        reject(new Error("unzip timed out after 60s"));
       }, 60000);
     });
+
+    sendProgress(100, downloaded, contentLength, "Complete");
     reply({ ok: true, version: latestVersion });
   } catch (err) {
     reply({ ok: false, error: err?.message || String(err) });
   } finally {
-    // Always clean up the temp zip regardless of success or failure
     if (tmpZip) { try { await fs.unlink(tmpZip); } catch (_) {} }
   }
 }

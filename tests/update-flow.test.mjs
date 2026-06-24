@@ -81,6 +81,14 @@ function loadPopup(overrides = {}) {
             }
             return resultPromise;
           },
+          remove(keys, callback) {
+            const resultPromise = Promise.resolve();
+            if (typeof callback === "function") {
+              resultPromise.then(() => callback());
+              return undefined;
+            }
+            return resultPromise;
+          },
         },
         session: {
           get(keys, callback) {
@@ -90,7 +98,7 @@ function loadPopup(overrides = {}) {
             return sandbox.chrome.storage.local.set(values, callback);
           },
         },
-        onChanged: { addListener() {} },
+        onChanged: { addListener() {}, removeListener() {} },
       },
     },
     document: {
@@ -341,11 +349,19 @@ test("runUpdateCheck reloads via bridge when server-based self-update succeeds",
   let reloaded = false;
   const { sandbox, elements } = loadPopup({
     installType: "development",
-    localGet: async () => ({ availableUpdate: { version: futureVersion } }),
+    // When the popup reads selfUpdateStatus after registering the onChanged listener,
+    // return the completed state to simulate the bridge finishing before the popup checks.
+    localGet: async (keys) => {
+      if (keys === "selfUpdateStatus" || (Array.isArray(keys) && keys.includes("selfUpdateStatus"))) {
+        return { selfUpdateStatus: { state: "complete", version: futureVersion } };
+      }
+      return { availableUpdate: { version: futureVersion } };
+    },
     sendMessage: async (message) => {
       calls.push(message);
       if (message.type === "AUTODOM_SELF_UPDATE") {
-        return { ok: true, version: futureVersion };
+        // New: SW responds immediately; download tracked via storage
+        return { ok: true, started: true };
       }
       return { ok: true };
     },
@@ -357,8 +373,8 @@ test("runUpdateCheck reloads via bridge when server-based self-update succeeds",
   await sandbox.runUpdateCheck();
 
   assert.ok(calls.some((m) => m.type === "AUTODOM_SELF_UPDATE"), "should send AUTODOM_SELF_UPDATE");
-  // reload is scheduled via setTimeout — advance timers
-  await new Promise((r) => setTimeout(r, 700));
+  // reload is scheduled via setTimeout(800ms) inside applyStatus
+  await new Promise((r) => setTimeout(r, 1000));
   assert.equal(reloaded, true, "should reload after successful server-based update");
 });
 

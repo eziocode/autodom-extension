@@ -56,6 +56,7 @@ const UPDATE_STORAGE_KEYS = {
   available: "availableUpdate",
   applyRequestedVersion: "autodomApplyRequestedVersion",
   applyRequestedAt: "autodomApplyRequestedAt",
+  selfUpdate: "selfUpdateStatus",
   lastCheckAt: "autodomLastUpdateCheckAt",
   lastCheckStatus: "autodomLastUpdateCheckStatus",
   lastCheckSource: "autodomLastUpdateCheckSource",
@@ -3227,16 +3228,34 @@ async function probeBridgePortMismatch(configuredPort) {
 
 
 // --- ws.onmessage handlers (extracted from connectWebSocket) ---
+async function _onWsConn_SELF_UPDATE_PROGRESS(message) {
+  await _writeUpdateStorage(
+    {
+      [UPDATE_STORAGE_KEYS.selfUpdate]: {
+        state: "downloading",
+        progress: message.progress || 0,
+        bytes: message.bytes || 0,
+        total: message.total || 0,
+        status: message.status || "",
+      },
+    },
+    "self-update progress",
+  );
+}
+
 async function _onWsConn_SELF_UPDATE_RESULT(message) {
-  const pending = pendingSelfUpdates.get(message.id);
-  if (pending) {
-    pendingSelfUpdates.delete(message.id);
-    pending.resolve({ ok: !!message.ok, version: message.version || "", error: message.error || null });
-  }
-  // Reload the extension when bridge reports success, even if the popup was
-  // closed mid-download or the service worker was recycled (pending map lost).
   if (message.ok) {
+    await _writeUpdateStorage(
+      { [UPDATE_STORAGE_KEYS.selfUpdate]: { state: "complete", version: message.version || "" } },
+      "self-update complete",
+    );
+    // Reload regardless of whether the popup is still open.
     setTimeout(() => { try { chrome.runtime.reload(); } catch (_) {} }, 600);
+  } else {
+    await _writeUpdateStorage(
+      { [UPDATE_STORAGE_KEYS.selfUpdate]: { state: "failed", error: message.error || "Unknown error" } },
+      "self-update failed",
+    );
   }
 }
 
@@ -3627,6 +3646,7 @@ async function _onWsConn_PING(message) {
 
 const _WS_CONN_MESSAGE_HANDLERS = Object.freeze({
   SELF_UPDATE_RESULT: _onWsConn_SELF_UPDATE_RESULT,
+  SELF_UPDATE_PROGRESS: _onWsConn_SELF_UPDATE_PROGRESS,
   CHECK_CLI_BINARY_RESPONSE: _onWsConn_CHECK_CLI_BINARY_RESPONSE,
   INSTALL_CLI_PACKAGE_RESPONSE: _onWsConn_INSTALL_CLI_PACKAGE_RESPONSE,
   AI_CHAT_DELTA: _onWsConn_AI_CHAT_DELTA,
@@ -3706,6 +3726,21 @@ function connectWebSocket(port) {
       }
       broadcastStatus(true, "Connected to MCP bridge server", "success");
       _debugLog("[AutoDOM] WebSocket connected");
+      // If a self-update was in progress when the bridge disconnected, the
+      // result can never arrive on the old socket. Clear a stale downloading
+      // entry so the popup doesn't stay stuck showing Downloading… forever.
+      _readUpdateStorage([UPDATE_STORAGE_KEYS.selfUpdate], "ws-onopen stale check").then((stored) => {
+        const su = stored[UPDATE_STORAGE_KEYS.selfUpdate];
+        if (su && su.state === "downloading") {
+          const age = Date.now() - (su.startedAt || 0);
+          if (age > 10 * 60 * 1000) { // older than 10 minutes → abandoned
+            _writeUpdateStorage(
+              { [UPDATE_STORAGE_KEYS.selfUpdate]: { state: "failed", error: "Bridge reconnected — previous download was interrupted" } },
+              "ws-onopen stale cleanup",
+            ).catch(() => {});
+          }
+        }
+      }).catch(() => {});
       // Show session border and chat panel on all tabs
       broadcastToAllTabs([
         { type: "SHOW_SESSION_BORDER" },
@@ -4183,26 +4218,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
     }
     const id = ++selfUpdateIdCounter;
-    const timer = setTimeout(() => {
-      if (pendingSelfUpdates.has(id)) {
-        pendingSelfUpdates.delete(id);
-        sendResponse({ ok: false, error: "Bridge did not finish the update in time (5m)" });
+    // Write the downloading state to storage BEFORE responding so that
+    // the popup never reads a stale terminal entry when it immediately
+    // checks storage after receiving the OK.
+    _writeUpdateStorage(
+      { [UPDATE_STORAGE_KEYS.selfUpdate]: { state: "downloading", progress: 0, startedAt: Date.now() } },
+      "self-update init",
+    ).finally(() => {
+      try {
+        ws.send(JSON.stringify({ type: "SELF_UPDATE", id }));
+        sendResponse({ ok: true, started: true });
+      } catch (err) {
+        _writeUpdateStorage(
+          { [UPDATE_STORAGE_KEYS.selfUpdate]: { state: "failed", error: err.message } },
+          "self-update send error",
+        ).catch(() => {});
+        sendResponse({ ok: false, error: err.message });
       }
-    }, 300000);
-    pendingSelfUpdates.set(id, {
-      resolve: (r) => {
-        clearTimeout(timer);
-        sendResponse(r);
-      },
     });
-    try {
-      ws.send(JSON.stringify({ type: "SELF_UPDATE", id }));
-    } catch (err) {
-      pendingSelfUpdates.delete(id);
-      clearTimeout(timer);
-      sendResponse({ ok: false, error: err.message });
-    }
-    return true;
+    return true; // Keep port open for the async sendResponse
   }
 
   // ── ActionGate messages ─────────────────────────────────────
@@ -5203,8 +5237,7 @@ const pendingCliChecks = new Map();
 let cliCheckIdCounter = 0;
 const pendingCliInstalls = new Map();
 let cliInstallIdCounter = 0;
-// Pending unpacked self-update requests (popup → SW → bridge → fs → back)
-const pendingSelfUpdates = new Map();
+// Counter for unpacked self-update WS messages (id used to correlate PROGRESS/RESULT)
 let selfUpdateIdCounter = 0;
 
 function resolvePendingAiRequests(error) {
@@ -8241,6 +8274,7 @@ chrome.runtime.onInstalled.addListener(() => {
       UPDATE_STORAGE_KEYS.applyRequestedVersion,
       UPDATE_STORAGE_KEYS.applyRequestedAt,
       UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt,
+      UPDATE_STORAGE_KEYS.selfUpdate,
     ]);
     if (chrome.action && chrome.action.setBadgeText) {
       chrome.action.setBadgeText({ text: "" });
