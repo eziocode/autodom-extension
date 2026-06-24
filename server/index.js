@@ -2894,6 +2894,9 @@ async function _handleSelfUpdate(socket, message) {
   const reply = (payload) => {
     try { socket.send(JSON.stringify({ type: "SELF_UPDATE_RESULT", id, ...payload })); } catch (_) {}
   };
+  // Server-side deadline: stay well under the extension's 5-minute timeout
+  // so any error message reaches the extension before it gives up.
+  const SELF_UPDATE_TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes
   let tmpZip = null;
   try {
     const extDir = resolvePath(serverPath, "..", "..", "extension");
@@ -2903,8 +2906,12 @@ async function _handleSelfUpdate(socket, message) {
       reply({ ok: false, error: `Extension folder not found at ${extDir}. Start the bridge from the AutoDOM share folder.` });
       return;
     }
-    // Fetch updates.xml using built-in fetch (Node 18+)
-    const xmlRes = await fetch("https://eziocode.github.io/autodom-extension/updates.xml");
+    // Fetch updates.xml — short timeout, it's a tiny file
+    const xmlRes = await fetchWithTimeout(
+      "https://eziocode.github.io/autodom-extension/updates.xml",
+      {},
+      15000,
+    );
     if (!xmlRes.ok) throw new Error(`updates.xml HTTP ${xmlRes.status}`);
     const xmlText = await xmlRes.text();
     const verMatch = xmlText.match(/version="([0-9]+\.[0-9]+\.[0-9]+)"/);
@@ -2915,16 +2922,20 @@ async function _handleSelfUpdate(socket, message) {
     const latestVersion = verMatch[1];
     const zipUrl = `https://github.com/eziocode/autodom-extension/releases/download/v${latestVersion}/autodom-chrome-${latestVersion}.zip`;
     tmpZip = join(tmpdir(), `autodom-update-${Date.now()}.zip`);
-    // Download zip (follow redirects — fetch does this automatically)
-    const zipRes = await fetch(zipUrl);
+    // Download zip — allow up to the full server deadline
+    const zipRes = await fetchWithTimeout(zipUrl, {}, SELF_UPDATE_TIMEOUT_MS);
     if (!zipRes.ok) throw new Error(`Zip download HTTP ${zipRes.status}`);
     const buf = Buffer.from(await zipRes.arrayBuffer());
     await fs.writeFile(tmpZip, buf);
-    // Extract using system unzip
+    // Extract using system unzip — cap at 60 s to prevent a hung child process
     await new Promise((resolve, reject) => {
-      execFile("unzip", ["-q", "-o", tmpZip, "-d", extDir], (err) => {
+      const child = execFile("unzip", ["-q", "-o", tmpZip, "-d", extDir], (err) => {
         if (err) reject(err); else resolve();
       });
+      setTimeout(() => {
+        try { child.kill(); } catch (_) {}
+        reject(new Error("unzip timed out"));
+      }, 60000);
     });
     reply({ ok: true, version: latestVersion });
   } catch (err) {

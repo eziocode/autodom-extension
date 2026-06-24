@@ -3233,6 +3233,11 @@ async function _onWsConn_SELF_UPDATE_RESULT(message) {
     pendingSelfUpdates.delete(message.id);
     pending.resolve({ ok: !!message.ok, version: message.version || "", error: message.error || null });
   }
+  // Reload the extension when bridge reports success, even if the popup was
+  // closed mid-download or the service worker was recycled (pending map lost).
+  if (message.ok) {
+    setTimeout(() => { try { chrome.runtime.reload(); } catch (_) {} }, 600);
+  }
 }
 
 async function _onWsConn_CHECK_CLI_BINARY_RESPONSE(message) {
