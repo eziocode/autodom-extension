@@ -105,6 +105,23 @@ function getUpdatePolicyInstallCommand() {
   return `sudo AUTODOM_EXTENSION_ID=${OFFICIAL_EXTENSION_ID} ./enterprise/install.sh`;
 }
 
+// Returns true when the extension is loaded as an unpacked dev build.
+// chrome.management.getSelf() does not require the `management` permission.
+async function isUnpackedInstall() {
+  try {
+    if (!chrome.management?.getSelf) return false;
+    const info = await new Promise((resolve) => {
+      chrome.management.getSelf((i) => {
+        if (chrome.runtime.lastError) { resolve(null); return; }
+        resolve(i);
+      });
+    });
+    return info?.installType === "development";
+  } catch (_) {
+    return false;
+  }
+}
+
 function showUpdatePolicyNotice(version, reason = "") {
   if (!DOM.updatePolicyNotice) return;
   const normalizedVersion = String(version || "").trim();
@@ -320,6 +337,17 @@ async function runUpdateCheck() {
     return;
   }
 
+  // For unpacked (developer) installs Chrome never downloads a pending CRX.
+  // Skip the full re-check cycle and surface the policy install notice immediately.
+  if (btn.dataset.updateState === "found" && await isUnpackedInstall()) {
+    const { availableUpdate } = await readUpdateState();
+    showUpdatePolicyNotice(
+      availableUpdate?.version || "?",
+      "unpacked extension — Chrome cannot auto-update",
+    );
+    return;
+  }
+
   const setLabel = (text, ttl = 4000) => {
     versionEl.textContent = text;
     if (ttl > 0) {
@@ -368,12 +396,18 @@ async function runUpdateCheck() {
         await applyPendingUpdate();
       } else {
         paintUpdateButton(null, { version: detailVersion || "?" });
-        const pendingUpdate = await waitForPendingUpdate();
+        const unpacked = await isUnpackedInstall();
+        const pendingUpdate = unpacked ? null : await waitForPendingUpdate();
         if (pendingUpdate) {
           paintUpdateButton(pendingUpdate, null);
           await applyPendingUpdate();
         } else {
-          showUpdatePolicyNotice(detailVersion || "?", "Chrome did not download a pending CRX");
+          showUpdatePolicyNotice(
+            detailVersion || "?",
+            unpacked
+              ? "unpacked extension — Chrome cannot auto-update"
+              : "Chrome did not download a pending CRX",
+          );
         }
       }
       return;
@@ -386,12 +420,18 @@ async function runUpdateCheck() {
       btn.classList.remove("spin");
       btn.disabled = false;
       paintUpdateButton(null, result.availableUpdate || result.details || { version: v });
-      const pendingUpdate = await waitForPendingUpdate();
+      const unpacked = await isUnpackedInstall();
+      const pendingUpdate = unpacked ? null : await waitForPendingUpdate();
       if (pendingUpdate) {
         paintUpdateButton(pendingUpdate, null);
         await applyPendingUpdate();
       } else {
-        showUpdatePolicyNotice(v, "Chrome did not download a pending CRX");
+        showUpdatePolicyNotice(
+          v,
+          unpacked
+            ? "unpacked extension — Chrome cannot auto-update"
+            : "Chrome did not download a pending CRX",
+        );
       }
       return;
     } else if (status === "skipped" && result.reason === "not_due") {

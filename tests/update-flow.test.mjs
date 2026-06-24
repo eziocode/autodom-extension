@@ -43,6 +43,7 @@ function loadPopup(overrides = {}) {
   const localGetImpl = overrides.localGet || (async () => ({}));
   const localSetImpl = overrides.localSet || (async () => {});
   const sendMessageImpl = overrides.sendMessage || (async () => ({ ok: true }));
+  const installType = overrides.installType || "normal";
   const sandbox = {
     chrome: {
       runtime: {
@@ -54,6 +55,13 @@ function loadPopup(overrides = {}) {
           return undefined;
         },
         onMessage: { addListener() {} },
+      },
+      management: {
+        getSelf(callback) {
+          if (typeof callback === "function") {
+            Promise.resolve().then(() => callback({ installType }));
+          }
+        },
       },
       storage: {
         local: {
@@ -282,6 +290,47 @@ test("paintUpdateButton shows persistent policy command for non-pending update",
     "sudo AUTODOM_EXTENSION_ID=kpjdffgogiajnkajnjneiboaincnaokf ./enterprise/install.sh",
   );
 });
+
+test("runUpdateCheck shows policy notice immediately for unpacked install in found state", async () => {
+  const versionParts = manifest.version.split(".");
+  const futureVersion = [
+    versionParts[0] || "0",
+    versionParts[1] || "0",
+    String((Number(versionParts[2]) || 0) + 1),
+  ].join(".");
+  const calls = [];
+  const { sandbox, elements } = loadPopup({
+    installType: "development",
+    localGet: async (keys) => {
+      const wantsPending = Array.isArray(keys)
+        ? keys.includes("pendingUpdate")
+        : keys === "pendingUpdate";
+      if (wantsPending) return { availableUpdate: { version: futureVersion } };
+      return { availableUpdate: { version: futureVersion } };
+    },
+    sendMessage: async (message) => {
+      calls.push(message);
+      return { ok: true };
+    },
+  });
+
+  const btn = elements.get("#checkUpdateBtn");
+  const notice = elements.get("#updatePolicyNotice");
+  const command = elements.get("#updatePolicyCommand");
+
+  btn.dataset.updateState = "found";
+
+  await sandbox.runUpdateCheck();
+
+  // Should not have sent a check message (returned early)
+  assert.ok(
+    !calls.some((m) => m.type === "AUTODOM_CHECK_FOR_UPDATE"),
+    "should not re-check for unpacked found state",
+  );
+  assert.equal(notice.style.display, "");
+  assert.match(command.textContent, /enterprise\/install\.sh/);
+});
+
 
 test("sanitize update state keeps pending update after reload race", async () => {
   const versionParts = manifest.version.split(".");
