@@ -7283,9 +7283,13 @@ async function toolVerifyArtifactCounts(params = {}) {
     decodedMaxBytes: params.decodedMaxBytes || params.readMaxBytes || DEFAULT_ARTIFACT_READ_MAX_BYTES,
   });
   if (params.includePayload !== true) {
-    delete response.text;
-    delete response.html;
-    delete response.json;
+    if (params.includeText !== true) {
+      delete response.text;
+      delete response.html;
+    }
+    if (params.includeJson !== true) {
+      delete response.json;
+    }
     delete response.base64;
   }
   return response;
