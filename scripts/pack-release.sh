@@ -37,8 +37,8 @@ mkdir -p "$STAGE/enterprise"
 rsync -a --exclude '.DS_Store' enterprise/ "$STAGE/enterprise/"
 chmod +x "$STAGE/enterprise/install.sh"
 
-cp setup.sh setup.ps1 "$STAGE/"
-chmod +x "$STAGE/setup.sh" "$STAGE/scripts/"*.sh
+cp setup.sh setup.ps1 update.sh "$STAGE/"
+chmod +x "$STAGE/setup.sh" "$STAGE/update.sh" "$STAGE/scripts/"*.sh
 
 cat > "$STAGE/QUICKSTART.txt" <<EOF
 AutoDOM v${VERSION} — Quick Start
@@ -60,9 +60,10 @@ installed automatically and updates itself from:
 Do NOT use "Load unpacked" for normal users. Unpacked extensions are
 developer-only and Chrome will not auto-update them.
 
-Manual developer-only install:
+Manual developer-only install (no admin):
     ./setup.sh --no-auto-update
     chrome://extensions → Developer mode → Load unpacked → extension/
+    To update later without admin: run  bash update.sh  then click Reload in extensions page.
 
 Restart your IDE.  Open the AutoDOM popup.  Status should say "Connected".
 

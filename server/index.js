@@ -2888,7 +2888,52 @@ function _handleClearToolLogs(socket) {
 // Replaces the previous 350-cyclomatic chain of if/return blocks.
 // PONG is aliased to the keepalive handler so we don't duplicate the
 // extension-identification logic.
+
+async function _handleSelfUpdate(socket, message) {
+  const { id } = message;
+  const reply = (payload) => {
+    try { socket.send(JSON.stringify({ type: "SELF_UPDATE_RESULT", id, ...payload })); } catch (_) {}
+  };
+  try {
+    const extDir = resolvePath(serverPath, "..", "..", "extension");
+    try {
+      await fs.access(join(extDir, "manifest.json"));
+    } catch {
+      reply({ ok: false, error: `Extension folder not found at ${extDir}. Start the bridge from the AutoDOM share folder.` });
+      return;
+    }
+    // Fetch updates.xml using built-in fetch (Node 18+)
+    const xmlRes = await fetch("https://eziocode.github.io/autodom-extension/updates.xml");
+    if (!xmlRes.ok) throw new Error(`updates.xml HTTP ${xmlRes.status}`);
+    const xmlText = await xmlRes.text();
+    const verMatch = xmlText.match(/version="([0-9]+\.[0-9]+\.[0-9]+)"/);
+    if (!verMatch) {
+      reply({ ok: false, error: "Could not read latest version from updates.xml" });
+      return;
+    }
+    const latestVersion = verMatch[1];
+    const zipUrl = `https://github.com/eziocode/autodom-extension/releases/download/v${latestVersion}/autodom-chrome-${latestVersion}.zip`;
+    const tmpZip = join(tmpdir(), `autodom-update-${Date.now()}.zip`);
+    // Download zip (follow redirects — fetch does this automatically)
+    const zipRes = await fetch(zipUrl);
+    if (!zipRes.ok) throw new Error(`Zip download HTTP ${zipRes.status}`);
+    const buf = Buffer.from(await zipRes.arrayBuffer());
+    await fs.writeFile(tmpZip, buf);
+    // Extract using system unzip
+    await new Promise((resolve, reject) => {
+      execFile("unzip", ["-q", "-o", tmpZip, "-d", extDir], (err) => {
+        if (err) reject(err); else resolve();
+      });
+    });
+    try { await fs.unlink(tmpZip); } catch (_) {}
+    reply({ ok: true, version: latestVersion });
+  } catch (err) {
+    reply({ ok: false, error: err?.message || String(err) });
+  }
+}
+
 const _WS_MESSAGE_HANDLERS = Object.freeze({
+  SELF_UPDATE: _handleSelfUpdate,
   AI_CHAT_ABORT: _handleAiChatAbort,
   CHECK_CLI_BINARY: _handleCheckCliBinary,
   INSTALL_CLI_PACKAGE: _handleInstallCliPackage,

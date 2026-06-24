@@ -338,12 +338,31 @@ async function runUpdateCheck() {
   }
 
   // For unpacked (developer) installs Chrome never downloads a pending CRX.
-  // Skip the full re-check cycle and surface the policy install notice immediately.
+  // Try server-based self-update first; fall back to policy notice if server
+  // is not connected or reports an error.
   if (btn.dataset.updateState === "found" && await isUnpackedInstall()) {
+    btn.disabled = true;
+    btn.textContent = "Downloading…";
+    versionEl.textContent = "downloading update via bridge…";
+    let result;
+    try {
+      result = await sendRuntimeMessage({ type: "AUTODOM_SELF_UPDATE" });
+    } catch (_) {
+      result = { ok: false, error: "Bridge unavailable" };
+    }
+    if (result?.ok) {
+      btn.textContent = "Reloading…";
+      versionEl.textContent = `Updated to v${result.version} — reloading…`;
+      setTimeout(() => { try { chrome.runtime.reload(); } catch (_) {} }, 600);
+      return;
+    }
+    // Server not running or failed — show the persistent policy notice
+    btn.disabled = false;
     const { availableUpdate } = await readUpdateState();
+    paintUpdateButton(null, availableUpdate);
     showUpdatePolicyNotice(
       availableUpdate?.version || "?",
-      "unpacked extension — Chrome cannot auto-update",
+      result?.error || "bridge not connected — start the MCP bridge first, or ask an admin",
     );
     return;
   }

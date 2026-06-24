@@ -291,7 +291,7 @@ test("paintUpdateButton shows persistent policy command for non-pending update",
   );
 });
 
-test("runUpdateCheck shows policy notice immediately for unpacked install in found state", async () => {
+test("runUpdateCheck shows policy notice when bridge unavailable for unpacked install", async () => {
   const versionParts = manifest.version.split(".");
   const futureVersion = [
     versionParts[0] || "0",
@@ -301,15 +301,13 @@ test("runUpdateCheck shows policy notice immediately for unpacked install in fou
   const calls = [];
   const { sandbox, elements } = loadPopup({
     installType: "development",
-    localGet: async (keys) => {
-      const wantsPending = Array.isArray(keys)
-        ? keys.includes("pendingUpdate")
-        : keys === "pendingUpdate";
-      if (wantsPending) return { availableUpdate: { version: futureVersion } };
-      return { availableUpdate: { version: futureVersion } };
-    },
+    localGet: async () => ({ availableUpdate: { version: futureVersion } }),
     sendMessage: async (message) => {
       calls.push(message);
+      // Bridge not connected — self-update fails
+      if (message.type === "AUTODOM_SELF_UPDATE") {
+        return { ok: false, error: "Bridge not connected" };
+      }
       return { ok: true };
     },
   });
@@ -319,16 +317,47 @@ test("runUpdateCheck shows policy notice immediately for unpacked install in fou
   const command = elements.get("#updatePolicyCommand");
 
   btn.dataset.updateState = "found";
-
   await sandbox.runUpdateCheck();
 
-  // Should not have sent a check message (returned early)
   assert.ok(
     !calls.some((m) => m.type === "AUTODOM_CHECK_FOR_UPDATE"),
     "should not re-check for unpacked found state",
   );
+  assert.ok(calls.some((m) => m.type === "AUTODOM_SELF_UPDATE"), "should try server self-update");
   assert.equal(notice.style.display, "");
   assert.match(command.textContent, /enterprise\/install\.sh/);
+});
+
+test("runUpdateCheck reloads via bridge when server-based self-update succeeds", async () => {
+  const versionParts = manifest.version.split(".");
+  const futureVersion = [
+    versionParts[0] || "0",
+    versionParts[1] || "0",
+    String((Number(versionParts[2]) || 0) + 1),
+  ].join(".");
+  const calls = [];
+  let reloaded = false;
+  const { sandbox, elements } = loadPopup({
+    installType: "development",
+    localGet: async () => ({ availableUpdate: { version: futureVersion } }),
+    sendMessage: async (message) => {
+      calls.push(message);
+      if (message.type === "AUTODOM_SELF_UPDATE") {
+        return { ok: true, version: futureVersion };
+      }
+      return { ok: true };
+    },
+  });
+  sandbox.chrome.runtime.reload = () => { reloaded = true; };
+
+  const btn = elements.get("#checkUpdateBtn");
+  btn.dataset.updateState = "found";
+  await sandbox.runUpdateCheck();
+
+  assert.ok(calls.some((m) => m.type === "AUTODOM_SELF_UPDATE"), "should send AUTODOM_SELF_UPDATE");
+  // reload is scheduled via setTimeout — advance timers
+  await new Promise((r) => setTimeout(r, 700));
+  assert.equal(reloaded, true, "should reload after successful server-based update");
 });
 
 
