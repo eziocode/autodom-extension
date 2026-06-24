@@ -33,6 +33,10 @@ rsync -a --exclude '.DS_Store' extension/ "$STAGE/extension/"
 mkdir -p "$STAGE/scripts"
 cp scripts/build-chrome.sh   "$STAGE/scripts/"
 
+mkdir -p "$STAGE/enterprise"
+rsync -a --exclude '.DS_Store' enterprise/ "$STAGE/enterprise/"
+chmod +x "$STAGE/enterprise/install.sh"
+
 cp setup.sh setup.ps1 "$STAGE/"
 chmod +x "$STAGE/setup.sh" "$STAGE/scripts/"*.sh
 
@@ -40,16 +44,25 @@ cat > "$STAGE/QUICKSTART.txt" <<EOF
 AutoDOM v${VERSION} — Quick Start
 =================================
 
+Recommended: auto-updating install
+----------------------------------
 macOS / Linux / WSL / Git Bash:
     ./setup.sh
 
 Windows (PowerShell):
     powershell -ExecutionPolicy Bypass -File .\\setup.ps1
 
-Then load the extension into Chrome / Edge / Brave:
-  chrome://extensions  →  Developer mode  →
-  Load unpacked  →  select the "extension/" folder
-  (or drag-and-drop autodom-chrome-${VERSION}.zip after unzipping)
+The setup script installs the MCP server and enrolls the browser extension
+through managed policy. After restarting Chrome / Edge / Brave, AutoDOM is
+installed automatically and updates itself from:
+  https://eziocode.github.io/autodom-extension/updates.xml
+
+Do NOT use "Load unpacked" for normal users. Unpacked extensions are
+developer-only and Chrome will not auto-update them.
+
+Manual developer-only install:
+    ./setup.sh --no-auto-update
+    chrome://extensions → Developer mode → Load unpacked → extension/
 
 Restart your IDE.  Open the AutoDOM popup.  Status should say "Connected".
 

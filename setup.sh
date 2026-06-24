@@ -34,6 +34,8 @@ SERVER_NAME="autodom"
 DEFAULT_EXTENSION_ID="kpjdffgogiajnkajnjneiboaincnaokf"
 ENABLE_AUTO_UPDATE="yes"        # default ON — flip to "no" with --no-auto-update
 EXTENSION_ID_OVERRIDE=""
+AUTO_UPDATE_ENROLLED="no"
+AUTO_UPDATE_ENROLL_SKIPPED_REASON=""
 
 usage() {
     cat <<EOF
@@ -640,6 +642,7 @@ ENTERPRISE_SCRIPT="$SCRIPT_DIR/enterprise/install.sh"
 
 maybe_enroll_auto_update() {
     if [ "$ENABLE_AUTO_UPDATE" = "no" ]; then
+        AUTO_UPDATE_ENROLL_SKIPPED_REASON="disabled"
         echo ""
         echo -e "${YELLOW}  ⏭  Skipping silent-install policy enrollment (--no-auto-update).${NC}"
         echo -e "    Re-run later with: ${CYAN}./setup.sh${NC}  (auto-update is the default)"
@@ -647,6 +650,7 @@ maybe_enroll_auto_update() {
     fi
 
     if [ ! -x "$ENTERPRISE_SCRIPT" ] && [ ! -f "$ENTERPRISE_SCRIPT" ]; then
+        AUTO_UPDATE_ENROLL_SKIPPED_REASON="missing-enterprise-installer"
         echo ""
         echo -e "${YELLOW}  ⚠ enterprise/install.sh not found — skipping silent-install enrollment.${NC}"
         return
@@ -655,6 +659,7 @@ maybe_enroll_auto_update() {
     case "$(uname -s)" in
         Darwin|Linux) ;;
         *)
+            AUTO_UPDATE_ENROLL_SKIPPED_REASON="unsupported-os"
             echo ""
             echo -e "${YELLOW}  ⚠ Silent install via setup.sh is supported on macOS/Linux only.${NC}"
             echo -e "    Windows users: run ${CYAN}enterprise\\install.ps1${NC} from an elevated PowerShell."
@@ -670,6 +675,7 @@ maybe_enroll_auto_update() {
     local ext_id="${EXTENSION_ID_OVERRIDE:-${AUTODOM_EXTENSION_ID:-$DEFAULT_EXTENSION_ID}}"
 
     if ! [[ "$ext_id" =~ ^[a-p]{32}$ ]]; then
+        AUTO_UPDATE_ENROLL_SKIPPED_REASON="invalid-extension-id"
         echo ""
         echo -e "${RED}  ✗ Invalid extension ID '$ext_id' — must be 32 lowercase a–p chars.${NC}"
         echo -e "    Skipping silent-install enrollment."
@@ -677,6 +683,7 @@ maybe_enroll_auto_update() {
     fi
 
     if ! command -v sudo >/dev/null 2>&1; then
+        AUTO_UPDATE_ENROLL_SKIPPED_REASON="sudo-unavailable"
         echo ""
         echo -e "${YELLOW}  ⚠ sudo not available — cannot write managed-policy file.${NC}"
         echo -e "    Run as root manually: ${CYAN}AUTODOM_EXTENSION_ID=$ext_id $ENTERPRISE_SCRIPT${NC}"
@@ -691,6 +698,7 @@ maybe_enroll_auto_update() {
     # rather than mid-script. -v just refreshes the cached credentials —
     # ideal when the user already has a valid sudo timestamp.
     if ! sudo -p "  [sudo] password for AutoDOM silent-install: " -v 2>/dev/null; then
+        AUTO_UPDATE_ENROLL_SKIPPED_REASON="sudo-denied"
         echo ""
         echo -e "${YELLOW}  ⚠ Could not acquire sudo (no TTY, denied, or no permission).${NC}"
         echo -e "    Run later as root: ${CYAN}sudo AUTODOM_EXTENSION_ID=$ext_id $ENTERPRISE_SCRIPT${NC}"
@@ -699,10 +707,13 @@ maybe_enroll_auto_update() {
 
     # -n: never prompt again. The credentials are guaranteed cached now.
     if AUTODOM_EXTENSION_ID="$ext_id" sudo -n -E bash "$ENTERPRISE_SCRIPT" >/dev/null 2>&1; then
+        AUTO_UPDATE_ENROLLED="yes"
+        AUTO_UPDATE_ENROLL_SKIPPED_REASON=""
         echo -e "${GREEN}✓${NC} Silent-install policy active."
         echo -e "  ${BOLD}Restart Chrome / Edge / Brave${NC} — AutoDOM installs in the background"
         echo -e "  on next launch and updates itself automatically from then on."
     else
+        AUTO_UPDATE_ENROLL_SKIPPED_REASON="enterprise-installer-failed"
         # Re-run with output visible so the user can see what failed.
         echo -e "${RED}✗${NC} enterprise/install.sh failed. Re-running with full output:"
         AUTODOM_EXTENSION_ID="$ext_id" sudo -n -E bash "$ENTERPRISE_SCRIPT" || true
@@ -731,11 +742,17 @@ if [ "$ENABLE_AUTO_UPDATE" = "no" ]; then
     echo -e "  2. Enable ${BOLD}Developer mode${NC} (top-right)"
     echo -e "  3. Click ${BOLD}Load unpacked${NC} → select ${CYAN}$EXTENSION_DIR${NC}"
     echo ""
-else
+elif [ "$AUTO_UPDATE_ENROLLED" = "yes" ]; then
     echo -e "  ${BOLD}Browser extension:${NC}"
     echo -e "  ${GREEN}✓ Silent-install policy active.${NC} ${BOLD}Restart your browser${NC} once —"
     echo -e "    Chrome / Edge / Brave will install AutoDOM automatically and"
     echo -e "    keep it up to date from now on. No manual steps required."
+    echo ""
+else
+    echo -e "  ${BOLD}Browser extension auto-update:${NC}"
+    echo -e "  ${YELLOW}⚠ Managed-policy enrollment did not complete (${AUTO_UPDATE_ENROLL_SKIPPED_REASON:-unknown}).${NC}"
+    echo -e "    Auto-update requires the policy installer; do not use Load unpacked for users."
+    echo -e "    Run later: ${CYAN}sudo AUTODOM_EXTENSION_ID=$DEFAULT_EXTENSION_ID $ENTERPRISE_SCRIPT${NC}"
     echo ""
 fi
 
