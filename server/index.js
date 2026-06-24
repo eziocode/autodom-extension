@@ -3805,7 +3805,7 @@ const BROWSER_AGENT_PROTOCOL =
   "- Observe first: use page context, get_dom_state, take_snapshot, and richer search/traversal tools before answering from guesswork.\n" +
   "- Identify targets by visible text, role/name, index, selector, frame/shadow context, and state; do not rely on brittle selectors when better evidence exists.\n" +
   "- Handle iframes, shadow DOM, popups/windows, tabs, dialogs, downloads, and SPA network-idle states before declaring something unavailable.\n" +
-  "- For .gz artifacts, report pages, API response-shape evidence, or sync-history count checks, prefer verify_artifact_counts or browser_fetch_raw/fetch_page_source over trying to render the payload in a browser tab.\n" +
+  "- For .gz artifacts, report pages, API response-shape evidence, or sync-history count checks, use verify_artifact_counts or browser_fetch_raw/fetch_page_source instead of trying to render the payload in a browser tab. Do not ask the user to run shell/curl/gunzip commands for URLs the browser tools can fetch.\n" +
   "- Act in short verified batches: perform the browser step, wait for the page to settle, then verify with state/text/URL/title/snapshot evidence.\n" +
   "- Ask before destructive, payment, account, credential, or irreversible actions unless the user has already clearly authorized the exact action.\n";
 

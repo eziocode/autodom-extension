@@ -10,6 +10,10 @@ const popupSrc = readFileSync(
   resolve(here, "../extension/popup/popup.js"),
   "utf8",
 );
+const serviceWorkerSrc = readFileSync(
+  resolve(here, "../extension/background/service-worker.js"),
+  "utf8",
+);
 const manifest = JSON.parse(
   readFileSync(resolve(here, "../extension/manifest.json"), "utf8"),
 );
@@ -115,6 +119,98 @@ function loadPopup(overrides = {}) {
   return { sandbox, elements };
 }
 
+function extractFunctionSource(src, name) {
+  const start = src.indexOf(`async function ${name}(`);
+  assert.notEqual(start, -1, `${name} should exist`);
+  let depth = 0;
+  let inString = "";
+  let escaped = false;
+  let seenBody = false;
+  for (let i = start; i < src.length; i += 1) {
+    const ch = src[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === inString) {
+        inString = "";
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      inString = ch;
+      continue;
+    }
+    if (ch === "{") {
+      seenBody = true;
+      depth += 1;
+    } else if (ch === "}") {
+      depth -= 1;
+      if (seenBody && depth === 0) return src.slice(start, i + 1);
+    }
+  }
+  throw new Error(`Could not extract ${name}`);
+}
+
+function loadServiceWorkerUpdateSanitizer(stored) {
+  const removed = [];
+  const writes = [];
+  const sandbox = {
+    Date: {
+      now: () => 1_000_000,
+    },
+    UPDATE_STORAGE_KEYS: {
+      pending: "pendingUpdate",
+      available: "availableUpdate",
+      applyRequestedVersion: "autodomApplyRequestedVersion",
+      applyRequestedAt: "autodomApplyRequestedAt",
+      autoUpdateApplyAttemptAt: "autodomAutoUpdateApplyAttemptAt",
+    },
+    UPDATE_APPLY_SANITIZE_GRACE_MS: 2 * 60 * 1000,
+    chrome: {
+      runtime: {
+        getManifest: () => ({ version: manifest.version }),
+      },
+      storage: {
+        local: {
+          remove(keys, callback) {
+            removed.push(...(Array.isArray(keys) ? keys : [keys]));
+            if (callback) callback();
+          },
+        },
+      },
+    },
+    _readUpdateStorage: async () => stored,
+    _writeUpdateStorage: async (values) => {
+      writes.push(values);
+      return true;
+    },
+  };
+  sandbox._compareExtensionVersions = function _compareExtensionVersions(a, b) {
+    const left = String(a || "").split(".");
+    const right = String(b || "").split(".");
+    const length = Math.max(left.length, right.length);
+    for (let i = 0; i < length; i += 1) {
+      const l = Number.parseInt(left[i] || "0", 10) || 0;
+      const r = Number.parseInt(right[i] || "0", 10) || 0;
+      if (l !== r) return l > r ? 1 : -1;
+    }
+    return 0;
+  };
+  sandbox._isVersionNewerThanCurrent = function _isVersionNewerThanCurrent(version) {
+    const currentVersion = sandbox.chrome.runtime.getManifest().version;
+    if (!version || version === "?") return false;
+    return sandbox._compareExtensionVersions(version, currentVersion) > 0;
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(
+    `${extractFunctionSource(serviceWorkerSrc, "_sanitizeStoredUpdateState")}; globalThis._sanitizeStoredUpdateState = _sanitizeStoredUpdateState;`,
+    sandbox,
+  );
+  return { sandbox, removed, writes };
+}
+
 test("paintUpdateButton ignores stale versions", () => {
   const { sandbox, elements } = loadPopup();
   const btn = elements.get("#checkUpdateBtn");
@@ -125,6 +221,67 @@ test("paintUpdateButton ignores stale versions", () => {
   assert.equal(btn.textContent, "↻");
   assert.equal(btn.dataset.updateState, undefined);
   assert.equal(versionEl.textContent, `v${manifest.version}`);
+});
+
+test("legacy apply_not_effective state does not show blocked update warning", () => {
+  const { sandbox, elements } = loadPopup();
+  const versionParts = manifest.version.split(".");
+  const futureVersion = [
+    versionParts[0] || "0",
+    versionParts[1] || "0",
+    String((Number(versionParts[2]) || 0) + 1),
+  ].join(".");
+  const versionEl = elements.get("#appVersion");
+
+  sandbox.paintUpdateButton(null, {
+    version: futureVersion,
+    runtimeStatus: "apply_not_effective",
+  });
+
+  assert.equal(
+    sandbox.shouldPromptUpdateInstallIntervention({
+      version: futureVersion,
+      runtimeStatus: "apply_not_effective",
+    }),
+    false,
+  );
+  assert.equal(
+    sandbox.shouldPromptUpdateInstallIntervention({
+      version: futureVersion,
+      runtimeStatus: "apply_not_effective",
+      manualInterventionRequired: true,
+    }),
+    true,
+  );
+  assert.equal(versionEl.textContent, `v${manifest.version} → v${futureVersion}`);
+});
+
+test("sanitize update state keeps pending update after reload race", async () => {
+  const versionParts = manifest.version.split(".");
+  const futureVersion = [
+    versionParts[0] || "0",
+    versionParts[1] || "0",
+    String((Number(versionParts[2]) || 0) + 1),
+  ].join(".");
+  const keys = {
+    pending: "pendingUpdate",
+    applyRequestedVersion: "autodomApplyRequestedVersion",
+    applyRequestedAt: "autodomApplyRequestedAt",
+    autoUpdateApplyAttemptAt: "autodomAutoUpdateApplyAttemptAt",
+  };
+  const { sandbox, removed, writes } = loadServiceWorkerUpdateSanitizer({
+    [keys.pending]: { version: futureVersion },
+    [keys.applyRequestedVersion]: futureVersion,
+    [keys.applyRequestedAt]: 1,
+  });
+
+  await sandbox._sanitizeStoredUpdateState("test");
+
+  assert.ok(!removed.includes(keys.pending), "pending update must survive reload races");
+  assert.ok(removed.includes(keys.applyRequestedVersion));
+  assert.ok(removed.includes(keys.applyRequestedAt));
+  assert.ok(removed.includes(keys.autoUpdateApplyAttemptAt));
+  assert.deepEqual(writes, []);
 });
 
 test("runUpdateCheck applies a pending update that appears after a release is found", async () => {

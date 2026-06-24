@@ -101,9 +101,13 @@ function shouldPromptUpdateInstallIntervention(availableUpdate) {
     return false;
   }
   const runtimeStatus = String(availableUpdate.runtimeStatus || "").toLowerCase();
-  // Only truly blocked when a reload was requested but the version did not change.
-  // Transient states (throttled, error, unknown, no_update) are not permission issues.
-  return runtimeStatus === "apply_not_effective";
+  // Legacy builds wrote apply_not_effective after a very short reload race,
+  // which produced a false "permission/manual intervention needed" warning.
+  // Only show that warning for future states that explicitly opt in.
+  return (
+    runtimeStatus === "apply_not_effective" &&
+    availableUpdate.manualInterventionRequired === true
+  );
 }
 
 async function maybeShowUpdateInstallInterventionPrompt(availableUpdate) {

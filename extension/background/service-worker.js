@@ -48,6 +48,7 @@ const UPDATE_CHECK_INTERVAL_MINUTES = 30;
 const UPDATE_CHECK_INTERVAL_MS = UPDATE_CHECK_INTERVAL_MINUTES * 60 * 1000;
 const UPDATE_MANIFEST_FETCH_TIMEOUT_MS = 8000;
 const AUTO_UPDATE_RELOAD_COOLDOWN_MS = 10 * 60 * 1000;
+const UPDATE_APPLY_SANITIZE_GRACE_MS = 2 * 60 * 1000;
 const OFFSCREEN_KEEPALIVE_STORAGE_KEY = "autodomOffscreenKeepaliveEnabled";
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const UPDATE_STORAGE_KEYS = {
@@ -8393,20 +8394,17 @@ async function _sanitizeStoredUpdateState(source) {
     pending?.version === requestedVersion &&
     _compareExtensionVersions(requestedVersion, currentVersion) > 0 &&
     requestedAt > 0 &&
-    Date.now() - requestedAt > 3000
+    Date.now() - requestedAt > UPDATE_APPLY_SANITIZE_GRACE_MS
   ) {
+    // A runtime reload may restart this service worker before Chromium has
+    // swapped in the downloaded CRX. Do not clear pendingUpdate or surface a
+    // manual-intervention/permission warning; keeping the pending marker lets
+    // the next manual click retry chrome.runtime.reload().
     toRemove.push(
-      UPDATE_STORAGE_KEYS.pending,
       UPDATE_STORAGE_KEYS.applyRequestedVersion,
       UPDATE_STORAGE_KEYS.applyRequestedAt,
+      UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt,
     );
-    nextAvailable = {
-      version: requestedVersion,
-      detectedAt: Date.now(),
-      runtimeStatus: "apply_not_effective",
-      source: source || "sanitize",
-      currentVersion,
-    };
   }
 
   if (nextAvailable) {

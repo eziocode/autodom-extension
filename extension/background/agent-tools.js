@@ -188,7 +188,7 @@
       name: "verify_artifact_counts",
       description:
         "Fetch a raw artifact/report/API payload with browser credentials and return compact count evidence. " +
-        "Use this when an open tab shows a gzipped HTML/API shell or artifact page and you need to verify sync-history counts without relying on rendered UI text. " +
+        "Use this when an open tab shows a gzipped HTML/API shell or artifact page and you need to verify sync-history counts without relying on rendered UI text. Do not ask the user to run shell/curl/gunzip for URLs this tool can fetch. " +
         "Defaults to a 262144-byte artifact read cap and omits payload text unless includePayload/includeText is true.",
       parameters: {
         type: "object",
