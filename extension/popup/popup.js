@@ -30,6 +30,10 @@ const DOM = {
   autoConnectToggle: $("#autoConnectToggle"),
   autoUpdateToggle: $("#autoUpdateToggle"),
   periodicUpdateCheckToggle: $("#periodicUpdateCheckToggle"),
+  updatePolicyNotice: $("#updatePolicyNotice"),
+  updatePolicyNoticeText: $("#updatePolicyNoticeText"),
+  updatePolicyCommand: $("#updatePolicyCommand"),
+  copyUpdatePolicyCommandBtn: $("#copyUpdatePolicyCommandBtn"),
   clearExtensionCacheBtn: $("#clearExtensionCacheBtn"),
   enableTabRecordingBtn: $("#enableTabRecordingBtn"),
   tabRecordingPermStatus: $("#tabRecordingPermStatus"),
@@ -71,6 +75,7 @@ let isConnected = false;
 
 const REFRESH_GLYPH = "↻";
 const UPDATE_LABEL = "Update";
+const OFFICIAL_EXTENSION_ID = "kpjdffgogiajnkajnjneiboaincnaokf";
 const AUTO_UPDATE_STORAGE_KEY = "autodomAutoUpdateEnabled";
 const PERIODIC_UPDATE_CHECKS_STORAGE_KEY = "autodomPeriodicUpdateChecksEnabled";
 const AVAILABLE_UPDATE_STORAGE_KEY = "availableUpdate";
@@ -94,6 +99,37 @@ function isVersionNewerThanCurrent(version) {
   if (!normalized || normalized === "?") return false;
   const currentVersion = chrome.runtime.getManifest?.().version || "";
   return compareExtensionVersions(normalized, currentVersion) > 0;
+}
+
+function getUpdatePolicyInstallCommand() {
+  return `sudo AUTODOM_EXTENSION_ID=${OFFICIAL_EXTENSION_ID} ./enterprise/install.sh`;
+}
+
+function showUpdatePolicyNotice(version, reason = "") {
+  if (!DOM.updatePolicyNotice) return;
+  const normalizedVersion = String(version || "").trim();
+  const currentVersion = chrome.runtime.getManifest?.().version || "";
+  const versionText =
+    normalizedVersion && normalizedVersion !== "?"
+      ? ` v${currentVersion} → v${normalizedVersion}`
+      : "";
+  if (DOM.updatePolicyNoticeText) {
+    DOM.updatePolicyNoticeText.textContent =
+      `AutoDOM${versionText} is available, but Chrome is not applying it. ` +
+      "This usually means AutoDOM was loaded unpacked or the managed-policy installer was not run with admin permission. " +
+      "Ask an admin to run this from the extracted AutoDOM share folder, then restart Chrome / Edge / Brave." +
+      (reason ? ` (${reason})` : "");
+  }
+  if (DOM.updatePolicyCommand) {
+    DOM.updatePolicyCommand.textContent = getUpdatePolicyInstallCommand();
+  }
+  DOM.updatePolicyNotice.style.display = "";
+}
+
+function hideUpdatePolicyNotice() {
+  if (DOM.updatePolicyNotice) {
+    DOM.updatePolicyNotice.style.display = "none";
+  }
 }
 
 function shouldPromptUpdateInstallIntervention(availableUpdate) {
@@ -162,7 +198,15 @@ function paintUpdateButton(pending, available) {
         : `v${chrome.runtime.getManifest().version} → v${update.version}`;
     }
     if (state === "found") {
+      showUpdatePolicyNotice(
+        update.version,
+        shouldPromptUpdateInstallIntervention(foundUpdate)
+          ? "manual install required"
+          : "update detected but not downloaded by Chrome yet",
+      );
       void maybeShowUpdateInstallInterventionPrompt(foundUpdate);
+    } else {
+      hideUpdatePolicyNotice();
     }
   } else {
     btn.classList.remove("has-update");
@@ -173,6 +217,7 @@ function paintUpdateButton(pending, available) {
     if (versionEl) {
       versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
     }
+    hideUpdatePolicyNotice();
   }
 }
 
@@ -327,6 +372,8 @@ async function runUpdateCheck() {
         if (pendingUpdate) {
           paintUpdateButton(pendingUpdate, null);
           await applyPendingUpdate();
+        } else {
+          showUpdatePolicyNotice(detailVersion || "?", "Chrome did not download a pending CRX");
         }
       }
       return;
@@ -343,6 +390,8 @@ async function runUpdateCheck() {
       if (pendingUpdate) {
         paintUpdateButton(pendingUpdate, null);
         await applyPendingUpdate();
+      } else {
+        showUpdatePolicyNotice(v, "Chrome did not download a pending CRX");
       }
       return;
     } else if (status === "skipped" && result.reason === "not_due") {
@@ -933,6 +982,21 @@ const _secretAreaName =
       }
       showPopupToast("Extension cache cleared.", "success");
       addLog("Extension cache cleared.", "success");
+    });
+  }
+
+  if (DOM.copyUpdatePolicyCommandBtn) {
+    DOM.copyUpdatePolicyCommandBtn.addEventListener("click", async () => {
+      const command =
+        DOM.updatePolicyCommand?.textContent || getUpdatePolicyInstallCommand();
+      try {
+        await navigator.clipboard.writeText(command);
+        showPopupToast("Update install command copied.", "success");
+        addLog("Copied update policy install command.", "info");
+      } catch (err) {
+        showPopupToast("Copy failed. Select the command manually.", "warn", 3200);
+        addLog(`Update policy command copy failed: ${err?.message || err}`, "warn");
+      }
     });
   }
 

@@ -24,6 +24,7 @@ function makeElement() {
     title: "",
     disabled: false,
     dataset: {},
+    style: {},
     addEventListener() {},
     classList: {
       add() {},
@@ -114,6 +115,10 @@ function loadPopup(overrides = {}) {
   sandbox.globalThis = sandbox;
   getElement("#appVersion");
   getElement("#checkUpdateBtn");
+  getElement("#updatePolicyNotice");
+  getElement("#updatePolicyNoticeText");
+  getElement("#updatePolicyCommand");
+  getElement("#copyUpdatePolicyCommandBtn");
   vm.createContext(sandbox);
   vm.runInContext(popupSrc, sandbox);
   return { sandbox, elements };
@@ -254,6 +259,28 @@ test("legacy apply_not_effective state does not show blocked update warning", ()
     true,
   );
   assert.equal(versionEl.textContent, `v${manifest.version} → v${futureVersion}`);
+});
+
+test("paintUpdateButton shows persistent policy command for non-pending update", () => {
+  const { sandbox, elements } = loadPopup();
+  const versionParts = manifest.version.split(".");
+  const futureVersion = [
+    versionParts[0] || "0",
+    versionParts[1] || "0",
+    String((Number(versionParts[2]) || 0) + 1),
+  ].join(".");
+  const notice = elements.get("#updatePolicyNotice");
+  const noticeText = elements.get("#updatePolicyNoticeText");
+  const command = elements.get("#updatePolicyCommand");
+
+  sandbox.paintUpdateButton(null, { version: futureVersion });
+
+  assert.equal(notice.style.display, "");
+  assert.match(noticeText.textContent, /managed-policy installer/);
+  assert.equal(
+    command.textContent,
+    "sudo AUTODOM_EXTENSION_ID=kpjdffgogiajnkajnjneiboaincnaokf ./enterprise/install.sh",
+  );
 });
 
 test("sanitize update state keeps pending update after reload race", async () => {

@@ -473,6 +473,42 @@ body {
     line-height: 1.4;
 }
 
+.update-policy-notice {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 10px;
+    border: 1px solid color-mix(in oklch, var(--warn) 55%, var(--border));
+    border-radius: 8px;
+    background: color-mix(in oklch, var(--warn) 13%, var(--bg-raised));
+    color: var(--text-secondary);
+}
+
+.update-policy-notice strong {
+    color: var(--text);
+    font-size: 12.5px;
+}
+
+.update-policy-notice p {
+    margin: 0;
+    font-size: 11.5px;
+    line-height: 1.4;
+}
+
+.update-policy-command {
+    display: block;
+    padding: 7px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-inset);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    line-height: 1.35;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
 .config-input,
 .provider-input,
 .provider-select {
@@ -623,6 +659,14 @@ select.config-input {
 
 .secondary-btn:active {
     background: var(--bg-inset);
+}
+
+.compact-btn {
+    width: auto;
+    min-height: 28px;
+    padding: 0 10px;
+    font-size: 11.5px;
+    align-self: flex-start;
 }
 
 .action-btn:focus-visible,

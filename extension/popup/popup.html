@@ -127,6 +127,25 @@
                                 also checks when the last check is stale. Keep this
                                 off to review and click Update manually.
                             </p>
+                            <div
+                                id="updatePolicyNotice"
+                                class="update-policy-notice"
+                                style="display: none"
+                                role="alert"
+                            >
+                                <strong>Update needs managed install</strong>
+                                <p id="updatePolicyNoticeText">
+                                    Chrome cannot auto-update unpacked extensions. Ask an admin to run this command from the extracted AutoDOM share folder, then restart the browser.
+                                </p>
+                                <code id="updatePolicyCommand" class="update-policy-command"></code>
+                                <button
+                                    type="button"
+                                    class="secondary-btn compact-btn"
+                                    id="copyUpdatePolicyCommandBtn"
+                                >
+                                    Copy command
+                                </button>
+                            </div>
                             <div class="inline-row">
                                 <button type="button" class="text-btn" id="clearExtensionCacheBtn">
                                     Clear extension cache
