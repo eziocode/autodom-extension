@@ -148,7 +148,94 @@
           },
           maxBytes: {
             type: "integer",
-            description: "Maximum text characters or binary bytes to return (default 30000)",
+            description: "Maximum text characters or binary/base64 bytes to return (default 30000)",
+          },
+          readMaxBytes: {
+            type: "integer",
+            description: "Maximum raw/compressed bytes to read before decoding; artifact mode defaults to 262144",
+          },
+          decodedMaxBytes: {
+            type: "integer",
+            description: "Maximum decoded bytes to inspect after decompression; defaults to readMaxBytes",
+          },
+          artifactMode: {
+            type: "boolean",
+            description: "Use artifact-friendly defaults for gzipped report/API payloads",
+          },
+          extractCounts: {
+            type: "boolean",
+            description: "Return compact count evidence from text/html/json payloads",
+          },
+          countMode: {
+            type: "string",
+            enum: ["generic", "sync_history", "both"],
+            description: "Count evidence mode; default both",
+          },
+          includeText: {
+            type: "boolean",
+            description: "Include decoded text/html in the result (default true for this tool)",
+          },
+          includeJson: {
+            type: "boolean",
+            description: "Include parsed JSON in the result when parseJson succeeds (default true)",
+          },
+        },
+        required: ["url"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "verify_artifact_counts",
+      description:
+        "Fetch a raw artifact/report/API payload with browser credentials and return compact count evidence. " +
+        "Use this when an open tab shows a gzipped HTML/API shell or artifact page and you need to verify sync-history counts without relying on rendered UI text. " +
+        "Defaults to a 262144-byte artifact read cap and omits payload text unless includePayload/includeText is true.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "Absolute artifact/report/API URL to fetch" },
+          headers: {
+            type: "object",
+            additionalProperties: { type: "string" },
+            description: "Optional request headers",
+          },
+          credentials: {
+            type: "string",
+            enum: ["include", "omit", "same-origin"],
+            description: "Fetch credentials mode, default include",
+          },
+          countMode: {
+            type: "string",
+            enum: ["generic", "sync_history", "both"],
+            description: "Count evidence mode; default both",
+          },
+          maxBytes: {
+            type: "integer",
+            description: "Maximum returned text/base64 bytes if payload output is included (default 30000)",
+          },
+          readMaxBytes: {
+            type: "integer",
+            description: "Maximum raw/compressed artifact bytes to read (default 262144)",
+          },
+          decodedMaxBytes: {
+            type: "integer",
+            description: "Maximum decoded bytes to inspect after decompression (default readMaxBytes)",
+          },
+          includePayload: {
+            type: "boolean",
+            description: "Include decoded text/html/json/base64 payload fields (default false)",
+          },
+          includeText: {
+            type: "boolean",
+            description: "Include decoded text/html fields (default false)",
+          },
+          includeJson: {
+            type: "boolean",
+            description: "Include parsed JSON when available (default false)",
+          },
+          extractLinks: {
+            type: "boolean",
+            description: "Extract links from decoded HTML (default false)",
           },
         },
         required: ["url"],

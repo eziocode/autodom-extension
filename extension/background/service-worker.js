@@ -5383,6 +5383,7 @@ const TOOL_HANDLERS = new Map([
   ["get_html", toolGetHtml],
   ["fetch_page_source", toolFetchPageSource],
   ["browser_fetch_raw", toolFetchPageSource],
+  ["verify_artifact_counts", toolVerifyArtifactCounts],
   ["set_attribute", toolSetAttribute],
   ["check_element_state", toolCheckElementState],
   ["drag_and_drop", toolDragAndDrop],
@@ -6300,19 +6301,29 @@ async function toolGetNetworkRequests(params) {
   const tab = await getActiveTab();
   return await executeInTab(
     tab.id,
-    (limit) => {
-      const entries = performance.getEntriesByType("resource").slice(-limit);
+    (limit, urlPattern, artifactOnly) => {
+      const pattern = String(urlPattern || "").toLowerCase();
+      const artifactRe = /(\.(?:gz|zip|json|ndjson|html?|csv|txt|log)(?:[?#]|$)|artifact|report|sync[\s_-]*history|api\/)/i;
+      const entries = performance.getEntriesByType("resource");
+      const mapped = entries.map((e) => ({
+        name: e.name,
+        type: e.initiatorType,
+        duration: Math.round(e.duration),
+        size: e.transferSize || 0,
+        startTime: Math.round(e.startTime),
+        artifactCandidate: artifactRe.test(e.name),
+      }));
+      const filtered = mapped.filter((e) => {
+        if (pattern && !String(e.name || "").toLowerCase().includes(pattern)) return false;
+        if (artifactOnly && !e.artifactCandidate) return false;
+        return true;
+      }).slice(-limit);
       return {
-        requests: entries.map((e) => ({
-          name: e.name,
-          type: e.initiatorType,
-          duration: Math.round(e.duration),
-          size: e.transferSize || 0,
-          startTime: Math.round(e.startTime),
-        })),
+        requests: filtered,
+        artifactCandidates: filtered.filter((e) => e.artifactCandidate).map((e) => e.name),
       };
     },
-    [params?.limit || 50],
+    [params?.limit || 50, params?.urlPattern || "", params?.artifactOnly === true],
   );
 }
 
@@ -6807,6 +6818,14 @@ function _looksLikeGzip(url, headers) {
   );
 }
 
+const DEFAULT_RAW_FETCH_MAX_BYTES = 30000;
+const DEFAULT_ARTIFACT_READ_MAX_BYTES = 262144;
+
+function _boundedPositiveNumber(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 function _isTextualResponse(url, contentType) {
   const lowerType = String(contentType || "").toLowerCase();
   if (
@@ -6829,6 +6848,158 @@ function _isTextualResponse(url, contentType) {
     }
   })();
   return /\.(txt|json|ndjson|html|htm|xml|csv|yaml|yml|js|css|log)$/.test(pathname);
+}
+
+function _looksLikeDecodedHtml(text) {
+  const sample = String(text || "").slice(0, 4096).toLowerCase();
+  return (
+    sample.includes("<!doctype html") ||
+    sample.includes("<html") ||
+    sample.includes("<body") ||
+    /<(table|main|section|article|div|span|script|style|a)\b/i.test(sample)
+  );
+}
+
+function _looksLikeDecodedJson(text) {
+  const sample = String(text || "").trimStart();
+  return sample.startsWith("{") || sample.startsWith("[");
+}
+
+function _inferDecodedKind(text, url, contentType) {
+  const lowerType = String(contentType || "").toLowerCase();
+  if (lowerType.includes("html")) return "html";
+  if (lowerType.includes("json")) return "json";
+  if (lowerType.includes("xml")) return "xml";
+  if (_looksLikeDecodedHtml(text)) return "html";
+  if (_looksLikeDecodedJson(text)) return "json";
+  if (_isTextualResponse(url, contentType)) return "text";
+  return "text";
+}
+
+function _normalizeCountMode(mode) {
+  const raw = String(mode || "both").toLowerCase().replace(/-/g, "_");
+  return raw === "generic" || raw === "sync_history" || raw === "both" ? raw : "both";
+}
+
+function _countPathMatches(path, mode) {
+  const p = String(path || "").toLowerCase();
+  const generic = /(count|total|size|length|row|item|event|record|entry|result|history)/i.test(p);
+  const syncHistory = /(sync[_\s-]*history|synchistory|sync|history)/i.test(p);
+  if (mode === "generic") return generic;
+  if (mode === "sync_history") return syncHistory;
+  return generic || syncHistory;
+}
+
+function _compactEvidenceSnippet(text, index, width = 180) {
+  const raw = String(text || "").replace(/\s+/g, " ").trim();
+  const start = Math.max(0, index - Math.floor(width / 2));
+  const snippet = raw.slice(start, start + width);
+  return `${start > 0 ? "..." : ""}${snippet}${start + width < raw.length ? "..." : ""}`;
+}
+
+function _pushCountCandidate(candidates, candidate, max = 30) {
+  if (!candidate || candidates.length >= max) return;
+  candidates.push(candidate);
+}
+
+function _extractJsonCountEvidence(value, mode) {
+  const candidates = [];
+  const arrayLengths = [];
+  const stack = [{ value, path: "$" }];
+  let nodesVisited = 0;
+  while (stack.length > 0 && nodesVisited < 2000) {
+    const current = stack.pop();
+    nodesVisited++;
+    const v = current.value;
+    const path = current.path;
+    if (Array.isArray(v)) {
+      if (_countPathMatches(path, mode)) {
+        arrayLengths.push({ path, length: v.length });
+      }
+      for (let i = Math.min(v.length - 1, 50); i >= 0; i--) {
+        stack.push({ value: v[i], path: `${path}[${i}]` });
+      }
+      continue;
+    }
+    if (!v || typeof v !== "object") {
+      if (typeof v === "number" && Number.isFinite(v) && _countPathMatches(path, mode)) {
+        _pushCountCandidate(candidates, { source: "json", path, value: v });
+      }
+      continue;
+    }
+    const entries = Object.entries(v);
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const [key, child] = entries[i];
+      const childPath = `${path}.${key}`;
+      if (typeof child === "number" && Number.isFinite(child) && _countPathMatches(childPath, mode)) {
+        _pushCountCandidate(candidates, { source: "json", path: childPath, value: child });
+      } else {
+        stack.push({ value: child, path: childPath });
+      }
+    }
+  }
+  return {
+    candidates,
+    arrayLengths: arrayLengths.slice(0, 20),
+    nodesVisited,
+    truncated: stack.length > 0,
+  };
+}
+
+function _extractTextCountEvidence(text, mode, kind) {
+  const candidates = [];
+  const plain = String(text || "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const countLineRe =
+    /((?:sync[\s_-]*history|history|count|total|rows?|items?|events?|records?|entries|results)[^.\n\r:=>]{0,80}[:=>]?\s*([0-9][0-9,]*))/gi;
+  let match;
+  while ((match = countLineRe.exec(plain)) && candidates.length < 30) {
+    if (!_countPathMatches(match[1], mode)) continue;
+    _pushCountCandidate(candidates, {
+      source: "text",
+      label: match[1].replace(/\s+/g, " ").trim(),
+      value: Number(match[2].replace(/,/g, "")),
+      snippet: _compactEvidenceSnippet(plain, match.index),
+    });
+  }
+
+  const syncMentions = (plain.match(/sync[\s_-]*history/gi) || []).length;
+  const htmlRows = kind === "html" ? (String(text || "").match(/<tr\b/gi) || []).length : undefined;
+  const htmlListItems = kind === "html" ? (String(text || "").match(/<li\b/gi) || []).length : undefined;
+  return {
+    candidates,
+    totals: {
+      syncHistoryMentions: syncMentions,
+      ...(htmlRows !== undefined ? { htmlRows } : {}),
+      ...(htmlListItems !== undefined ? { htmlListItems } : {}),
+    },
+  };
+}
+
+function _extractCountEvidence({ text, json, mode, kind }) {
+  const normalizedMode = _normalizeCountMode(mode);
+  const textEvidence = text ? _extractTextCountEvidence(text, normalizedMode, kind) : null;
+  const jsonEvidence = json !== undefined ? _extractJsonCountEvidence(json, normalizedMode) : null;
+  const candidates = [
+    ...(jsonEvidence?.candidates || []),
+    ...(textEvidence?.candidates || []),
+  ].slice(0, 30);
+  return {
+    mode: normalizedMode,
+    inferredType: kind,
+    candidates,
+    arrayLengths: (jsonEvidence?.arrayLengths || []).slice(0, 20),
+    totals: {
+      candidateCount: candidates.length,
+      ...(textEvidence?.totals || {}),
+    },
+    truncated: !!jsonEvidence?.truncated,
+  };
 }
 
 async function _decompressGzipBytes(bytes, maxBytes) {
@@ -6924,14 +7095,26 @@ async function toolFetchPageSource(params) {
     body,
     credentials = "include",
     extractLinks = true,
-    maxBytes = 30000,
+    maxBytes = DEFAULT_RAW_FETCH_MAX_BYTES,
+    readMaxBytes,
+    decodedMaxBytes,
     responseType = "auto",
     decompress = true,
     parseJson = true,
+    includeText = true,
+    includeJson = true,
+    extractCounts = false,
+    countMode = "both",
+    artifactMode = false,
   } = params || {};
   if (!url || typeof url !== "string") return { ok: false, error: "url is required" };
 
-  const cap = Number(maxBytes) > 0 ? Number(maxBytes) : 30000;
+  const cap = _boundedPositiveNumber(maxBytes, DEFAULT_RAW_FETCH_MAX_BYTES);
+  const readCap = _boundedPositiveNumber(
+    readMaxBytes,
+    artifactMode || extractCounts ? DEFAULT_ARTIFACT_READ_MAX_BYTES : cap,
+  );
+  const decodeCap = _boundedPositiveNumber(decodedMaxBytes, readCap);
   const methodUpper = String(method || "GET").toUpperCase();
   const canFollowRedirects = (methodUpper === "GET" || methodUpper === "HEAD") && body === undefined;
   const ac = typeof AbortController !== "undefined" ? new AbortController() : null;
@@ -6968,10 +7151,12 @@ async function toolFetchPageSource(params) {
         bodyLength: 0,
         bodyTruncated: false,
         maxBytes: cap,
+        readMaxBytes: readCap,
+        decodedMaxBytes: decodeCap,
         truncated: false,
       };
     }
-    const rawRead = await _readStreamBytes(response.body, cap);
+    const rawRead = await _readStreamBytes(response.body, readCap);
     const bytes = rawRead.bytes;
     const gzipLike = _looksLikeGzip(finalUrl, responseHeaders);
     const wantsBase64 = responseType === "base64";
@@ -6995,6 +7180,8 @@ async function toolFetchPageSource(params) {
       bodyLength: bytes.byteLength,
       bodyTruncated: rawRead.truncated,
       maxBytes: cap,
+      readMaxBytes: readCap,
+      decodedMaxBytes: decodeCap,
       truncated: false,
     };
 
@@ -7002,10 +7189,10 @@ async function toolFetchPageSource(params) {
     if (gzipLike && decompress !== false && !wantsBase64) {
       result.decompression = { attempted: true, ok: false, format: "gzip" };
       if (rawRead.truncated) {
-        result.decompression.error = "Compressed body exceeds maxBytes; skipped decompression";
+        result.decompression.error = "Compressed body exceeds readMaxBytes; skipped decompression";
       } else {
         try {
-          const decompressed = await _decompressGzipBytes(bytes, cap);
+          const decompressed = await _decompressGzipBytes(bytes, decodeCap);
           textBytes = decompressed.bytes;
           result.decompression.ok = true;
           result.decompression.truncated = decompressed.truncated;
@@ -7019,31 +7206,50 @@ async function toolFetchPageSource(params) {
     const canReturnText =
       wantsText ||
       wantsJson ||
+      extractCounts === true ||
+      artifactMode === true ||
       (responseType === "auto" && (textual || result.decompression?.ok));
 
     if (canReturnText) {
       const decoded = new TextDecoder("utf-8").decode(textBytes);
+      const inferredKind = _inferDecodedKind(decoded, finalUrl, contentType);
       const truncated = _truncateText(decoded, cap);
-      result.text = truncated.text;
+      const decodedTruncated = rawRead.truncated || result.decompression?.truncated === true;
+      let parsedJson;
+      if (includeText !== false) {
+        result.text = truncated.text;
+      }
       result.fullLength = truncated.fullLength;
-      result.truncated = truncated.truncated || rawRead.truncated || result.decompression?.truncated === true;
-      if (contentType.toLowerCase().includes("html")) {
+      result.truncated = truncated.truncated || decodedTruncated;
+      result.inferredContentType = inferredKind;
+      if (includeText !== false && inferredKind === "html") {
         result.html = result.text;
       }
-      if (parseJson !== false && (wantsJson || contentType.toLowerCase().includes("json"))) {
-        if (result.truncated) {
+      if (parseJson !== false && (wantsJson || inferredKind === "json")) {
+        if (decodedTruncated) {
           result.jsonOmitted = true;
-          result.jsonOmitReason = "Response body exceeds maxBytes";
+          result.jsonOmitReason = "Decoded response body exceeds decodedMaxBytes";
         } else {
           try {
-            result.json = JSON.parse(decoded);
+            parsedJson = JSON.parse(decoded);
+            if (includeJson !== false) {
+              result.json = parsedJson;
+            }
           } catch (err) {
             result.jsonParseError = err && err.message ? err.message : String(err);
           }
         }
       }
-      if (extractLinks !== false && contentType.toLowerCase().includes("html")) {
-        result.links = _extractLinksFromHtml(result.text, finalUrl);
+      if (extractLinks !== false && inferredKind === "html") {
+        result.links = _extractLinksFromHtml(decoded, finalUrl);
+      }
+      if (extractCounts === true) {
+        result.countEvidence = _extractCountEvidence({
+          text: decoded,
+          json: parsedJson,
+          mode: countMode,
+          kind: inferredKind,
+        });
       }
     } else {
       const binaryBytes = bytes.byteLength > cap ? bytes.subarray(0, cap) : bytes;
@@ -7059,6 +7265,30 @@ async function toolFetchPageSource(params) {
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+async function toolVerifyArtifactCounts(params = {}) {
+  const response = await toolFetchPageSource({
+    ...params,
+    method: params.method || "GET",
+    responseType: params.responseType || "auto",
+    artifactMode: true,
+    extractCounts: true,
+    countMode: params.countMode || "both",
+    extractLinks: params.extractLinks === true,
+    includeText: params.includePayload === true || params.includeText === true,
+    includeJson: params.includePayload === true || params.includeJson === true,
+    maxBytes: params.maxBytes || DEFAULT_RAW_FETCH_MAX_BYTES,
+    readMaxBytes: params.readMaxBytes || DEFAULT_ARTIFACT_READ_MAX_BYTES,
+    decodedMaxBytes: params.decodedMaxBytes || params.readMaxBytes || DEFAULT_ARTIFACT_READ_MAX_BYTES,
+  });
+  if (params.includePayload !== true) {
+    delete response.text;
+    delete response.html;
+    delete response.json;
+    delete response.base64;
+  }
+  return response;
 }
 
 // 30. Set attribute on element
@@ -8573,13 +8803,32 @@ if (chrome.runtime && chrome.runtime.onUpdateAvailable) {
 }
 
 try {
-  _refreshPeriodicUpdateScheduler("service_worker_startup");
-  _sanitizeStoredUpdateState("service_worker_startup");
-  _runExtensionUpdateCheck({ source: "service_worker_startup" });
+  void (async () => {
+    try {
+      await _refreshPeriodicUpdateScheduler("service_worker_startup");
+      await _sanitizeStoredUpdateState("service_worker_startup");
+      await _runExtensionUpdateCheck({ source: "service_worker_startup" });
+    } catch (err) {
+      _debugWarn(
+        "[AutoDOM SW] startup update sync failed:",
+        err?.message || err,
+      );
+    }
+  })();
   if (chrome.runtime && chrome.runtime.onStartup) {
     chrome.runtime.onStartup.addListener(() => {
-      _refreshPeriodicUpdateScheduler("browser_startup");
-      _runExtensionUpdateCheck({ source: "browser_startup" });
+      void (async () => {
+        try {
+          await _refreshPeriodicUpdateScheduler("browser_startup");
+          await _sanitizeStoredUpdateState("browser_startup");
+          await _runExtensionUpdateCheck({ source: "browser_startup" });
+        } catch (err) {
+          _debugWarn(
+            "[AutoDOM SW] browser startup update sync failed:",
+            err?.message || err,
+          );
+        }
+      })();
       void _syncOffscreenKeepalive("browser_startup");
     });
   }

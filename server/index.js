@@ -682,6 +682,7 @@ const TOOL_TIERS = new Map([
   ["get_storage", "read"],
   ["fetch_page_source", "read"],
   ["browser_fetch_raw", "read"],
+  ["verify_artifact_counts", "read"],
   ["get_network_requests", "read"],
   ["get_console_logs", "read"],
   ["list_tabs", "read"],
@@ -3804,7 +3805,7 @@ const BROWSER_AGENT_PROTOCOL =
   "- Observe first: use page context, get_dom_state, take_snapshot, and richer search/traversal tools before answering from guesswork.\n" +
   "- Identify targets by visible text, role/name, index, selector, frame/shadow context, and state; do not rely on brittle selectors when better evidence exists.\n" +
   "- Handle iframes, shadow DOM, popups/windows, tabs, dialogs, downloads, and SPA network-idle states before declaring something unavailable.\n" +
-  "- For .gz artifacts, report pages, and API response-shape evidence, prefer browser_fetch_raw/fetch_page_source over trying to render the payload in a browser tab.\n" +
+  "- For .gz artifacts, report pages, API response-shape evidence, or sync-history count checks, prefer verify_artifact_counts or browser_fetch_raw/fetch_page_source over trying to render the payload in a browser tab.\n" +
   "- Act in short verified batches: perform the browser step, wait for the page to settle, then verify with state/text/URL/title/snapshot evidence.\n" +
   "- Ask before destructive, payment, account, credential, or irreversible actions unless the user has already clearly authorized the exact action.\n";
 
@@ -5678,6 +5679,8 @@ async function _callPlaywrightCompatTool(toolName, params = {}) {
     case "browser_fetch_raw":
     case "fetch_page_source":
       return callExtensionTool("fetch_page_source", p);
+    case "verify_artifact_counts":
+      return callExtensionTool("verify_artifact_counts", p);
     case "list_downloads":
       return callExtensionTool("list_downloads", p);
     case "wait_for_download":
@@ -5800,7 +5803,23 @@ const PLAYWRIGHT_COMPAT_TOOLS = [
         .describe("Try to decompress gzip-like payloads when possible; default true"),
       parseJson: z.boolean().optional().describe("Parse JSON responses into a json field; default true"),
       extractLinks: z.boolean().optional().describe("Extract links from HTML responses; default true"),
-      maxBytes: z.number().optional().describe("Maximum text characters or binary bytes to return"),
+      maxBytes: z.number().optional().describe("Maximum text characters or binary/base64 bytes to return"),
+      readMaxBytes: z
+        .number()
+        .optional()
+        .describe("Maximum raw/compressed bytes to read before decoding; artifact mode defaults to 262144"),
+      decodedMaxBytes: z
+        .number()
+        .optional()
+        .describe("Maximum decoded bytes to inspect after decompression; defaults to readMaxBytes"),
+      artifactMode: z.boolean().optional().describe("Use artifact-friendly defaults for gzipped report/API payloads"),
+      extractCounts: z.boolean().optional().describe("Return compact count evidence from text/html/json payloads"),
+      countMode: z
+        .enum(["generic", "sync_history", "both"])
+        .optional()
+        .describe("Count evidence mode; default both"),
+      includeText: z.boolean().optional().describe("Include decoded text/html in the result; default true"),
+      includeJson: z.boolean().optional().describe("Include parsed JSON when parseJson succeeds; default true"),
     }),
   },
   {
@@ -5826,7 +5845,59 @@ const PLAYWRIGHT_COMPAT_TOOLS = [
         .describe("Try to decompress gzip-like payloads when possible; default true"),
       parseJson: z.boolean().optional().describe("Parse JSON responses into a json field; default true"),
       extractLinks: z.boolean().optional().describe("Extract links from HTML responses; default true"),
-      maxBytes: z.number().optional().describe("Maximum text characters or binary bytes to return"),
+      maxBytes: z.number().optional().describe("Maximum text characters or binary/base64 bytes to return"),
+      readMaxBytes: z
+        .number()
+        .optional()
+        .describe("Maximum raw/compressed bytes to read before decoding; artifact mode defaults to 262144"),
+      decodedMaxBytes: z
+        .number()
+        .optional()
+        .describe("Maximum decoded bytes to inspect after decompression; defaults to readMaxBytes"),
+      artifactMode: z.boolean().optional().describe("Use artifact-friendly defaults for gzipped report/API payloads"),
+      extractCounts: z.boolean().optional().describe("Return compact count evidence from text/html/json payloads"),
+      countMode: z
+        .enum(["generic", "sync_history", "both"])
+        .optional()
+        .describe("Count evidence mode; default both"),
+      includeText: z.boolean().optional().describe("Include decoded text/html in the result; default true"),
+      includeJson: z.boolean().optional().describe("Include parsed JSON when parseJson succeeds; default true"),
+    }),
+  },
+  {
+    name: "verify_artifact_counts",
+    description:
+      "Fetch a raw artifact/report/API payload with browser credentials and return compact count evidence. Use this for gzipped HTML/API shells and sync-history count verification without relying on rendered UI text.",
+    parameters: z.object({
+      url: z.string().describe("Absolute artifact/report/API URL to fetch"),
+      headers: z.record(z.string()).optional().describe("Optional request headers"),
+      credentials: z
+        .enum(["include", "omit", "same-origin"])
+        .optional()
+        .describe("Fetch credentials mode, default include"),
+      countMode: z
+        .enum(["generic", "sync_history", "both"])
+        .optional()
+        .describe("Count evidence mode; default both"),
+      maxBytes: z
+        .number()
+        .optional()
+        .describe("Maximum returned text/base64 bytes if payload output is included; default 30000"),
+      readMaxBytes: z
+        .number()
+        .optional()
+        .describe("Maximum raw/compressed artifact bytes to read; default 262144"),
+      decodedMaxBytes: z
+        .number()
+        .optional()
+        .describe("Maximum decoded bytes to inspect after decompression; default readMaxBytes"),
+      includePayload: z
+        .boolean()
+        .optional()
+        .describe("Include decoded text/html/json/base64 payload fields; default false"),
+      includeText: z.boolean().optional().describe("Include decoded text/html fields; default false"),
+      includeJson: z.boolean().optional().describe("Include parsed JSON when available; default false"),
+      extractLinks: z.boolean().optional().describe("Extract links from decoded HTML; default false"),
     }),
   },
   {
@@ -5930,10 +6001,11 @@ const PLAYWRIGHT_COMPAT_TOOLS = [
   },
   {
     name: "browser_network_requests",
-    description: "Read recent network requests observed for the page.",
+    description: "Read recent network requests observed for the page, with optional artifact/report URL candidate filtering.",
     parameters: z.object({
       urlPattern: z.string().optional().describe("Optional URL substring or pattern filter"),
       limit: z.number().optional().describe("Maximum number of requests"),
+      artifactOnly: z.boolean().optional().describe("Return only likely artifact/report/API payload URLs"),
     }),
   },
   {
@@ -6683,13 +6755,15 @@ server.addTool({
 server.addTool({
   name: "get_network_requests",
   description:
-    "List recent network requests made by the page (via Performance API).",
+    "List recent network requests made by the page (via Performance API), including likely artifact/report payload candidates.",
   parameters: z.object({
     limit: z
       .number()
       .optional()
       .default(50)
       .describe("Max number of requests to return"),
+    urlPattern: z.string().optional().describe("Optional URL substring filter"),
+    artifactOnly: z.boolean().optional().describe("Return only likely artifact/report/API payload URLs"),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("get_network_requests", params);

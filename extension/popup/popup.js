@@ -209,6 +209,19 @@ async function readPendingUpdate() {
   return pendingUpdate;
 }
 
+async function waitForPendingUpdate(maxWaitMs = 5000, intervalMs = 250) {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() <= deadline) {
+    const pendingUpdate = await readPendingUpdate();
+    if (pendingUpdate && isVersionNewerThanCurrent(pendingUpdate.version)) {
+      return pendingUpdate;
+    }
+    if (Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return null;
+}
+
 async function applyPendingUpdate() {
   const btn = DOM.checkUpdateBtn;
   const versionEl = DOM.appVersion;
@@ -293,6 +306,7 @@ async function runUpdateCheck() {
       btn.classList.remove("spin");
       btn.disabled = false;
       paintUpdateButton(result.pendingUpdate, null);
+      await applyPendingUpdate();
       return;
     }
     if (status === "update_available") {
@@ -302,8 +316,14 @@ async function runUpdateCheck() {
       btn.disabled = false;
       if (pendingVersion) {
         paintUpdateButton(result.pendingUpdate, null);
+        await applyPendingUpdate();
       } else {
         paintUpdateButton(null, { version: detailVersion || "?" });
+        const pendingUpdate = await waitForPendingUpdate();
+        if (pendingUpdate) {
+          paintUpdateButton(pendingUpdate, null);
+          await applyPendingUpdate();
+        }
       }
       return;
     } else if (status === "no_update") {
@@ -315,6 +335,11 @@ async function runUpdateCheck() {
       btn.classList.remove("spin");
       btn.disabled = false;
       paintUpdateButton(null, result.availableUpdate || result.details || { version: v });
+      const pendingUpdate = await waitForPendingUpdate();
+      if (pendingUpdate) {
+        paintUpdateButton(pendingUpdate, null);
+        await applyPendingUpdate();
+      }
       return;
     } else if (status === "skipped" && result.reason === "not_due") {
       setLabel("checked recently");

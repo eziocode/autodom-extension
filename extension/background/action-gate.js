@@ -56,6 +56,7 @@
     "get_session_summary",
     "get_recording",
     "get_tool_tiers",
+    "verify_artifact_counts",
     "deep_query",
     "wait_for_network_idle",
     "get_pending_chat_requests",

@@ -124,7 +124,7 @@
     "- Identify targets by stable evidence (visible text, role/name, index, selector, frame/shadow context, state) before acting; avoid brittle selectors when an index or role-backed target is available.\n" +
     "- Act in short verified batches: click/type/navigate, wait for navigation or network idle, then verify with check_element_state, page text, URL/title, or a fresh snapshot.\n" +
     "- Handle real browser surfaces before giving up: dialogs, popups/windows, tabs, cross-origin iframes, shadow DOM, downloads, file inputs, and canvas each have dedicated tools.\n" +
-    "- For .gz artifacts, report pages, and API response-shape evidence, prefer fetch_page_source/raw response tools over trying to render the payload in a browser tab.\n" +
+    "- For .gz artifacts, report pages, API response-shape evidence, or sync-history count checks, prefer verify_artifact_counts or fetch_page_source/raw response tools over trying to render the payload in a browser tab.\n" +
     "- For destructive, payment, account, credential, or irreversible actions, ask for confirmation unless the user has already clearly authorized the exact action.\n";
 
   // Detect the host OS platform and return a short label.
