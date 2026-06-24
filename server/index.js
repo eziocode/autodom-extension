@@ -2894,6 +2894,7 @@ async function _handleSelfUpdate(socket, message) {
   const reply = (payload) => {
     try { socket.send(JSON.stringify({ type: "SELF_UPDATE_RESULT", id, ...payload })); } catch (_) {}
   };
+  let tmpZip = null;
   try {
     const extDir = resolvePath(serverPath, "..", "..", "extension");
     try {
@@ -2913,7 +2914,7 @@ async function _handleSelfUpdate(socket, message) {
     }
     const latestVersion = verMatch[1];
     const zipUrl = `https://github.com/eziocode/autodom-extension/releases/download/v${latestVersion}/autodom-chrome-${latestVersion}.zip`;
-    const tmpZip = join(tmpdir(), `autodom-update-${Date.now()}.zip`);
+    tmpZip = join(tmpdir(), `autodom-update-${Date.now()}.zip`);
     // Download zip (follow redirects — fetch does this automatically)
     const zipRes = await fetch(zipUrl);
     if (!zipRes.ok) throw new Error(`Zip download HTTP ${zipRes.status}`);
@@ -2925,10 +2926,12 @@ async function _handleSelfUpdate(socket, message) {
         if (err) reject(err); else resolve();
       });
     });
-    try { await fs.unlink(tmpZip); } catch (_) {}
     reply({ ok: true, version: latestVersion });
   } catch (err) {
     reply({ ok: false, error: err?.message || String(err) });
+  } finally {
+    // Always clean up the temp zip regardless of success or failure
+    if (tmpZip) { try { await fs.unlink(tmpZip); } catch (_) {} }
   }
 }
 

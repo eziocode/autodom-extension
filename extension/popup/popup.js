@@ -329,6 +329,9 @@ async function runUpdateCheck() {
   const btn = DOM.checkUpdateBtn;
   const versionEl = DOM.appVersion;
   if (!btn || !versionEl) return;
+  // Disable immediately (before any await) to prevent re-entrant double-clicks.
+  if (btn.disabled) return;
+  btn.disabled = true;
 
   // If Chrome has already downloaded the CRX, this click means "apply it now".
   // A manifest-only "found" state still needs a forced runtime update check.
@@ -341,7 +344,6 @@ async function runUpdateCheck() {
   // Try server-based self-update first; fall back to policy notice if server
   // is not connected or reports an error.
   if (btn.dataset.updateState === "found" && await isUnpackedInstall()) {
-    btn.disabled = true;
     btn.textContent = "Downloading…";
     versionEl.textContent = "downloading update via bridge…";
     let result;
