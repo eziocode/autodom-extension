@@ -413,6 +413,15 @@ const PROXY_LOCK_WAIT_MS = parseInt(
 );
 const PROXY_LOCK_POLL_MS = 100;
 const SSE_PORT = parseInt(getArgValue("--sse-port") || "0", 10);
+// When set, a plain HTTP REST API starts alongside the MCP/SSE transports.
+// Any HTTP client (curl, scripts, CI runners) can then call tools directly —
+// no MCP-aware AI agent or IDE plugin required.
+//   node index.js --http-port 9877
+//   AUTODOM_HTTP_PORT=9877 node index.js
+const HTTP_PORT = parseInt(
+  getArgValue("--http-port") || process.env.AUTODOM_HTTP_PORT || "0",
+  10,
+);
 
 // ─── Domain Guardrails ───────────────────────────────────────
 // Controls which domains agents can perform write/destructive actions on.
@@ -989,6 +998,7 @@ async function writeLockFile() {
       {
         pid: process.pid,
         port: WS_PORT,
+        ...(HTTP_PORT > 0 ? { httpPort: HTTP_PORT } : {}),
         serverPath,
         startedAt: new Date().toISOString(),
         token: AUTH_TOKEN,
@@ -8220,6 +8230,150 @@ server.addTool({
   },
 });
 
+// ─── HTTP REST API Server ────────────────────────────────────
+// Plain HTTP layer so any script, CI runner, or HTTP client can invoke
+// browser-automation tools without needing an MCP-compatible AI agent
+// or IDE plugin. Start with --http-port <n> or AUTODOM_HTTP_PORT=<n>.
+//
+//   GET  /health             — liveness + extension-connected status
+//   GET  /tools              — list all registered tools
+//   GET  /tools/<name>       — describe one tool
+//   POST /tools/<name>       — call a tool; body = JSON params object
+//
+// Optional auth: set AUTODOM_HTTP_TOKEN to a secret string and pass it
+// as  Authorization: Bearer <token>  on every non-health request.
+async function startHttpApiServer(port) {
+  const { createServer } = await import("http");
+
+  const httpServer = createServer((req, res) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization",
+    );
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    function sendJson(status, body) {
+      const text = JSON.stringify(body, null, 2);
+      res.writeHead(status, {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(text),
+      });
+      res.end(text);
+    }
+
+    let pathname;
+    try {
+      pathname =
+        new URL(req.url, `http://127.0.0.1:${port}`).pathname.replace(
+          /\/+$/,
+          "",
+        ) || "/";
+    } catch {
+      pathname = (req.url || "").split("?")[0].replace(/\/+$/, "") || "/";
+    }
+
+    // Health endpoint is always public (used by monitoring probes).
+    // Every other endpoint honours AUTODOM_HTTP_TOKEN when it is set.
+    const httpToken = process.env.AUTODOM_HTTP_TOKEN;
+    if (httpToken && pathname !== "/health") {
+      const reqToken = tokenFromRequest(req);
+      if (!reqToken || !safeTokenEqual(reqToken, httpToken)) {
+        return sendJson(401, {
+          error:
+            "Unauthorized — provide: Authorization: Bearer <AUTODOM_HTTP_TOKEN>",
+        });
+      }
+    }
+
+    // GET /health
+    if (req.method === "GET" && pathname === "/health") {
+      return sendJson(200, {
+        status: "ok",
+        extensionConnected: _isExtensionReady(),
+        uptime: Math.floor((Date.now() - _serverStartTime) / 1000),
+        wsPort: WS_PORT,
+        httpPort: port,
+      });
+    }
+
+    // GET / or GET /tools — list all tools
+    if (
+      req.method === "GET" &&
+      (pathname === "/" || pathname === "/tools")
+    ) {
+      const tools = (server.tools || []).map((t) => ({
+        name: t.name,
+        description: t.description,
+      }));
+      return sendJson(200, { tools });
+    }
+
+    // GET /tools/:name — describe one tool
+    if (req.method === "GET" && pathname.startsWith("/tools/")) {
+      const toolName = pathname.slice("/tools/".length);
+      const tool = (server.tools || []).find((t) => t.name === toolName);
+      if (!tool)
+        return sendJson(404, { error: `Tool "${toolName}" not found` });
+      return sendJson(200, { name: tool.name, description: tool.description });
+    }
+
+    // POST /tools/:name — invoke a tool
+    if (req.method === "POST" && pathname.startsWith("/tools/")) {
+      const toolName = pathname.slice("/tools/".length);
+      if (!toolName) {
+        return sendJson(400, {
+          error: "Tool name required in path: POST /tools/<name>",
+        });
+      }
+
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", async () => {
+        let params = {};
+        try {
+          if (body.trim()) params = JSON.parse(body);
+        } catch {
+          return sendJson(400, { error: "Invalid JSON body" });
+        }
+        try {
+          const raw = await callExtensionTool(toolName, params);
+          if (raw && typeof raw === "object" && "error" in raw) {
+            return sendJson(502, { error: raw.error });
+          }
+          return sendJson(200, { result: raw });
+        } catch (err) {
+          return sendJson(500, { error: err?.message || String(err) });
+        }
+      });
+      return;
+    }
+
+    sendJson(404, {
+      error: `${req.method} ${pathname} — endpoint not found`,
+    });
+  });
+
+  return new Promise((resolve, reject) => {
+    httpServer.on("error", reject);
+    httpServer.listen(port, "127.0.0.1", () => {
+      process.stderr.write(
+        `[AutoDOM] HTTP REST API on http://127.0.0.1:${port}\n`,
+      );
+      process.stderr.write(`[AutoDOM]   GET  /health\n`);
+      process.stderr.write(`[AutoDOM]   GET  /tools\n`);
+      process.stderr.write(`[AutoDOM]   POST /tools/<name>  (body: JSON params)\n`);
+      resolve(httpServer);
+    });
+  });
+}
+
 // ─── Start FastMCP Server ────────────────────────────────────
 
 if (STOP_ONLY) {
@@ -8413,6 +8567,19 @@ if (STOP_ONLY) {
       } catch (sseErr) {
         process.stderr.write(
           `[AutoDOM] SSE transport failed to start: ${sseErr.message}\n`,
+        );
+      }
+    }
+
+    // ─── Optional HTTP REST API ─────────────────────────────
+    // Starts a plain HTTP server that any script or CI tool can call
+    // without an MCP client. Enable with --http-port or AUTODOM_HTTP_PORT.
+    if (HTTP_PORT > 0) {
+      try {
+        await startHttpApiServer(HTTP_PORT);
+      } catch (httpErr) {
+        process.stderr.write(
+          `[AutoDOM] HTTP REST API failed to start: ${httpErr.message}\n`,
         );
       }
     }

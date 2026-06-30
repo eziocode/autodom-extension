@@ -292,8 +292,10 @@ async function runDoctor() {
 // ─── Print Config ────────────────────────────────────────────
 function printConfig() {
   const port = parseInt(getArgValue("--port") || "9876", 10);
+  const httpPort = parseInt(getArgValue("--http-port") || process.env.AUTODOM_HTTP_PORT || "0", 10);
   const portArg =
     port !== 9876 ? `, "--port", "${port}"` : "";
+  const httpPortArg = httpPort > 0 ? `, "--http-port", "${httpPort}"` : "";
 
   log("");
   log(`${c.bold}MCP Server Configuration${c.reset}`);
@@ -308,11 +310,27 @@ function printConfig() {
 ${c.dim}  "mcpServers": {${c.reset}
 ${c.dim}    "autodom": {${c.reset}
 ${c.dim}      "command": "${c.reset}node${c.dim}",${c.reset}
-${c.dim}      "args": ["${c.reset}${c.cyan}${INDEX_JS}${c.reset}${c.dim}"${portArg}]${c.reset}
+${c.dim}      "args": ["${c.reset}${c.cyan}${INDEX_JS}${c.reset}${c.dim}"${portArg}${httpPortArg}]${c.reset}
 ${c.dim}    }${c.reset}
 ${c.dim}  }${c.reset}
 ${c.dim}}${c.reset}`,
   );
+  log("");
+  log(`${c.bold}HTTP REST API (scripts, CI, curl — no AI agent required):${c.reset}`);
+  log("");
+  const displayHttpPort = httpPort > 0 ? httpPort : 9877;
+  log(`  ${c.cyan}node cli.js --http-port ${displayHttpPort}${c.reset}`);
+  log(`  ${c.dim}# or:  AUTODOM_HTTP_PORT=${displayHttpPort} node cli.js${c.reset}`);
+  log("");
+  log(`  ${c.bold}Endpoints:${c.reset}`);
+  log(`  ${c.green}GET ${c.reset} http://127.0.0.1:${displayHttpPort}/health`);
+  log(`  ${c.green}GET ${c.reset} http://127.0.0.1:${displayHttpPort}/tools`);
+  log(`  ${c.green}POST${c.reset} http://127.0.0.1:${displayHttpPort}/tools/<name>   body: JSON params`);
+  log("");
+  log(`  ${c.bold}Example:${c.reset}`);
+  log(`  ${c.dim}curl -s -X POST http://127.0.0.1:${displayHttpPort}/tools/navigate \\${c.reset}`);
+  log(`  ${c.dim}     -H 'Content-Type: application/json' \\${c.reset}`);
+  log(`  ${c.dim}     -d '{"url":"https://example.com"}'${c.reset}`);
   log("");
 }
 
@@ -334,6 +352,7 @@ async function main() {
     log(`${c.bold}Usage:${c.reset}`);
     log(`  node cli.js                 Start the MCP bridge server`);
     log(`  node cli.js --port 9877     Use a custom WebSocket port`);
+    log(`  node cli.js --http-port 9878  Start HTTP REST API on port 9878`);
     log(`  node cli.js --setup         Run interactive setup (configure IDEs)`);
     log(`  node cli.js --doctor        Diagnose common issues`);
     log(`  node cli.js --config        Print MCP config snippets`);
@@ -343,6 +362,8 @@ async function main() {
     log(`${c.bold}Environment:${c.reset}`);
     log(`  AUTODOM_TOOL_TIMEOUT=30000      Tool execution timeout (ms)`);
     log(`  AUTODOM_INACTIVITY_TIMEOUT=600000  Auto-shutdown after idle (ms, 0=disable)`);
+    log(`  AUTODOM_HTTP_PORT=9878          Enable HTTP REST API on that port`);
+    log(`  AUTODOM_HTTP_TOKEN=<secret>     Require Bearer token on REST API calls`);
     log(`  AUTODOM_DEBUG=1                 Enable diagnostic logging`);
     log(`  AUTODOM_WIRE_LOG=1              Log all MCP wire traffic`);
     log("");
