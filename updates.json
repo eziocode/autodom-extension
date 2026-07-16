@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "extensionId": "kpjdffgogiajnkajnjneiboaincnaokf",
+  "version": "4.2.1",
+  "publishedAt": "2026-07-16T08:00:13.108Z",
+  "artifacts": {
+    "crx": {
+      "url": "https://github.com/eziocode/autodom-extension/releases/download/v4.2.1/autodom-4.2.1.crx",
+      "sha256": "70a37c48532fcbf8a295e3fa3dea9a8e929b2b06d6290c5d45a97c1f0654eab0"
+    },
+    "zip": {
+      "url": "https://github.com/eziocode/autodom-extension/releases/download/v4.2.1/autodom-chrome-4.2.1.zip",
+      "sha256": "8fe21c5178589d14cbcb9543297579751b102a9a111a6306b710f7b2e90a2d46"
+    }
+  }
+}
