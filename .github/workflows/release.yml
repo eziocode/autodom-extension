@@ -112,6 +112,10 @@ jobs:
         working-directory: server
         run: npm ci
 
+      - name: Audit server dependencies (fail on high+)
+        working-directory: server
+        run: npm audit --audit-level=high
+
       - name: Stamp version into manifests + server package
         env:
           V: ${{ steps.ver.outputs.version }}
@@ -167,55 +171,89 @@ jobs:
           shred -u /tmp/autodom.pem
           ls -lh "dist/autodom-${V}.crx"
 
-      - name: Generate updates.xml
+      - name: Compute release checksums
+        id: sums
         env:
           V: ${{ steps.ver.outputs.version }}
         run: |
-          mkdir -p gh-pages-publish
+          CRX_SHA256="$(sha256sum "dist/autodom-${V}.crx" | awk '{print $1}')"
+          ZIP_SHA256="$(sha256sum "dist/autodom-chrome-${V}.zip" | awk '{print $1}')"
+          echo "crx_sha256=$CRX_SHA256" >> "$GITHUB_OUTPUT"
+          echo "zip_sha256=$ZIP_SHA256" >> "$GITHUB_OUTPUT"
+
+      # Another packaging workflow or a maintainer may create the release at
+      # the same time. Treat that race as success, then upload with --clobber.
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          if ! gh release view "v${V}" >/dev/null 2>&1; then
+            gh release create "v${V}" --title "AutoDOM v${V}" --generate-notes || \
+              gh release view "v${V}" >/dev/null
+          fi
+          gh release upload "v${V}" \
+            "dist/autodom-${V}.crx" \
+            "dist/autodom-chrome-${V}.zip" \
+            --clobber
+
+      - name: Verify uploaded release assets
+        env:
+          V: ${{ steps.ver.outputs.version }}
+        run: |
+          for asset in "autodom-${V}.crx" "autodom-chrome-${V}.zip"; do
+            curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+              --output /dev/null \
+              "https://github.com/${AUTODOM_REPO_SLUG}/releases/download/v${V}/${asset}"
+          done
+
+      - name: Generate update manifests
+        env:
+          V: ${{ steps.ver.outputs.version }}
+          CRX_SHA256: ${{ steps.sums.outputs.crx_sha256 }}
+          ZIP_SHA256: ${{ steps.sums.outputs.zip_sha256 }}
+        run: |
           node scripts/build-update-manifests.mjs \
             --version "$V" \
             --extension-id "$CHROME_EXTENSION_ID" \
             --crx-url "https://github.com/${AUTODOM_REPO_SLUG}/releases/download/v${V}/autodom-${V}.crx" \
-            --out-dir gh-pages-publish
+            --crx-sha256 "$CRX_SHA256" \
+            --zip-url "https://github.com/${AUTODOM_REPO_SLUG}/releases/download/v${V}/autodom-chrome-${V}.zip" \
+            --zip-sha256 "$ZIP_SHA256" \
+            --out-dir dist/update-manifests
 
       - name: Publish update manifests to GitHub Pages
         env:
           V: ${{ steps.ver.outputs.version }}
         run: |
+          git fetch origin gh-pages
+          git worktree add --detach gh-pages-publish origin/gh-pages
+          cp dist/update-manifests/updates.xml gh-pages-publish/updates.xml
+          cp dist/update-manifests/updates.json gh-pages-publish/updates.json
           cd gh-pages-publish
-          git init
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
-          git add -A
-          git commit -m "Deploy update manifests for v${V}"
-          git push --force \
-            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
-            HEAD:gh-pages
+          git add updates.xml updates.json
+          if git diff --cached --quiet; then
+            echo "Update manifests already current."
+          else
+            git commit -m "Deploy update manifests for v${V}"
+            git push origin HEAD:gh-pages
+          fi
 
-      - name: Stage release assets
+      - name: Verify live update channel
         env:
           V: ${{ steps.ver.outputs.version }}
         run: |
-          {
-            echo "dist/autodom-${V}.crx"
-            echo "dist/autodom-chrome-${V}.zip"
-          } > /tmp/release-assets.txt
-          echo "── Release assets ──"
-          cat /tmp/release-assets.txt
-          {
-            echo "RELEASE_FILES<<__EOF__"
-            cat /tmp/release-assets.txt
-            echo "__EOF__"
-          } >> "$GITHUB_ENV"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
-        with:
-          tag_name: v${{ steps.ver.outputs.version }}
-          name: AutoDOM v${{ steps.ver.outputs.version }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: ${{ env.RELEASE_FILES }}
+          for attempt in {1..12}; do
+            if node scripts/verify-update-channel.mjs \
+              "https://eziocode.github.io/autodom-extension" "$V"; then
+              exit 0
+            fi
+            echo "GitHub Pages not current yet (attempt ${attempt}/12); retrying in 10s…"
+            sleep 10
+          done
+          exit 1
 
       - name: Summary
         run: |
@@ -224,7 +262,7 @@ jobs:
             echo
             echo "- CRX: \`dist/autodom-${{ steps.ver.outputs.version }}.crx\`"
             echo "- Chrome zip: \`dist/autodom-chrome-${{ steps.ver.outputs.version }}.zip\`"
-            echo "- updates.xml published to \`gh-pages\`."
+            echo "- updates.xml + updates.json published to \`gh-pages\`."
             echo
             echo "Existing installs will pick up this version on their next scheduled update check."
           } >> "$GITHUB_STEP_SUMMARY"

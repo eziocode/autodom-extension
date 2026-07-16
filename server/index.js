@@ -15,6 +15,15 @@
  */
 
 import { FastMCP, imageContent } from "fastmcp";
+import extractZip from "extract-zip";
+import {
+  MAX_UPDATE_BYTES,
+  atomicReplaceDirectory,
+  compareExtensionVersions,
+  isGitWorktree,
+  validateStagedExtension,
+  validateUpdateMetadata,
+} from "./update-utils.js";
 import { WebSocketServer, WebSocket } from "ws";
 import { z } from "zod";
 import { fileURLToPath } from "url";
@@ -23,7 +32,7 @@ import { promises as fs, readFileSync, rmSync, createWriteStream } from "fs";
 import { tmpdir } from "os";
 import { join, isAbsolute, resolve as resolvePath } from "path";
 import { promisify } from "util";
-import { randomBytes, timingSafeEqual } from "crypto";
+import { createHash, randomBytes, timingSafeEqual } from "crypto";
 
 // Local Playwright/Node automation backends were intentionally removed: AutoDOM
 // is a Playwright alternative, not a wrapper, and any server-spawned automation
@@ -880,6 +889,9 @@ function sendToExtensionImmediate(messageObj) {
 // ─── WebSocket Server (for Chrome extension) ─────────────────
 
 const serverPath = fileURLToPath(import.meta.url);
+const SERVER_VERSION = JSON.parse(
+  readFileSync(new URL("./package.json", import.meta.url), "utf8"),
+).version;
 const lockFilePath = join(tmpdir(), `autodom-bridge-${WS_PORT}.json`);
 
 // ─── Inactivity Auto-Shutdown ────────────────────────────────
@@ -2908,6 +2920,8 @@ function _handleSelfUpdate(socket, message) {
 
 async function _runSelfUpdateInBackground(socket, id) {
   const DOWNLOAD_TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes
+  const UPDATE_METADATA_URL =
+    "https://eziocode.github.io/autodom-extension/updates.json";
 
   const reply = (payload) => {
     try { socket.send(JSON.stringify({ type: "SELF_UPDATE_RESULT", id, ...payload })); } catch (_) {}
@@ -2917,8 +2931,11 @@ async function _runSelfUpdateInBackground(socket, id) {
   };
 
   let tmpZip = null;
+  let stagingDir = null;
+  let backupDir = null;
   try {
     const extDir = resolvePath(serverPath, "..", "..", "extension");
+    const installRoot = resolvePath(extDir, "..");
     try {
       await fs.access(join(extDir, "manifest.json"));
     } catch {
@@ -2926,21 +2943,45 @@ async function _runSelfUpdateInBackground(socket, id) {
       return;
     }
 
+    // Never overwrite source-controlled developer work. Share bundles do not
+    // contain .git and remain eligible for the bridge updater.
+    if (await isGitWorktree(installRoot)) {
+      reply({
+        ok: false,
+        error:
+          "AutoDOM is running from a Git worktree. Update with `git pull`, then reload the unpacked extension; bridge self-update will not overwrite source files.",
+      });
+      return;
+    }
+
     sendProgress(2, 0, 0, "Fetching latest version info…");
-    const xmlRes = await fetchWithTimeout(
-      "https://eziocode.github.io/autodom-extension/updates.xml",
+    const metadataRes = await fetchWithTimeout(
+      UPDATE_METADATA_URL,
       {},
       15000,
     );
-    if (!xmlRes.ok) throw new Error(`updates.xml HTTP ${xmlRes.status}`);
-    const xmlText = await xmlRes.text();
-    const verMatch = xmlText.match(/version="([0-9]+\.[0-9]+\.[0-9]+)"/);
-    if (!verMatch) {
-      reply({ ok: false, error: "Could not read latest version from updates.xml" });
+    if (!metadataRes.ok) {
+      throw new Error(`updates.json HTTP ${metadataRes.status}`);
+    }
+    const metadata = await metadataRes.json();
+    const {
+      version: latestVersion,
+      url: zipUrl,
+      sha256: expectedSha256,
+    } = validateUpdateMetadata(metadata, DEFAULT_CHROME_EXTENSION_ID);
+
+    const currentManifest = JSON.parse(
+      await fs.readFile(join(extDir, "manifest.json"), "utf8"),
+    );
+    const manifestVersion = String(currentManifest.version || "");
+    const currentVersion = /^\d+\.\d+\.\d+(\.\d+)?$/.test(manifestVersion)
+      ? manifestVersion
+      : "0.0.0";
+    if (compareExtensionVersions(currentVersion, latestVersion) >= 0) {
+      sendProgress(100, 0, 0, `Already on v${currentVersion}`);
+      reply({ ok: true, version: currentVersion, alreadyCurrent: true });
       return;
     }
-    const latestVersion = verMatch[1];
-    const zipUrl = `https://github.com/eziocode/autodom-extension/releases/download/v${latestVersion}/autodom-chrome-${latestVersion}.zip`;
     tmpZip = join(tmpdir(), `autodom-update-${Date.now()}.zip`);
 
     sendProgress(5, 0, 0, `Starting download of v${latestVersion}…`);
@@ -2962,8 +3003,13 @@ async function _runSelfUpdateInBackground(socket, id) {
     }
 
     const contentLength = parseInt(zipRes.headers.get("content-length") || "0", 10);
+    if (contentLength > MAX_UPDATE_BYTES) {
+      clearTimeout(downloadTimer);
+      throw new Error("Update ZIP exceeds 50 MiB safety limit");
+    }
     const reader = zipRes.body.getReader();
-    const chunks = [];
+    const output = await fs.open(tmpZip, "wx", 0o600);
+    const hash = createHash("sha256");
     let downloaded = 0;
     let lastReportedPct = 5;
     let lastReportedBytes = 0;
@@ -2972,8 +3018,12 @@ async function _runSelfUpdateInBackground(socket, id) {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        chunks.push(value);
         downloaded += value.length;
+        if (downloaded > MAX_UPDATE_BYTES) {
+          throw new Error("Update ZIP exceeds 50 MiB safety limit");
+        }
+        hash.update(value);
+        await output.write(value);
         if (contentLength > 0) {
           // Accurate percentage: map body progress to 5–85 % range, report every 5 %
           const pct = Math.min(85, Math.round(5 + (downloaded / contentLength) * 80));
@@ -2996,24 +3046,26 @@ async function _runSelfUpdateInBackground(socket, id) {
       }
     } finally {
       clearTimeout(downloadTimer);
+      await output.close();
     }
 
-    const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
-    await fs.writeFile(tmpZip, buf);
+    const actualSha256 = hash.digest("hex");
+    if (actualSha256 !== expectedSha256) {
+      throw new Error(
+        `Update ZIP SHA-256 mismatch (${actualSha256} != ${expectedSha256})`,
+      );
+    }
 
-    sendProgress(88, downloaded, contentLength, "Extracting…");
+    sendProgress(88, downloaded, contentLength, "Validating…");
+    stagingDir = await fs.mkdtemp(join(installRoot, ".autodom-extension-update-"));
+    await extractZip(tmpZip, { dir: stagingDir });
+    await validateStagedExtension(stagingDir, latestVersion);
 
-    await new Promise((resolve, reject) => {
-      let unzipTimer;
-      const child = execFile("unzip", ["-q", "-o", tmpZip, "-d", extDir], (err) => {
-        clearTimeout(unzipTimer);
-        if (err) reject(err); else resolve();
-      });
-      unzipTimer = setTimeout(() => {
-        try { child.kill(); } catch (_) {}
-        reject(new Error("unzip timed out after 60s"));
-      }, 60000);
-    });
+    sendProgress(94, downloaded, contentLength, "Installing atomically…");
+    backupDir = join(installRoot, `.autodom-extension-backup-${Date.now()}`);
+    await atomicReplaceDirectory(extDir, stagingDir, backupDir);
+    stagingDir = null;
+    backupDir = null;
 
     sendProgress(100, downloaded, contentLength, "Complete");
     reply({ ok: true, version: latestVersion });
@@ -3021,6 +3073,15 @@ async function _runSelfUpdateInBackground(socket, id) {
     reply({ ok: false, error: err?.message || String(err) });
   } finally {
     if (tmpZip) { try { await fs.unlink(tmpZip); } catch (_) {} }
+    if (stagingDir) {
+      try { await fs.rm(stagingDir, { recursive: true, force: true }); } catch (_) {}
+    }
+    if (backupDir) {
+      try {
+        const extDir = resolvePath(serverPath, "..", "..", "extension");
+        await fs.access(extDir).catch(async () => fs.rename(backupDir, extDir));
+      } catch (_) {}
+    }
   }
 }
 
@@ -5799,9 +5860,28 @@ async function callCliProvider({
   };
 }
 
+const fastMcpLogger = {
+  debug: (...args) => diagLog(`[FastMCP] ${args.map(String).join(" ")}`),
+  info: (...args) => diagLog(`[FastMCP] ${args.map(String).join(" ")}`),
+  log: (...args) => diagLog(`[FastMCP] ${args.map(String).join(" ")}`),
+  warn: (...args) => {
+    const message = args.map(String).join(" ");
+    // Lean test/IDE clients may omit optional capability metadata. AutoDOM
+    // does not consume it, so this warning is noise rather than instability.
+    if (message.includes("could not infer client capabilities")) return;
+    process.stderr.write(`[FastMCP warning] ${message}\n`);
+  },
+  error: (...args) =>
+    process.stderr.write(`[FastMCP error] ${args.map(String).join(" ")}\n`),
+};
+
 const server = new FastMCP({
   name: "autodom",
-  version: "1.0.0",
+  version: SERVER_VERSION,
+  // AutoDOM never consumes client filesystem roots. Disabling negotiation
+  // avoids repeated capability probes against lean IDE MCP clients.
+  roots: { enabled: false },
+  logger: fastMcpLogger,
 });
 
 function _playwrightTarget(params = {}) {
@@ -6307,9 +6387,17 @@ server.addTool({
       .describe("Include hidden/invisible elements"),
     maxElements: z
       .number()
+      .int()
+      .min(1)
+      .max(200)
       .optional()
-      .default(200)
+      .default(60)
       .describe("Maximum number of elements to return"),
+    includeDiagnostics: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Include scan duration, candidate count, pass count, and truncation state"),
     autoScroll: z
       .boolean()
       .optional()
@@ -6319,16 +6407,23 @@ server.addTool({
       ),
     maxScrolls: z
       .number()
+      .int()
+      .min(0)
+      .max(50)
       .optional()
       .default(12)
       .describe("Max scroll steps when autoScroll is true"),
     scrollDelayMs: z
       .number()
+      .min(0)
+      .max(2000)
       .optional()
       .default(350)
       .describe("Delay after each scroll step to let lazy content render (ms)"),
     maxDurationMs: z
       .number()
+      .min(100)
+      .max(30000)
       .optional()
       .default(8000)
       .describe("Overall time budget for autoScroll collection (ms)"),
@@ -8416,13 +8511,13 @@ if (STOP_ONLY) {
       session.on("error", (err) => {
         diagLog(`MCP session error: ${err?.message || err}`);
       });
-      session.on("close", () => {
-        diagLog("MCP session closed");
-        if (activeMcpSession === session) {
-          activeMcpSession = null;
-          process.stderr.write("[AutoDOM] IDE AI agent session disconnected\n");
-        }
-      });
+    });
+    server.on("disconnect", ({ session }) => {
+      diagLog("MCP session disconnected");
+      if (activeMcpSession === session) {
+        activeMcpSession = null;
+        process.stderr.write("[AutoDOM] IDE AI agent session disconnected\n");
+      }
     });
 
     await server.start({

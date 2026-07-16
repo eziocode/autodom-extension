@@ -35,19 +35,8 @@ jobs:
         working-directory: server
         run: npm audit --audit-level=high
 
-      - name: Syntax check (server)
-        working-directory: server
-        run: node --check index.js && node --check cli.js && node --check wrapper.js
-
-      - name: Syntax check (extension)
-        run: |
-          for f in extension/background/service-worker.js \
-                   extension/common/webext-api.js \
-                   extension/content/chat-panel.js \
-                   extension/content/session-border.js \
-                   extension/popup/popup.js; do
-            node --check "$f"
-          done
+      - name: Syntax check all JavaScript
+        run: git ls-files '*.js' '*.mjs' '*.cjs' | xargs -n1 node --check
 
       - name: Validate manifest
         run: python3 -c "import json; json.load(open('extension/manifest.json'))"
@@ -56,9 +45,16 @@ jobs:
         working-directory: server
         run: node test/test-wsauth.mjs
 
-      - name: End-to-end smoke test
+      - name: Extension and updater unit tests
+        run: node --test tests/*.test.mjs server/test/test-update-utils.mjs
+
+      - name: Bridge reliability tests
         working-directory: server
-        run: node test/e2e.cjs
+        run: |
+          node test/test-reconnect.cjs
+          node test/test-proxy-reconnect.cjs
+          node test/test-concurrency.cjs
+          node test/e2e.cjs
 
       - name: Build Chrome zip
         run: bash scripts/build-chrome.sh

@@ -40,6 +40,10 @@
         type: "object",
         properties: {
           maxElements: { type: "integer", description: "Cap (default 60)" },
+          includeDiagnostics: {
+            type: "boolean",
+            description: "Include scan timing and operation counts (default false)",
+          },
           autoScroll: {
             type: "boolean",
             description:
@@ -49,6 +53,10 @@
           scrollDelayMs: {
             type: "integer",
             description: "Delay per scroll step in ms (default 350)",
+          },
+          maxDurationMs: {
+            type: "integer",
+            description: "Overall auto-scroll budget in ms (default 8000)",
           },
         },
         additionalProperties: false,

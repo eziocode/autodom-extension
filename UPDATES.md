@@ -7,7 +7,7 @@ provided you install it via one of the supported paths below.
 | Browser | Install path | Updates? |
 |---|---|---|
 | Chrome / Edge / Brave / Arc / Ulaa | One-time enterprise policy install — handled automatically by `setup.sh` / `setup.ps1`, or manually via `enterprise/install.{sh,ps1}` | ✅ silent, ~5h cadence |
-| Chrome / Edge / Brave (developer / unpacked) | `Load unpacked` from a clone of this repo — source manifest carries the same canonical extension ID, so the same self-hosted update channel still applies | ✅ silent, ~5h cadence (Chromium will replace the unpacked load with the signed CRX on update) |
+| Chrome / Edge / Brave (developer / unpacked) | `Load unpacked` from a clone or share bundle | Share bundle: ✅ via bridge updater. Git clone: use `git pull` + reload; source files are never overwritten. |
 
 > **Why is there a policy install?** Chrome silently blocks off-Web-Store
 > installs for unmanaged users — that's a browser policy decision, not
@@ -92,11 +92,12 @@ For local development on the extension itself:
 - `chrome://extensions` → enable *Developer mode* → *Load unpacked* → pick
   the `extension/` folder.
 
-The source manifest now carries the canonical signing `key`, so an unpacked
-load resolves to the same extension ID as the published CRX. The browser
-will still poll the self-hosted update channel and replace the unpacked load
-with the signed CRX once an update is available — keep `git pull` + manual
-reload only if you're actively iterating on local changes.
+The source manifest carries the canonical signing `key`, so an unpacked load
+resolves to the same extension ID as the published CRX. Chromium does not
+reliably install self-hosted CRXs over a development load. AutoDOM therefore
+uses its local bridge updater for unpacked share bundles. When `.git` is
+present, the updater refuses to overwrite the worktree; run `git pull`, then
+reload from `chrome://extensions`.
 
 ---
 
@@ -142,13 +143,14 @@ maintainer pushes git tag vX.Y.Z
             │
             ▼
 .github/workflows/release.yml
-   • bump version in extension/manifest.json + server/package.json
+   • validate tag against committed manifest/package versions
    • re-validate the embedded Chrome `key` (already in source manifest)
    • build chrome zip
    • crx-pack signed CRX with CHROME_CRX_PRIVATE_KEY
+   • upload + verify signed CRX and unpacked ZIP
    • node scripts/build-update-manifests.mjs
             │
-            ├──► gh-pages branch (updates.xml)
+            ├──► gh-pages branch (updates.xml + updates.json)
             │       │
             │       └─► https://eziocode.github.io/autodom-extension/updates.xml
             │              ▲
@@ -163,6 +165,11 @@ maintainer pushes git tag vX.Y.Z
 Stable URL (never changes across releases):
 
 - Chromium update manifest: <https://eziocode.github.io/autodom-extension/updates.xml>
+- Verified share-update metadata: <https://eziocode.github.io/autodom-extension/updates.json>
+
+`updates.json` pins SHA-256 digests for both release artifacts. The bridge
+streams the ZIP into a bounded temporary file, verifies its digest, validates
+the staged manifest, and swaps directories atomically with rollback.
 
 For maintainer-side setup (signing keys, gh-pages bootstrap), see
 [`docs/RELEASE-SIGNING.md`](docs/RELEASE-SIGNING.md).
