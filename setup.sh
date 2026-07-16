@@ -310,16 +310,17 @@ echo -e "${BLUE}[1/6]${NC} Checking Node.js..."
 
 if ! command -v node &> /dev/null; then
     echo -e "${RED}✗ Node.js not found.${NC}"
-    echo "  Install it from https://nodejs.org (v18+)"
+    echo "  Install it from https://nodejs.org (v20.19+, v22.12+, or v23+)"
     echo ""
     echo "  macOS (Homebrew):   brew install node"
     echo "  Ubuntu/Debian:      curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt-get install -y nodejs"
     exit 1
 fi
 
-NODE_VERSION=$(node -v | sed 's/v//' | cut -d. -f1)
-if [ "$NODE_VERSION" -lt 18 ]; then
-    echo -e "${RED}✗ Node.js v18+ required (found $(node -v))${NC}"
+NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]")
+NODE_MINOR=$(node -p "process.versions.node.split('.')[1]")
+if ! { { [ "$NODE_MAJOR" -eq 20 ] && [ "$NODE_MINOR" -ge 19 ]; } || { [ "$NODE_MAJOR" -eq 22 ] && [ "$NODE_MINOR" -ge 12 ]; } || [ "$NODE_MAJOR" -ge 23 ]; }; then
+    echo -e "${RED}✗ Node.js v20.19+, v22.12+, or v23+ required (found $(node -v))${NC}"
     echo "  Update at https://nodejs.org"
     exit 1
 fi

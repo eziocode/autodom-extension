@@ -16,7 +16,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server + Chromium ex
 <br>
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](server/package.json)
-[![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/node-20.19%2B%20%7C%2022.12%2B%20%7C%2023%2B-brightgreen?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org)
 [![MCP](https://img.shields.io/badge/protocol-MCP-blueviolet?style=flat-square)](https://modelcontextprotocol.io)
 [![Chrome MV3](https://img.shields.io/badge/extension-Manifest%20V3-yellow?style=flat-square&logo=googlechrome&logoColor=white)](extension/manifest.json)
 [![Release](https://img.shields.io/github/v/release/eziocode/autodom-extension?style=flat-square&color=orange)](https://github.com/eziocode/autodom-extension/releases/latest)
@@ -98,7 +98,7 @@ GPO / plist / JSON policy templates for force-install across macOS, Windows, and
 
 | Requirement | Details |
 |:---|:---|
-| **Node.js** | v18 or newer — `node -v` to check |
+| **Node.js** | v20.19+, v22.12+, or v23+ — `node -v` to check |
 | **Chromium browser** | Chrome, Edge, Brave, Arc, Ulaa, or any MV3-compatible browser |
 | **MCP-capable IDE** | IntelliJ family, VS Code, Cursor, Claude Desktop, Gemini CLI |
 | **Free port** | `9876` on `127.0.0.1` *(configurable)* |
@@ -123,7 +123,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 <summary><b>What the installer does</b></summary>
 <br>
 
-1. ✅ Verifies Node.js v18+
+1. ✅ Verifies a supported Node.js version (v20.19+, v22.12+, or v23+)
 2. ✅ Runs `npm install` inside `server/`
 3. ✅ Auto-detects installed IDEs and writes MCP config for each
 4. ✅ Enables AutoDOM for **GitHub Copilot** and **JetBrains AI Assistant**

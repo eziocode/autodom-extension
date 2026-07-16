@@ -4,7 +4,7 @@
 
 | Requirement | Minimum Version | How to Check |
 |---|---|---|
-| **Node.js** | v18+ | `node -v` |
+| **Node.js** | v20.19+, v22.12+, or v23+ | `node -v` |
 | **npm** | (bundled with Node.js) | `npm -v` |
 | **Chromium-based browser** | Chrome, Edge, Brave, Ulaa, Arc, etc. | Any browser supporting Manifest V3 extensions |
 | **IDE with MCP support** | See supported IDEs below | — |
@@ -61,7 +61,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 
 Both scripts will:
 
-- ✅ Check Node.js v18+ is installed
+- ✅ Check a supported Node.js version (v20.19+, v22.12+, or v23+) is installed
 - ✅ Install server dependencies (`npm install`)
 - ✅ Auto-configure all detected IDEs (JetBrains, VS Code, Cursor, Claude Desktop, Gemini CLI)
 - ✅ On macOS/Linux: enable AutoDOM for both **GitHub Copilot** and **JetBrains AI Assistant**
@@ -363,7 +363,7 @@ Also check browser tabs — the extension's content scripts (chat panel, session
 ### Node.js version too old
 
 ```bash
-node -v   # must be v18.0.0 or later
+node -v   # must be v20.19+, v22.12+, or v23+
 ```
 
 Update via:

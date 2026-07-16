@@ -8262,7 +8262,7 @@ chrome.storage.local.get(
 
 // Also auto-connect on extension install/update
 chrome.runtime.onInstalled.addListener(() => {
-  _ensureUpdateCheckAlarm();
+  void _refreshPeriodicUpdateScheduler("extension_installed");
 
   // A fresh install or successful update arrival clears any pending-update
   // marker. The new manifest version is already running, so the popup
@@ -8573,6 +8573,14 @@ async function _requestPublishedUpdateManifest() {
 
 async function _maybeAutoApplyPendingUpdate(pending, source) {
   if (!pending || !pending.version) return false;
+  // Do not tear down an active agent run. Alarm/startup checks encounter the
+  // persisted pending marker again and retry once the run is idle.
+  if (_activeAgentRun) {
+    _debugLog(
+      `[AutoDOM SW] Deferring update ${pending.version}; agent run is active`,
+    );
+    return false;
+  }
   const stored = await _readUpdateStorage(
     [
       UPDATE_STORAGE_KEYS.autoUpdateEnabled,
@@ -8614,9 +8622,10 @@ async function _setAvailableUpdate(details, runtimeStatus, source) {
     available.codebase = details.codebase;
   }
   try {
-    chrome.storage.local.set({
-      [UPDATE_STORAGE_KEYS.available]: available,
-    });
+    await _writeUpdateStorage(
+      { [UPDATE_STORAGE_KEYS.available]: available },
+      "available update",
+    );
     if (chrome.action && chrome.action.setBadgeText) {
       chrome.action.setBadgeText({ text: "•" });
     }
@@ -8650,10 +8659,17 @@ async function _setPendingUpdate(version, source) {
     detectedAt: Date.now(),
   };
   try {
-    chrome.storage.local.set({
-      [UPDATE_STORAGE_KEYS.pending]: pending,
+    await _writeUpdateStorage(
+      { [UPDATE_STORAGE_KEYS.pending]: pending },
+      "pending update",
+    );
+    await new Promise((resolve) => {
+      try {
+        chrome.storage.local.remove(UPDATE_STORAGE_KEYS.available, resolve);
+      } catch (_) {
+        resolve();
+      }
     });
-    chrome.storage.local.remove(UPDATE_STORAGE_KEYS.available);
     if (chrome.action && chrome.action.setBadgeText) {
       chrome.action.setBadgeText({ text: "•" });
     }
@@ -9381,15 +9397,19 @@ async function executeCodeViaCdp(tabId, code, timeoutMs) {
 async function toolGetDomState(params) {
   const tab = await getActiveTab();
   const includeHidden = params?.includeHidden || false;
-  const maxElements = params?.maxElements || 60;
+  const maxElements = Math.min(200, Math.max(1, Number(params?.maxElements) || 60));
   const autoScroll = params?.autoScroll || false;
-  const maxScrolls = Number.isFinite(params?.maxScrolls) ? params.maxScrolls : 12;
+  const maxScrolls = Math.min(
+    50,
+    Math.max(0, Number.isFinite(params?.maxScrolls) ? params.maxScrolls : 12),
+  );
   const scrollDelayMs = Number.isFinite(params?.scrollDelayMs)
-    ? params.scrollDelayMs
+    ? Math.min(2000, Math.max(0, params.scrollDelayMs))
     : 350;
   const maxDurationMs = Number.isFinite(params?.maxDurationMs)
-    ? params.maxDurationMs
+    ? Math.min(30000, Math.max(100, params.maxDurationMs))
     : 8000;
+  const includeDiagnostics = params?.includeDiagnostics === true;
 
   const result = await executeInTab(
     tab.id,
@@ -9400,7 +9420,48 @@ async function toolGetDomState(params) {
       maxScrolls,
       scrollDelayMs,
       maxDurationMs,
+      includeDiagnostics,
     ) => {
+      const scanStartedAt = performance.now();
+      let selectorQueries = 0;
+      let layoutReads = 0;
+      let collectionPasses = 0;
+      let scannedCandidates = 0;
+      let visibilityCache = new WeakMap();
+      const queryAll = (root, selector) => {
+        selectorQueries += 1;
+        return root.querySelectorAll(selector);
+      };
+      const countInteractiveDescendants = (allElements, root, isNoisyCandidate) => {
+        const noisyCandidates = new Set(allElements.filter(isNoisyCandidate));
+        const counts = new Map();
+        if (!noisyCandidates.size) return counts;
+        for (const child of allElements) {
+          let ancestor = child.parentElement;
+          while (ancestor) {
+            if (noisyCandidates.has(ancestor)) {
+              counts.set(ancestor, Math.min(4, (counts.get(ancestor) || 0) + 1));
+            }
+            if (ancestor === root) break;
+            ancestor = ancestor.parentElement;
+          }
+        }
+        return counts;
+      };
+      const finish = (payload) => {
+        if (!includeDiagnostics) return payload;
+        return {
+          ...payload,
+          diagnostics: {
+            durationMs: Math.round((performance.now() - scanStartedAt) * 10) / 10,
+            scannedCandidates,
+            selectorQueries,
+            layoutReads,
+            collectionPasses,
+            truncated: payload.elementCount >= maxElements,
+          },
+        };
+      };
       const INTERACTIVE_SELECTORS = [
         "a[href]",
         "button",
@@ -9476,23 +9537,29 @@ async function toolGetDomState(params) {
 
       function isVisible(el) {
         if (includeHidden) return true;
+        if (visibilityCache.has(el)) return visibilityCache.get(el);
         const style = window.getComputedStyle(el);
+        layoutReads += 1;
         if (
           style.display === "none" ||
           style.visibility === "hidden" ||
           style.opacity === "0"
         ) {
+          visibilityCache.set(el, false);
           return false;
         }
         const rect = el.getBoundingClientRect();
-        return rect.width > 0 || rect.height > 0;
+        layoutReads += 1;
+        const visible = rect.width > 0 || rect.height > 0;
+        visibilityCache.set(el, visible);
+        return visible;
       }
 
       function isExtensionUi(el) {
         return !!(EXTENSION_UI_SELECTOR && el.closest(EXTENSION_UI_SELECTOR));
       }
 
-      function isNoisyContainer(el) {
+      function isNoisyContainerShape(el) {
         const tag = el.tagName.toLowerCase();
         const role = (el.getAttribute("role") || "").toLowerCase();
         if (INTERACTIVE_ROLES.has(role)) return false;
@@ -9506,7 +9573,7 @@ async function toolGetDomState(params) {
         if (!["div", "section", "main", "article", "nav", "aside"].includes(tag)) {
           return false;
         }
-        return el.querySelectorAll(INTERACTIVE_QUERY).length >= 4;
+        return true;
       }
 
       function describeRoot(root, strategy) {
@@ -9565,10 +9632,18 @@ async function toolGetDomState(params) {
       }
 
       function collectElements(root, excludeChrome) {
+        collectionPasses += 1;
+        visibilityCache = new WeakMap();
         const seen = new Set();
         const elements = [];
         const refs = [];
-        const allEls = root.querySelectorAll(INTERACTIVE_QUERY);
+        const allEls = Array.from(queryAll(root, INTERACTIVE_QUERY));
+        scannedCandidates += allEls.length;
+        const descendantCounts = countInteractiveDescendants(
+          allEls,
+          root,
+          isNoisyContainerShape,
+        );
 
         for (const el of allEls) {
           if (seen.has(el)) continue;
@@ -9577,7 +9652,7 @@ async function toolGetDomState(params) {
           if (isExtensionUi(el)) continue;
           if (excludeChrome && el.closest(APP_CHROME_SELECTOR)) continue;
           if (!isVisible(el)) continue;
-          if (isNoisyContainer(el)) continue;
+          if ((descendantCounts.get(el) || 0) >= 4) continue;
 
           elements.push(serializeElement(el, elements.length));
           refs.push(el);
@@ -9598,6 +9673,7 @@ async function toolGetDomState(params) {
           }
           seenRoots.add(root);
           const rect = root.getBoundingClientRect();
+          layoutReads += 1;
           const score = Math.max(0, rect.width) * Math.max(0, rect.height);
           if (score > bestScore) {
             best = root;
@@ -9605,9 +9681,7 @@ async function toolGetDomState(params) {
           }
         };
 
-        ROOT_CANDIDATE_SELECTORS.forEach((selector) => {
-          document.querySelectorAll(selector).forEach(consider);
-        });
+        queryAll(document, ROOT_CANDIDATE_SELECTORS.join(",")).forEach(consider);
 
         const probe = document.elementFromPoint(
           Math.min(window.innerWidth - 40, Math.floor(window.innerWidth * 0.66)),
@@ -9623,15 +9697,15 @@ async function toolGetDomState(params) {
       function pickVisibleOverlay() {
         let best = null;
         let bestScore = 0;
-        document
-          .querySelectorAll(OVERLAY_CANDIDATE_SELECTORS.join(","))
+        queryAll(document, OVERLAY_CANDIDATE_SELECTORS.join(","))
           .forEach((el) => {
             if (isExtensionUi(el) || !isVisible(el)) return;
             const text = (el.textContent || "").trim();
-            if (!text && el.querySelectorAll(INTERACTIVE_QUERY).length === 0) {
+            if (!text && queryAll(el, INTERACTIVE_QUERY).length === 0) {
               return;
             }
             const rect = el.getBoundingClientRect();
+            layoutReads += 1;
             const score = Math.max(1, rect.width) * Math.max(1, rect.height);
             if (score > bestScore) {
               best = el;
@@ -9691,7 +9765,7 @@ async function toolGetDomState(params) {
           const searchScope = root && root !== document ? root : document;
           let best = null;
           let bestScore = 0;
-          searchScope.querySelectorAll("*").forEach((el) => {
+          queryAll(searchScope, "*").forEach((el) => {
             if (!isScrollable(el)) return;
             const rect = el.getBoundingClientRect();
             const score =
@@ -9833,14 +9907,14 @@ async function toolGetDomState(params) {
           items: mergedMeta,
         };
 
-        return {
+        return finish({
           title: document.title,
           url: location.href,
           scope: scopeInfo,
           elementCount: mergedEls.length,
           elements: mergedEls,
           autoScrolled: true,
-        };
+        });
       }
 
       let scope = { strategy: "document-filtered", label: "document body" };
@@ -9884,13 +9958,13 @@ async function toolGetDomState(params) {
       window.__autodomIndexedElements = indexRefs;
       window.__autodomIndexMeta = null;
 
-      return {
+      return finish({
         title: document.title,
         url: location.href,
         scope,
         elementCount: elements.length,
         elements,
-      };
+      });
     },
     [
       includeHidden,
@@ -9899,6 +9973,7 @@ async function toolGetDomState(params) {
       maxScrolls,
       scrollDelayMs,
       maxDurationMs,
+      includeDiagnostics,
     ],
   );
 

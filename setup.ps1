@@ -78,13 +78,18 @@ Write-Host ""
 Write-Step "Checking Node.js..."
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) {
-    Write-Fail "Node.js not found. Install v18+ from https://nodejs.org"
+    Write-Fail "Node.js not found. Install v20.19+, v22.12+, or v23+ from https://nodejs.org"
     exit 1
 }
 $nodeVer = (& node -v).TrimStart('v')
-$majorVer = [int]($nodeVer.Split('.')[0])
-if ($majorVer -lt 18) {
-    Write-Fail "Node.js v18+ required (found v$nodeVer)"
+$nodeParts = $nodeVer.Split('.')
+$majorVer = [int]$nodeParts[0]
+$minorVer = [int]$nodeParts[1]
+$supportedNode = (($majorVer -eq 20 -and $minorVer -ge 19) -or
+                  ($majorVer -eq 22 -and $minorVer -ge 12) -or
+                  $majorVer -ge 23)
+if (-not $supportedNode) {
+    Write-Fail "Node.js v20.19+, v22.12+, or v23+ required (found v$nodeVer)"
     exit 1
 }
 Write-Ok "node v$nodeVer"

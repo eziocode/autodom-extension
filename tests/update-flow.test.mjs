@@ -234,6 +234,16 @@ function loadServiceWorkerUpdateSanitizer(stored) {
   return { sandbox, removed, writes };
 }
 
+function loadServiceWorkerFunction(name, sandbox) {
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(
+    `${extractFunctionSource(serviceWorkerSrc, name)}; globalThis.${name} = ${name};`,
+    sandbox,
+  );
+  return sandbox[name];
+}
+
 test("paintUpdateButton ignores stale versions", () => {
   const { sandbox, elements } = loadPopup();
   const btn = elements.get("#checkUpdateBtn");
@@ -458,4 +468,46 @@ test("runUpdateCheck applies a pending update that appears after a release is fo
     "manual update check should apply the pending update",
   );
   assert.equal(elements.get("#checkUpdateBtn").disabled, false);
+});
+
+test("auto apply defers reload while an agent run is active", async () => {
+  let storageReads = 0;
+  let reloaded = false;
+  const sandbox = {
+    _activeAgentRun: { runId: "active" },
+    _debugLog() {},
+    _readUpdateStorage: async () => {
+      storageReads += 1;
+      return { autodomAutoUpdateEnabled: true };
+    },
+    _writeUpdateStorage: async () => true,
+    UPDATE_STORAGE_KEYS: {
+      autoUpdateEnabled: "autodomAutoUpdateEnabled",
+      autoUpdateApplyAttemptAt: "autodomAutoUpdateApplyAttemptAt",
+    },
+    AUTO_UPDATE_RELOAD_COOLDOWN_MS: 10 * 60 * 1000,
+    chrome: { runtime: { reload() { reloaded = true; } } },
+    setTimeout,
+    Date,
+  };
+  const maybeApply = loadServiceWorkerFunction("_maybeAutoApplyPendingUpdate", sandbox);
+  assert.equal(await maybeApply({ version: "9.0.0" }, "test"), false);
+  assert.equal(storageReads, 0);
+  assert.equal(reloaded, false);
+});
+
+test("periodic scheduler clears alarm when preference is disabled", async () => {
+  let ensured = 0;
+  let cleared = 0;
+  const sandbox = {
+    _isPeriodicUpdateChecksEnabled: async () => false,
+    _ensureUpdateCheckAlarm: () => { ensured += 1; },
+    _clearUpdateCheckAlarm: () => { cleared += 1; },
+  };
+  const refresh = loadServiceWorkerFunction("_refreshPeriodicUpdateScheduler", sandbox);
+  const result = await refresh("test");
+  assert.equal(result.enabled, false);
+  assert.equal(result.source, "test");
+  assert.equal(ensured, 0);
+  assert.equal(cleared, 1);
 });

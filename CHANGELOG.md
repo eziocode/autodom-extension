@@ -4,7 +4,26 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
-## Unreleased
+## 4.2.1
+
+### Fixed — update channel and updater integrity
+- Release publishing now uploads and verifies CRX/ZIP assets before changing
+  `updates.xml`, preventing manifests from pointing at missing release files.
+- Added checksummed-channel `updates.json` metadata with SHA-256 artifact pins.
+- Unpacked share updates now stream to disk, enforce a size limit, verify the
+  digest and manifest, stage cross-platform extraction, and install atomically
+  with rollback. Git worktrees are never overwritten.
+- Periodic-update preference now remains respected after extension updates,
+  and automatic reload waits until active agent work finishes.
+
+### Improved — runtime speed and MCP compatibility
+- Upgraded FastMCP 4, Zod 4, and ws 8; MCP server version now matches package
+  version and unused roots negotiation is disabled.
+- Raised bridge runtime floor to Node 20.19+, Node 22.12+, or Node 23+ because
+  FastMCP 4 dependencies no longer support Node 18 or Node 21.
+- Reduced `get_dom_state` subtree scans and repeated layout reads, standardized
+  its 60-element default, clamped expensive inputs, and added opt-in scan
+  diagnostics.
 
 ### Fixed — Multi-IDE bridge reliability ("secondary server can't reach primary")
 - **Pre-startup cleanup no longer kills healthy sibling bridges.** During concurrent startup or an MCP restart, a newly launched instance could terminate another IDE's running bridge, orphaning every secondary that proxied through it. Root causes removed:
