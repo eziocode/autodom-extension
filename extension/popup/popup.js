@@ -7,9 +7,6 @@
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
 
-// Single source of truth — bump this when tools are added/removed.
-const MCP_TOOL_COUNT = "70+";
-
 const DOM = {
   appVersion: $("#appVersion"),
   checkUpdateBtn: $("#checkUpdateBtn"),
@@ -385,6 +382,76 @@ async function _attachSelfUpdateTracker(btn, versionEl) {
 // Runs Chromium / Firefox's built-in extension update check against the
 // configured `update_url`. Browsers throttle this to a few times per hour,
 // so failures with status="throttled" are normal and surfaced to the user.
+async function _startBridgeSelfUpdate(btn, versionEl) {
+  btn.textContent = "Downloading…";
+  versionEl.textContent = "starting download via bridge…";
+  let startResult;
+  try {
+    startResult = await sendRuntimeMessage({ type: "AUTODOM_SELF_UPDATE" });
+  } catch (_) {
+    startResult = { ok: false, error: "Bridge unavailable" };
+  }
+  if (!startResult?.ok) {
+    btn.disabled = false;
+    const { availableUpdate } = await readUpdateState();
+    paintUpdateButton(null, availableUpdate);
+    showUpdatePolicyNotice(
+      availableUpdate?.version || "?",
+      startResult?.error ||
+        "bridge not connected — start the MCP bridge first, or ask an admin",
+    );
+    return false;
+  }
+  await _attachSelfUpdateTracker(btn, versionEl);
+  return true;
+}
+
+async function _applyOrExplainDiscoveredUpdate(result) {
+  const btn = DOM.checkUpdateBtn;
+  const pending = result?.pendingUpdate || null;
+  const version =
+    pending?.version ||
+    result?.details?.version ||
+    result?.availableUpdate?.version ||
+    "?";
+  btn.classList.remove("spin");
+  btn.disabled = false;
+  if (pending?.version) {
+    paintUpdateButton(pending, null);
+    await applyPendingUpdate();
+    return;
+  }
+
+  paintUpdateButton(
+    null,
+    result?.availableUpdate || result?.details || { version },
+  );
+  const unpacked = await isUnpackedInstall();
+  const latePending = unpacked ? null : await waitForPendingUpdate();
+  if (latePending) {
+    paintUpdateButton(latePending, null);
+    await applyPendingUpdate();
+    return;
+  }
+  showUpdatePolicyNotice(
+    version,
+    unpacked
+      ? "unpacked extension — Chrome cannot auto-update"
+      : "Chrome did not download a pending CRX",
+  );
+}
+
+function _updateCheckStatusLabel(result) {
+  const status = result?.status || "unknown";
+  if (status === "no_update") return "up to date";
+  if (status === "throttled") return "rate-limited";
+  if (status === "skipped" && result.reason === "not_due") {
+    return "checked recently";
+  }
+  if (status === "unsupported") return "not supported";
+  return String(status);
+}
+
 async function runUpdateCheck() {
   const btn = DOM.checkUpdateBtn;
   const versionEl = DOM.appVersion;
@@ -404,30 +471,7 @@ async function runUpdateCheck() {
   // Try server-based self-update first; fall back to policy notice if server
   // is not connected or reports an error.
   if (btn.dataset.updateState === "found" && await isUnpackedInstall()) {
-    btn.textContent = "Downloading…";
-    versionEl.textContent = "starting download via bridge…";
-    let startResult;
-    try {
-      startResult = await sendRuntimeMessage({ type: "AUTODOM_SELF_UPDATE" });
-    } catch (_) {
-      startResult = { ok: false, error: "Bridge unavailable" };
-    }
-
-    if (!startResult?.ok) {
-      // Bridge not connected or immediate send failure
-      btn.disabled = false;
-      const { availableUpdate } = await readUpdateState();
-      paintUpdateButton(null, availableUpdate);
-      showUpdatePolicyNotice(
-        availableUpdate?.version || "?",
-        startResult?.error || "bridge not connected — start the MCP bridge first, or ask an admin",
-      );
-      return;
-    }
-
-    // The SW accepted the request and the bridge is downloading in the background.
-    // Track progress and completion via chrome.storage changes (survives popup close + reopen).
-    await _attachSelfUpdateTracker(btn, versionEl);
+    await _startBridgeSelfUpdate(btn, versionEl);
     return;
   }
 
@@ -458,72 +502,18 @@ async function runUpdateCheck() {
       return;
     }
 
-    const status = (result && result.status) || "unknown";
     // Pending means Chrome has downloaded the CRX and a reload can apply it.
     // Available means the published manifest is newer, so clicking Update
     // should keep asking Chrome to fetch/install it rather than reloading.
-    if (result && result.pendingUpdate && result.pendingUpdate.version) {
-      btn.classList.remove("spin");
-      btn.disabled = false;
-      paintUpdateButton(result.pendingUpdate, null);
-      await applyPendingUpdate();
+    if (
+      result?.pendingUpdate?.version ||
+      result?.status === "update_available" ||
+      result?.status === "new_release_found"
+    ) {
+      await _applyOrExplainDiscoveredUpdate(result);
       return;
     }
-    if (status === "update_available") {
-      const pendingVersion = result?.pendingUpdate?.version || "";
-      const detailVersion = result?.details?.version || "";
-      btn.classList.remove("spin");
-      btn.disabled = false;
-      if (pendingVersion) {
-        paintUpdateButton(result.pendingUpdate, null);
-        await applyPendingUpdate();
-      } else {
-        paintUpdateButton(null, { version: detailVersion || "?" });
-        const unpacked = await isUnpackedInstall();
-        const pendingUpdate = unpacked ? null : await waitForPendingUpdate();
-        if (pendingUpdate) {
-          paintUpdateButton(pendingUpdate, null);
-          await applyPendingUpdate();
-        } else {
-          showUpdatePolicyNotice(
-            detailVersion || "?",
-            unpacked
-              ? "unpacked extension — Chrome cannot auto-update"
-              : "Chrome did not download a pending CRX",
-          );
-        }
-      }
-      return;
-    } else if (status === "no_update") {
-      setLabel("up to date");
-    } else if (status === "throttled") {
-      setLabel("rate-limited");
-    } else if (status === "new_release_found") {
-      const v = (result.details && result.details.version) || "?";
-      btn.classList.remove("spin");
-      btn.disabled = false;
-      paintUpdateButton(null, result.availableUpdate || result.details || { version: v });
-      const unpacked = await isUnpackedInstall();
-      const pendingUpdate = unpacked ? null : await waitForPendingUpdate();
-      if (pendingUpdate) {
-        paintUpdateButton(pendingUpdate, null);
-        await applyPendingUpdate();
-      } else {
-        showUpdatePolicyNotice(
-          v,
-          unpacked
-            ? "unpacked extension — Chrome cannot auto-update"
-            : "Chrome did not download a pending CRX",
-        );
-      }
-      return;
-    } else if (status === "skipped" && result.reason === "not_due") {
-      setLabel("checked recently");
-    } else if (status === "unsupported") {
-      setLabel("not supported");
-    } else {
-      setLabel(String(status));
-    }
+    setLabel(_updateCheckStatusLabel(result));
   } catch (err) {
     setLabel(`error: ${(err && err.message) || err}`.slice(0, 40));
   } finally {
@@ -762,9 +752,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (DOM.appVersion) {
     DOM.appVersion.textContent = `v${chrome.runtime.getManifest().version}`;
   }
-
-  const toolCountEls = document.querySelectorAll("#configToolCount, #footerToolCount");
-  toolCountEls.forEach((el) => { el.textContent = MCP_TOOL_COUNT; });
 
   if (DOM.checkUpdateBtn) {
     DOM.checkUpdateBtn.addEventListener("click", () => runUpdateCheck());

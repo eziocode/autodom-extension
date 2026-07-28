@@ -49,11 +49,22 @@ const UPDATE_CHECK_INTERVAL_MS = UPDATE_CHECK_INTERVAL_MINUTES * 60 * 1000;
 const UPDATE_MANIFEST_FETCH_TIMEOUT_MS = 8000;
 const AUTO_UPDATE_RELOAD_COOLDOWN_MS = 10 * 60 * 1000;
 const UPDATE_APPLY_SANITIZE_GRACE_MS = 2 * 60 * 1000;
+const UPDATE_MAX_RELOAD_ATTEMPTS = 2;
+const UPDATE_PHASES = Object.freeze({
+  IDLE: "idle",
+  AVAILABLE: "available",
+  READY: "ready",
+  APPLYING: "applying",
+  APPLIED: "applied",
+  BLOCKED: "blocked",
+  FAILED: "failed",
+});
 const OFFSCREEN_KEEPALIVE_STORAGE_KEY = "autodomOffscreenKeepaliveEnabled";
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const UPDATE_STORAGE_KEYS = {
   pending: "pendingUpdate",
   available: "availableUpdate",
+  lifecycle: "autodomUpdateLifecycle",
   applyRequestedVersion: "autodomApplyRequestedVersion",
   applyRequestedAt: "autodomApplyRequestedAt",
   selfUpdate: "selfUpdateStatus",
@@ -8261,30 +8272,54 @@ chrome.storage.local.get(
 );
 
 // Also auto-connect on extension install/update
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
   void _refreshPeriodicUpdateScheduler("extension_installed");
 
-  // A fresh install or successful update arrival clears any pending-update
-  // marker. The new manifest version is already running, so the popup
-  // should drop back to its idle state.
-  try {
-    chrome.storage.local.remove([
-      UPDATE_STORAGE_KEYS.pending,
-      UPDATE_STORAGE_KEYS.available,
-      UPDATE_STORAGE_KEYS.applyRequestedVersion,
-      UPDATE_STORAGE_KEYS.applyRequestedAt,
-      UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt,
-      UPDATE_STORAGE_KEYS.selfUpdate,
-    ]);
-    if (chrome.action && chrome.action.setBadgeText) {
-      chrome.action.setBadgeText({ text: "" });
+  void (async () => {
+    const currentVersion = chrome.runtime.getManifest?.().version || "";
+    const stored = await _readUpdateStorage(
+      [UPDATE_STORAGE_KEYS.lifecycle],
+      "installed update lifecycle",
+    );
+    const previous = stored[UPDATE_STORAGE_KEYS.lifecycle] || {};
+    try {
+      chrome.storage.local.remove([
+        UPDATE_STORAGE_KEYS.pending,
+        UPDATE_STORAGE_KEYS.available,
+        UPDATE_STORAGE_KEYS.applyRequestedVersion,
+        UPDATE_STORAGE_KEYS.applyRequestedAt,
+        UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt,
+        UPDATE_STORAGE_KEYS.selfUpdate,
+      ]);
+      await _recordUpdateLifecycle(
+        {
+          phase: details?.reason === "update" ? "applied" : "idle",
+          targetVersion: details?.reason === "update" ? currentVersion : null,
+          lastAppliedVersion:
+            details?.reason === "update" ? currentVersion : previous.lastAppliedVersion,
+          lastAppliedAt: details?.reason === "update" ? Date.now() : previous.lastAppliedAt,
+          reason: null,
+          lastFailure: null,
+          applyAttempt: null,
+          reloadAttempts: 0,
+        },
+        `onInstalled:${details?.reason || "unknown"}`,
+      );
+      if (chrome.action && chrome.action.setBadgeText) {
+        chrome.action.setBadgeText({ text: "" });
+      }
+      if (chrome.action && chrome.action.setTitle) {
+        const actionTitle =
+          chrome.runtime.getManifest()?.action?.default_title || "AutoDOM";
+        chrome.action.setTitle({ title: actionTitle });
+      }
+    } catch (err) {
+      _debugWarn(
+        "[AutoDOM SW] Failed to reconcile installed update:",
+        err?.message || err,
+      );
     }
-    if (chrome.action && chrome.action.setTitle) {
-      const actionTitle =
-        chrome.runtime.getManifest()?.action?.default_title || "AutoDOM";
-      chrome.action.setTitle({ title: actionTitle });
-    }
-  } catch (_) {}
+  })();
 
   chrome.storage.local.get(
     [
@@ -8438,12 +8473,104 @@ function _isVersionNewerThanCurrent(version) {
   return _compareExtensionVersions(version, currentVersion) > 0;
 }
 
+function _browserFamilyForUpdateDiagnostics() {
+  const ua = String(globalThis.navigator?.userAgent || "");
+  if (/Edg\//.test(ua)) return "edge";
+  if (/Brave\//.test(ua) || globalThis.navigator?.brave) return "brave";
+  if (/Chrome\//.test(ua)) return "chrome";
+  return "chromium";
+}
+
+async function _getUpdateInstallType() {
+  if (!chrome.management?.getSelf) return "unknown";
+  return new Promise((resolve) => {
+    try {
+      chrome.management.getSelf((info) => {
+        try {
+          if (chrome.runtime?.lastError) {
+            resolve("unknown");
+            return;
+          }
+        } catch (_) {}
+        resolve(info?.installType || "unknown");
+      });
+    } catch (_) {
+      resolve("unknown");
+    }
+  });
+}
+
+async function _recordUpdateLifecycle(patch, source = "unknown") {
+  const stored = await _readUpdateStorage(
+    [UPDATE_STORAGE_KEYS.lifecycle],
+    "update lifecycle",
+  );
+  const previous = stored[UPDATE_STORAGE_KEYS.lifecycle] || {};
+  const currentVersion = chrome.runtime.getManifest?.().version || "";
+  const next = {
+    phase: "idle",
+    browserFamily: _browserFamilyForUpdateDiagnostics(),
+    updatedAt: Date.now(),
+    ...previous,
+    ...patch,
+    source,
+    currentVersion,
+  };
+  await _writeUpdateStorage(
+    { [UPDATE_STORAGE_KEYS.lifecycle]: next },
+    "update lifecycle",
+  );
+  return next;
+}
+
+async function _getUpdateDiagnostics() {
+  const stored = await _readUpdateStorage(
+    [
+      UPDATE_STORAGE_KEYS.lifecycle,
+      UPDATE_STORAGE_KEYS.pending,
+      UPDATE_STORAGE_KEYS.available,
+      UPDATE_STORAGE_KEYS.selfUpdate,
+      UPDATE_STORAGE_KEYS.lastCheckAt,
+      UPDATE_STORAGE_KEYS.lastCheckStatus,
+      UPDATE_STORAGE_KEYS.lastCheckSource,
+    ],
+    "update diagnostics",
+  );
+  const installType = await _getUpdateInstallType();
+  const browserFamily = _browserFamilyForUpdateDiagnostics();
+  const policyPage =
+    browserFamily === "edge"
+      ? "edge://policy"
+      : browserFamily === "brave"
+        ? "brave://policy"
+        : "chrome://policy";
+  return {
+    lifecycle: stored[UPDATE_STORAGE_KEYS.lifecycle] || null,
+    pendingUpdate: stored[UPDATE_STORAGE_KEYS.pending] || null,
+    availableUpdate: stored[UPDATE_STORAGE_KEYS.available] || null,
+    bridgeUpdate: stored[UPDATE_STORAGE_KEYS.selfUpdate] || null,
+    installType,
+    browserFamily,
+    currentVersion: chrome.runtime.getManifest?.().version || "",
+    lastCheckAt: stored[UPDATE_STORAGE_KEYS.lastCheckAt] || null,
+    lastCheckStatus: stored[UPDATE_STORAGE_KEYS.lastCheckStatus] || null,
+    lastCheckSource: stored[UPDATE_STORAGE_KEYS.lastCheckSource] || null,
+    bridgeConnected: isConnected === true,
+    bridgeRole: "extension_client",
+    policyGuidance:
+      installType === "development"
+        ? "Unpacked install: use the bridge share updater, or git pull + Reload for a worktree."
+        : `Verify ExtensionSettings on ${policyPage} before relying on managed updates.`,
+  };
+}
+
 async function _sanitizeStoredUpdateState(source) {
   const currentVersion = chrome.runtime.getManifest?.().version || "";
   const stored = await _readUpdateStorage(
     [
       UPDATE_STORAGE_KEYS.pending,
       UPDATE_STORAGE_KEYS.available,
+      UPDATE_STORAGE_KEYS.lifecycle,
       UPDATE_STORAGE_KEYS.applyRequestedVersion,
       UPDATE_STORAGE_KEYS.applyRequestedAt,
     ],
@@ -8453,6 +8580,7 @@ async function _sanitizeStoredUpdateState(source) {
   const available = stored[UPDATE_STORAGE_KEYS.available] || null;
   const requestedVersion = stored[UPDATE_STORAGE_KEYS.applyRequestedVersion] || "";
   const requestedAt = Number(stored[UPDATE_STORAGE_KEYS.applyRequestedAt]) || 0;
+  const lifecycle = stored[UPDATE_STORAGE_KEYS.lifecycle] || null;
   const toRemove = [];
   let nextAvailable = null;
 
@@ -8476,11 +8604,38 @@ async function _sanitizeStoredUpdateState(source) {
     requestedAt > 0 &&
     Date.now() - requestedAt > UPDATE_APPLY_SANITIZE_GRACE_MS
   ) {
-    // A runtime reload may restart this service worker before Chromium has
-    // swapped in the downloaded CRX. Do not clear pendingUpdate or surface a
-    // manual-intervention/permission warning; keeping the pending marker lets
-    // the next manual click retry chrome.runtime.reload().
+    const attemptCount = Math.max(
+      1,
+      Number(lifecycle?.applyAttempt?.attemptCount) || 1,
+    );
+    nextAvailable = {
+      ...(available || {}),
+      version: requestedVersion,
+      runtimeStatus: "blocked",
+      manualInterventionRequired: true,
+      reason: "reload_did_not_apply",
+      detectedAt: available?.detectedAt || Date.now(),
+    };
+    await _writeUpdateStorage(
+      {
+        [UPDATE_STORAGE_KEYS.lifecycle]: {
+          ...(lifecycle || {}),
+          phase: "blocked",
+          currentVersion,
+          targetVersion: requestedVersion,
+          updatedAt: Date.now(),
+          source,
+          reloadAttempts: attemptCount,
+          reason: "reload_did_not_apply",
+          lastFailure:
+            `Chromium restarted but still runs v${currentVersion}; ` +
+            `v${requestedVersion} was never applied.`,
+        },
+      },
+      "blocked update lifecycle",
+    );
     toRemove.push(
+      UPDATE_STORAGE_KEYS.pending,
       UPDATE_STORAGE_KEYS.applyRequestedVersion,
       UPDATE_STORAGE_KEYS.applyRequestedAt,
       UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt,
@@ -8626,6 +8781,17 @@ async function _setAvailableUpdate(details, runtimeStatus, source) {
       { [UPDATE_STORAGE_KEYS.available]: available },
       "available update",
     );
+    await _recordUpdateLifecycle(
+      {
+        phase: "available",
+        targetVersion: version,
+        preflightStatus: "new_release_found",
+        runtimeStatus: runtimeStatus || "unknown",
+        pendingEventReceived: false,
+        lastFailure: null,
+      },
+      source,
+    );
     if (chrome.action && chrome.action.setBadgeText) {
       chrome.action.setBadgeText({ text: "•" });
     }
@@ -8662,6 +8828,17 @@ async function _setPendingUpdate(version, source) {
     await _writeUpdateStorage(
       { [UPDATE_STORAGE_KEYS.pending]: pending },
       "pending update",
+    );
+    await _recordUpdateLifecycle(
+      {
+        phase: "ready",
+        targetVersion: normalizedVersion,
+        runtimeStatus: "update_available",
+        pendingEventReceived: true,
+        readyAt: Date.now(),
+        lastFailure: null,
+      },
+      source,
     );
     await new Promise((resolve) => {
       try {
@@ -8760,6 +8937,18 @@ async function _runExtensionUpdateCheckNow(opts = {}) {
       "update manifest preflight result",
     );
     try {
+      await _recordUpdateLifecycle(
+        {
+          phase: "idle",
+          targetVersion: null,
+          preflightStatus: "no_update",
+          runtimeStatus: null,
+          pendingEventReceived: false,
+          reason: null,
+          lastFailure: null,
+        },
+        source,
+      );
       if (chrome.action && chrome.action.setBadgeText) {
         chrome.action.setBadgeText({ text: "" });
       }
@@ -8845,6 +9034,14 @@ async function _runExtensionUpdateCheckNow(opts = {}) {
       "update check error",
     );
     _debugWarn("[AutoDOM SW] Update check failed:", err?.message || err);
+    await _recordUpdateLifecycle(
+      {
+        phase: "failed",
+        reason: "update_check_failed",
+        lastFailure: err?.message || String(err),
+      },
+      source,
+    ).catch(() => {});
     return {
       ok: false,
       status: "error",
@@ -9040,7 +9237,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     (async () => {
       const currentVersion = chrome.runtime.getManifest?.().version || "";
       const stored = await _readUpdateStorage(
-        [UPDATE_STORAGE_KEYS.pending],
+        [UPDATE_STORAGE_KEYS.pending, UPDATE_STORAGE_KEYS.lifecycle],
         "apply update precheck",
       );
       const pending = stored[UPDATE_STORAGE_KEYS.pending];
@@ -9060,6 +9257,30 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         });
         return;
       }
+      const lifecycle = stored[UPDATE_STORAGE_KEYS.lifecycle] || {};
+      const previousAttempts =
+        Number(lifecycle?.applyAttempt?.attemptCount) || 0;
+      if (previousAttempts >= UPDATE_MAX_RELOAD_ATTEMPTS) {
+        await _recordUpdateLifecycle(
+          {
+            phase: "blocked",
+            targetVersion: pendingVersion,
+            reloadAttempts: previousAttempts,
+            reason: "reload_attempt_limit",
+            lastFailure:
+              `Update reload limit reached while still running v${currentVersion}.`,
+          },
+          "popup_apply",
+        );
+        sendResponse({
+          ok: false,
+          reason: "reload_attempt_limit",
+          currentVersion,
+          pendingVersion,
+        });
+        return;
+      }
+      const installType = await _getUpdateInstallType();
       await _writeUpdateStorage(
         {
           [UPDATE_STORAGE_KEYS.applyRequestedVersion]: pendingVersion,
@@ -9067,11 +9288,38 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         },
         "apply update marker",
       );
+      await _recordUpdateLifecycle(
+        {
+          phase: "applying",
+          targetVersion: pendingVersion,
+          installType,
+          applyAttempt: {
+            sourceVersion: currentVersion,
+            targetVersion: pendingVersion,
+            installType,
+            browserFamily: _browserFamilyForUpdateDiagnostics(),
+            requestedAt: Date.now(),
+            attemptCount: previousAttempts + 1,
+          },
+          reloadAttempts: previousAttempts + 1,
+          reason: null,
+          lastFailure: null,
+        },
+        "popup_apply",
+      );
       sendResponse({ ok: true, pendingVersion, currentVersion });
       setTimeout(() => {
         try { chrome.runtime.reload(); } catch (_) {}
       }, 50);
     })();
+    return true;
+  }
+  if (msg && msg.type === "AUTODOM_GET_UPDATE_DIAGNOSTICS") {
+    _getUpdateDiagnostics().then(
+      (diagnostics) => sendResponse({ ok: true, diagnostics }),
+      (error) =>
+        sendResponse({ ok: false, error: error?.message || String(error) }),
+    );
     return true;
   }
 });

@@ -35,7 +35,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server + Chromium ex
 <tr>
 <td width="50%">
 
-### 🧰 70+ Browser Tools
+### 🧰 Full Browser Tool Suite
 DOM queries, navigation, network logs, cookies, tabs, JS eval, screenshots, Playwright-compatible aliases — all exposed over MCP.
 
 </td>
@@ -55,8 +55,9 @@ All traffic stays on `127.0.0.1`. Auth tokens are auto-generated. API keys live 
 </td>
 <td>
 
-### ⚡ Zero-Touch Setup
-One command installs the server, registers MCP for every detected IDE, and silently enrolls the extension into your Chromium browsers.
+### ⚡ Guided One-Command Setup
+One command installs the server, registers MCP for detected IDEs, and writes
+verified managed-policy files for supported browser targets.
 
 </td>
 </tr>
@@ -99,10 +100,10 @@ GPO / plist / JSON policy templates for force-install across macOS, Windows, and
 | Requirement | Details |
 |:---|:---|
 | **Node.js** | v20.19+, v22.12+, or v23+ — `node -v` to check |
-| **Chromium browser** | Chrome, Edge, Brave, Arc, Ulaa, or any MV3-compatible browser |
+| **Chromium browser** | Chrome/Edge for managed installs; Brave best-effort; other MV3 browsers use the unpacked/manual path |
 | **MCP-capable IDE** | IntelliJ family, VS Code, Cursor, Claude Desktop, Gemini CLI |
 | **Free port** | `9876` on `127.0.0.1` *(configurable)* |
-| **Admin / sudo** | One-time, for silent-install policy enrollment |
+| **Admin / sudo** | One-time, for managed-policy enrollment where the browser supports it |
 
 ---
 
@@ -127,7 +128,7 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 2. ✅ Runs `npm install` inside `server/`
 3. ✅ Auto-detects installed IDEs and writes MCP config for each
 4. ✅ Enables AutoDOM for **GitHub Copilot** and **JetBrains AI Assistant**
-5. ✅ Enrolls the silent-install policy for all Chromium browsers *(one `sudo` / UAC prompt)*
+5. ✅ Writes and verifies managed-policy files for Chrome/Edge and best-effort Brave *(one `sudo` / UAC prompt)*
 
 > Opt out of auto-install: `--no-auto-update` (macOS/Linux) or `-NoAutoUpdate` (PowerShell)
 
@@ -135,7 +136,9 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 
 ### After setup
 
-1. **Restart your browser** — AutoDOM installs automatically via the update channel.
+1. **Restart Chrome / Edge / Brave**, then confirm `ExtensionSettings` is active
+   on the browser policy page. Managed installation and updates only work after
+   the browser accepts that policy.
 2. **Restart your IDE** — so it picks up the new MCP config.
 3. Open the AutoDOM popup → confirm **Connected** ✅
 4. Ask your AI agent to do something in the browser 🎉
@@ -296,7 +299,7 @@ This section describes the internal design for contributors and anyone who wants
 │                                │       │            │         │         │          │           │ │
 │                                │  ┌────▼────────────▼──────┐  │         │  ┌───────▼────────┐  │ │
 │                                │  │    Tool Dispatcher     │  │         │  │ Content Scripts │  │ │
-│                                │  │  70+ tools · 3 tiers   │  │         │  │  Chat · Border  │  │ │
+│                                │  │ browser tools · 3 tiers│  │         │  │  Chat · Border  │  │ │
 │                                │  │  read / write / destr. │  │         │  └───────┬────────┘  │ │
 │                                │  └────────────────────────┘  │         │          │           │ │
 │                                │                              │         │  ┌───────▼────────┐  │ │
@@ -382,7 +385,7 @@ A Manifest V3 Chromium extension with four main layers:
 
 #### 🟠 Tool tiers
 
-All 70+ tools are classified into three tiers for access control:
+All public browser tools are classified into three tiers for access control:
 
 | Tier | Examples | Behavior |
 |:---|:---|:---|
@@ -400,7 +403,11 @@ Force-install the extension across managed fleets without user interaction:
 | **Windows** | `autodom-policy.reg.tmpl` (Group Policy / Registry) |
 | **Linux** | `autodom-policy.json.tmpl` (`/etc/opt/chrome/policies/`) |
 
-Enterprise installers (`install.sh`, `install.ps1`) apply the correct template for each detected browser. The extension receives updates from the GitHub Pages update channel.
+Enterprise installers (`install.sh`, `install.ps1`) write and verify policy
+files for Chrome/Edge and best-effort Brave. Confirm the policy is active in
+the browser before relying on the GitHub Pages update channel. Arc, Ulaa, and
+other browsers use the unpacked/manual path unless vendor policy support is
+verified separately.
 
 ### Repository layout
 
@@ -436,8 +443,8 @@ autodom-extension/
 ├── tests/                     Test suites
 ├── examples/                  Usage examples
 │
-├── setup.sh                   Zero-touch installer (macOS/Linux)
-├── setup.ps1                  Zero-touch installer (Windows)
+├── setup.sh                   Guided installer (macOS/Linux)
+├── setup.ps1                  Guided installer (Windows)
 │
 ├── INSTALL.md                 Detailed setup guide
 ├── CHANGELOG.md               Release history

@@ -5,9 +5,10 @@ AutoDOM and keep it auto-updated from our self-hosted update endpoint:
 
   https://eziocode.github.io/autodom-extension/updates.xml
 
-Run the appropriate installer **once per machine** (admin/root). After that,
-Chrome / Edge / Brave will install AutoDOM on next launch and auto-update on
-their normal background check (~5h cadence) without any further user action.
+Run the appropriate installer **once per machine** (admin/root). The scripts
+write and verify policy files for Chrome/Edge and best-effort Brave. Managed
+installation and updates only begin after the browser reports the policy as
+active.
 
 | OS | Run as admin/root | Script |
 |---|---|---|
@@ -16,13 +17,13 @@ their normal background check (~5h cadence) without any further user action.
 | Linux   | yes (`sudo`)              | `enterprise/install.sh` |
 
 Both installers:
-- detect every Chromium-family browser installed on the machine,
-- write the right policy file in the right location for each one,
-- print the post-install verification steps.
+- write the known Chrome/Edge/Brave policy targets for the current OS,
+- verify the extension ID and update URL after writing,
+- print the required browser-side verification steps.
 
-> ℹ AutoDOM is **Chromium-only** (Chrome, Edge, Brave, Arc, Ulaa, etc.).
-> Firefox is no longer supported. See [`UPDATES.md`](../UPDATES.md) for the
-> end-to-end update flow.
+> AutoDOM is Chromium-only. Managed self-hosted updates are evidence-backed
+> for Chrome/Edge and best-effort for Brave. Arc, Ulaa, and other Chromium
+> browsers use the unpacked/manual path unless vendor support is verified.
 
 ## What gets installed
 
@@ -60,9 +61,10 @@ powershell -ExecutionPolicy Bypass -File .\enterprise\install.ps1
 
 Open `chrome://policy` (or `edge://policy` / `brave://policy`) and look for
 `ExtensionSettings`. The AutoDOM ID should be listed with
-`installation_mode: force_installed`. Reload policies with **Reload policies**
-and re-launch the browser — AutoDOM appears in the toolbar within a few
-seconds.
+`installation_mode: force_installed` and the expected `update_url`. Reload
+policies and re-launch the browser. A successfully written file is not enough:
+do not expect managed installation or updates until the browser reports the
+entry as active.
 
 ## Uninstalling
 

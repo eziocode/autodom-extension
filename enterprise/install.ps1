@@ -87,6 +87,12 @@ foreach ($b in $Browsers) {
     Set-ItemProperty -Path $sub -Name 'installation_mode' -Value 'force_installed' -Type String
     Set-ItemProperty -Path $sub -Name 'update_url'        -Value $UpdateUrl         -Type String
     Write-Host "  ✓ wrote $sub"
+
+    $written = Get-ItemProperty -Path $sub
+    if ($written.installation_mode -ne 'force_installed' -or $written.update_url -ne $UpdateUrl) {
+      throw "Policy verification failed for $sub"
+    }
+    Write-Host "  ✓ verified $sub"
   }
 }
 
@@ -99,10 +105,15 @@ if ($Remove) {
   Write-Host ''
   Write-Host 'Next steps:'
   Write-Host '  1. Quit any open Chrome / Edge / Brave windows.'
-  Write-Host '  2. Re-launch the browser. AutoDOM installs silently within a few seconds.'
-  Write-Host "  3. Verify at chrome://policy → ExtensionSettings → $ExtensionId"
-  Write-Host '     should show installation_mode=force_installed.'
-  Write-Host '  4. From now on the browser auto-updates AutoDOM in the background.'
+  Write-Host '  2. Re-launch the browser, then verify chrome://policy, edge://policy,'
+  Write-Host '     or brave://policy (Brave is best-effort).'
+  Write-Host "  3. ExtensionSettings → $ExtensionId must show installation_mode="
+  Write-Host '     force_installed and the expected update_url.'
+  Write-Host '  4. Only after the browser reports the policy as active should managed'
+  Write-Host '     installation and background updates be expected.'
+  Write-Host ''
+  Write-Host '  Arc, Ulaa, and other Chromium browsers are not configured here.'
+  Write-Host '  Use the unpacked/share-bundle path unless vendor support is verified.'
   Write-Host ''
   Write-Host '  To remove later: powershell -ExecutionPolicy Bypass -File .\enterprise\install.ps1 -Remove'
 }

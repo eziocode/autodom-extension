@@ -186,6 +186,7 @@ function loadServiceWorkerUpdateSanitizer(stored) {
     UPDATE_STORAGE_KEYS: {
       pending: "pendingUpdate",
       available: "availableUpdate",
+      lifecycle: "autodomUpdateLifecycle",
       applyRequestedVersion: "autodomApplyRequestedVersion",
       applyRequestedAt: "autodomApplyRequestedAt",
       autoUpdateApplyAttemptAt: "autodomAutoUpdateApplyAttemptAt",
@@ -389,7 +390,7 @@ test("runUpdateCheck reloads via bridge when server-based self-update succeeds",
 });
 
 
-test("sanitize update state keeps pending update after reload race", async () => {
+test("sanitize update state marks an ineffective reload as blocked", async () => {
   const versionParts = manifest.version.split(".");
   const futureVersion = [
     versionParts[0] || "0",
@@ -398,6 +399,8 @@ test("sanitize update state keeps pending update after reload race", async () =>
   ].join(".");
   const keys = {
     pending: "pendingUpdate",
+    available: "availableUpdate",
+    lifecycle: "autodomUpdateLifecycle",
     applyRequestedVersion: "autodomApplyRequestedVersion",
     applyRequestedAt: "autodomApplyRequestedAt",
     autoUpdateApplyAttemptAt: "autodomAutoUpdateApplyAttemptAt",
@@ -406,15 +409,22 @@ test("sanitize update state keeps pending update after reload race", async () =>
     [keys.pending]: { version: futureVersion },
     [keys.applyRequestedVersion]: futureVersion,
     [keys.applyRequestedAt]: 1,
+    [keys.lifecycle]: {
+      phase: "applying",
+      targetVersion: futureVersion,
+      applyAttempt: { attemptCount: 1 },
+    },
   });
 
   await sandbox._sanitizeStoredUpdateState("test");
 
-  assert.ok(!removed.includes(keys.pending), "pending update must survive reload races");
+  assert.ok(removed.includes(keys.pending), "blocked update must stop reload loop");
   assert.ok(removed.includes(keys.applyRequestedVersion));
   assert.ok(removed.includes(keys.applyRequestedAt));
   assert.ok(removed.includes(keys.autoUpdateApplyAttemptAt));
-  assert.deepEqual(writes, []);
+  assert.equal(writes[0][keys.lifecycle].phase, "blocked");
+  assert.equal(writes[0][keys.lifecycle].reason, "reload_did_not_apply");
+  assert.equal(writes[1][keys.available].manualInterventionRequired, true);
 });
 
 test("runUpdateCheck applies a pending update that appears after a release is found", async () => {
@@ -510,4 +520,22 @@ test("periodic scheduler clears alarm when preference is disabled", async () => 
   assert.equal(result.source, "test");
   assert.equal(ensured, 0);
   assert.equal(cleared, 1);
+});
+
+test("service worker exposes explicit update lifecycle and diagnostics", () => {
+  for (const phase of [
+    "idle",
+    "available",
+    "ready",
+    "applying",
+    "applied",
+    "blocked",
+    "failed",
+  ]) {
+    assert.match(serviceWorkerSrc, new RegExp(`${phase.toUpperCase()}: "${phase}"`));
+  }
+  assert.match(serviceWorkerSrc, /autodomUpdateLifecycle/);
+  assert.match(serviceWorkerSrc, /AUTODOM_GET_UPDATE_DIAGNOSTICS/);
+  assert.match(serviceWorkerSrc, /reload_did_not_apply/);
+  assert.match(serviceWorkerSrc, /UPDATE_MAX_RELOAD_ATTEMPTS/);
 });

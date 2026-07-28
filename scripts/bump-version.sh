@@ -108,6 +108,30 @@ echo "    [✓] extension/manifest.json"
 echo "    [✓] server/package.json"
 [[ -f server/package-lock.json ]] && echo "    [✓] server/package-lock.json"
 
+# Release invariant: manifest, package, lock root, and lock package entry must
+# all agree before this helper can report success.
+node - "$NEXT" <<'NODE'
+const fs = require("fs");
+const expected = process.argv[2];
+const manifest = JSON.parse(fs.readFileSync("extension/manifest.json", "utf8"));
+const pkg = JSON.parse(fs.readFileSync("server/package.json", "utf8"));
+const lock = JSON.parse(fs.readFileSync("server/package-lock.json", "utf8"));
+const versions = [
+  ["extension/manifest.json", manifest.version],
+  ["server/package.json", pkg.version],
+  ["server/package-lock.json", lock.version],
+  ['server/package-lock.json packages[""]', lock.packages?.[""]?.version],
+];
+const mismatches = versions.filter(([, version]) => version !== expected);
+if (mismatches.length) {
+  for (const [file, version] of mismatches) {
+    console.error(`error: ${file} has ${version || "(missing)"}, expected ${expected}`);
+  }
+  process.exit(1);
+}
+NODE
+echo "    [✓] release version invariant"
+
 # 3. Optional git commit / tag.
 if [[ "$COMMIT" == 1 ]]; then
     git add extension/manifest.json server/package.json server/package-lock.json 2>/dev/null || true
@@ -123,4 +147,6 @@ echo ""
 echo "[OK] Bumped to v${NEXT}."
 echo "     Next: scripts/build-chrome.sh   (rebuild the zip)"
 echo "           scripts/pack-release.sh   (rebuild the share bundle)"
-[[ "$TAG" == 1 ]] && echo "           git push && git push origin v${NEXT}   (after review)"
+if [[ "$TAG" == 1 ]]; then
+    echo "           git push && git push origin v${NEXT}   (after review)"
+fi

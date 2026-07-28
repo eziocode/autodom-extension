@@ -32,6 +32,7 @@ rsync -a --exclude '.DS_Store' extension/ "$STAGE/extension/"
 
 mkdir -p "$STAGE/scripts"
 cp scripts/build-chrome.sh   "$STAGE/scripts/"
+cp scripts/update-unpacked.mjs "$STAGE/scripts/"
 
 mkdir -p "$STAGE/enterprise"
 rsync -a --exclude '.DS_Store' enterprise/ "$STAGE/enterprise/"
@@ -52,13 +53,17 @@ macOS / Linux / WSL / Git Bash:
 Windows (PowerShell):
     powershell -ExecutionPolicy Bypass -File .\\setup.ps1
 
-The setup script installs the MCP server and enrolls the browser extension
-through managed policy. After restarting Chrome / Edge / Brave, AutoDOM is
-installed automatically and updates itself from:
+The setup script installs the MCP server and writes verified policy files for
+Chrome/Edge and best-effort Brave. After restarting the browser, confirm
+AutoDOM under ExtensionSettings on its policy page. Once active, it updates
+from:
   https://eziocode.github.io/autodom-extension/updates.xml
 
 Do NOT use "Load unpacked" for normal users. Unpacked extensions are
 developer-only and Chrome will not auto-update them.
+
+Arc, Ulaa, and other Chromium browsers use the unpacked/manual path unless
+their vendor-managed extension policy support is verified separately.
 
 Manual developer-only install (no admin):
     ./setup.sh --no-auto-update

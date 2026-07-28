@@ -6,14 +6,15 @@ provided you install it via one of the supported paths below.
 
 | Browser | Install path | Updates? |
 |---|---|---|
-| Chrome / Edge / Brave / Arc / Ulaa | One-time enterprise policy install — handled automatically by `setup.sh` / `setup.ps1`, or manually via `enterprise/install.{sh,ps1}` | ✅ silent, ~5h cadence |
-| Chrome / Edge / Brave (developer / unpacked) | `Load unpacked` from a clone or share bundle | Share bundle: ✅ via bridge updater. Git clone: use `git pull` + reload; source files are never overwritten. |
+| Chrome / Edge | Managed enterprise policy, when the browser/device accepts externally hosted force-installed extensions | Silent background updates after the policy is confirmed active |
+| Brave | Existing Chromium-style policy templates | Best-effort; verify `ExtensionSettings` on `brave://policy` before relying on it |
+| Arc / Ulaa / other Chromium browsers | Vendor-managed policy support is not established by AutoDOM | Use an unpacked share bundle or manual update path |
+| Any supported unpacked browser | `Load unpacked` from a clone or share bundle | Share bundle: bridge updater. Git clone: `git pull` + reload; source files are never overwritten. |
 
-> **Why is there a policy install?** Chrome silently blocks off-Web-Store
-> installs for unmanaged users — that's a browser policy decision, not
-> something AutoDOM can work around. The enterprise-policy path tells Chrome
-> "this extension is allowed and should be force-installed", which is the
-> standard Chromium mechanism for self-hosted distribution.
+> **Why is there a policy install?** Chromium vendors restrict off-store
+> installs. A policy file is only the enrollment request; the browser and
+> device must meet that vendor's management prerequisites and report the
+> policy as active. AutoDOM cannot bypass those browser restrictions.
 
 ---
 
@@ -42,18 +43,18 @@ powershell -ExecutionPolicy Bypass -File .\enterprise\install.ps1
 
 What this does:
 
-- Writes a `ExtensionSettings` policy entry for every Chromium-family browser
-  installed on the machine (Chrome, Edge, Brave).
+- Writes and verifies `ExtensionSettings` policy files for Chrome, Edge, and
+  best-effort Brave targets.
 - Pins AutoDOM's `installation_mode` to `force_installed` and points its
   `update_url` at our update endpoint.
 
 What you'll see:
 
 1. Restart Chrome / Edge / Brave.
-2. AutoDOM appears in the toolbar within seconds — no Web Store prompt, no
-   "developer mode" warning, no per-user install.
-3. The browser pings our update endpoint roughly every 5 hours. New releases
-   roll out silently in the background.
+2. Open the browser policy page and confirm AutoDOM's `ExtensionSettings`
+   entry is active with the expected `update_url`.
+3. Only after that confirmation should AutoDOM appear as a managed extension
+   and poll the update endpoint on the browser's cadence.
 
 ### Verifying it worked
 
@@ -110,11 +111,33 @@ results:
 | Label | Meaning |
 |---|---|
 | `up to date` | The browser already has the latest published version. |
-| `update → vX.Y.Z` | A newer version exists; the browser will install it on its next pass (Chromium usually within a minute). |
+| `update → vX.Y.Z` | A newer release exists. It is not ready to apply until Chromium reports a downloaded pending update. |
 | `auto-install blocked` warning | A newer version was found, but the browser did not apply it. Re-run `./setup.sh` to refresh policy enrollment or update manually from the browser extensions page. |
 | `rate-limited` | The browser throttles update checks. Try again in a few minutes. |
 | `not supported` | This browser does not expose a programmatic update check. Use the browser's built-in flow instead (`chrome://extensions` → *Update*). |
 | `error: …` | Update endpoint unreachable, or the browser refused the request. |
+
+AutoDOM stores a separate lifecycle phase: `idle`, `available`, `ready`,
+`applying`, `applied`, `blocked`, or `failed`. A published version only reaches
+`ready` after Chromium reports a downloaded pending package. Apply attempts
+record source/target versions, install type, browser family, timestamp, and
+attempt count. If Chromium restarts but keeps running the old version beyond
+the grace period, AutoDOM marks `reload_did_not_apply`, removes the pending
+reload marker, and stops retrying.
+
+For support diagnostics, open the service-worker console from
+`chrome://extensions` and run:
+
+```js
+chrome.runtime.sendMessage(
+  { type: "AUTODOM_GET_UPDATE_DIAGNOSTICS" },
+  console.log,
+);
+```
+
+The payload includes manifest preflight/runtime status, pending-event receipt,
+apply attempts, policy/install guidance inputs, bridge connection/status, and
+the last concrete failure.
 
 ---
 
@@ -182,5 +205,7 @@ For maintainer-side setup (signing keys, gh-pages bootstrap), see
 |---|---|
 | Chrome shows "Disabled by administrator" instead of installing | The policy was written but the browser hasn't reloaded it. Open `chrome://policy` → *Reload policies* → fully quit and relaunch the browser. |
 | `chrome://policy` does not list `ExtensionSettings` after running `install.sh` | The browser binary you're testing wasn't covered by the installer (e.g. a snap/flatpak Chrome on Linux uses a non-standard policy directory). Drop `enterprise/linux/autodom-policy.json.tmpl` into the policy dir for that variant manually. |
-| Popup says `update available` but nothing installs | Chromium will install on the next scheduled check. To force it now, restart the browser. |
+| Popup stays on `update available` | Confirm the running install is managed (not unpacked), verify AutoDOM under `ExtensionSettings` on the browser policy page, then retry. A restart cannot apply a CRX that the browser never downloaded. |
+| Diagnostics show `reload_did_not_apply` | Chromium restarted but still runs the source version. Reload policies, verify the exact extension ID/update URL, then use the browser's extension update control. AutoDOM stops automatic reloads after the bounded attempt. |
+| Unpacked Git worktree will not self-update | Run `git pull`, then click Reload on the browser extensions page. AutoDOM intentionally never overwrites source-controlled files. |
 | Browser unaware of any updates after a release | Confirm the gh-pages URL returns the new version (`curl https://eziocode.github.io/autodom-extension/updates.xml`). If it's stale, re-run the release workflow — the publish step may have failed. |

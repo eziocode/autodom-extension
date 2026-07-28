@@ -4,6 +4,56 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 4.3.0
+
+### Added
+- Added sticky-tab restriction and the public tools `double_click`,
+  `middle_click`, `force_click`, `click_at_coordinates`, `key_down`, `key_up`,
+  `get_bounding_box`, `get_computed_style`, `set_geolocation`,
+  `delete_cookie`, `clear_cookies`, `print_to_pdf`, and `emulate_media`.
+- Added explicit update lifecycle diagnostics covering discovery, runtime
+  availability, pending-package receipt, apply attempts, install type, browser
+  family, bridge state, and bounded blocked/failure reasons.
+- Added canonical public tool-contract tests covering all 106 registrations,
+  descriptions, schemas, handlers, uniqueness, and stale count copy.
+
+### Fixed
+- Separated published-manifest discovery from Chromium's downloaded
+  `onUpdateAvailable` signal. Reload attempts are persisted and bounded; an
+  ineffective reload becomes a truthful `blocked` state instead of an endless
+  update/restart loop.
+- Preserved unpacked share-bundle updates through the bridge while refusing to
+  overwrite Git worktrees, which now receive exact `git pull` + Reload steps.
+- Replaced `update.sh`'s unchecked in-place unzip with checksummed
+  `updates.json`, a 50 MiB limit, staged validation, atomic replacement, and
+  rollback.
+- Propagated elevated Windows policy-installer failures and verified generated
+  plist, JSON, and registry values after writing.
+
+### Improved
+- Upgraded FastMCP from 4.5.0 to 4.12.1 and resolved patched Hono, MCP SDK,
+  `body-parser`, and `fast-uri` versions; `npm audit` reports zero
+  vulnerabilities.
+- Corrected managed-browser claims: Chrome/Edge require active vendor policy,
+  Brave remains best-effort, and Arc/Ulaa/other Chromium browsers use the
+  unpacked/manual path unless vendor support is verified separately.
+- Pinned GitHub Actions and CRX release tooling to reviewed immutable versions.
+- Split update-check orchestration into focused helpers, reducing measured
+  `runUpdateCheck` cyclomatic complexity from 79 to 31 without changing test
+  behavior.
+- Removed hardcoded `70`/`70+` tool-count copy and corrected stale Node 18
+  updater guidance.
+- Hardened direct-provider context, WebSocket origin/auth handling, debugger
+  tracking, destructive-tool tiers, cache feedback, and Security-tab escaping.
+
+### Tests
+- Added update lifecycle, policy installer, release workflow, updater
+  integrity, and public tool-contract regression coverage.
+- Verified FastMCP stdio, WebSocket auth, reconnect, proxy reconnect,
+  concurrent multi-IDE traffic, and end-to-end tool calls.
+
+---
+
 ## 4.2.1
 
 ### Fixed — update channel and updater integrity
@@ -61,37 +111,6 @@ All notable changes to AutoDOM are documented in this file.
 ### Tests
 - New `tests/media-tools.test.mjs` covering catalog/tiers shape, handler surface, and the macro install/stop helper.
 - Extended `tests/action-gate.test.mjs` with classification assertions for every new tool.
-
----
-
-## Unreleased
-
-### Added
-- **Sticky tab restriction** — Lock AutoDOM operations to selected tabs from the popup so agents cannot drift to unrelated browser tabs.
-- **`double_click`** — Double-click an element by CSS selector or visible text. Exposes the existing `dblClick` path as a first-class tool.
-- **`middle_click`** — Middle-click (button 1) an element; opens links in a new tab without needing `target=_blank`.
-- **`force_click`** — Click an element bypassing visibility and interactability checks.
-- **`click_at_coordinates`** — Click at absolute viewport `(x, y)` pixel coordinates with support for left/middle/right button and double-click. Pairs with `get_bounding_box`.
-- **`key_down`** / **`key_up`** — Dispatch isolated keydown/keyup events to hold and release modifier keys (Shift, Control, Alt, Meta) around other actions.
-- **`get_bounding_box`** — Return viewport position and size (`x`, `y`, `width`, `height`, `top/right/bottom/left`) for any element.
-- **`get_computed_style`** — Return resolved CSS property values for an element; accepts a `properties` array or returns sensible defaults (display, color, font-size, etc.).
-- **`set_geolocation`** — Override browser geolocation via CDP (`Emulation.setGeolocationOverride`); pass `clear:true` to remove the override.
-- **`delete_cookie`** — Remove a single named cookie for the current or given URL.
-- **`clear_cookies`** — Remove all cookies for the current or given URL (full session reset).
-- **`print_to_pdf`** — Export the active page to PDF via CDP (`Page.printToPDF`); returns base64-encoded data.
-- **`emulate_media`** — Override CSS media type and features via CDP: dark/light mode, print layout, `prefers-reduced-motion`, `prefers-contrast`, `forced-colors`.
-
-### Improved
-- Hardened the local WebSocket bridge by pinning the packaged extension origin, supporting explicit dev/fork extension ID allowlists, preserving bearer-token proxy auth, and rejecting oversized or malformed messages before routing.
-- Wrapped direct-provider page/tab context in nonce-delimited untrusted-data blocks and scrubbed account identifiers plus internal marker tags from AI-facing and user-facing strings.
-- Reclassified arbitrary-code and sensitive export/reset tools (`execute_code`, `evaluate_script`, `execute_async_script`, `run_automation_script`, `clear_cookies`, `print_to_pdf`) as destructive where applicable.
-- Added a popup warning when a browser reports that an available update could not be auto-installed, with guidance to re-run setup or update manually.
-- Added a click-again confirmation and accessible popup toast feedback for **Clear extension cache**, including visible success and error states instead of only an activity log entry.
-
-### Fixed
-- Kept debugger attachment tracking in sync when Chrome reports an existing debugger session or detach happens outside AutoDOM.
-- Escaped Security-tab load errors before rendering them in the popup.
-- Awaited the update-intervention marker write so storage failures do not cause repeated prompts.
 
 ---
 

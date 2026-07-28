@@ -273,10 +273,12 @@ if ($NoAutoUpdate) {
         $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
         if ($isAdmin) {
-            $env:AUTODOM_EXTENSION_ID = $ExtensionId
             try {
-                & powershell -NoProfile -ExecutionPolicy Bypass -File $entInstaller
-                Write-Ok "Silent-install policy active. Restart Chrome / Edge / Brave to apply."
+                & powershell -NoProfile -ExecutionPolicy Bypass -File $entInstaller -ExtensionId $ExtensionId
+                if ($LASTEXITCODE -ne 0) {
+                    throw "enterprise\install.ps1 exited with code $LASTEXITCODE"
+                }
+                Write-Ok "Managed-policy files installed and verified."
                 $AutoUpdateEnrolled = $true
             } catch {
                 Write-Fail "enterprise\install.ps1 failed: $_"
@@ -288,12 +290,16 @@ if ($NoAutoUpdate) {
             Write-Host "  Triggering UAC prompt to install machine-wide policy (one click)..." -ForegroundColor White
             $cmd = "`$env:AUTODOM_EXTENSION_ID='$ExtensionId'; & '$entInstaller'"
             try {
-                Start-Process powershell.exe `
+                $policyProcess = Start-Process powershell.exe `
                     -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command',$cmd) `
                     -Verb RunAs `
                     -Wait `
+                    -PassThru `
                     -WindowStyle Hidden
-                Write-Ok "Silent-install policy active. Restart Chrome / Edge / Brave to apply."
+                if ($policyProcess.ExitCode -ne 0) {
+                    throw "enterprise\install.ps1 exited with code $($policyProcess.ExitCode)"
+                }
+                Write-Ok "Managed-policy files installed and verified."
                 $AutoUpdateEnrolled = $true
             } catch {
                 Write-Warn "UAC was declined or elevation failed — extension will not auto-install."
@@ -313,8 +319,10 @@ Write-Host ""
 
 if ($AutoUpdateEnrolled) {
     Write-Host "  Browser extension:" -ForegroundColor White
-    Write-Host "    Silent-install policy active. Restart Chrome / Edge / Brave once -" -ForegroundColor Green
-    Write-Host "    AutoDOM installs automatically and stays up to date from now on." -ForegroundColor Green
+    Write-Host "    Policy files are installed for Chrome/Edge and best-effort Brave." -ForegroundColor Green
+    Write-Host "    Restart the browser and confirm ExtensionSettings on its policy page." -ForegroundColor Green
+    Write-Host "    Arc/Ulaa/other browsers require the unpacked/manual path unless" -ForegroundColor Yellow
+    Write-Host "    their vendor policy support is verified separately." -ForegroundColor Yellow
 } else {
     Write-Host "  Manual extension install:" -ForegroundColor White
     Write-Host "    1. Open chrome://extensions"

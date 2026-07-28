@@ -8,12 +8,14 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 import {
   atomicReplaceDirectory,
   compareExtensionVersions,
+  downloadVerifiedArchive,
   isGitWorktree,
   validateStagedExtension,
   validateUpdateMetadata,
@@ -111,4 +113,85 @@ test("isGitWorktree recognizes .git directory or file", async (t) => {
   assert.equal(await isGitWorktree(root), false);
   await writeFile(join(root, ".git"), "gitdir: elsewhere");
   assert.equal(await isGitWorktree(root), true);
+});
+
+function archiveResponse(chunks, contentLength = 0) {
+  let index = 0;
+  return {
+    ok: true,
+    status: 200,
+    headers: {
+      get(name) {
+        return name === "content-length" && contentLength
+          ? String(contentLength)
+          : null;
+      },
+    },
+    body: {
+      getReader() {
+        return {
+          async read() {
+            if (index >= chunks.length) return { done: true };
+            return { done: false, value: chunks[index++] };
+          },
+          async cancel() {},
+        };
+      },
+    },
+  };
+}
+
+test("downloadVerifiedArchive rejects checksum mismatch and removes no existing file", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "autodom-update-download-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const destination = join(root, "update.zip");
+  await assert.rejects(
+    () =>
+      downloadVerifiedArchive(
+        archiveResponse([Buffer.from("invalid")]),
+        destination,
+        "0".repeat(64),
+      ),
+    /SHA-256 mismatch/,
+  );
+  assert.equal(await readFile(destination, "utf8"), "invalid");
+});
+
+test("downloadVerifiedArchive enforces declared and streamed size limits", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "autodom-update-size-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await assert.rejects(
+    () =>
+      downloadVerifiedArchive(
+        archiveResponse([], 11),
+        join(root, "declared.zip"),
+        "0".repeat(64),
+        { maxBytes: 10 },
+      ),
+    /safety limit/,
+  );
+  await assert.rejects(
+    () =>
+      downloadVerifiedArchive(
+        archiveResponse([Buffer.alloc(6), Buffer.alloc(6)]),
+        join(root, "streamed.zip"),
+        "0".repeat(64),
+        { maxBytes: 10 },
+      ),
+    /safety limit/,
+  );
+});
+
+test("legacy updater delegates to verified staged Node implementation", async () => {
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+  const [shell, updater] = await Promise.all([
+    readFile(join(root, "update.sh"), "utf8"),
+    readFile(join(root, "scripts/update-unpacked.mjs"), "utf8"),
+  ]);
+  assert.match(shell, /scripts\/update-unpacked\.mjs/);
+  assert.doesNotMatch(shell, /updates\.xml|unzip -q -o/);
+  assert.match(updater, /updates\.json/);
+  assert.match(updater, /downloadVerifiedArchive/);
+  assert.match(updater, /isGitWorktree/);
+  assert.match(updater, /atomicReplaceDirectory/);
 });

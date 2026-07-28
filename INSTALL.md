@@ -6,7 +6,7 @@
 |---|---|---|
 | **Node.js** | v20.19+, v22.12+, or v23+ | `node -v` |
 | **npm** | (bundled with Node.js) | `npm -v` |
-| **Chromium-based browser** | Chrome, Edge, Brave, Ulaa, Arc, etc. | Any browser supporting Manifest V3 extensions |
+| **Chromium-based browser** | Chrome/Edge for managed installs; Brave best-effort; other MV3 browsers use unpacked/manual installation | Browser-specific policy support varies |
 | **IDE with MCP support** | See supported IDEs below | — |
 
 ### Supported IDEs
@@ -65,17 +65,17 @@ Both scripts will:
 - ✅ Install server dependencies (`npm install`)
 - ✅ Auto-configure all detected IDEs (JetBrains, VS Code, Cursor, Claude Desktop, Gemini CLI)
 - ✅ On macOS/Linux: enable AutoDOM for both **GitHub Copilot** and **JetBrains AI Assistant**
-- ✅ **Enroll the Chromium force-install policy** for every browser detected
-  (Chrome, Edge, Brave). Single sudo / UAC prompt — no further interaction.
+- ✅ **Write and verify Chromium force-install policy files** for Chrome/Edge
+  and best-effort Brave. Single sudo / UAC prompt.
 
 After the script finishes:
 
-1. **Restart Chrome / Edge / Brave once.** AutoDOM installs automatically and
-   stays up to date from the GitHub Pages update channel (~5h cadence) — no
-   `Load unpacked`, no Developer-mode toggle, no Web-Store prompt.
+1. **Restart Chrome / Edge / Brave once**, then open the browser policy page
+   and confirm `ExtensionSettings` is active for AutoDOM. Only then should the
+   browser install and update it from the GitHub Pages channel.
 2. **Restart your IDE** so it picks up the new MCP config.
 3. Open the AutoDOM popup in the browser → confirm it says **Connected**.
-4. Your AI agent now has access to 70 browser-automation tools.
+4. Your AI agent now has access to AutoDOM's browser-automation tool suite.
 
 If you ran with `--no-auto-update` / `-NoAutoUpdate`, install the extension
 manually:
@@ -109,7 +109,9 @@ npm install
 > The source `extension/manifest.json` ships with the canonical signing
 > `key`, so an unpacked load resolves to the same extension ID
 > (`kpjdffgogiajnkajnjneiboaincnaokf`) as the signed CRX from a GitHub
-> Release. Updates from the self-hosted channel work either way.
+> Release. Chromium does not auto-update unpacked extensions through
+> `requestUpdateCheck`: share bundles use AutoDOM's bridge updater, while Git
+> worktrees require `git pull` followed by Reload on the extensions page.
 
 ### Step 3 — Configure Your IDE
 
@@ -213,7 +215,7 @@ Edit `~/.gemini/settings.json` (Windows: `%USERPROFILE%\.gemini\settings.json`):
 2. Click the AutoDOM icon in the browser toolbar
 3. The popup should show **Connected** (green status)
 4. If it shows Disconnected, click **Connect**
-5. In your IDE, autodom should appear as an available MCP server with 70 tools
+5. In your IDE, AutoDOM should appear as an available MCP server with its browser tools
 
 ---
 

@@ -17,9 +17,9 @@
 import { FastMCP, imageContent } from "fastmcp";
 import extractZip from "extract-zip";
 import {
-  MAX_UPDATE_BYTES,
   atomicReplaceDirectory,
   compareExtensionVersions,
+  downloadVerifiedArchive,
   isGitWorktree,
   validateStagedExtension,
   validateUpdateMetadata,
@@ -32,7 +32,7 @@ import { promises as fs, readFileSync, rmSync, createWriteStream } from "fs";
 import { tmpdir } from "os";
 import { join, isAbsolute, resolve as resolvePath } from "path";
 import { promisify } from "util";
-import { createHash, randomBytes, timingSafeEqual } from "crypto";
+import { randomBytes, timingSafeEqual } from "crypto";
 
 // Local Playwright/Node automation backends were intentionally removed: AutoDOM
 // is a Playwright alternative, not a wrapper, and any server-spawned automation
@@ -3002,58 +3002,54 @@ async function _runSelfUpdateInBackground(socket, id) {
       throw new Error(`Zip download HTTP ${zipRes.status}`);
     }
 
-    const contentLength = parseInt(zipRes.headers.get("content-length") || "0", 10);
-    if (contentLength > MAX_UPDATE_BYTES) {
-      clearTimeout(downloadTimer);
-      throw new Error("Update ZIP exceeds 50 MiB safety limit");
-    }
-    const reader = zipRes.body.getReader();
-    const output = await fs.open(tmpZip, "wx", 0o600);
-    const hash = createHash("sha256");
     let downloaded = 0;
+    let contentLength = 0;
     let lastReportedPct = 5;
     let lastReportedBytes = 0;
 
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        downloaded += value.length;
-        if (downloaded > MAX_UPDATE_BYTES) {
-          throw new Error("Update ZIP exceeds 50 MiB safety limit");
-        }
-        hash.update(value);
-        await output.write(value);
-        if (contentLength > 0) {
-          // Accurate percentage: map body progress to 5–85 % range, report every 5 %
-          const pct = Math.min(85, Math.round(5 + (downloaded / contentLength) * 80));
-          if (pct >= lastReportedPct + 5) {
-            lastReportedPct = pct;
-            const mb = (downloaded / 1048576).toFixed(1);
-            const totalMb = (contentLength / 1048576).toFixed(1);
-            sendProgress(pct, downloaded, contentLength, `Downloading… ${mb} / ${totalMb} MB`);
-          }
-        } else {
-          // No Content-Length (GitHub CDN chunked transfer) — report every 512 KB
-          if (downloaded - lastReportedBytes >= 512 * 1024) {
-            lastReportedBytes = downloaded;
-            const mb = (downloaded / 1048576).toFixed(1);
-            // Rough visual: ~5 % per MB, capped at 85
-            const pct = Math.min(85, 5 + Math.round((downloaded / 1048576) * 5));
-            sendProgress(pct, downloaded, 0, `Downloading… ${mb} MB`);
-          }
-        }
-      }
+      const download = await downloadVerifiedArchive(
+        zipRes,
+        tmpZip,
+        expectedSha256,
+        {
+          onProgress: ({ downloaded: bytes, contentLength: total }) => {
+            downloaded = bytes;
+            contentLength = total;
+            if (contentLength > 0) {
+              // Accurate percentage: map body progress to 5–85 % range.
+              const pct = Math.min(
+                85,
+                Math.round(5 + (downloaded / contentLength) * 80),
+              );
+              if (pct >= lastReportedPct + 5) {
+                lastReportedPct = pct;
+                const mb = (downloaded / 1048576).toFixed(1);
+                const totalMb = (contentLength / 1048576).toFixed(1);
+                sendProgress(
+                  pct,
+                  downloaded,
+                  contentLength,
+                  `Downloading… ${mb} / ${totalMb} MB`,
+                );
+              }
+            } else if (downloaded - lastReportedBytes >= 512 * 1024) {
+              // Chunked transfer: report every 512 KiB.
+              lastReportedBytes = downloaded;
+              const mb = (downloaded / 1048576).toFixed(1);
+              const pct = Math.min(
+                85,
+                5 + Math.round((downloaded / 1048576) * 5),
+              );
+              sendProgress(pct, downloaded, 0, `Downloading… ${mb} MB`);
+            }
+          },
+        },
+      );
+      downloaded = download.downloaded;
+      contentLength = download.contentLength;
     } finally {
       clearTimeout(downloadTimer);
-      await output.close();
-    }
-
-    const actualSha256 = hash.digest("hex");
-    if (actualSha256 !== expectedSha256) {
-      throw new Error(
-        `Update ZIP SHA-256 mismatch (${actualSha256} != ${expectedSha256})`,
-      );
     }
 
     sendProgress(88, downloaded, contentLength, "Validating…");
@@ -5864,13 +5860,8 @@ const fastMcpLogger = {
   debug: (...args) => diagLog(`[FastMCP] ${args.map(String).join(" ")}`),
   info: (...args) => diagLog(`[FastMCP] ${args.map(String).join(" ")}`),
   log: (...args) => diagLog(`[FastMCP] ${args.map(String).join(" ")}`),
-  warn: (...args) => {
-    const message = args.map(String).join(" ");
-    // Lean test/IDE clients may omit optional capability metadata. AutoDOM
-    // does not consume it, so this warning is noise rather than instability.
-    if (message.includes("could not infer client capabilities")) return;
-    process.stderr.write(`[FastMCP warning] ${message}\n`);
-  },
+  warn: (...args) =>
+    process.stderr.write(`[FastMCP warning] ${args.map(String).join(" ")}\n`),
   error: (...args) =>
     process.stderr.write(`[FastMCP error] ${args.map(String).join(" ")}\n`),
 };

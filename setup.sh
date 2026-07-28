@@ -710,9 +710,9 @@ maybe_enroll_auto_update() {
     if AUTODOM_EXTENSION_ID="$ext_id" sudo -n -E bash "$ENTERPRISE_SCRIPT" >/dev/null 2>&1; then
         AUTO_UPDATE_ENROLLED="yes"
         AUTO_UPDATE_ENROLL_SKIPPED_REASON=""
-        echo -e "${GREEN}✓${NC} Silent-install policy active."
-        echo -e "  ${BOLD}Restart Chrome / Edge / Brave${NC} — AutoDOM installs in the background"
-        echo -e "  on next launch and updates itself automatically from then on."
+        echo -e "${GREEN}✓${NC} Managed-policy files installed and verified."
+        echo -e "  ${BOLD}Restart Chrome / Edge / Brave${NC}, then confirm ExtensionSettings"
+        echo -e "  on the browser policy page before expecting managed updates."
     else
         AUTO_UPDATE_ENROLL_SKIPPED_REASON="enterprise-installer-failed"
         # Re-run with output visible so the user can see what failed.
@@ -745,9 +745,10 @@ if [ "$ENABLE_AUTO_UPDATE" = "no" ]; then
     echo ""
 elif [ "$AUTO_UPDATE_ENROLLED" = "yes" ]; then
     echo -e "  ${BOLD}Browser extension:${NC}"
-    echo -e "  ${GREEN}✓ Silent-install policy active.${NC} ${BOLD}Restart your browser${NC} once —"
-    echo -e "    Chrome / Edge / Brave will install AutoDOM automatically and"
-    echo -e "    keep it up to date from now on. No manual steps required."
+    echo -e "  ${GREEN}✓ Policy files installed for Chrome/Edge and best-effort Brave.${NC}"
+    echo -e "    ${BOLD}Restart the browser${NC} and verify ExtensionSettings on its policy page."
+    echo -e "    Arc/Ulaa/other browsers need the unpacked/manual path unless vendor"
+    echo -e "    policy support is verified separately."
     echo ""
 else
     echo -e "  ${BOLD}Browser extension auto-update:${NC}"
