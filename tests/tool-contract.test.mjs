@@ -33,7 +33,7 @@ function namesFromCompatCatalog(serverSource) {
   ].map((match) => match[1]);
 }
 
-test("public FastMCP registration is unique and structurally complete", async () => {
+test("public MCP registration is unique and structurally complete", async () => {
   const server = await source("server/index.js");
   const direct = namesFromAddToolCalls(server);
   const compat = namesFromCompatCatalog(server);
@@ -64,10 +64,25 @@ test("tool-count copy cannot drift from public inventory", async () => {
   }
 });
 
-test("FastMCP upgrade remains pinned to reviewed compatible range", async () => {
+test("official MCP SDK v2 remains pinned to reviewed compatible range", async () => {
   const packageJson = JSON.parse(await source("server/package.json"));
   const lock = JSON.parse(await source("server/package-lock.json"));
-  assert.equal(packageJson.dependencies.fastmcp, "^4.12.1");
-  assert.equal(lock.packages[""].dependencies.fastmcp, "^4.12.1");
-  assert.equal(lock.packages["node_modules/fastmcp"].version, "4.12.1");
+  for (const dependency of [
+    "@modelcontextprotocol/server",
+    "@modelcontextprotocol/client",
+    "@modelcontextprotocol/node",
+  ]) {
+    assert.equal(packageJson.dependencies[dependency], "^2.0.0");
+    assert.equal(lock.packages[""].dependencies[dependency], "^2.0.0");
+    assert.equal(lock.packages[`node_modules/${dependency}`].version, "2.0.0");
+  }
+});
+
+test("release version files stay aligned", async () => {
+  const manifest = JSON.parse(await source("extension/manifest.json"));
+  const packageJson = JSON.parse(await source("server/package.json"));
+  const lock = JSON.parse(await source("server/package-lock.json"));
+  assert.equal(packageJson.version, manifest.version);
+  assert.equal(lock.version, manifest.version);
+  assert.equal(lock.packages[""].version, manifest.version);
 });

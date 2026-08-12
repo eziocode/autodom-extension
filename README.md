@@ -87,7 +87,7 @@ GPO / plist / JSON policy templates for force-install across macOS, Windows, and
   │   IDE / Agent   │◀──────────────────────────▶│  AutoDOM Server │◀──────────────────────────────▶│    Extension    │
   │                 │                            │                 │                                │                 │
   │  Copilot, Claude│   JSON-RPC over stdin/out  │  Node.js bridge │ pinned origin / bearer token   │  Chromium MV3   │
-  │  Cursor, Gemini │                            │  fastmcp + ws   │                                │  service worker │
+  │  Cursor, Gemini │                            │ MCP SDK v2 + ws │                                │  service worker │
   └─────────────────┘                            └─────────────────┘                                └─────────────────┘
 ```
 
@@ -293,7 +293,7 @@ This section describes the internal design for contributors and anyone who wants
 │  │   IDE / AI Agent  │  stdio  │      AutoDOM MCP Server      │   WS    │  Chrome Extension    │ │
 │  │                   │◀───────▶│                              │◀───────▶│                      │ │
 │  │  Copilot, Claude, │ JSON-RPC│  ┌────────┐  ┌───────────┐  │ Bearer  │  ┌────────────────┐  │ │
-│  │  Cursor, Gemini,  │         │  │ FastMCP │  │ WS Bridge │  │  Token  │  │ Service Worker │  │ │
+│  │  Cursor, Gemini,  │         │  │ MCP SDK │  │ WS Bridge │  │  Token  │  │ Service Worker │  │ │
 │  │  JetBrains AI     │         │  │ Router  │  │  Server   │  │         │  │  (background)  │  │ │
 │  └───────────────────┘         │  └────┬───┘  └─────┬─────┘  │         │  └───────┬────────┘  │ │
 │                                │       │            │         │         │          │           │ │
@@ -317,11 +317,11 @@ This section describes the internal design for contributors and anyone who wants
 
 #### 🔵 MCP Server (`server/`)
 
-The bridge is a single-file Node.js server (`index.js`) built on **FastMCP** and **ws**.
+The bridge is a single-file Node.js server (`index.js`) built on the official **MCP TypeScript SDK v2** and **ws**. It speaks MCP `2026-07-28` over stdio and can optionally expose stateless Streamable HTTP at `/mcp` with `--mcp-http-port`.
 
 | Concern | How it works |
 |:---|:---|
-| **MCP transport** | JSON-RPC over `stdin/stdout` — the IDE launches it as a child process |
+| **MCP transport** | Stateless MCP `2026-07-28` over `stdin/stdout`; optional stateless Streamable HTTP at `/mcp` |
 | **WebSocket bridge** | Listens on `ws://127.0.0.1:9876` for the extension to connect |
 | **Primary / proxy mode** | First instance owns the port and writes a lockfile (PID, port, token). Subsequent instances enter **proxy mode** — they connect *to* the primary via the lockfile token instead of fighting for the port |
 | **Lockfile** | Stored in OS temp dir with `0600` permissions. Contains port, PID, server path, and auth token |
@@ -424,7 +424,7 @@ autodom-extension/
 │
 ├── server/
 │   ├── index.js               MCP server + WS bridge (single file)
-│   └── package.json           Dependencies: fastmcp, ws, zod
+│   └── package.json           Dependencies: official MCP SDK v2, ws, zod
 │
 ├── enterprise/                Policy templates for managed deployment
 │   ├── macos/                 plist templates (Chrome, Edge, Brave)

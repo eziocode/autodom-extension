@@ -126,7 +126,7 @@ try {
 # ── 4. Verify critical deps ──────────────────────────────────
 Write-Step "Verifying critical dependencies..."
 $missing = @()
-foreach ($dep in @("fastmcp","ws","zod")) {
+foreach ($dep in @("@modelcontextprotocol/server","@modelcontextprotocol/client","@modelcontextprotocol/node","ws","zod")) {
     $depDir = Join-Path $ServerDir "node_modules\$dep"
     if (-not (Test-Path $depDir)) {
         $missing += $dep

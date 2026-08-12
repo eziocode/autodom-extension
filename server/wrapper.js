@@ -87,7 +87,7 @@ child.stdout.on("close", () => {
   log.write(`[${ts()}] Child stdout CLOSE\n`);
 });
 
-// child stderr -> pass through to IDE stderr (FastMCP diagnostics)
+// child stderr -> pass through to IDE stderr (MCP SDK diagnostics)
 child.stderr.on("data", (chunk) => {
   log.write(`[${ts()}] STDERR: ${chunk.toString("utf8")}`);
   process.stderr.write(chunk);

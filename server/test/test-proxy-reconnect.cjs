@@ -55,23 +55,6 @@ async function main() {
 
   const lock = JSON.parse(fs.readFileSync(LOCK, "utf8"));
 
-  // MCP handshake for both.
-  for (const c of [primary, secondary]) {
-    send(c, {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: "2024-11-05",
-        capabilities: {},
-        clientInfo: { name: c.name, version: "1" },
-      },
-    });
-  }
-  await new Promise((r) => setTimeout(r, 300));
-  for (const c of [primary, secondary])
-    send(c, { jsonrpc: "2.0", method: "notifications/initialized" });
-
   // Fake extension connects to the primary.
   const connectExt = () => {
     const ext = new WebSocket(
@@ -116,7 +99,15 @@ async function main() {
     jsonrpc: "2.0",
     id: 99,
     method: "tools/call",
-    params: { name: "list_tabs", arguments: {} },
+    params: {
+      name: "list_tabs",
+      arguments: {},
+      _meta: {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": { name: secondary.name, version: "1" },
+        "io.modelcontextprotocol/clientCapabilities": {},
+      },
+    },
   });
 
   // Reconnect the extension within the grace window.

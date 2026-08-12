@@ -92,7 +92,9 @@ function checkDependenciesInstalled() {
   // Quick sanity: check that key deps exist
   const require = createRequire(import.meta.url);
   try {
-    require.resolve("fastmcp");
+    require.resolve("@modelcontextprotocol/server");
+    require.resolve("@modelcontextprotocol/client");
+    require.resolve("@modelcontextprotocol/node");
     require.resolve("ws");
     require.resolve("zod");
     return true;
@@ -352,6 +354,7 @@ async function main() {
     log(`${c.bold}Usage:${c.reset}`);
     log(`  node cli.js                 Start the MCP bridge server`);
     log(`  node cli.js --port 9877     Use a custom WebSocket port`);
+    log(`  node cli.js --mcp-http-port 9879  Start stateless MCP 2026-07-28 HTTP endpoint`);
     log(`  node cli.js --http-port 9878  Start HTTP REST API on port 9878`);
     log(`  node cli.js --setup         Run interactive setup (configure IDEs)`);
     log(`  node cli.js --doctor        Diagnose common issues`);
@@ -362,6 +365,7 @@ async function main() {
     log(`${c.bold}Environment:${c.reset}`);
     log(`  AUTODOM_TOOL_TIMEOUT=30000      Tool execution timeout (ms)`);
     log(`  AUTODOM_INACTIVITY_TIMEOUT=600000  Auto-shutdown after idle (ms, 0=disable)`);
+    log(`  AUTODOM_MCP_HTTP_PORT=9879      Enable stateless MCP HTTP at /mcp`);
     log(`  AUTODOM_HTTP_PORT=9878          Enable HTTP REST API on that port`);
     log(`  AUTODOM_HTTP_TOKEN=<secret>     Require Bearer token on REST API calls`);
     log(`  AUTODOM_DEBUG=1                 Enable diagnostic logging`);

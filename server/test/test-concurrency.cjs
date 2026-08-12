@@ -110,20 +110,8 @@ async function main() {
   });
   await new Promise((r) => setTimeout(r, 500));
 
-  // 3) MCP handshake for every client + fire overlapping tool calls.
+  // 3) Fire overlapping stateless MCP 2026-07-28 tool calls.
   let nextRpcId = 1;
-  for (const c of clients) {
-    send(c, {
-      jsonrpc: "2.0", id: nextRpcId++,
-      method: "initialize",
-      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: c.name, version: "1" } },
-    });
-  }
-  await new Promise((r) => setTimeout(r, 400));
-  for (const c of clients) {
-    send(c, { jsonrpc: "2.0", method: "notifications/initialized" });
-  }
-
   // Overlap: each client fires CALLS_PER_CLIENT calls back-to-back.
   const callPlan = []; // {client, rpcId}
   for (const c of clients) {
@@ -133,7 +121,15 @@ async function main() {
       send(c, {
         jsonrpc: "2.0", id: rpcId,
         method: "tools/call",
-        params: { name: "list_tabs", arguments: {} },
+        params: {
+          name: "list_tabs",
+          arguments: {},
+          _meta: {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": { name: c.name, version: "1" },
+            "io.modelcontextprotocol/clientCapabilities": {},
+          },
+        },
       });
     }
   }

@@ -27,11 +27,6 @@ async function main() {
   await new Promise(r => setTimeout(r, 1500));
   const lock = JSON.parse(fs.readFileSync(LOCK, 'utf8'));
 
-  // MCP handshake
-  send({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2024-11-05',capabilities:{},clientInfo:{name:'t',version:'1'}}});
-  await new Promise(r => setTimeout(r, 300));
-  send({jsonrpc:'2.0',method:'notifications/initialized'});
-
   // Extension connects
   let ext = new WebSocket(`ws://127.0.0.1:${PORT}/?token=${encodeURIComponent(lock.token)}`);
   await new Promise(r => ext.on('open', r));
@@ -51,7 +46,20 @@ async function main() {
 
   // Fire a tool call immediately (server now sees extensionSocket null)
   const t0 = Date.now();
-  send({jsonrpc:'2.0',id:99,method:'tools/call',params:{name:'list_tabs',arguments:{}}});
+  send({
+    jsonrpc:'2.0',
+    id:99,
+    method:'tools/call',
+    params:{
+      name:'list_tabs',
+      arguments:{},
+      _meta:{
+        'io.modelcontextprotocol/protocolVersion':'2026-07-28',
+        'io.modelcontextprotocol/clientInfo':{name:'t',version:'1'},
+        'io.modelcontextprotocol/clientCapabilities':{},
+      },
+    },
+  });
 
   // Reconnect after 1.5s (within RECONNECT_GRACE_MS=4s)
   await new Promise(r => setTimeout(r, 1500));

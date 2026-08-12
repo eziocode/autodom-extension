@@ -356,7 +356,7 @@ echo -e "${GREEN}✓${NC} Dependencies installed"
 echo -e "${BLUE}[4/6]${NC} Verifying critical dependencies..."
 
 MISSING_DEPS=0
-for dep in fastmcp ws zod; do
+for dep in @modelcontextprotocol/server @modelcontextprotocol/client @modelcontextprotocol/node ws zod; do
     if [ ! -d "$SERVER_DIR/node_modules/$dep" ]; then
         echo -e "${RED}  ✗ $dep not found in node_modules${NC}"
         MISSING_DEPS=$((MISSING_DEPS + 1))
@@ -370,7 +370,7 @@ if [ "$MISSING_DEPS" -gt 0 ]; then
     echo -e "${YELLOW}  Retrying with clean install...${NC}"
     rm -rf "$SERVER_DIR/node_modules"
     npm install --silent 2>&1 | tail -1
-    for dep in fastmcp ws zod; do
+    for dep in @modelcontextprotocol/server @modelcontextprotocol/client @modelcontextprotocol/node ws zod; do
         if [ ! -d "$SERVER_DIR/node_modules/$dep" ]; then
             echo -e "${RED}✗ $dep still missing after clean install. Check your network and try again.${NC}"
             exit 1
@@ -385,82 +385,26 @@ fi
 echo -e "${BLUE}[5/6]${NC} Verifying server..."
 
 VERIFY_OUTPUT="$(SERVER_ARGS_JSON="$SERVER_ARGS_JSON" node <<'NODE' 2>&1 || true
-const { spawn } = require("child_process");
-
-const serverArgs = JSON.parse(process.env.SERVER_ARGS_JSON || "[]");
-const child = spawn("node", serverArgs, { stdio: ["pipe", "pipe", "pipe"] });
-let stdout = "";
-let stderr = "";
-let ok = false;
-let toolsCount = 0;
-
-function send(message) {
-  child.stdin.write(JSON.stringify(message) + "\n");
-}
-
-function inspectOutput() {
-  const messages = stdout
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line);
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
-
-  for (const msg of messages) {
-    if (msg.id === 2 && Array.isArray(msg.result?.tools)) {
-      toolsCount = msg.result.tools.length;
-      if (toolsCount > 0) ok = true;
-    }
-  }
-}
-
-child.stderr.on("data", (chunk) => {
-  stderr += chunk.toString("utf8");
-});
-child.stdout.on("data", (chunk) => {
-  stdout += chunk.toString("utf8");
-  inspectOutput();
-  if (ok) {
-    child.stdin.end();
-    child.kill("SIGTERM");
-  }
-});
-
-child.on("spawn", () => {
-  send({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "initialize",
-    params: {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
-      clientInfo: { name: "autodom-setup", version: "1.0.0" },
-    },
-  });
-  send({ jsonrpc: "2.0", method: "notifications/initialized" });
-  send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
-});
-
-const timer = setTimeout(() => {
-  inspectOutput();
-  child.stdin.end();
-  child.kill("SIGTERM");
-}, 8000);
-
-child.on("close", () => {
-  clearTimeout(timer);
-  inspectOutput();
-  if (ok) {
+(async () => {
+  const { Client } = await import("@modelcontextprotocol/client");
+  const { StdioClientTransport } = await import("@modelcontextprotocol/client/stdio");
+  const serverArgs = JSON.parse(process.env.SERVER_ARGS_JSON || "[]");
+  const transport = new StdioClientTransport({ command: "node", args: serverArgs });
+  const client = new Client(
+    { name: "autodom-setup", version: "1.0.0" },
+    { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+  );
+  try {
+    await client.connect(transport);
+    const result = await client.listTools();
+    const toolsCount = Array.isArray(result.tools) ? result.tools.length : 0;
+    if (toolsCount < 1) throw new Error("MCP tools/list returned no tools");
     console.log(`MCP tools/list returned ${toolsCount} tools`);
-    process.exit(0);
+  } finally {
+    await client.close().catch(() => {});
   }
-  console.error(stderr.trim() || stdout.trim() || "No MCP response from server");
+})().catch((error) => {
+  console.error(error?.stack || error?.message || String(error));
   process.exit(1);
 });
 NODE

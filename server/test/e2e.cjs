@@ -49,24 +49,18 @@ setTimeout(() => {
       JSON.stringify({
         jsonrpc: '2.0',
         id: 1,
-        method: 'initialize',
+        method: 'tools/call',
         params: {
-          protocolVersion: '2024-11-05',
-          capabilities: {},
-          clientInfo: { name: 'ide', version: '1' },
+          name: 'list_tabs',
+          arguments: {},
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+            'io.modelcontextprotocol/clientInfo': { name: 'ide', version: '1' },
+            'io.modelcontextprotocol/clientCapabilities': {},
+          },
         },
       }) + '\n',
     );
-    setTimeout(() => {
-      p.stdin.write(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id: 2,
-          method: 'tools/call',
-          params: { name: 'list_tabs', arguments: {} },
-        }) + '\n',
-      );
-    }, 500);
   }, 1000);
 }, 1000);
 

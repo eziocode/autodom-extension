@@ -14,7 +14,12 @@
  *   node index.js --stop [--port 9876]
  */
 
-import { FastMCP, imageContent } from "fastmcp";
+import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
+import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import {
+  localhostHostValidation,
+  toNodeHandler,
+} from "@modelcontextprotocol/node";
 import extractZip from "extract-zip";
 import {
   atomicReplaceDirectory,
@@ -421,8 +426,14 @@ const PROXY_LOCK_WAIT_MS = parseInt(
   10,
 );
 const PROXY_LOCK_POLL_MS = 100;
-const SSE_PORT = parseInt(getArgValue("--sse-port") || "0", 10);
-// When set, a plain HTTP REST API starts alongside the MCP/SSE transports.
+const MCP_HTTP_PORT = parseInt(
+  getArgValue("--mcp-http-port") ||
+    process.env.AUTODOM_MCP_HTTP_PORT ||
+    getArgValue("--sse-port") ||
+    "0",
+  10,
+);
+// When set, a plain HTTP REST API starts alongside MCP transports.
 // Any HTTP client (curl, scripts, CI runners) can then call tools directly —
 // no MCP-aware AI agent or IDE plugin required.
 //   node index.js --http-port 9877
@@ -672,9 +683,13 @@ function _signalProxyReady() {
 }
 
 // ─── IDE AI Agent Routing ────────────────────────────────────
-// Tracks the active MCP session so we can use requestSampling to
-// route chat panel requests to the IDE's connected AI agent.
-let activeMcpSession = null;
+// MCP 2026-07-28 has no protocol-level session and forbids unsolicited
+// server-to-client requests. Track only whether stdio is owned by an IDE;
+// chat-panel work is handed to the IDE through explicit queue tools below.
+let mcpTransportConnected = false;
+let stdioMcpHandle = null;
+let mcpHttpServer = null;
+let mcpHttpHandler = null;
 // Queue of unresolved chat requests that the IDE agent can pick up
 // via the `get_pending_chat_requests` / `respond_to_chat` tools.
 let pendingChatRequests = new Map(); // id → { text, context, socket, timestamp }
@@ -915,16 +930,16 @@ function startInactivityTimer() {
     const idleMs = Date.now() - lastActivityTime;
     const idleMins = (idleMs / 60000).toFixed(1);
     if (idleMs >= INACTIVITY_TIMEOUT_MS) {
-      // Don't auto-shutdown if the IDE MCP session is still active.
+      // Don't auto-shutdown while the IDE still owns the stdio transport.
       // The IDE (JetBrains AI Assistant, Copilot Chat, etc.) manages
       // the server process lifecycle via stdio. Killing ourselves while
       // the IDE's transport is still open corrupts the MCP transport
       // state machine — the IDE reports "Transport closed" and cannot
       // reconnect without a full restart.  Only shut down for inactivity
-      // when no IDE session is connected (e.g. standalone/SSE mode).
-      if (activeMcpSession) {
+      // when no IDE transport is connected (e.g. standalone HTTP mode).
+      if (mcpTransportConnected) {
         diagLog(
-          `Inactivity timeout reached (${idleMins}m) but MCP session is still active — skipping shutdown`,
+          `Inactivity timeout reached (${idleMins}m) but MCP stdio transport is still active — skipping shutdown`,
         );
         // Reset the timer so we don't log this warning every 30s
         lastActivityTime = Date.now();
@@ -1011,6 +1026,7 @@ async function writeLockFile() {
         pid: process.pid,
         port: WS_PORT,
         ...(HTTP_PORT > 0 ? { httpPort: HTTP_PORT } : {}),
+        ...(MCP_HTTP_PORT > 0 ? { mcpHttpPort: MCP_HTTP_PORT } : {}),
         serverPath,
         startedAt: new Date().toISOString(),
         token: AUTH_TOKEN,
@@ -1252,6 +1268,20 @@ async function shutdown(code = 0) {
 
   // Stop inactivity timer
   stopInactivityTimer();
+
+  if (mcpHttpServer) {
+    await new Promise((resolve) => mcpHttpServer.close(() => resolve()));
+    mcpHttpServer = null;
+  }
+  if (mcpHttpHandler) {
+    await mcpHttpHandler.close().catch(() => {});
+    mcpHttpHandler = null;
+  }
+  if (stdioMcpHandle) {
+    await stdioMcpHandle.close().catch(() => {});
+    stdioMcpHandle = null;
+    mcpTransportConnected = false;
+  }
 
   await removeLockFileIfOwned();
   process.exit(code);
@@ -2592,7 +2622,7 @@ const _HEURISTIC_INTENT_HANDLERS = [
 ];
 
 function _shouldPreferIdeAiForRichIntent(lower) {
-  if (!activeMcpSession) return false;
+  if (!mcpTransportConnected) return false;
   return (
     lower.includes("summarize") || lower.includes("summary") ||
     lower === "tldr" || lower === "tl;dr" ||
@@ -2626,117 +2656,43 @@ async function _runHeuristicAiChatPath({
       return { responseText };
     }
   }
-  // Fallback: route to IDE AI agent via MCP sampling.
-  const responseText = await _routeViaIdeSamplingOrQueue({
-    socket, id, text, context, effectiveContext, toolCalls,
-  });
+  // MCP 2026-07-28 disallows unsolicited sampling outside an active request.
+  // Hand work to the IDE through explicit queue tools instead.
+  const responseText = await _routeViaIdeQueue({ socket, id, text, context });
   return { responseText };
 }
 
-async function _routeViaIdeSamplingOrQueue({
+async function _routeViaIdeQueue({
   socket,
   id,
   text,
   context,
-  effectiveContext,
-  toolCalls,
 }) {
-  let responseText = "";
-  let aiRouted = false;
+  const chatReqId = ++chatRequestIdCounter;
+  pendingChatRequests.set(chatReqId, {
+    id: chatReqId,
+    text,
+    context: context || {},
+    socket,
+    wsMessageId: id,
+    timestamp: Date.now(),
+  });
 
-  if (activeMcpSession) {
-    try {
-      process.stderr.write(
-        `[AutoDOM] Routing chat to IDE AI agent via sampling: "${(text || "").substring(0, 80)}"\n`,
-      );
+  setTimeout(() => {
+    pendingChatRequests.delete(chatReqId);
+  }, 120000).unref();
 
-      // Build a rich prompt with page context for the AI agent
-      let samplingPrompt = `The user is interacting with a web page through the AutoDOM browser extension's chat panel.\n\n`;
-      samplingPrompt += `Page: ${scrubSensitiveContextText(context?.title || "Unknown")}\n`;
-      samplingPrompt += `URL: ${scrubSensitiveContextText(context?.url || "Unknown")}\n`;
-      if (context?.interactiveElements) {
-        const ie = context.interactiveElements;
-        samplingPrompt += `Interactive elements: ${ie.links || 0} links, ${ie.buttons || 0} buttons, ${ie.inputs || 0} inputs, ${ie.forms || 0} forms\n`;
-      }
-      if (effectiveContext?.browserSnapshot && !effectiveContext.browserSnapshot.error) {
-        const snap = formatBrowserSnapshotForPrompt(effectiveContext.browserSnapshot);
-        if (snap) {
-          samplingPrompt += `\nActive page data already captured by AutoDOM (use this directly; do not ask the user to run /dom or paste DOM output):\n${snap}\n`;
-        }
-      }
-      samplingPrompt += `\nUser request: "${text}"\n\n`;
-      samplingPrompt += `You have access to AutoDOM MCP tools (get_dom_state, click_by_index, type_by_index, execute_code, navigate, screenshot, scroll, etc.).\n`;
-      samplingPrompt += `Please fulfill the user's request using the available tools. Do not ask the user to run browser-console snippets, paste DOM output, or type internal placeholder tokens. Respond with a clear, helpful answer describing what you found or did. Never expose raw internal shorthand like IC7 or CB0 in the final answer; if you need to mention an indexed element, say element #7 and describe it in plain English.`;
+  process.stderr.write(
+    `[AutoDOM] Pending chat request #${chatReqId}: "${(text || "").substring(0, 100)}"\n`,
+  );
 
-      const samplingResult = await activeMcpSession.requestSampling(
-        {
-          messages: [
-            {
-              role: "user",
-              content: { type: "text", text: samplingPrompt },
-            },
-          ],
-          maxTokens: 4096,
-        },
-        { timeout: 55000 },
-      );
-
-      if (samplingResult && samplingResult.content) {
-        const aiText =
-          typeof samplingResult.content === "string"
-            ? samplingResult.content
-            : samplingResult.content.text ||
-              JSON.stringify(samplingResult.content);
-        responseText = aiText;
-        toolCalls.push({ tool: "_ide_ai_agent", via: "sampling" });
-        aiRouted = true;
-        process.stderr.write(
-          `[AutoDOM] IDE AI agent responded (${aiText.length} chars)\n`,
-        );
-      }
-    } catch (samplingErr) {
-      process.stderr.write(
-        `[AutoDOM] Sampling failed (${samplingErr.message}), falling back to queue\n`,
-      );
-    }
-  }
-
-  // Fallback: No AI is actually connected. Sampling didn't work and no
-  // direct provider is configured. Show a short, actionable message
-  // instead of the verbose queue dump — the queued request rarely gets
-  // picked up unless the user has explicitly told their IDE agent to
-  // poll get_pending_chat_requests.
-  if (!aiRouted) {
-    const chatReqId = ++chatRequestIdCounter;
-    pendingChatRequests.set(chatReqId, {
-      id: chatReqId,
-      text: text,
-      context: context || {},
-      socket: socket,
-      wsMessageId: id,
-      timestamp: Date.now(),
-    });
-
-    // Auto-expire after 2 minutes
-    setTimeout(() => {
-      if (pendingChatRequests.has(chatReqId)) {
-        pendingChatRequests.delete(chatReqId);
-      }
-    }, 120000).unref();
-
-    responseText =
-      `**No AI provider is connected.**\n\n` +
-      `To chat with AutoDOM, please connect an AI:\n\n` +
-      `• Open the AutoDOM extension settings and add an **OpenAI**, **Anthropic**, or **Ollama** key/endpoint, **or**\n` +
-      `• Ask the AI agent in your IDE (Copilot, Codex, Cursor, etc.) to call \`get_pending_chat_requests\` to pick up this message.\n\n` +
-      `Slash commands like \`/dom\`, \`/screenshot\`, \`/click\`, \`/help\` work without an AI.`;
-
-    process.stderr.write(
-      `[AutoDOM] ⚡ Pending chat request #${chatReqId} (no AI connected): "${(text || "").substring(0, 100)}"\n`,
-    );
-  }
-
-  return responseText;
+  return (
+    `**Request queued for your IDE agent.**\n\n` +
+    `Ask it to call \`get_pending_chat_requests\`, handle request #${chatReqId}, ` +
+    `then call \`respond_to_chat\`. This explicit flow is compatible with stateless MCP 2026-07-28.\n\n` +
+    `You can also configure OpenAI, Anthropic, or Ollama in AutoDOM settings. ` +
+    `Slash commands like \`/dom\`, \`/screenshot\`, and \`/click\` work without an AI.`
+  );
 }
 
 // ── INTERNAL_PROXY_CALL ──────────────────────────────────────
@@ -3355,7 +3311,7 @@ function callExtensionTool(tool, params, options = {}) {
   });
 }
 
-// ─── FastMCP Server ──────────────────────────────────────────
+// ─── MCP Server ──────────────────────────────────────────────
 
 function normalizeProviderSelection(provider) {
   // Handle object forms: { type: "openai" }, { provider: "openai" }, { source: "openai" }
@@ -5856,24 +5812,56 @@ async function callCliProvider({
   };
 }
 
-const fastMcpLogger = {
-  debug: (...args) => diagLog(`[FastMCP] ${args.map(String).join(" ")}`),
-  info: (...args) => diagLog(`[FastMCP] ${args.map(String).join(" ")}`),
-  log: (...args) => diagLog(`[FastMCP] ${args.map(String).join(" ")}`),
-  warn: (...args) =>
-    process.stderr.write(`[FastMCP warning] ${args.map(String).join(" ")}\n`),
-  error: (...args) =>
-    process.stderr.write(`[FastMCP error] ${args.map(String).join(" ")}\n`),
+const toolDefinitions = [];
+
+// Keep existing declarative tool definitions compact while using official SDK
+// v2 underneath. Factory is intentionally side-effect-free: modern HTTP builds
+// one server per request, and stdio may build one probe instance before pinning
+// protocol era for connection lifetime.
+const server = {
+  tools: toolDefinitions,
+  addTool(definition) {
+    toolDefinitions.push(definition);
+  },
 };
 
-const server = new FastMCP({
-  name: "autodom",
-  version: SERVER_VERSION,
-  // AutoDOM never consumes client filesystem roots. Disabling negotiation
-  // avoids repeated capability probes against lean IDE MCP clients.
-  roots: { enabled: false },
-  logger: fastMcpLogger,
-});
+function normalizeMcpToolResult(value) {
+  if (value && typeof value === "object" && Array.isArray(value.content)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return { content: [{ type: "text", text: value }] };
+  }
+  const text = stringifyToolResult(value);
+  const result = { content: [{ type: "text", text }] };
+  if (value !== undefined) result.structuredContent = value;
+  return result;
+}
+
+function createAutoDomMcpServer() {
+  const mcpServer = new McpServer(
+    { name: "autodom", version: SERVER_VERSION },
+    {
+      instructions:
+        "Inspect page state before UI actions. Use explicit identifiers returned by tools across calls; MCP transport sessions are not application state.",
+      cacheHints: {
+        "server/discover": { ttlMs: 60000, cacheScope: "public" },
+        "tools/list": { ttlMs: 60000, cacheScope: "public" },
+      },
+    },
+  );
+
+  for (const definition of toolDefinitions) {
+    const { name, parameters, execute, ...config } = definition;
+    mcpServer.registerTool(
+      name,
+      { ...config, inputSchema: parameters },
+      async (params, context) =>
+        normalizeMcpToolResult(await execute(params, context)),
+    );
+  }
+  return mcpServer;
+}
 
 function _playwrightTarget(params = {}) {
   return String(
@@ -8460,7 +8448,7 @@ async function startHttpApiServer(port) {
   });
 }
 
-// ─── Start FastMCP Server ────────────────────────────────────
+// ─── Start MCP Server ────────────────────────────────────────
 
 if (STOP_ONLY) {
   try {
@@ -8492,45 +8480,57 @@ if (STOP_ONLY) {
       `isPrimaryServer=${isPrimaryServer} proxyClient=${proxyClient ? "created" : "null"}`,
     );
 
-    // Monitor the stdio transport session for close/error
-    server.on("connect", ({ session }) => {
-      diagLog("MCP session connected");
-      activeMcpSession = session;
-      process.stderr.write(
-        "[AutoDOM] IDE AI agent session connected — chat panel requests will be routed to IDE\n",
-      );
-      session.on("error", (err) => {
-        diagLog(`MCP session error: ${err?.message || err}`);
-      });
+    stdioMcpHandle = serveStdio(() => {
+      mcpTransportConnected = true;
+      return createAutoDomMcpServer();
+    }, {
+      onerror: (err) => {
+        process.stderr.write(`[AutoDOM] MCP stdio error: ${err.message}\n`);
+      },
     });
-    server.on("disconnect", ({ session }) => {
-      diagLog("MCP session disconnected");
-      if (activeMcpSession === session) {
-        activeMcpSession = null;
-        process.stderr.write("[AutoDOM] IDE AI agent session disconnected\n");
-      }
-    });
+    diagLog("Official MCP SDK v2 stdio transport active");
 
-    await server.start({
-      transportType: "stdio",
-    });
-
-    diagLog("server.start() resolved — stdio transport active");
-
-    // ─── Optional SSE Transport (for in-browser chat) ──────────
-    // When --sse-port is specified, start a second transport for HTTP clients.
-    // This allows the extension's chat panel to connect directly to the MCP
-    // server without needing the IDE as an intermediary.
-    if (SSE_PORT > 0) {
+    // ─── Optional stateless Streamable HTTP transport ─────────
+    // --sse-port remains an input alias for compatibility, but old /sse and
+    // /message endpoints are intentionally gone. MCP 2026-07-28 uses /mcp.
+    if (MCP_HTTP_PORT > 0) {
       try {
         const { createServer } = await import("http");
-        const sseClients = new Set();
+        const validateHost = localhostHostValidation();
+        mcpHttpHandler = createMcpHandler(createAutoDomMcpServer, {
+          onerror: (err) =>
+            process.stderr.write(`[AutoDOM] MCP HTTP error: ${err.message}\n`),
+        });
+        const handleMcpRequest = toNodeHandler(mcpHttpHandler, {
+          onerror: (err) =>
+            process.stderr.write(`[AutoDOM] MCP HTTP adapter error: ${err.message}\n`),
+        });
 
-        const httpServer = createServer(async (req, res) => {
-          // CORS headers for extension access
-          res.setHeader("Access-Control-Allow-Origin", "*");
+        mcpHttpServer = createServer(async (req, res) => {
+          if (!validateHost(req, res)) return;
+
+          const origin = req.headers.origin;
+          if (origin) {
+            let originAllowed = isAllowedOrigin(origin);
+            try {
+              const hostname = new URL(origin).hostname;
+              originAllowed ||= ["localhost", "127.0.0.1", "[::1]", "::1"].includes(
+                hostname,
+              );
+            } catch (_) {}
+            if (!originAllowed) {
+              res.writeHead(403, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Origin is not allowed" }));
+              return;
+            }
+            res.setHeader("Access-Control-Allow-Origin", origin);
+            res.setHeader("Vary", "Origin");
+          }
           res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-          res.setHeader("Access-Control-Allow-Headers", "Content-Type, Accept");
+          res.setHeader(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Accept, Authorization, MCP-Protocol-Version, Mcp-Method, Mcp-Name, traceparent, tracestate, baggage",
+          );
 
           if (req.method === "OPTIONS") {
             res.writeHead(204);
@@ -8538,121 +8538,44 @@ if (STOP_ONLY) {
             return;
           }
 
-          // SSE endpoint for streaming responses
-          if (req.method === "GET" && req.url === "/sse") {
-            res.writeHead(200, {
-              "Content-Type": "text/event-stream",
-              "Cache-Control": "no-cache",
-              Connection: "keep-alive",
-            });
-
-            // Send initial connection event
-            res.write(`event: endpoint\ndata: /message\n\n`);
-
-            const client = { res, id: Date.now() };
-            sseClients.add(client);
-
-            req.on("close", () => {
-              sseClients.delete(client);
-              diagLog(`SSE client ${client.id} disconnected`);
-            });
-
-            diagLog(`SSE client ${client.id} connected`);
-            return;
-          }
-
-          // Message endpoint for JSON-RPC requests
-          if (req.method === "POST" && req.url === "/message") {
-            let body = "";
-            req.on("data", (chunk) => (body += chunk));
-            req.on("end", async () => {
-              try {
-                const jsonRpc = JSON.parse(body);
-                diagLog(`SSE received: ${jsonRpc.method || "response"}`);
-
-                // Handle tool calls through the same MCP server
-                if (jsonRpc.method && jsonRpc.method.startsWith("tools/")) {
-                  const toolName = jsonRpc.params?.name;
-                  const toolArgs = jsonRpc.params?.arguments || {};
-
-                  if (toolName) {
-                    const result = await callExtensionTool(toolName, toolArgs);
-                    const response = {
-                      jsonrpc: "2.0",
-                      id: jsonRpc.id,
-                      result: {
-                        content: [
-                          {
-                            type: "text",
-                            text: stringifyToolResult(result),
-                          },
-                        ],
-                      },
-                    };
-
-                    // Send via SSE to all clients
-                    for (const client of sseClients) {
-                      client.res.write(
-                        `event: message\ndata: ${JSON.stringify(response)}\n\n`,
-                      );
-                    }
-                  }
-                }
-
-                // Also forward list requests
-                if (jsonRpc.method === "tools/list") {
-                  const tools = server.tools || [];
-                  const response = {
-                    jsonrpc: "2.0",
-                    id: jsonRpc.id,
-                    result: { tools },
-                  };
-                  for (const client of sseClients) {
-                    client.res.write(
-                      `event: message\ndata: ${JSON.stringify(response)}\n\n`,
-                    );
-                  }
-                }
-
-                res.writeHead(202, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ status: "accepted" }));
-              } catch (err) {
-                res.writeHead(400, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ error: err.message }));
-              }
-            });
-            return;
-          }
-
-          // Health check
-          if (req.method === "GET" && req.url === "/health") {
+          const pathname = (req.url || "").split("?")[0].replace(/\/+$/, "") || "/";
+          if (req.method === "GET" && pathname === "/health") {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(
               JSON.stringify({
                 status: "ok",
-                extensionConnected: !!extensionSocket,
-                sseClients: sseClients.size,
-                transport: "sse",
+                extensionConnected: _isExtensionReady(),
+                transport: "streamable-http-stateless",
+                protocolVersion: "2026-07-28",
               }),
             );
             return;
           }
-
-          res.writeHead(404);
-          res.end("Not found");
+          if (pathname === "/mcp") {
+            await handleMcpRequest(req, res);
+            return;
+          }
+          if (pathname === "/sse" || pathname === "/message") {
+            res.writeHead(410, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                error: "Legacy SSE transport removed; use stateless Streamable HTTP at /mcp",
+              }),
+            );
+            return;
+          }
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Not found" }));
         });
 
-        httpServer.listen(SSE_PORT, "127.0.0.1", () => {
+        mcpHttpServer.listen(MCP_HTTP_PORT, "127.0.0.1", () => {
           process.stderr.write(
-            `[AutoDOM] SSE transport listening on http://127.0.0.1:${SSE_PORT}\n`,
-          );
-          process.stderr.write(
-            `[AutoDOM] In-browser chat can connect via SSE at http://127.0.0.1:${SSE_PORT}/sse\n`,
+            `[AutoDOM] Stateless MCP 2026-07-28 on http://127.0.0.1:${MCP_HTTP_PORT}/mcp\n`,
           );
         });
-      } catch (sseErr) {
+      } catch (mcpHttpErr) {
         process.stderr.write(
-          `[AutoDOM] SSE transport failed to start: ${sseErr.message}\n`,
+          `[AutoDOM] MCP HTTP transport failed to start: ${mcpHttpErr.message}\n`,
         );
       }
     }

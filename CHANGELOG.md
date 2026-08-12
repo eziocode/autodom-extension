@@ -4,6 +4,33 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 5.0.0
+
+### Changed
+- Replaced FastMCP with the official Model Context Protocol TypeScript SDK v2.
+- Added native MCP `2026-07-28` negotiation over stdio and an optional
+  stateless Streamable HTTP endpoint at `/mcp`.
+- Removed the legacy `/sse` and `/message` transport endpoints. The old
+  `--sse-port` option remains as an alias for `--mcp-http-port`, but serves the
+  new stateless `/mcp` endpoint.
+- Replaced unsolicited IDE sampling with explicit `get_pending_chat_requests`
+  and `respond_to_chat` tool handoff, matching the stateless protocol model.
+
+### Improved
+- Added public 60-second cache hints for `server/discover` and `tools/list`.
+- Added localhost Host validation, extension/loopback Origin validation, and
+  MCP `2026-07-28` CORS headers for the optional HTTP transport.
+- Updated macOS/Linux and Windows setup dependency checks for official MCP SDK
+  packages.
+
+### Tests
+- Migrated reconnect, proxy, concurrency, end-to-end, and setup verification
+  flows to stateless per-request metadata.
+- Verified modern stdio and Streamable HTTP negotiation at `2026-07-28`, all
+  106 public tools, sessionless HTTP, cache hints, and the dependency audit.
+
+---
+
 ## 4.3.0
 
 ### Added
