@@ -3257,7 +3257,16 @@ async function _onWsConn_SELF_UPDATE_PROGRESS(message) {
 async function _onWsConn_SELF_UPDATE_RESULT(message) {
   if (message.ok) {
     await _writeUpdateStorage(
-      { [UPDATE_STORAGE_KEYS.selfUpdate]: { state: "complete", version: message.version || "" } },
+      {
+        [UPDATE_STORAGE_KEYS.selfUpdate]: {
+          state: "complete",
+          version: message.version || "",
+          // "git" (clone moved to the release tag) or "zip" (share bundle
+          // replaced from the verified archive) — surfaced in diagnostics.
+          method: message.method || "unknown",
+          alreadyCurrent: message.alreadyCurrent === true,
+        },
+      },
       "self-update complete",
     );
     // Reload regardless of whether the popup is still open.
@@ -4228,25 +4237,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: "Bridge not connected. Click Connect first." });
       return false;
     }
-    const id = ++selfUpdateIdCounter;
-    // Write the downloading state to storage BEFORE responding so that
-    // the popup never reads a stale terminal entry when it immediately
-    // checks storage after receiving the OK.
-    _writeUpdateStorage(
-      { [UPDATE_STORAGE_KEYS.selfUpdate]: { state: "downloading", progress: 0, startedAt: Date.now() } },
-      "self-update init",
-    ).finally(() => {
-      try {
-        ws.send(JSON.stringify({ type: "SELF_UPDATE", id }));
-        sendResponse({ ok: true, started: true });
-      } catch (err) {
-        _writeUpdateStorage(
-          { [UPDATE_STORAGE_KEYS.selfUpdate]: { state: "failed", error: err.message } },
-          "self-update send error",
-        ).catch(() => {});
-        sendResponse({ ok: false, error: err.message });
-      }
-    });
+    _startBridgeSelfUpdate(message.source || "popup").then(
+      (result) => sendResponse(result),
+      (err) => sendResponse({ ok: false, error: err?.message || String(err) }),
+    );
     return true; // Keep port open for the async sendResponse
   }
 
@@ -8559,7 +8553,9 @@ async function _getUpdateDiagnostics() {
     bridgeRole: "extension_client",
     policyGuidance:
       installType === "development"
-        ? "Unpacked install: use the bridge share updater, or git pull + Reload for a worktree."
+        ? "Unpacked install: the bridge applies updates on disk. Clean clones move " +
+          "to the release tag; share bundles are replaced from the verified ZIP. " +
+          "Enable Auto-apply updates for zero-click updates."
         : `Verify ExtensionSettings on ${policyPage} before relying on managed updates.`,
   };
 }
@@ -8760,6 +8756,99 @@ async function _maybeAutoApplyPendingUpdate(pending, source) {
     try { chrome.runtime.reload(); } catch (_) {}
   }, 500);
   return true;
+}
+
+// ── Bridge self-update (unpacked installs) ────────────────────
+// Chromium never downloads a pending CRX for a development load, so
+// `onUpdateAvailable` never fires and the CRX path above can never complete.
+// For those installs the MCP bridge does the update on disk instead. Both the
+// popup button and the automatic path below funnel through here so the
+// "downloading" marker is always written before the frame is sent.
+async function _startBridgeSelfUpdate(source) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return { ok: false, error: "Bridge not connected. Click Connect first." };
+  }
+  const id = ++selfUpdateIdCounter;
+  // Write the downloading state to storage BEFORE sending so the popup never
+  // reads a stale terminal entry when it checks storage right after the OK.
+  await _writeUpdateStorage(
+    {
+      [UPDATE_STORAGE_KEYS.selfUpdate]: {
+        state: "downloading",
+        progress: 0,
+        startedAt: Date.now(),
+        source: source || "unknown",
+      },
+    },
+    "self-update init",
+  );
+  try {
+    ws.send(JSON.stringify({ type: "SELF_UPDATE", id }));
+  } catch (err) {
+    await _writeUpdateStorage(
+      { [UPDATE_STORAGE_KEYS.selfUpdate]: { state: "failed", error: err.message } },
+      "self-update send error",
+    );
+    return { ok: false, error: err.message };
+  }
+  return { ok: true, started: true, id };
+}
+
+// Zero-click path: when "Auto-apply updates" is on and we are an unpacked
+// install with a live bridge, a newly published release applies itself. The
+// gates mirror _maybeAutoApplyPendingUpdate so an in-flight agent run is never
+// torn down and a failing bridge cannot spin.
+async function _maybeAutoSelfUpdateViaBridge(details, source) {
+  const version = details && details.version ? details.version : "";
+  if (!version || !_isVersionNewerThanCurrent(version)) return false;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  if (_activeAgentRun) {
+    _debugLog(
+      `[AutoDOM SW] Deferring bridge self-update ${version}; agent run is active`,
+    );
+    return false;
+  }
+
+  const stored = await _readUpdateStorage(
+    [
+      UPDATE_STORAGE_KEYS.autoUpdateEnabled,
+      UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt,
+      UPDATE_STORAGE_KEYS.selfUpdate,
+    ],
+    "bridge auto-update settings",
+  );
+  if (stored[UPDATE_STORAGE_KEYS.autoUpdateEnabled] !== true) return false;
+  if (stored[UPDATE_STORAGE_KEYS.selfUpdate]?.state === "downloading") return false;
+
+  const now = Date.now();
+  const lastAttempt =
+    Number(stored[UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt]) || 0;
+  if (now - lastAttempt < AUTO_UPDATE_RELOAD_COOLDOWN_MS) return false;
+
+  // Only development loads need the bridge; managed/CRX installs let Chromium
+  // apply the signed package itself.
+  const installType = await _getUpdateInstallType();
+  if (installType !== "development") return false;
+
+  await _writeUpdateStorage(
+    { [UPDATE_STORAGE_KEYS.autoUpdateApplyAttemptAt]: now },
+    "bridge auto-update marker",
+  );
+  _debugLog(
+    `[AutoDOM SW] Auto-updating to ${version} via bridge (${source || "unknown"})`,
+  );
+  const started = await _startBridgeSelfUpdate(`auto:${source || "unknown"}`);
+  await _recordUpdateLifecycle(
+    {
+      phase: started.ok ? "applying" : "failed",
+      targetVersion: version,
+      applyMethod: "bridge",
+      applyAttempt: { attemptCount: 1, at: now, automatic: true },
+      lastFailure: started.ok ? null : started.error || "bridge start failed",
+    },
+    `bridge_auto_update:${source || "unknown"}`,
+  ).catch(() => {});
+  return started.ok;
 }
 
 async function _setAvailableUpdate(details, runtimeStatus, source) {
@@ -9005,7 +9094,15 @@ async function _runExtensionUpdateCheckNow(opts = {}) {
         status,
         source,
       );
+      // Unpacked installs get no pending CRX, so the bridge is the only way
+      // this ever applies. Fire and forget: the SELF_UPDATE_RESULT handler
+      // reloads the extension when it lands.
+      const bridgeAutoStarted = await _maybeAutoSelfUpdateViaBridge(
+        preflight.details || details,
+        source,
+      );
       return {
+        bridgeAutoStarted,
         ok: true,
         status: "new_release_found",
         details: preflight.details,

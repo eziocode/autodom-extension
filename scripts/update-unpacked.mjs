@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import extractZip from "../server/node_modules/extract-zip/index.js";
 import {
   access,
   mkdtemp,
@@ -13,9 +12,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   atomicReplaceDirectory,
+  classifyInstallRoot,
   compareExtensionVersions,
   downloadVerifiedArchive,
-  isGitWorktree,
+  extractZipArchive,
+  gitUpdateToTag,
   validateStagedExtension,
   validateUpdateMetadata,
 } from "../server/update-utils.js";
@@ -31,10 +32,23 @@ let archivePath = "";
 
 try {
   await access(join(extensionDir, "manifest.json"));
-  if (await isGitWorktree(root)) {
-    throw new Error(
-      "Git worktree detected. Run `git pull`, then reload AutoDOM on the browser extensions page.",
-    );
+
+  // A clone updates through Git so extension/ and server/ move together and
+  // the checkout stays coherent. Local work is never discarded.
+  const install = await classifyInstallRoot(root);
+  if (install.kind === "git") {
+    if (install.error) throw new Error(install.error);
+    if (!install.clean) {
+      throw new Error(
+        `Uncommitted changes in ${root}. Commit or stash them, then retry.`,
+      );
+    }
+    if (!install.remoteOk) {
+      throw new Error(
+        `This clone's origin is ${install.remoteUrl || "not set"}, not the ` +
+          "official AutoDOM repository. Update it manually with `git pull`.",
+      );
+    }
   }
 
   const currentManifest = JSON.parse(
@@ -58,6 +72,15 @@ try {
     process.exit(0);
   }
 
+  if (install.kind === "git") {
+    process.stdout.write(`Fetching v${version} from Git…\n`);
+    const { tag } = await gitUpdateToTag(root, version);
+    process.stdout.write(
+      `Checked out ${tag}.\nReload AutoDOM on chrome://extensions, edge://extensions, or brave://extensions.\n`,
+    );
+    process.exit(0);
+  }
+
   stagingDir = await mkdtemp(join(root, ".autodom-extension-update-"));
   archivePath = `${stagingDir}.zip`;
   const archiveResponse = await fetch(url, {
@@ -65,7 +88,7 @@ try {
   });
   process.stdout.write(`Downloading and verifying v${version}…\n`);
   await downloadVerifiedArchive(archiveResponse, archivePath, sha256);
-  await extractZip(archivePath, { dir: stagingDir });
+  await extractZipArchive(archivePath, stagingDir);
   await validateStagedExtension(stagingDir, version);
 
   backupDir = join(root, `.autodom-extension-backup-${Date.now()}`);

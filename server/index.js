@@ -20,12 +20,13 @@ import {
   localhostHostValidation,
   toNodeHandler,
 } from "@modelcontextprotocol/node";
-import extractZip from "extract-zip";
 import {
   atomicReplaceDirectory,
+  classifyInstallRoot,
   compareExtensionVersions,
   downloadVerifiedArchive,
-  isGitWorktree,
+  extractZipArchive,
+  gitUpdateToTag,
   validateStagedExtension,
   validateUpdateMetadata,
 } from "./update-utils.js";
@@ -2867,6 +2868,22 @@ function _handleClearToolLogs(socket) {
 // PONG is aliased to the keepalive handler so we don't duplicate the
 // extension-identification logic.
 
+// Explains, in terms the popup can show verbatim, why a Git install was not
+// touched. Each branch is recoverable by the user without losing work.
+function _gitInstallRefusalReason(install, installRoot) {
+  if (install.error) return install.error;
+  if (!install.clean) {
+    return (
+      `Uncommitted changes in ${installRoot}. Commit or stash them, then retry ` +
+      `the update (AutoDOM will not discard local work).`
+    );
+  }
+  return (
+    `This clone's origin is ${install.remoteUrl || "not set"}, not the official ` +
+    `AutoDOM repository. Update it manually with \`git pull\`.`
+  );
+}
+
 function _handleSelfUpdate(socket, message) {
   // Kick off the download as a background task so the WebSocket message
   // handler returns immediately. Progress and completion are reported via
@@ -2899,13 +2916,16 @@ async function _runSelfUpdateInBackground(socket, id) {
       return;
     }
 
-    // Never overwrite source-controlled developer work. Share bundles do not
-    // contain .git and remain eligible for the bridge updater.
-    if (await isGitWorktree(installRoot)) {
+    // A clone is the documented consumer install, so it must be updatable —
+    // but only by moving Git itself to the release tag, and only when there is
+    // no local work to destroy. Share bundles have no .git and take the
+    // verified-ZIP path below.
+    const install = await classifyInstallRoot(installRoot);
+    if (install.kind === "git" && !(install.clean && install.remoteOk)) {
       reply({
         ok: false,
-        error:
-          "AutoDOM is running from a Git worktree. Update with `git pull`, then reload the unpacked extension; bridge self-update will not overwrite source files.",
+        method: "git",
+        error: _gitInstallRefusalReason(install, installRoot),
       });
       return;
     }
@@ -2935,9 +2955,26 @@ async function _runSelfUpdateInBackground(socket, id) {
       : "0.0.0";
     if (compareExtensionVersions(currentVersion, latestVersion) >= 0) {
       sendProgress(100, 0, 0, `Already on v${currentVersion}`);
-      reply({ ok: true, version: currentVersion, alreadyCurrent: true });
+      reply({
+        ok: true,
+        method: install.kind === "git" ? "git" : "zip",
+        version: currentVersion,
+        alreadyCurrent: true,
+      });
       return;
     }
+
+    // Clean official clone: let Git do the work. This updates extension/ and
+    // server/ together and leaves the checkout in a coherent state, which an
+    // extension-only ZIP overwrite cannot do inside a repository.
+    if (install.kind === "git") {
+      sendProgress(20, 0, 0, `Fetching v${latestVersion} from Git…`);
+      const { tag, commit } = await gitUpdateToTag(installRoot, latestVersion);
+      sendProgress(100, 0, 0, `Checked out ${tag}`);
+      reply({ ok: true, method: "git", version: latestVersion, tag, commit });
+      return;
+    }
+
     tmpZip = join(tmpdir(), `autodom-update-${Date.now()}.zip`);
 
     sendProgress(5, 0, 0, `Starting download of v${latestVersion}…`);
@@ -3010,7 +3047,7 @@ async function _runSelfUpdateInBackground(socket, id) {
 
     sendProgress(88, downloaded, contentLength, "Validating…");
     stagingDir = await fs.mkdtemp(join(installRoot, ".autodom-extension-update-"));
-    await extractZip(tmpZip, { dir: stagingDir });
+    await extractZipArchive(tmpZip, stagingDir);
     await validateStagedExtension(stagingDir, latestVersion);
 
     sendProgress(94, downloaded, contentLength, "Installing atomically…");
@@ -3020,7 +3057,7 @@ async function _runSelfUpdateInBackground(socket, id) {
     backupDir = null;
 
     sendProgress(100, downloaded, contentLength, "Complete");
-    reply({ ok: true, version: latestVersion });
+    reply({ ok: true, method: "zip", version: latestVersion });
   } catch (err) {
     reply({ ok: false, error: err?.message || String(err) });
   } finally {

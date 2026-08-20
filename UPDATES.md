@@ -9,7 +9,7 @@ provided you install it via one of the supported paths below.
 | Chrome / Edge | Managed enterprise policy, when the browser/device accepts externally hosted force-installed extensions | Silent background updates after the policy is confirmed active |
 | Brave | Existing Chromium-style policy templates | Best-effort; verify `ExtensionSettings` on `brave://policy` before relying on it |
 | Arc / Ulaa / other Chromium browsers | Vendor-managed policy support is not established by AutoDOM | Use an unpacked share bundle or manual update path |
-| Any supported unpacked browser | `Load unpacked` from a clone or share bundle | Share bundle: bridge updater. Git clone: `git pull` + reload; source files are never overwritten. |
+| Any supported unpacked browser | `Load unpacked` from a clone or share bundle | Bridge updater, automatically when *Auto-apply updates* is on. Share bundles are replaced from the verified ZIP; clean clones are moved to the release tag with Git. |
 
 > **Why is there a policy install?** Chromium vendors restrict off-store
 > installs. A policy file is only the enrollment request; the browser and
@@ -95,10 +95,25 @@ For local development on the extension itself:
 
 The source manifest carries the canonical signing `key`, so an unpacked load
 resolves to the same extension ID as the published CRX. Chromium does not
-reliably install self-hosted CRXs over a development load. AutoDOM therefore
-uses its local bridge updater for unpacked share bundles. When `.git` is
-present, the updater refuses to overwrite the worktree; run `git pull`, then
-reload from `chrome://extensions`.
+install self-hosted CRXs over a development load at all — `onUpdateAvailable`
+never fires for an unpacked extension. AutoDOM therefore updates unpacked
+installs through its local bridge, and picks the method from what it finds on
+disk:
+
+| Install root | Method | Notes |
+|---|---|---|
+| No `.git` (share bundle) | Verified ZIP | Streams the release ZIP, checks its SHA-256 against `updates.json`, validates the staged manifest, swaps `extension/` atomically with rollback. |
+| Clean clone of `eziocode/autodom-extension` | `git fetch --tags` + `checkout v<X.Y.Z>` | Moves `extension/` and `server/` together and leaves the checkout coherent. Ends on a detached release tag. |
+| Clone with uncommitted changes | Refused | Commit or stash first. AutoDOM never discards local work. |
+| Clone with a different `origin` (fork) | Refused | Update it yourself with `git pull`. |
+| Install root nested inside another repository | Refused | AutoDOM will not move a checkout it does not own. |
+
+With **Auto-apply updates** enabled this needs no interaction: the background
+update check notices the new release, the bridge applies it, and the extension
+reloads itself. Otherwise click the ↻ button once in the popup footer.
+
+The `bash update.sh` script performs the same update from a terminal, using the
+same rules.
 
 ---
 
@@ -194,6 +209,10 @@ Stable URL (never changes across releases):
 streams the ZIP into a bounded temporary file, verifies its digest, validates
 the staged manifest, and swaps directories atomically with rollback.
 
+Managed installs take the CRX branch; unpacked installs take the bridge branch,
+which reads the same `updates.json` and then either replaces `extension/` from
+the verified ZIP or checks the clone out at the release tag.
+
 For maintainer-side setup (signing keys, gh-pages bootstrap), see
 [`docs/RELEASE-SIGNING.md`](docs/RELEASE-SIGNING.md).
 
@@ -207,5 +226,8 @@ For maintainer-side setup (signing keys, gh-pages bootstrap), see
 | `chrome://policy` does not list `ExtensionSettings` after running `install.sh` | The browser binary you're testing wasn't covered by the installer (e.g. a snap/flatpak Chrome on Linux uses a non-standard policy directory). Drop `enterprise/linux/autodom-policy.json.tmpl` into the policy dir for that variant manually. |
 | Popup stays on `update available` | Confirm the running install is managed (not unpacked), verify AutoDOM under `ExtensionSettings` on the browser policy page, then retry. A restart cannot apply a CRX that the browser never downloaded. |
 | Diagnostics show `reload_did_not_apply` | Chromium restarted but still runs the source version. Reload policies, verify the exact extension ID/update URL, then use the browser's extension update control. AutoDOM stops automatic reloads after the bounded attempt. |
-| Unpacked Git worktree will not self-update | Run `git pull`, then click Reload on the browser extensions page. AutoDOM intentionally never overwrites source-controlled files. |
+| Bridge reports "Uncommitted changes in …" | The clone has local edits. `git commit` or `git stash` them, then retry. AutoDOM will not discard local work. |
+| Bridge reports "not the official AutoDOM repository" | You are on a fork. Update it yourself with `git pull`. |
+| Popup says the bridge is not connected | The bridge applies unpacked updates, so it must be running. Connect it from the popup, then click ↻ again. |
+| Updates worked for months, then silently stopped on a managed install | Your device-management agent (Jamf, Intune, ManageEngine, …) most likely re-pushed its profile and erased AutoDOM's `ExtensionSettings`. Confirm with `grep -rl <extension-id> "/Library/Managed Preferences"` on macOS — no hit means enrollment is gone. `enterprise/install.sh` writes into that MDM-owned directory, so every profile push clobbers it. Ask your MDM admin to add AutoDOM to the managed policy itself, or use the unpacked + bridge path above, which no MDM push can undo. |
 | Browser unaware of any updates after a release | Confirm the gh-pages URL returns the new version (`curl https://eziocode.github.io/autodom-extension/updates.xml`). If it's stale, re-run the release workflow — the publish step may have failed. |

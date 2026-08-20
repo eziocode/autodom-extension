@@ -105,7 +105,16 @@ function getUpdatePolicyInstallCommand() {
 
 // Returns true when the extension is loaded as an unpacked dev build.
 // chrome.management.getSelf() does not require the `management` permission.
+// Cached because paintUpdateButton() is synchronous but needs to know whether
+// the CRX path can ever apply. Populated on first await of isUnpackedInstall().
+let _unpackedInstallCache = null;
+
+// True from the moment a bridge download starts until the tracker settles, so
+// runUpdateCheck's finally block cannot re-enable the button mid-download.
+let _bridgeUpdateInFlight = false;
+
 async function isUnpackedInstall() {
+  if (_unpackedInstallCache !== null) return _unpackedInstallCache;
   try {
     if (!chrome.management?.getSelf) return false;
     const info = await new Promise((resolve) => {
@@ -114,13 +123,17 @@ async function isUnpackedInstall() {
         resolve(i);
       });
     });
-    return info?.installType === "development";
+    _unpackedInstallCache = info?.installType === "development";
+    return _unpackedInstallCache;
   } catch (_) {
     return false;
   }
 }
 
-function showUpdatePolicyNotice(version, reason = "") {
+// `mode: "bridge"` is for unpacked installs, where Chrome was never going to
+// apply a CRX and the managed-policy advice would be a red herring — the
+// bridge's own error is the actionable message.
+function showUpdatePolicyNotice(version, reason = "", mode = "policy") {
   if (!DOM.updatePolicyNotice) return;
   const normalizedVersion = String(version || "").trim();
   const currentVersion = chrome.runtime.getManifest?.().version || "";
@@ -130,13 +143,18 @@ function showUpdatePolicyNotice(version, reason = "") {
       : "";
   if (DOM.updatePolicyNoticeText) {
     DOM.updatePolicyNoticeText.textContent =
-      `AutoDOM${versionText} is available, but Chrome is not applying it. ` +
-      "This usually means AutoDOM was loaded unpacked or the managed-policy installer was not run with admin permission. " +
-      "Ask an admin to run this from the extracted AutoDOM share folder, then restart Chrome / Edge / Brave." +
-      (reason ? ` (${reason})` : "");
+      mode === "bridge"
+        ? `AutoDOM${versionText} is available. This is an unpacked install, so the ` +
+          "MCP bridge applies updates on disk. " +
+          (reason || "Start the bridge, then click Update again.")
+        : `AutoDOM${versionText} is available, but Chrome is not applying it. ` +
+          "This usually means AutoDOM was loaded unpacked or the managed-policy installer was not run with admin permission. " +
+          "Ask an admin to run this from the extracted AutoDOM share folder, then restart Chrome / Edge / Brave." +
+          (reason ? ` (${reason})` : "");
   }
   if (DOM.updatePolicyCommand) {
-    DOM.updatePolicyCommand.textContent = getUpdatePolicyInstallCommand();
+    DOM.updatePolicyCommand.textContent =
+      mode === "bridge" ? "bash update.sh" : getUpdatePolicyInstallCommand();
   }
   DOM.updatePolicyNotice.style.display = "";
 }
@@ -213,13 +231,17 @@ function paintUpdateButton(pending, available) {
         : `v${chrome.runtime.getManifest().version} → v${update.version}`;
     }
     if (state === "found") {
-      showUpdatePolicyNotice(
-        update.version,
-        shouldPromptUpdateInstallIntervention(foundUpdate)
-          ? "manual install required"
-          : "update detected but not downloaded by Chrome yet",
-      );
-      void maybeShowUpdateInstallInterventionPrompt(foundUpdate);
+      if (_unpackedInstallCache === true) {
+        showUpdatePolicyNotice(update.version, "", "bridge");
+      } else {
+        showUpdatePolicyNotice(
+          update.version,
+          shouldPromptUpdateInstallIntervention(foundUpdate)
+            ? "manual install required"
+            : "update detected but not downloaded by Chrome yet",
+        );
+        void maybeShowUpdateInstallInterventionPrompt(foundUpdate);
+      }
     } else {
       hideUpdatePolicyNotice();
     }
@@ -343,6 +365,7 @@ async function _attachSelfUpdateTracker(btn, versionEl) {
       // Guard against a stale "complete" entry left over from a previous update.
       if (!isVersionNewerThanCurrent(status.version)) {
         try { chrome.storage.local.remove(SELF_UPDATE_STORAGE_KEY); } catch (_) {}
+        _bridgeUpdateInFlight = false;
         btn.disabled = false;
         const { pendingUpdate, availableUpdate } = await readUpdateState();
         paintUpdateButton(pendingUpdate, availableUpdate);
@@ -354,12 +377,14 @@ async function _attachSelfUpdateTracker(btn, versionEl) {
       setTimeout(() => { try { chrome.runtime.reload(); } catch (_) {} }, 800);
     } else if (status.state === "failed") {
       try { chrome.storage.onChanged.removeListener(onStorageChange); } catch (_) {}
+      _bridgeUpdateInFlight = false;
       btn.disabled = false;
       const { availableUpdate } = await readUpdateState();
       paintUpdateButton(null, availableUpdate);
       showUpdatePolicyNotice(
         availableUpdate?.version || "?",
-        status.error || "Update failed — check the bridge logs",
+        status.error || "Update failed — check the bridge logs.",
+        "bridge",
       );
     }
   };
@@ -383,6 +408,11 @@ async function _attachSelfUpdateTracker(btn, versionEl) {
 // configured `update_url`. Browsers throttle this to a few times per hour,
 // so failures with status="throttled" are normal and surfaced to the user.
 async function _startBridgeSelfUpdate(btn, versionEl) {
+  // Held until the tracker settles, so neither entry path can queue a
+  // second concurrent download.
+  btn.disabled = true;
+  btn.classList.remove("spin");
+  _bridgeUpdateInFlight = true;
   btn.textContent = "Downloading…";
   versionEl.textContent = "starting download via bridge…";
   let startResult;
@@ -392,13 +422,15 @@ async function _startBridgeSelfUpdate(btn, versionEl) {
     startResult = { ok: false, error: "Bridge unavailable" };
   }
   if (!startResult?.ok) {
+    _bridgeUpdateInFlight = false;
     btn.disabled = false;
     const { availableUpdate } = await readUpdateState();
     paintUpdateButton(null, availableUpdate);
     showUpdatePolicyNotice(
       availableUpdate?.version || "?",
       startResult?.error ||
-        "bridge not connected — start the MCP bridge first, or ask an admin",
+        "Bridge not connected — start the MCP bridge, then click Update again.",
+      "bridge",
     );
     return false;
   }
@@ -422,23 +454,36 @@ async function _applyOrExplainDiscoveredUpdate(result) {
     return;
   }
 
+  const unpacked = await isUnpackedInstall();
   paintUpdateButton(
     null,
     result?.availableUpdate || result?.details || { version },
   );
-  const unpacked = await isUnpackedInstall();
-  const latePending = unpacked ? null : await waitForPendingUpdate();
+
+  // Unpacked installs never receive a pending CRX, so waiting for one is
+  // pointless — hand straight to the bridge on this first click. The service
+  // worker may already have started it automatically; _startBridgeSelfUpdate
+  // is idempotent enough that a second SELF_UPDATE just reports the current
+  // version as already current.
+  if (unpacked) {
+    if (result?.bridgeAutoStarted) {
+      _bridgeUpdateInFlight = true;
+      btn.disabled = true;
+      btn.textContent = "Downloading…";
+      await _attachSelfUpdateTracker(btn, DOM.appVersion);
+      return;
+    }
+    await _startBridgeSelfUpdate(btn, DOM.appVersion);
+    return;
+  }
+
+  const latePending = await waitForPendingUpdate();
   if (latePending) {
     paintUpdateButton(latePending, null);
     await applyPendingUpdate();
     return;
   }
-  showUpdatePolicyNotice(
-    version,
-    unpacked
-      ? "unpacked extension — Chrome cannot auto-update"
-      : "Chrome did not download a pending CRX",
-  );
+  showUpdatePolicyNotice(version, "Chrome did not download a pending CRX");
 }
 
 function _updateCheckStatusLabel(result) {
@@ -518,7 +563,7 @@ async function runUpdateCheck() {
     setLabel(`error: ${(err && err.message) || err}`.slice(0, 40));
   } finally {
     btn.classList.remove("spin");
-    btn.disabled = false;
+    if (!_bridgeUpdateInFlight) btn.disabled = false;
   }
 }
 
@@ -753,6 +798,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     DOM.appVersion.textContent = `v${chrome.runtime.getManifest().version}`;
   }
 
+  // Resolve the install kind before the first paint so the "found" state shows
+  // bridge guidance rather than managed-policy advice on unpacked loads.
+  await isUnpackedInstall();
+
   if (DOM.checkUpdateBtn) {
     DOM.checkUpdateBtn.addEventListener("click", () => runUpdateCheck());
     // Initial paint: if the service worker has already detected or downloaded
@@ -775,6 +824,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           const versionEl = DOM.appVersion;
           if (!btn || !versionEl) return;
           btn.disabled = true;
+          _bridgeUpdateInFlight = true;
           btn.textContent = "Downloading…";
           _attachSelfUpdateTracker(btn, versionEl);
         });

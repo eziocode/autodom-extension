@@ -312,7 +312,7 @@ test("paintUpdateButton shows persistent policy command for non-pending update",
   );
 });
 
-test("runUpdateCheck shows policy notice when bridge unavailable for unpacked install", async () => {
+test("runUpdateCheck shows bridge guidance, not policy advice, for unpacked install", async () => {
   const versionParts = manifest.version.split(".");
   const futureVersion = [
     versionParts[0] || "0",
@@ -346,7 +346,12 @@ test("runUpdateCheck shows policy notice when bridge unavailable for unpacked in
   );
   assert.ok(calls.some((m) => m.type === "AUTODOM_SELF_UPDATE"), "should try server self-update");
   assert.equal(notice.style.display, "");
-  assert.match(command.textContent, /enterprise\/install\.sh/);
+  assert.match(command.textContent, /update\.sh/);
+  assert.doesNotMatch(command.textContent, /enterprise\/install\.sh/);
+  assert.match(
+    elements.get("#updatePolicyNoticeText").textContent,
+    /Bridge not connected/,
+  );
 });
 
 test("runUpdateCheck reloads via bridge when server-based self-update succeeds", async () => {
@@ -538,4 +543,162 @@ test("service worker exposes explicit update lifecycle and diagnostics", () => {
   assert.match(serviceWorkerSrc, /AUTODOM_GET_UPDATE_DIAGNOSTICS/);
   assert.match(serviceWorkerSrc, /reload_did_not_apply/);
   assert.match(serviceWorkerSrc, /UPDATE_MAX_RELOAD_ATTEMPTS/);
+});
+
+// ── Zero-click bridge auto-update ──────────────────────────────
+// Unpacked installs never receive a pending CRX, so the bridge is the only
+// path that can ever apply a release. These tests pin the gates that decide
+// whether it fires on its own.
+
+function loadAutoBridgeUpdater(overrides = {}) {
+  const started = [];
+  const writes = [];
+  const lifecycle = [];
+  const sandbox = {
+    Date: { now: () => overrides.now ?? 1_000_000 },
+    console,
+    WebSocket: { OPEN: 1 },
+    ws: overrides.ws === undefined ? { readyState: 1 } : overrides.ws,
+    _activeAgentRun: overrides.activeAgentRun ?? null,
+    AUTO_UPDATE_RELOAD_COOLDOWN_MS: 10 * 60 * 1000,
+    UPDATE_STORAGE_KEYS: {
+      autoUpdateEnabled: "autodomAutoUpdateEnabled",
+      autoUpdateApplyAttemptAt: "autodomAutoUpdateApplyAttemptAt",
+      selfUpdate: "selfUpdateStatus",
+    },
+    _debugLog() {},
+    _readUpdateStorage: async () => ({
+      autodomAutoUpdateEnabled: overrides.autoUpdateEnabled ?? true,
+      autodomAutoUpdateApplyAttemptAt: overrides.lastAttemptAt ?? 0,
+      selfUpdateStatus: overrides.selfUpdateStatus ?? null,
+    }),
+    _writeUpdateStorage: async (values) => {
+      writes.push(values);
+      return true;
+    },
+    _getUpdateInstallType: async () => overrides.installType ?? "development",
+    _startBridgeSelfUpdate: async (source) => {
+      started.push(source);
+      return overrides.startResult ?? { ok: true, started: true };
+    },
+    _recordUpdateLifecycle: async (patch, source) => {
+      lifecycle.push({ patch, source });
+      return patch;
+    },
+    _isVersionNewerThanCurrent: (version) => {
+      if (!version || version === "?") return false;
+      const [a = 0, b = 0, c = 0] = String(version).split(".").map(Number);
+      const [x = 0, y = 0, z = 0] = manifest.version.split(".").map(Number);
+      return a > x || (a === x && (b > y || (b === y && c > z)));
+    },
+  };
+  const fn = loadServiceWorkerFunction("_maybeAutoSelfUpdateViaBridge", sandbox);
+  return { fn, started, writes, lifecycle, sandbox };
+}
+
+const NEWER_VERSION = (() => {
+  const parts = manifest.version.split(".");
+  return [parts[0] || "0", parts[1] || "0", String((Number(parts[2]) || 0) + 1)].join(".");
+})();
+
+test("bridge auto-update fires for an unpacked install with all gates open", async () => {
+  const { fn, started, lifecycle } = loadAutoBridgeUpdater();
+  assert.equal(await fn({ version: NEWER_VERSION }, "alarm"), true);
+  assert.deepEqual(started, ["auto:alarm"]);
+  assert.equal(lifecycle[0].patch.phase, "applying");
+  assert.equal(lifecycle[0].patch.applyMethod, "bridge");
+  assert.equal(lifecycle[0].patch.applyAttempt.automatic, true);
+});
+
+test("bridge auto-update stays out of the way of a running agent", async () => {
+  const { fn, started } = loadAutoBridgeUpdater({
+    activeAgentRun: { runId: "r1" },
+  });
+  assert.equal(await fn({ version: NEWER_VERSION }, "alarm"), false);
+  assert.deepEqual(started, []);
+});
+
+test("bridge auto-update requires the auto-apply preference", async () => {
+  const { fn, started } = loadAutoBridgeUpdater({ autoUpdateEnabled: false });
+  assert.equal(await fn({ version: NEWER_VERSION }, "alarm"), false);
+  assert.deepEqual(started, []);
+});
+
+test("bridge auto-update does not touch managed CRX installs", async () => {
+  const { fn, started } = loadAutoBridgeUpdater({ installType: "normal" });
+  assert.equal(await fn({ version: NEWER_VERSION }, "alarm"), false);
+  assert.deepEqual(started, []);
+});
+
+test("bridge auto-update needs a connected bridge", async () => {
+  for (const ws of [null, { readyState: 3 }]) {
+    const { fn, started } = loadAutoBridgeUpdater({ ws });
+    assert.equal(await fn({ version: NEWER_VERSION }, "alarm"), false);
+    assert.deepEqual(started, []);
+  }
+});
+
+test("bridge auto-update respects the cooldown and in-flight download", async () => {
+  const cooled = loadAutoBridgeUpdater({ now: 1_000_000, lastAttemptAt: 999_000 });
+  assert.equal(await cooled.fn({ version: NEWER_VERSION }, "alarm"), false);
+  assert.deepEqual(cooled.started, []);
+
+  const busy = loadAutoBridgeUpdater({
+    selfUpdateStatus: { state: "downloading" },
+  });
+  assert.equal(await busy.fn({ version: NEWER_VERSION }, "alarm"), false);
+  assert.deepEqual(busy.started, []);
+});
+
+test("bridge auto-update ignores a version that is not newer", async () => {
+  const { fn, started } = loadAutoBridgeUpdater();
+  assert.equal(await fn({ version: manifest.version }, "alarm"), false);
+  assert.equal(await fn({ version: "?" }, "alarm"), false);
+  assert.equal(await fn(null, "alarm"), false);
+  assert.deepEqual(started, []);
+});
+
+test("bridge auto-update records the failure when the bridge refuses", async () => {
+  const { fn, started, lifecycle } = loadAutoBridgeUpdater({
+    startResult: { ok: false, error: "Bridge not connected" },
+  });
+  assert.equal(await fn({ version: NEWER_VERSION }, "startup"), false);
+  assert.deepEqual(started, ["auto:startup"]);
+  assert.equal(lifecycle[0].patch.phase, "failed");
+  assert.match(lifecycle[0].patch.lastFailure, /Bridge not connected/);
+});
+
+test("unpacked install starts the bridge update on the first click", async () => {
+  const calls = [];
+  const { sandbox, elements } = loadPopup({
+    installType: "development",
+    localGet: async () => ({ availableUpdate: { version: NEWER_VERSION } }),
+    sendMessage: async (message) => {
+      calls.push(message);
+      if (message.type === "AUTODOM_CHECK_FOR_UPDATE") {
+        return {
+          ok: true,
+          status: "new_release_found",
+          details: { version: NEWER_VERSION },
+          availableUpdate: { version: NEWER_VERSION },
+        };
+      }
+      return { ok: true, started: true };
+    },
+  });
+
+  // Prime the install-kind cache the same way popup init does, then click a
+  // button that has never been painted into the "found" state.
+  await sandbox.isUnpackedInstall();
+  const btn = elements.get("#checkUpdateBtn");
+  assert.equal(btn.dataset.updateState, undefined);
+
+  await sandbox.runUpdateCheck();
+
+  assert.deepEqual(
+    calls.map((m) => m.type),
+    ["AUTODOM_CHECK_FOR_UPDATE", "AUTODOM_SELF_UPDATE"],
+    "one click should check and then hand straight to the bridge",
+  );
+  assert.equal(btn.disabled, true, "button stays disabled while downloading");
 });

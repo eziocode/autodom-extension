@@ -4,6 +4,46 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 5.0.1
+
+### Fixed
+- Unpacked installs can auto-update again. Since 4.3.0 the bridge refused any
+  install root containing `.git`, which is every `git clone` install — the
+  documented consumer path. It now classifies the root instead: a clean clone
+  of the official repository is moved to the release tag with
+  `git fetch --tags` + `git checkout v<X.Y.Z>` (updating `extension/` and
+  `server/` together), a share bundle takes the existing verified-ZIP path, and
+  a clone with uncommitted tracked changes or a different `origin` is refused
+  with a specific reason. Untracked files no longer block an update and are
+  never destroyed.
+- The popup's ↻ button starts the bridge update on the first click for unpacked
+  installs. It previously needed two: the first click only painted the
+  "found" state.
+- Updates now apply with no clicks at all when *Auto-apply updates* is on. The
+  service worker starts the bridge update itself once a newer release is
+  published, gated on a live bridge, a development install, no active agent
+  run, and the existing retry cooldown. The toggle was previously inert for
+  unpacked installs, which never receive a pending CRX.
+- Unpacked installs no longer see managed-policy advice when an update needs
+  attention; the notice reports what the bridge actually said.
+- Replaced `extract-zip` with a dependency-free ZIP extractor. `extract-zip`
+  2.0.1 (via unmaintained `fd-slicer`) hangs on Node >= 24 for any entry larger
+  than one stream chunk, which silently broke share-bundle updates — the
+  release archive stalls on `background/service-worker.js`. The replacement
+  rejects path traversal, absolute names, symlinks, ZIP64, unsupported
+  compression, and size/payload mismatches, and its output is byte-identical to
+  system `unzip`.
+
+### Tests
+- Added coverage for install-root classification, tag checkout argv, the
+  zero-click auto-update gates, first-click bridge start, and the ZIP
+  extractor's adversarial cases.
+- Verified all three update paths end to end against the live update channel:
+  dirty-clone refusal, clean-clone Git update, and share-bundle ZIP update,
+  each driven through the real bridge WebSocket.
+
+---
+
 ## 5.0.0
 
 ### Changed
