@@ -1,16 +1,16 @@
 {
   "schemaVersion": 1,
   "extensionId": "kpjdffgogiajnkajnjneiboaincnaokf",
-  "version": "5.0.0",
-  "publishedAt": "2026-08-12T02:15:51.975Z",
+  "version": "5.0.1",
+  "publishedAt": "2026-08-20T08:13:27.141Z",
   "artifacts": {
     "crx": {
-      "url": "https://github.com/eziocode/autodom-extension/releases/download/v5.0.0/autodom-5.0.0.crx",
-      "sha256": "dd76d78849ec02e1b9b41ddc216d028d402391c84c0f8633be3d9b7a98584cb3"
+      "url": "https://github.com/eziocode/autodom-extension/releases/download/v5.0.1/autodom-5.0.1.crx",
+      "sha256": "339b97352bfc2b40cbc7bf356cd34e5d76dd2666e7d124a0e02bdff48423390d"
     },
     "zip": {
-      "url": "https://github.com/eziocode/autodom-extension/releases/download/v5.0.0/autodom-chrome-5.0.0.zip",
-      "sha256": "a678a829e2bc238c477c52a3c1153fdf29c48f98c9cd460d3f534bee920f91ef"
+      "url": "https://github.com/eziocode/autodom-extension/releases/download/v5.0.1/autodom-chrome-5.0.1.zip",
+      "sha256": "960c87b872410ec664754e5b8809250d4ee5e1c640a799ae8ff49adce1edba7a"
     }
   }
 }
