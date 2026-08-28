@@ -742,11 +742,13 @@ function showPopupToast(message, tone = "info", durationMs = 2200) {
     "toast-warn",
   );
   toast.classList.add(`toast-${tone}`, "is-visible");
-  toast.setAttribute("aria-hidden", "false");
   if (popupToastTimer) clearTimeout(popupToastTimer);
   popupToastTimer = setTimeout(() => {
     toast.classList.remove("is-visible");
-    toast.setAttribute("aria-hidden", "true");
+    // Clear the text rather than leaving it parked behind opacity: 0.
+    // A faded-out toast is still real text — it was landing in
+    // select-all copies of the popup long after it had "gone".
+    toast.textContent = "";
   }, durationMs);
 }
 
@@ -1589,6 +1591,7 @@ function initChatAppearanceTab() {
     if (statusTimer) clearTimeout(statusTimer);
     statusTimer = setTimeout(() => {
       statusEl.classList.remove("is-visible");
+      statusEl.textContent = "";
     }, 1800);
   }
 

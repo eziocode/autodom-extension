@@ -4,6 +4,41 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 5.0.2
+
+### Fixed
+- Copying the chat surface no longer picks up the UI. Select-all in the side
+  panel (or on a host page with the panel open) swept in the header, status
+  badge, page-context bar, welcome copy, suggestion chips, quick-action
+  labels, keyboard hints, the footer legend, and the entire quick-prompt
+  overlay, so a pasted conversation was mostly button text with the actual
+  turns buried inside it. The panel and overlay roots now opt out of
+  selection and only real content opts back in: message bodies, tool-result
+  payloads, tool-card bodies, the page-context line, and form fields.
+- The closed in-page panel and the dismissed quick-prompt overlay were hidden
+  with `transform` / `opacity` alone, which leaves an element laid out — still
+  selectable, still reachable with Tab, and still exposed to assistive tech as
+  a live dialog. Both now leave the flow via `visibility`, with the flip
+  delayed on the way out so the slide and fade still play. The side panel pins
+  itself visible, since there the panel is the window.
+- `closePanel()` is a no-op in the side panel. Esc and the MCP-disconnect
+  auto-close both called it, which left the surface fully on screen (the
+  side-panel overrides pin its transform) while the state machine believed it
+  was shut: status polling stopped, the "chat panel will close" notice never
+  came true, and the next toggle re-opened an already-visible panel.
+- `/click` with no argument, and a bare `click ` in natural language, routed to
+  `click_by_index` with `index: NaN` instead of falling through to the text
+  matcher — `!isNaN("")` is true because `Number("")` is `0`. Both now require
+  an explicit run of digits, and every `parseInt` in the command parsers passes
+  radix 10.
+- The chat and popup toasts stopped toggling `aria-hidden` on their
+  `role="status"` live regions. Flipping a live region in and out of the
+  accessibility tree announces unreliably — the text is set before the region
+  re-enters it — and the faded-out string stayed parked in the DOM for the next
+  select-all. They clear their text on hide instead.
+
+---
+
 ## 5.0.1
 
 ### Fixed

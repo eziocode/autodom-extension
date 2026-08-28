@@ -3577,3 +3577,101 @@
   70%  { box-shadow: 0 0 0 8px rgba(255, 59, 48, 0); }
   100% { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0); }
 }
+
+/* ─── Selection scope: chrome is not copyable content ──────
+   Select-all (or a drag across the panel) used to sweep up every
+   piece of UI chrome — header title, status badge, context URL,
+   welcome copy, suggestion chips, quick-action labels, keyboard
+   hints, the footer legend, and the whole (visually hidden) inline
+   overlay — so pasting a conversation produced a wall of button
+   text with the actual turns buried inside it.
+
+   Fix is scoped, not global: the panel roots opt out of selection,
+   and only real content opts back in (message bodies, code blocks,
+   tool-result payloads, the page-context line, and form fields).
+   Anything added later inherits the safe default. */
+#__autodom_chat_panel,
+#__autodom_inline_overlay {
+  -webkit-user-select: none;
+  user-select: none;
+}
+#__autodom_chat_panel .autodom-chat-msg,
+#__autodom_inline_overlay .autodom-chat-msg,
+#__autodom_chat_panel .autodom-inline-response-content,
+#__autodom_inline_overlay .autodom-inline-response-content,
+#__autodom_chat_panel .autodom-chat-context-text,
+#__autodom_chat_panel .autodom-chat-input,
+#__autodom_chat_panel input,
+#__autodom_chat_panel textarea,
+#__autodom_inline_overlay input,
+#__autodom_inline_overlay textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+/* Per-message chrome sits *inside* the selectable bubble, so it has to
+   opt out again: the hover copy button, the model badge / "N tools"
+   chip footer, and the collapsed tool-result / tool-card headers. */
+#__autodom_chat_panel .autodom-chat-msg .msg-copy-btn,
+#__autodom_inline_overlay .autodom-chat-msg .msg-copy-btn,
+#__autodom_chat_panel .autodom-chat-msg .tr-copy-btn,
+#__autodom_inline_overlay .autodom-chat-msg .tr-copy-btn,
+#__autodom_chat_panel .autodom-chat-msg .autodom-msg-meta,
+#__autodom_inline_overlay .autodom-chat-msg .autodom-msg-meta,
+#__autodom_chat_panel .autodom-chat-msg.tool-result summary,
+#__autodom_inline_overlay .autodom-chat-msg.tool-result summary,
+#__autodom_chat_panel .ai-tool-card-head,
+#__autodom_inline_overlay .ai-tool-card-head {
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* ...but the tool payloads themselves are the whole reason someone
+   copies a tool result, so keep those selectable. */
+#__autodom_chat_panel .autodom-chat-msg.tool-result pre,
+#__autodom_inline_overlay .autodom-chat-msg.tool-result pre,
+#__autodom_chat_panel .ai-tool-card-body,
+#__autodom_inline_overlay .ai-tool-card-body {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* ─── Hidden inline overlay must be truly hidden ───────────
+   The quick-prompt overlay and its backdrop are faded out with
+   opacity + pointer-events only, which leaves them laid out: still
+   selectable (they showed up verbatim in copied transcripts) and
+   still exposed to assistive tech as a live dialog. visibility
+   removes both while preserving the fade — it is an animatable
+   property, and the delayed flip means the fade-out still plays. */
+#__autodom_inline_overlay:not(.visible),
+.autodom-inline-backdrop:not(.visible) {
+  visibility: hidden;
+  transition: opacity 0.2s ease, transform 0.2s var(--ease-out),
+              visibility 0s linear 0.2s;
+}
+#__autodom_inline_overlay.visible,
+.autodom-inline-backdrop.visible {
+  visibility: visible;
+  transition: opacity 0.2s ease, transform 0.2s var(--ease-out),
+              visibility 0s linear 0s;
+}
+
+/* ─── Closed panel must be truly hidden ────────────────────
+   The in-page panel is parked off-screen with translateX(100%)
+   when closed. That only moves it: it stays laid out, so on any
+   host page where the panel had ever been opened, Ctrl+A / Cmd+A
+   swept the entire AutoDOM UI into the page's own copied text, and
+   Tab still walked into every one of its buttons.
+
+   visibility removes it from selection, hit-testing and the focus
+   order without disturbing layout (widths are still measurable for
+   _applyPanelWidth). The 0.32s delay on the way out keeps the slide
+   animation intact; on the way in it flips immediately.
+
+   Side-panel mode always holds `.open`, so this never applies there. */
+#__autodom_chat_panel:not(.open) {
+  visibility: hidden;
+  transition: transform 0.32s var(--ease-out), visibility 0s linear 0.32s;
+}
+#__autodom_chat_panel.open {
+  visibility: visible;
+  transition: transform 0.32s var(--ease-out), visibility 0s linear 0s;
+}

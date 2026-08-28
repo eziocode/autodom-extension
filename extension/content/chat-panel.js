@@ -1308,7 +1308,7 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="3"/><circle cx="18" cy="12" r="3"/><path d="M6 12h12"/></svg>
       </button>
     </div>
-    <div class="autodom-chat-toast" id="__autodom_chat_toast" role="status" aria-live="polite" aria-hidden="true"></div>
+    <div class="autodom-chat-toast" id="__autodom_chat_toast" role="status" aria-live="polite"></div>
 
     <!-- Input Area -->
     <div class="autodom-chat-input-area">
@@ -1454,6 +1454,17 @@
         border-radius: 0 !important;
         transform: none !important;
         transition: none !important;
+        /* The in-page panel hides itself when it loses the "open"
+           class (see the closed-panel rule in chat-panel.css). In the
+           side panel the panel *is* the window, and paths like Esc /
+           MCP-idle can drop that class with no intent to blank the
+           surface — the transform-based hide was already a no-op here
+           for the same reason. Pin it visible.
+           NOTE: this block is a JS template literal. No backticks in
+           these comments — a stray pair turns the rest of the string
+           into a tagged template call and the whole side-panel
+           stylesheet silently fails to apply. */
+        visibility: visible !important;
       }
       /* Hide the in-panel resize handle and the close button — the
          browser's native side-panel chrome already provides both. */
@@ -2290,11 +2301,14 @@
       if (!toast) return;
       toast.textContent = text;
       toast.classList.add("is-visible");
-      toast.setAttribute("aria-hidden", "false");
       if (_toastTimer) clearTimeout(_toastTimer);
       _toastTimer = setTimeout(() => {
         toast.classList.remove("is-visible");
-        toast.setAttribute("aria-hidden", "true");
+        // Clear rather than re-hiding: an aria-live region that gets
+        // flipped in and out of aria-hidden announces unreliably (the
+        // text was already set before it re-entered the a11y tree), and
+        // the faded-out string otherwise lingers in the DOM.
+        toast.textContent = "";
       }, durationMs);
     } catch (_) {}
   }
@@ -2536,7 +2550,7 @@
     // Guard with a cancellable timer: refresh/startup can briefly report
     // inactive before the live status arrives, and we must not close in
     // that reconnect window.
-    if (isOpen && !_mcpInactiveCloseTimer) {
+    if (isOpen && !SIDE_PANEL_MODE && !_mcpInactiveCloseTimer) {
       addMessage("system", "MCP session ended. Chat panel will close.");
       _mcpInactiveCloseTimer = setTimeout(() => {
         _mcpInactiveCloseTimer = null;
@@ -2587,6 +2601,13 @@
 
   function closePanel() {
     _log("closePanel called");
+    // In the side panel the panel IS the window: there is nothing to
+    // close, and the browser owns the real close affordance. Closing
+    // here used to leave the surface fully on screen (the side-panel
+    // override pins transform/visibility) while the state machine
+    // believed it was shut — status polling stopped, and the next
+    // toggle re-"opened" an already-visible panel. No-op instead.
+    if (SIDE_PANEL_MODE) return;
     if (_mcpInactiveCloseTimer) {
       clearTimeout(_mcpInactiveCloseTimer);
       _mcpInactiveCloseTimer = null;
@@ -5821,10 +5842,14 @@
             displayName: "Page info",
           };
         case "click":
-          if (!isNaN(rest)) {
+          // Must be an explicit run of digits. `!isNaN("")` is true
+          // (Number("") === 0), so a bare `/click` used to route to
+          // click_by_index with `index: NaN` instead of falling through
+          // to the text matcher.
+          if (/^\d+$/.test(rest.trim())) {
             return {
               tool: "click_by_index",
-              params: { index: parseInt(rest) },
+              params: { index: parseInt(rest.trim(), 10) },
             };
           }
           return { tool: "click", params: { text: rest || undefined } };
@@ -5835,7 +5860,7 @@
             return {
               tool: "type_by_index",
               params: {
-                index: parseInt(match[1]),
+                index: parseInt(match[1], 10),
                 text: match[2],
                 clearFirst: true,
               },
@@ -7274,8 +7299,13 @@
     }
     if (lower.startsWith("click ")) {
       const target = text.substring(6).trim();
-      if (!isNaN(target)) {
-        return { tool: "click_by_index", params: { index: parseInt(target) } };
+      // Same guard as the /click slash command: "click " with nothing
+      // after it is not index 0, it is a text click with no target.
+      if (/^\d+$/.test(target)) {
+        return {
+          tool: "click_by_index",
+          params: { index: parseInt(target, 10) },
+        };
       }
       return { tool: "click", params: { text: target } };
     }
