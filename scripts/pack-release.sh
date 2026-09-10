@@ -33,6 +33,11 @@ rsync -a --exclude '.DS_Store' extension/ "$STAGE/extension/"
 mkdir -p "$STAGE/scripts"
 cp scripts/build-chrome.sh   "$STAGE/scripts/"
 cp scripts/update-unpacked.mjs "$STAGE/scripts/"
+# The bundled setup.sh / setup.ps1 call both of these directly — the
+# JetBrains config upsert and the MCP handshake health check. Omitting
+# them breaks setup inside the share bundle.
+cp scripts/jetbrains-mcp-upsert.mjs "$STAGE/scripts/"
+cp scripts/mcp-selftest.mjs "$STAGE/scripts/"
 
 mkdir -p "$STAGE/enterprise"
 rsync -a --exclude '.DS_Store' enterprise/ "$STAGE/enterprise/"
