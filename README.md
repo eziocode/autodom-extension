@@ -192,7 +192,8 @@ Pass these via `env` in your MCP config block.
 | `WS_PORT` | `9876` | Local WebSocket bridge port |
 | `AUTODOM_TOKEN` | *random* | Override the auto-generated auth token |
 | `AUTODOM_ALLOWED_EXTENSION_ORIGINS` / `AUTODOM_ALLOWED_EXTENSION_IDS` | canonical AutoDOM Chrome ID | Comma-separated extra extension origins or IDs for dev/fork builds |
-| `AUTODOM_HEARTBEAT_MS` | `15000` | WebSocket ping interval (ms) |
+| `AUTODOM_HEARTBEAT_MS` | `3000` | Parent/launcher liveness check interval (ms) |
+| `AUTODOM_BOOTSTRAP_WAIT` | `12000` | Tool-call wait for the primary/proxy election to settle (ms) |
 | `AUTODOM_TOOL_TIMEOUT` | `30000` | Per-tool-call timeout (ms) |
 | `AUTODOM_INACTIVITY_TIMEOUT` | `600000` | Idle session timeout; `0` disables |
 | `AUTODOM_DEBUG` | `0` | `1` for verbose stderr logs |

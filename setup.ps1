@@ -97,17 +97,39 @@ Write-Ok "node v$nodeVer"
 # ── 2. Kill stale listeners on the target port ───────────────
 Write-Step "Cleaning up stale listeners on port $Port..."
 $killed = 0
+$foreignHolder = $false
 try {
     $conns = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
     foreach ($c in $conns) {
+        # Identify the holder before signalling it. Killing an unrelated
+        # user process that happens to own the port is far worse than
+        # letting AutoDOM fall back to proxy mode.
+        $cmdLine = ""
         try {
-            Stop-Process -Id $c.OwningProcess -Force -ErrorAction Stop
-            $killed++
+            $procInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$($c.OwningProcess)" -ErrorAction Stop
+            $cmdLine = "$($procInfo.CommandLine)"
         } catch { }
+        if ($cmdLine -like "*autodom*index.js*" -or $cmdLine -like "*autodom*cli.js*") {
+            try {
+                Stop-Process -Id $c.OwningProcess -Force -ErrorAction Stop
+                $killed++
+            } catch { }
+        } else {
+            $foreignHolder = $true
+            Write-Warn "Port $Port held by PID $($c.OwningProcess) — not killing it; AutoDOM will use proxy mode"
+        }
     }
 } catch { }
-$lockFile = Join-Path $env:TEMP "autodom-bridge-$Port.json"
-Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
+# Only clear the lock file once the holder is actually gone: deleting a
+# live primary's lock file strands its auth token and every secondary
+# then fails the proxy handshake.
+if (-not $foreignHolder) {
+    $stillListening = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    if (-not $stillListening) {
+        $lockFile = Join-Path $env:TEMP "autodom-bridge-$Port.json"
+        Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
+    }
+}
 if ($killed -gt 0) { Write-Ok "Killed $killed stale process(es)" }
 else                { Write-Ok "No stale listeners found" }
 
@@ -152,17 +174,22 @@ if ($missing.Count -gt 0) {
 Pop-Location
 
 # ── 5. Verify server starts ──────────────────────────────────
+# A real MCP handshake, not a grep of the startup banner. The old check
+# fed the server invalid JSON-RPC and matched its stderr text — including
+# the proxy-mode line, so it reported success even when the verified
+# instance never became primary, and it broke whenever wording changed.
 Write-Step "Verifying server..."
-$serverArgs = @($ServerPath)
-if ($Port -ne $DefaultPort) { $serverArgs += @("--port","$Port") }
+$selfTest = Join-Path $ScriptDir "scripts\mcp-selftest.mjs"
+$selfTestArgs = @($selfTest, $ServerPath, "--port", "$Port")
+if (-not $foreignHolder) { $selfTestArgs += @("--expect-role", "primary") }
 $verifyOut = ""
 try {
-    $verifyOut = "{}" | & node @serverArgs 2>&1
+    $verifyOut = & node @selfTestArgs 2>&1
 } catch {
     $verifyOut = "$_"
 }
-if ($verifyOut -notmatch "Bridge Server Started|Proxy client connected|MCP server running on stdio transport") {
-    Write-Fail "Server failed to start"
+if ($LASTEXITCODE -ne 0) {
+    Write-Fail "Server failed MCP handshake verification"
     Write-Host $verifyOut
     exit 1
 }
@@ -232,6 +259,28 @@ if (Test-Path (Split-Path -Parent (Split-Path -Parent $copilotFile))) {
     if (Upsert-JsonServer $copilotFile "servers" "copilot") {
         Write-Ok "Copilot for IntelliJ ($Name)"
         $Configured++
+    }
+}
+
+# JetBrains AI Assistant. This branch used to be missing entirely, so
+# Windows IntelliJ users got zero configuration from this installer. The
+# XML upsert lives in scripts/jetbrains-mcp-upsert.mjs, shared with setup.sh.
+$jetbrainsRoot = Join-Path $env:APPDATA "JetBrains"
+if (Test-Path $jetbrainsRoot) {
+    $upsertScript = Join-Path $ScriptDir "scripts\jetbrains-mcp-upsert.mjs"
+    $ideDirs = Get-ChildItem -Path $jetbrainsRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^(IntelliJIdea|IdeaIC|PyCharm|WebStorm|GoLand|CLion|RubyMine|PhpStorm|Rider|DataGrip|RustRover|AndroidStudio)' }
+    foreach ($ide in $ideDirs) {
+        $optionsDir = Join-Path $ide.FullName "options"
+        $upsertArgs = @($upsertScript, "--options-dir", $optionsDir, "--name", $Name, "--arg", $ServerPath)
+        if ($Port -ne $DefaultPort) { $upsertArgs += @("--arg", "--port", "--arg", "$Port") }
+        $upsertOut = & node @upsertArgs 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "$($ide.Name) ($Name)"
+            $Configured++
+        } else {
+            Write-Warn "Could not update $($ide.Name) — $upsertOut"
+        }
     }
 }
 

@@ -4,6 +4,93 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 5.1.0
+
+### Fixed
+- The MCP server would not reliably auto-initiate, and restarting it from
+  IntelliJ AI Assistant or GitHub Copilot MCP did nothing. Startup awaited
+  stale-process cleanup *and* the WebSocket port election before attaching
+  the stdio transport, so until both finished nothing read stdin and the
+  client's `initialize` sat unread in the pipe. With the port free that was
+  ~100ms — which is why Claude Code, usually the first client to start,
+  always worked. With the port contended it was 5-11 seconds, past both
+  hosts' handshake deadline. The stdio transport now comes up first and
+  unconditionally; the bridge link is established in the background.
+- A restart could hang the client forever. `setupProxyClient` and
+  `tryRecoverSecondaryAsPrimary` called each other with no attempt cap and
+  no backoff, and because the startup path awaited that promise chain, the
+  stdio transport was never attached at all. The scenario was routine: the
+  host SIGKILLs the launcher, the surviving grandchild keeps port 9876
+  bound, and the replacement instance spins on it. Election is now a
+  bounded state machine — a bind retry ladder (~4s, covering the departing
+  instance's 3s hard-exit watchdog), at most three rounds, and recovery
+  that is serialized and rate-capped instead of recursive.
+- A failed election used to report success. `startWebSocketServer()`
+  resolved through `.finally(resolve)` whether or not anything worked, so
+  the server could come up owning neither the port nor a proxy link:
+  `tools/list` answered normally and every single tool call returned
+  "Chrome extension is not connected" — a bridge problem reported as a
+  browser problem. There is now an explicit degraded state whose error
+  names the port, the actual cause, and the `--stop` remedy, and
+  `autodom_diagnostics` reports the real role.
+- Tool calls arriving during startup took the primary path and produced the
+  same misleading extension error, because the role defaulted to primary
+  before anything had been decided. They now wait for the election to
+  settle, and say so if it does not.
+- A WebSocket server error after successful binding had no listener at all
+  (`wss.once("error")` was consumed by the bind attempt). It fell through to
+  the keep-alive `uncaughtException` hook, leaving a live process with a
+  silently dead WebSocket server. A persistent handler now triggers recovery.
+- `resources/list`, `resources/templates/list` and `prompts/list` answered
+  `-32601`. That is spec-legal for an unadvertised capability, but some
+  JetBrains AI Assistant builds treat a `-32601` on a startup probe as a
+  fatal handshake error rather than "unsupported". Empty `resources` and
+  `prompts` capabilities are now declared so those methods return empty
+  lists, and `tools.listChanged` is advertised `false` to match reality —
+  nothing ever emitted that notification.
+- Every one of the 106 tool schemas shipped a top-level `$schema` keyword
+  that zod stamps on conversion — ~5.8KB of dead weight, and some clients
+  run incoming schemas through a sanitizer that rejects or mangles a draft
+  it does not recognize. `tools/list` is now built without it.
+- The pre-startup zombie scan matched every AutoDOM bridge on the machine
+  and could SIGTERM/SIGKILL a healthy one serving a different port. It is
+  now scoped to the port this instance is actually starting on.
+- SIGHUP killed the bridge. The code deliberately left it unhandled on the
+  belief that Node ignores SIGHUP when stdin is a pipe; it does not, the
+  default action terminates — and `cli.js` forwarded SIGHUP into the child
+  itself. macOS sends it on benign terminal and process-group changes, so a
+  perfectly valid stdio pipe surfaced in the IDE as "Transport closed".
+  SIGHUP is now explicitly ignored, and no longer forwarded.
+- `--port=9877` was silently ignored by both entry points, which parsed only
+  the space-separated form, so the server bound the default port instead and
+  then collided with whatever already owned it. Both forms now work.
+- `cli.js` could block for up to 60 seconds running `npm install` before the
+  server process existed, which an MCP client sees as a dead server rather
+  than a slow one. It now auto-installs only when a human is watching (stdin
+  is a TTY) and otherwise fails immediately with the command to run.
+- An orphaned bridge held the port for up to 15 seconds after its launcher
+  died — exactly the window that forced the next client down the slow path.
+  The liveness check now runs every 3 seconds, and because `cli.js` spawns
+  the server rather than exec-replacing itself (Node cannot), the launcher's
+  PID is passed down so the child notices a SIGKILLed launcher even after
+  being reparented.
+- `setup.ps1` had no JetBrains branch at all, so Windows IntelliJ AI
+  Assistant users got zero configuration from the installer. The XML upsert
+  now lives in `scripts/jetbrains-mcp-upsert.mjs`, shared with `setup.sh`,
+  and the PowerShell installer registers every JetBrains IDE it finds.
+- Both installers killed whatever held the target port without identifying
+  it first, and `setup.sh` did it with a `kill` on a multi-line PID string
+  that simply failed when there was more than one listener. Each holder is
+  now identified, only AutoDOM processes are signalled, and the lock file is
+  cleared only once the port is actually free — deleting a live primary's
+  lock file stranded its auth token and broke every secondary's handshake.
+- `setup.ps1` verified the server by feeding it invalid JSON-RPC and
+  grepping its stderr banner, which passed even when the instance never
+  became primary. Both installers now share `scripts/mcp-selftest.mjs`,
+  which performs a real handshake and asserts the elected role.
+
+---
+
 ## 5.0.2
 
 ### Fixed

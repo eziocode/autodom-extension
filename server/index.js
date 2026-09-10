@@ -325,13 +325,19 @@ process.on("exit", (code) => {
 // ─── Signal Handlers ─────────────────────────────────────────
 // Ensure the process exits cleanly on signals the IDE or OS may send.
 // Without these, the WebSocket server keeps the event loop alive.
-// NOTE: We intentionally do NOT handle SIGHUP.
-// On macOS, SIGHUP is sent when the controlling terminal closes or
-// when a parent process group changes (e.g. IDE restarts an internal
-// tool window). The default SIGHUP behaviour would kill the bridge
-// even though the stdio pipe is still valid, causing a spurious
-// "Transport closed" in the IDE. Node.js already ignores SIGHUP
-// when stdin is a pipe (non-TTY), which is exactly our case.
+// SIGHUP is explicitly ignored. On macOS it arrives when the controlling
+// terminal closes or a parent process group changes (e.g. an IDE reloads
+// an internal tool window) — the stdio pipe is still perfectly valid, so
+// dying here surfaces as a spurious "Transport closed" in the IDE.
+//
+// This handler is required, not decorative: Node does NOT ignore SIGHUP
+// on its own when stdin is a pipe (the default action terminates the
+// process), and cli.js used to forward SIGHUP straight into this process.
+process.on("SIGHUP", () => {
+  process.stderr.write(
+    "[AutoDOM] SIGHUP ignored — stdio pipe is still valid\n",
+  );
+});
 process.on("SIGINT", () => {
   void shutdown(0);
 });
@@ -355,11 +361,23 @@ process.on("SIGTERM", () => {
 // respawned us, the extension briefly saw ERR_CONNECTION_REFUSED, and
 // the chat panel/border state churned. The kill-0 check below is the
 // only reliable orphan signal.
+// 3s, not 15s: the window between "our launcher was killed" and "we
+// notice" is exactly the window in which we squat the WebSocket port and
+// force the next instance down the slow proxy path. The check itself is
+// two `process.kill(pid, 0)` calls.
 const HEARTBEAT_INTERVAL_MS = parseInt(
-  process.env.AUTODOM_HEARTBEAT_MS || "15000",
+  process.env.AUTODOM_HEARTBEAT_MS || "3000",
   10,
 );
 const _parentPid = process.ppid;
+// cli.js spawns us rather than exec-replacing itself (Node cannot), so if
+// the IDE SIGKILLs the launcher we get reparented instead of orphaned and
+// the PPID probe below sees a live parent (launchd/init). Probing the
+// recorded launcher PID is what actually catches that case.
+const _launcherPid = Number.parseInt(
+  process.env.AUTODOM_LAUNCHER_PID || "",
+  10,
+);
 const _heartbeatInterval = setInterval(() => {
   // Probe the *current* parent (which may have changed legitimately).
   // If we have no parent at all (PID 0) treat as orphan.
@@ -383,6 +401,21 @@ const _heartbeatInterval = setInterval(() => {
     void shutdown(0);
     return;
   }
+  // If we were started by cli.js, its death means our client is gone.
+  if (_launcherPid > 0) {
+    try {
+      process.kill(_launcherPid, 0);
+    } catch (err) {
+      if (err.code !== "EPERM") {
+        process.stderr.write(
+          `[AutoDOM] Launcher process (PID ${_launcherPid}) is gone — shutting down\n`,
+        );
+        clearInterval(_heartbeatInterval);
+        void shutdown(0);
+        return;
+      }
+    }
+  }
   // PPID changes alone are NOT a shutdown signal — see comment above.
   if (currentPpid !== _parentPid) {
     diagLog(
@@ -394,12 +427,20 @@ _heartbeatInterval.unref(); // Don't let the timer alone keep the process alive
 
 // ─── Configuration ───────────────────────────────────────────
 const argv = process.argv.slice(2);
+// Both `--port 9876` and `--port=9876` are accepted. Only the space form
+// used to work, so an IDE config or shell alias written with the equals
+// form silently bound the default port instead of the requested one — and
+// then collided with whatever already owned it.
 const getArgValue = (flag) => {
   const index = argv.indexOf(flag);
-  return index >= 0 ? argv[index + 1] : undefined;
+  if (index >= 0) return argv[index + 1];
+  const inline = argv.find((a) => a.startsWith(`${flag}=`));
+  return inline ? inline.slice(flag.length + 1) : undefined;
 };
-const hasArg = (flag) => argv.includes(flag);
-const WS_PORT = parseInt(getArgValue("--port") || "9876", 10);
+const hasArg = (flag) =>
+  argv.includes(flag) || argv.some((a) => a.startsWith(`${flag}=`));
+const DEFAULT_WS_PORT = 9876;
+const WS_PORT = parseInt(getArgValue("--port") || String(DEFAULT_WS_PORT), 10);
 const STOP_ONLY = hasArg("--stop");
 const TOOL_TIMEOUT = parseInt(process.env.AUTODOM_TOOL_TIMEOUT || "30000", 10);
 const SHUTDOWN_GRACE_MS = 1500;
@@ -654,7 +695,8 @@ function _waitForExtensionReady(timeoutMs = RECONNECT_GRACE_MS) {
 }
 
 function _waitForProxyReady(timeoutMs = RECONNECT_GRACE_MS) {
-  if (_isProxyReady() || isPrimaryServer) return Promise.resolve(true);
+  if (_isProxyReady() || bridgeRole === BRIDGE_ROLE.PRIMARY)
+    return Promise.resolve(true);
   if (timeoutMs <= 0) return Promise.resolve(false);
   return new Promise((resolve) => {
     const entry = { resolve, timer: null };
@@ -1086,6 +1128,14 @@ async function getProcessCommand(pid) {
   }
 }
 
+// Does this bridge command line serve WS_PORT? An explicit --port must
+// match; a command with no --port flag serves the default port.
+function _commandTargetsOurPort(command) {
+  const match = /--port[=\s]+(\d+)/.exec(command || "");
+  if (match) return Number.parseInt(match[1], 10) === WS_PORT;
+  return WS_PORT === DEFAULT_WS_PORT;
+}
+
 async function getProcessCwd(pid) {
   try {
     const { stdout } = await execFileAsync("lsof", [
@@ -1290,7 +1340,73 @@ async function shutdown(code = 0) {
 
 let proxyClient = null; // If we are a secondary instance, we connect to the primary instance here
 let proxyConnectPromise = null;
-let isPrimaryServer = true;
+
+// ─── Bridge Role State Machine ───────────────────────────────
+// Exactly one instance per port owns the WebSocket listener (PRIMARY);
+// every other instance forwards tool calls to it (PROXY). Which role we
+// get is decided by `establishBridgeRole()` *after* the stdio transport
+// is already serving, so a slow or contended election can never delay
+// the MCP `initialize` handshake.
+//
+// BOOTSTRAPPING is the honest starting state: we hold neither the port
+// nor a proxy link yet. It used to be spelled `isPrimaryServer = true`,
+// which made a tool call arriving during startup take the primary path
+// and report "Chrome extension is not connected" — a lie, since the
+// bridge had not yet decided whether it even owned the port.
+const BRIDGE_ROLE = {
+  BOOTSTRAPPING: "bootstrapping",
+  PRIMARY: "primary",
+  PROXY: "proxy",
+  DEGRADED: "degraded",
+};
+let bridgeRole = BRIDGE_ROLE.BOOTSTRAPPING;
+let bridgeRoleDetail = "";
+// Derived mirror of bridgeRole, kept so the many read sites stay simple.
+// Never assign it directly — always go through setBridgeRole().
+let isPrimaryServer = false;
+
+function setBridgeRole(role, detail = "") {
+  if (bridgeRole !== role) {
+    diagLog(
+      `bridgeRole ${bridgeRole} -> ${role}${detail ? ` (${detail})` : ""}`,
+    );
+  }
+  bridgeRole = role;
+  bridgeRoleDetail = detail;
+  isPrimaryServer = role === BRIDGE_ROLE.PRIMARY;
+}
+
+// Resolved once the election has settled on a final role (primary, proxy
+// or degraded). Tool calls that arrive mid-election wait on this instead
+// of guessing.
+let bootstrapSettled = false;
+const _bootstrapWaiters = new Set(); // { resolve, timer }
+const BOOTSTRAP_WAIT_MS = parseInt(
+  process.env.AUTODOM_BOOTSTRAP_WAIT || "12000",
+  10,
+);
+
+function waitForBootstrap(timeoutMs = BOOTSTRAP_WAIT_MS) {
+  if (bootstrapSettled) return Promise.resolve(true);
+  if (timeoutMs <= 0) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const entry = { resolve, timer: null };
+    entry.timer = setTimeout(() => {
+      _bootstrapWaiters.delete(entry);
+      resolve(false);
+    }, timeoutMs);
+    entry.timer.unref?.();
+    _bootstrapWaiters.add(entry);
+  });
+}
+
+function _signalBootstrapDone() {
+  for (const entry of _bootstrapWaiters) {
+    clearTimeout(entry.timer);
+    entry.resolve(true);
+  }
+  _bootstrapWaiters.clear();
+}
 
 // Tracks AI chat request ids the user has cancelled via the chat
 // panel's stop button. The agent loop checks this set between awaits
@@ -1435,7 +1551,7 @@ async function cleanupStaleProcesses() {
             process.stderr.write(
               `[AutoDOM] Existing bridge (PID ${pid}) on port ${WS_PORT} has a live parent — will use proxy mode\n`,
             );
-            // Don't kill it — let startWebSocketServer() detect the port
+            // Don't kill it — let tryBecomePrimary() detect the port
             // conflict and fall through to proxy mode instead.
             continue;
           }
@@ -1457,7 +1573,7 @@ async function cleanupStaleProcesses() {
         // launcher we don't recognize) and produced the intermittent
         // "secondary can't reach primary" failures. A false kill is far more
         // damaging than a false proxy: do NOT kill. Fall through and let
-        // startWebSocketServer() hit EADDRINUSE and switch to proxy mode. If
+        // tryBecomePrimary() hit EADDRINUSE and switch to proxy mode. If
         // the holder really is foreign, the proxy handshake fails with a
         // clear, recoverable error instead of us terminating a user process.
         process.stderr.write(
@@ -1503,20 +1619,25 @@ async function cleanupStaleProcesses() {
         .filter(Boolean)
         .filter((p) => p !== process.pid);
 
-      // Batch-fetch process info for all candidates in parallel
+      // Batch-fetch process info for all candidates in parallel.
+      // The command line comes along so we can scope the scan to OUR port:
+      // the pgrep pattern above matches every autodom bridge on the machine,
+      // and reaping a healthy bridge that serves a different port breaks
+      // that port's clients for no reason.
       const candidateInfos = await Promise.allSettled(
         candidates.map(async (pid) => {
           const { stdout: psOut } = await execFileAsync("ps", [
             "-p",
             String(pid),
             "-o",
-            "ppid=,pcpu=",
+            "ppid=,command=",
           ]);
-          const parts = psOut.trim().split(/\s+/);
+          const trimmed = psOut.trim();
+          const spaceAt = trimmed.indexOf(" ");
           return {
             pid,
-            ppid: Number.parseInt(parts[0], 10),
-            cpu: Number.parseFloat(parts[1]),
+            ppid: Number.parseInt(trimmed, 10),
+            command: spaceAt >= 0 ? trimmed.slice(spaceAt + 1).trim() : "",
           };
         }),
       );
@@ -1538,10 +1659,19 @@ async function cleanupStaleProcesses() {
 
       for (const result of candidateInfos) {
         if (result.status !== "fulfilled") continue;
-        const { pid, ppid } = result.value;
+        const { pid, ppid, command } = result.value;
 
         // Never reap the active bridge recorded in the lock file.
         if (lockOwnerPid && pid === lockOwnerPid) continue;
+
+        // Never reap a bridge serving a different port — it is not ours
+        // to clean up, and its clients would see "Transport closed".
+        if (!_commandTargetsOurPort(command)) {
+          diagLog(
+            `Zombie scan: skipping PID ${pid} (serves another port): ${command.slice(0, 100)}`,
+          );
+          continue;
+        }
 
         let shouldKill = false;
         let reason = "";
@@ -1598,9 +1728,20 @@ async function cleanupStaleProcesses() {
   diagLog(`Pre-startup cleanup completed in ${cleanupMs}ms`);
 }
 
-// Function to start the WebSocket server gracefully or act as a proxy client
-async function startWebSocketServer() {
-  return await new Promise((resolve, reject) => {
+// ─── Primary/Secondary Election ──────────────────────────────
+// A restarting predecessor keeps port WS_PORT bound until its shutdown
+// hard-exit watchdog fires (3s, see shutdown()). Retrying the bind across
+// that window is what makes an IDE-driven "Restart MCP server" land as
+// primary again instead of degrading into a proxy against a dying peer.
+const BIND_RETRY_DELAYS_MS = [150, 350, 700, 1200, 1500]; // ≈4s total
+const MAX_ELECTION_ROUNDS = 3;
+const MAX_RECOVERY_ATTEMPTS = 5;
+const RECOVERY_WINDOW_MS = 60000;
+
+// One-shot bind. Resolves the listening server, or rejects with the raw
+// error so callers can branch on err.code (EADDRINUSE vs everything else).
+function bindWebSocketServer() {
+  return new Promise((resolve, reject) => {
     const wss = new WebSocketServer({
       port: WS_PORT,
       host: "127.0.0.1",
@@ -1616,9 +1757,45 @@ async function startWebSocketServer() {
       },
     });
 
-    wss.once("listening", () => {
-      isPrimaryServer = true;
+    const onError = (err) => {
+      wss.removeListener("listening", onListening);
+      try {
+        wss.close();
+      } catch (_) {}
+      reject(err);
+    };
+
+    const onListening = () => {
+      wss.removeListener("error", onError);
+      // Persistent error listener. Without one, any post-`listening`
+      // error had no handler at all and was absorbed by the
+      // keep-alive `uncaughtException` hook, leaving a live process
+      // with a silently dead WebSocket server.
+      wss.on("error", (err) => {
+        process.stderr.write(
+          `[AutoDOM] WebSocket server error: ${err.message}\n`,
+        );
+        if (webSocketServer === wss) {
+          setBridgeRole(BRIDGE_ROLE.DEGRADED, `ws server error: ${err.message}`);
+          void recoverBridge();
+        }
+      });
+      resolve(wss);
+    };
+
+    wss.once("error", onError);
+    wss.once("listening", onListening);
+  });
+}
+
+// Try to own the port, retrying only on EADDRINUSE. Returns false when the
+// port stays occupied; any other bind failure propagates to the caller.
+async function tryBecomePrimary() {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const wss = await bindWebSocketServer();
       webSocketServer = wss;
+      setBridgeRole(BRIDGE_ROLE.PRIMARY);
       writeLockFile().catch((err) => {
         process.stderr.write(
           `[AutoDOM] Failed to persist lock file: ${err.message}\n`,
@@ -1638,21 +1815,153 @@ async function startWebSocketServer() {
 📦 Message batching: ${WS_BATCH_INTERVAL_MS}ms window
 `);
       setupWssConnection(wss);
-      resolve(wss);
-    });
-
-    wss.once("error", (err) => {
-      if (err.code === "EADDRINUSE") {
+      return true;
+    } catch (err) {
+      if (err.code !== "EADDRINUSE") throw err;
+      if (attempt >= BIND_RETRY_DELAYS_MS.length) {
         process.stderr.write(
-          `[AutoDOM] Port ${WS_PORT} in use. Falling back to Proxy Client mode for concurrent IDE support.\n`,
+          `[AutoDOM] Port ${WS_PORT} still in use after ${attempt} retries. Falling back to Proxy Client mode for concurrent IDE support.\n`,
         );
-        isPrimaryServer = false;
-        setupProxyClient(resolve);
-        return;
+        return false;
       }
-      reject(err);
-    });
+      diagLog(
+        `bind EADDRINUSE, retry in ${BIND_RETRY_DELAYS_MS[attempt]}ms (attempt ${attempt + 1})`,
+      );
+      await delay(BIND_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
+// Bounded election. Each round tries the port first, then the proxy link.
+// Never recurses: the previous implementation had setupProxyClient and
+// tryRecoverSecondaryAsPrimary call each other with no attempt cap, which
+// could spin forever and — because the startup path awaited it — meant the
+// stdio transport was never attached and the client's `initialize` hung.
+async function establishBridgeRole() {
+  for (let round = 1; round <= MAX_ELECTION_ROUNDS; round++) {
+    if (await tryBecomePrimary()) return BRIDGE_ROLE.PRIMARY;
+
+    // Provisional: ensureProxyClientConnected()'s readiness helpers read
+    // the role, and we are definitively not primary at this point.
+    setBridgeRole(BRIDGE_ROLE.PROXY, "connecting");
+    let connected = false;
+    try {
+      connected = await ensureProxyClientConnected();
+    } catch (err) {
+      process.stderr.write(
+        `[AutoDOM] Proxy setup failed: ${err?.message || err}\n`,
+      );
+    }
+    if (connected) {
+      setBridgeRole(BRIDGE_ROLE.PROXY);
+      return BRIDGE_ROLE.PROXY;
+    }
+
+    setBridgeRole(
+      BRIDGE_ROLE.BOOTSTRAPPING,
+      `election round ${round} of ${MAX_ELECTION_ROUNDS} failed`,
+    );
+    await delay(200 * round);
+  }
+
+  setBridgeRole(
+    BRIDGE_ROLE.DEGRADED,
+    `could not bind port ${WS_PORT} nor reach a primary bridge after ${MAX_ELECTION_ROUNDS} rounds`,
+  );
+  return BRIDGE_ROLE.DEGRADED;
+}
+
+// Serialized, rate-capped re-election. Replaces the old recursive
+// tryRecoverSecondaryAsPrimary: one attempt in flight at a time, at most
+// MAX_RECOVERY_ATTEMPTS per RECOVERY_WINDOW_MS sliding window.
+let recoveryPromise = null;
+let recoveryAttempts = 0;
+let recoveryWindowStart = Date.now();
+
+function recoverBridge() {
+  if (bridgeRole === BRIDGE_ROLE.PRIMARY) return Promise.resolve(true);
+  if (recoveryPromise) return recoveryPromise;
+
+  if (Date.now() - recoveryWindowStart > RECOVERY_WINDOW_MS) {
+    recoveryAttempts = 0;
+    recoveryWindowStart = Date.now();
+  }
+  if (recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+    setBridgeRole(
+      BRIDGE_ROLE.DEGRADED,
+      `recovery gave up after ${MAX_RECOVERY_ATTEMPTS} attempts in ${RECOVERY_WINDOW_MS / 1000}s`,
+    );
+    return Promise.resolve(false);
+  }
+  recoveryAttempts++;
+
+  recoveryPromise = (async () => {
+    process.stderr.write(
+      `[AutoDOM] Bridge link lost; re-running election (attempt ${recoveryAttempts}/${MAX_RECOVERY_ATTEMPTS}).\n`,
+    );
+    try {
+      if (await tryBecomePrimary()) {
+        process.stderr.write(
+          "[AutoDOM] Recovered as primary bridge.\n",
+        );
+        _signalProxyReady();
+        return true;
+      }
+    } catch (err) {
+      process.stderr.write(
+        `[AutoDOM] Recovery bind failed: ${err?.message || err}\n`,
+      );
+    }
+
+    setBridgeRole(BRIDGE_ROLE.PROXY, "reconnecting");
+    try {
+      if (await ensureProxyClientConnected()) {
+        setBridgeRole(BRIDGE_ROLE.PROXY);
+        _signalProxyReady();
+        return true;
+      }
+    } catch (err) {
+      process.stderr.write(
+        `[AutoDOM] Recovery proxy connect failed: ${err?.message || err}\n`,
+      );
+    }
+
+    setBridgeRole(
+      BRIDGE_ROLE.DEGRADED,
+      `primary bridge unreachable and port ${WS_PORT} unavailable`,
+    );
+    return false;
+  })().finally(() => {
+    recoveryPromise = null;
   });
+
+  return recoveryPromise;
+}
+
+// Bootstrap the bridge link. Deliberately NOT awaited by the startup path:
+// stdio must already be serving before any of this runs.
+async function bootstrapBridge() {
+  try {
+    await cleanupStaleProcesses();
+    await establishBridgeRole();
+  } catch (err) {
+    setBridgeRole(BRIDGE_ROLE.DEGRADED, err?.message || String(err));
+    process.stderr.write(
+      `[AutoDOM] Bridge bootstrap failed: ${bridgeRoleDetail}\n`,
+    );
+  } finally {
+    bootstrapSettled = true;
+    _signalBootstrapDone();
+    process.stderr.write(
+      `[AutoDOM] Bridge role: ${bridgeRole}${bridgeRoleDetail ? ` — ${bridgeRoleDetail}` : ""}\n`,
+    );
+    if (bridgeRole !== BRIDGE_ROLE.DEGRADED) {
+      process.stderr.write(
+        `[AutoDOM] Waiting for Chrome extension to connect on ws://localhost:${WS_PORT}...\n`,
+      );
+    }
+  }
+  return bridgeRole;
 }
 
 async function readProxyAuthToken() {
@@ -1676,7 +1985,7 @@ async function readProxyAuthToken() {
 }
 
 function rejectPendingProxyCalls(error) {
-  if (isPrimaryServer) return;
+  if (bridgeRole === BRIDGE_ROLE.PRIMARY) return;
   for (const [id, pending] of pendingCalls) {
     clearTimeout(pending.timer);
     pendingCalls.delete(id);
@@ -1771,17 +2080,16 @@ async function ensureProxyClientConnected() {
           `[AutoDOM] Proxy client disconnected from primary server (code=${code}${suffix})\n`,
         );
         // Don't immediately reject pending proxy calls. Give the system
-        // a RECONNECT_GRACE_MS window during which we try (in parallel):
-        //   1. Reconnect to the existing primary (if it just restarted).
-        //   2. Promote ourselves to primary (if the primary is gone for
-        //      good — this is the key fix for "IntelliJ MCP entry goes
-        //      inactive after Copilot CLI was killed").
-        // If either succeeds in time, in-flight calls naturally proceed
-        // because they re-resolve readiness on each retry path. If both
-        // fail, fall back to the original reject-pending behavior so
-        // the IDE still gets a definitive error instead of hanging.
+        // a RECONNECT_GRACE_MS window during which recoverBridge() tries,
+        // in order, to promote us to primary (the primary is gone for good
+        // — this is the fix for "IntelliJ MCP entry goes inactive after
+        // Copilot CLI was killed") and then to reconnect to a primary that
+        // merely restarted. If it succeeds in time, in-flight calls proceed
+        // because they re-resolve readiness on each retry path. If it
+        // fails, fall back to reject-pending so the IDE gets a definitive
+        // error instead of hanging.
         const recoveryDeadline = setTimeout(() => {
-          if (!_isProxyReady() && !isPrimaryServer) {
+          if (!_isProxyReady() && bridgeRole !== BRIDGE_ROLE.PRIMARY) {
             rejectPendingProxyCalls(
               "Proxy connection to primary AutoDOM server closed and recovery window expired.",
             );
@@ -1789,25 +2097,12 @@ async function ensureProxyClientConnected() {
         }, RECONNECT_GRACE_MS);
         recoveryDeadline.unref?.();
 
-        // Eager recovery: kick off both paths concurrently. Whichever
-        // resolves readiness first wakes the waiters via _signalProxyReady.
-        (async () => {
-          try {
-            const recovered = await tryRecoverSecondaryAsPrimary();
-            if (recovered) {
-              clearTimeout(recoveryDeadline);
-              _signalProxyReady();
-              return;
-            }
-          } catch (_) {}
-          try {
-            const reconnected = await ensureProxyClientConnected();
-            if (reconnected) {
-              clearTimeout(recoveryDeadline);
-              _signalProxyReady();
-            }
-          } catch (_) {}
-        })();
+        void recoverBridge().then((ok) => {
+          if (ok) {
+            clearTimeout(recoveryDeadline);
+            _signalProxyReady();
+          }
+        });
       });
 
       ws.on("message", (data) => {
@@ -1834,61 +2129,17 @@ async function ensureProxyClientConnected() {
   return await proxyConnectPromise;
 }
 
-function setupProxyClient(resolve) {
-  (async () => {
-    let connected = false;
-    try {
-      connected = await ensureProxyClientConnected();
-    } catch (err) {
-      process.stderr.write(
-        `[AutoDOM] Proxy setup failed: ${err?.message || err}\n`,
-      );
-    }
-
-    if (!connected && !isPrimaryServer) {
-      try {
-        await tryRecoverSecondaryAsPrimary();
-      } catch (err) {
-        process.stderr.write(
-          `[AutoDOM] Proxy startup recovery failed: ${err?.message || err}\n`,
-        );
-      }
-    }
-  })().finally(resolve);
-}
-
-async function tryRecoverSecondaryAsPrimary() {
-  if (isPrimaryServer) return true;
-  process.stderr.write(
-    "[AutoDOM] Proxy unavailable; attempting to recover as primary bridge.\n",
-  );
-  try {
-    isPrimaryServer = true;
-    await startWebSocketServer();
-    if (isPrimaryServer) {
-      process.stderr.write(
-        "[AutoDOM] Recovered secondary server as primary bridge.\n",
-      );
-      return true;
-    }
-  } catch (err) {
-    process.stderr.write(
-      `[AutoDOM] Secondary recovery as primary failed: ${err?.message || err}\n`,
-    );
-  }
-  isPrimaryServer = false;
-  return false;
-}
-
 async function ensureBridgeReadyForDiagnostics() {
-  if (isPrimaryServer || _isProxyReady()) return;
+  // The election may still be running — diagnostics is often the very
+  // first tool an agent calls, so wait for a settled role before
+  // reporting one.
+  if (bridgeRole === BRIDGE_ROLE.BOOTSTRAPPING) {
+    await waitForBootstrap();
+  }
+  if (bridgeRole === BRIDGE_ROLE.PRIMARY || _isProxyReady()) return;
 
   try {
-    if (await ensureProxyClientConnected()) return;
-  } catch (_) {}
-
-  try {
-    await tryRecoverSecondaryAsPrimary();
+    await recoverBridge();
   } catch (_) {}
 }
 
@@ -3139,21 +3390,61 @@ function callExtensionTool(tool, params, options = {}) {
       resolve(result);
     };
 
+    // The election runs in the background so it can never delay the MCP
+    // handshake, which means a tool call can arrive before we know whether
+    // we own the port. Wait for a settled role rather than guessing — note
+    // that _waitForExtensionReady() is useless here, because the extension
+    // can never become ready while we hold neither the port nor a proxy
+    // link, so it would just burn the grace window and then report the
+    // wrong error.
+    if (bridgeRole === BRIDGE_ROLE.BOOTSTRAPPING) {
+      diagLog(`toolCall WAIT tool=${tool} reason=bridge_bootstrapping`);
+      (async () => {
+        if (!(await waitForBootstrap())) {
+          diagLog(`toolCall FAIL tool=${tool} reason=bootstrap_timeout`);
+          wrappedResolve({
+            error: `AutoDOM bridge is still starting up (port ${WS_PORT} election in progress). Retry in a moment.`,
+          });
+          return;
+        }
+        // Re-enter with a settled role. Bounded to one extra hop: the role
+        // is now primary, proxy, or degraded — never bootstrapping.
+        resolve(await callExtensionTool(tool, params, options));
+      })();
+      return;
+    }
+
+    if (bridgeRole === BRIDGE_ROLE.DEGRADED) {
+      (async () => {
+        if (await recoverBridge()) {
+          resolve(await callExtensionTool(tool, params, options));
+          return;
+        }
+        diagLog(`toolCall FAIL tool=${tool} reason=bridge_degraded`);
+        wrappedResolve({
+          error:
+            `AutoDOM owns neither the WebSocket port ${WS_PORT} nor a proxy link to a primary bridge` +
+            `${bridgeRoleDetail ? ` (${bridgeRoleDetail})` : ""}. ` +
+            "Run `node server/index.js --stop`, then reconnect AutoDOM.",
+        });
+      })();
+      return;
+    }
+
     // Route through proxy if we are a secondary instance
     if (!isPrimaryServer) {
       (async () => {
         let connected = await ensureProxyClientConnected();
         if (!connected) {
-          // Wait briefly for an eager recovery (proxy close handler kicks
-          // off promotion + reconnect concurrently); if we became primary
-          // during the wait, recurse through the primary path.
+          // Wait briefly for an in-flight recovery (the proxy close handler
+          // kicks one off); if we became primary during the wait, recurse
+          // through the primary path.
           await _waitForProxyReady();
           if (isPrimaryServer) {
             resolve(await callExtensionTool(tool, params, options));
             return;
           }
-          const recoveredPrimary = await tryRecoverSecondaryAsPrimary();
-          if (recoveredPrimary) {
+          if (await recoverBridge()) {
             resolve(await callExtensionTool(tool, params, options));
             return;
           }
@@ -5875,6 +6166,64 @@ function normalizeMcpToolResult(value) {
   return result;
 }
 
+// ─── tools/list payload ──────────────────────────────────────
+// The SDK derives each inputSchema from its zod schema, and zod always
+// stamps a top-level `$schema` on the result. That is ~5.8KB of dead
+// weight across 106 tools, and more importantly some MCP clients run
+// incoming schemas through a sanitizer that rejects or mangles an
+// explicit `$schema` for a draft it does not recognize. There is no
+// conversion hook (standardSchemaToJsonSchema is internal to the SDK and
+// unconfigurable), so we build the payload ourselves and override the
+// handler after registration.
+//
+// This is safe precisely because every tool definition carries only
+// name/description/parameters/execute — no title, annotations, icons,
+// execution, _meta or outputSchema — so these objects are equivalent to
+// the SDK's own minus `$schema`. tests/mcp-handshake.test.mjs guards that
+// invariant; if a tool ever gains one of those keys, extend this mapping
+// or drop the override.
+//
+// Plan B if this override ever breaks: register via the SDK's exported
+// `fromJsonSchema()` with pre-stripped JSON Schema. That is the supported
+// route, but it swaps zod validation for the SDK's generic JSON Schema
+// validator on all 106 tools, losing zod defaults/coercion/transform.
+let _toolListPayload = null;
+
+function _stripSchemaKeyword(node) {
+  if (Array.isArray(node)) return node.map(_stripSchemaKeyword);
+  if (!node || typeof node !== "object") return node;
+  const out = {};
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "$schema") continue;
+    out[key] = _stripSchemaKeyword(value);
+  }
+  return out;
+}
+
+function _jsonSchemaForTool(parameters) {
+  // A handful of tools take no arguments and omit `parameters` entirely.
+  // Mirror the SDK's EMPTY_OBJECT_JSON_SCHEMA for those.
+  if (!parameters) return { type: "object", properties: {} };
+  const standard = parameters?.["~standard"];
+  const raw = standard?.jsonSchema
+    ? standard.jsonSchema.input({ target: "draft-2020-12" })
+    : z.toJSONSchema(parameters, { target: "draft-2020-12", io: "input" });
+  const stripped = _stripSchemaKeyword(raw);
+  // MCP requires an object root; the SDK asserts the same.
+  return stripped.type === "object" ? stripped : { type: "object", ...stripped };
+}
+
+function toolListPayload() {
+  if (!_toolListPayload) {
+    _toolListPayload = toolDefinitions.map(({ name, description, parameters }) => ({
+      name,
+      description,
+      inputSchema: _jsonSchemaForTool(parameters),
+    }));
+  }
+  return _toolListPayload;
+}
+
 function createAutoDomMcpServer() {
   const mcpServer = new McpServer(
     { name: "autodom", version: SERVER_VERSION },
@@ -5884,6 +6233,22 @@ function createAutoDomMcpServer() {
       cacheHints: {
         "server/discover": { ttlMs: 60000, cacheScope: "public" },
         "tools/list": { ttlMs: 60000, cacheScope: "public" },
+      },
+      // Declared explicitly for two reasons.
+      //
+      // listChanged: false is simply honest — nothing here ever emits
+      // notifications/tools/list_changed, and the SDK defaults it to true.
+      //
+      // resources and prompts are declared *empty* so the SDK installs its
+      // list handlers, which then return empty arrays. Without the
+      // declaration those methods answer -32601, and while that is
+      // spec-legal for an unadvertised capability, some JetBrains AI
+      // Assistant builds treat a -32601 on a startup probe as a fatal
+      // handshake error instead of "unsupported".
+      capabilities: {
+        tools: { listChanged: false },
+        resources: { listChanged: false, subscribe: false },
+        prompts: { listChanged: false },
       },
     },
   );
@@ -5897,6 +6262,15 @@ function createAutoDomMcpServer() {
         normalizeMcpToolResult(await execute(params, context)),
     );
   }
+
+  // Must come after the registration loop: registerTool() installs the
+  // SDK's own tools/list handler on first call. setRequestHandler
+  // overwrites freely, and the SDK's installer is idempotent, so nothing
+  // clobbers this afterwards. tools/call still validates through zod.
+  mcpServer.server.setRequestHandler("tools/list", () => ({
+    tools: toolListPayload(),
+  }));
+
   return mcpServer;
 }
 
@@ -7124,7 +7498,10 @@ server.addTool({
         pid: process.pid,
         clientId: MY_CLIENT_ID,
         uptimeMs: Date.now() - _serverStartTime,
-        role: isPrimaryServer ? "primary" : "proxy",
+        role: bridgeRole,
+        roleDetail: bridgeRoleDetail || undefined,
+        bootstrapSettled,
+        recoveryAttempts,
         wsPort: WS_PORT,
         extensionConnected: _isExtensionReady(),
         proxyConnected: !isPrimaryServer && _isProxyReady(),
@@ -8506,17 +8883,16 @@ if (STOP_ONLY) {
   }
 } else {
   try {
-    // Clean up any stale/zombie processes before trying to bind
-    await cleanupStaleProcesses();
-    await startWebSocketServer();
-    process.stderr.write("[AutoDOM] MCP server running on stdio transport\n");
-    process.stderr.write(
-      `[AutoDOM] Waiting for Chrome extension to connect on ws://localhost:${WS_PORT}...\n`,
-    );
-    diagLog(
-      `isPrimaryServer=${isPrimaryServer} proxyClient=${proxyClient ? "created" : "null"}`,
-    );
-
+    // ─── stdio transport FIRST ───────────────────────────────
+    // serveStdio() is synchronous — it only attaches a `data` listener to
+    // stdin — so nothing here may block on it. This ordering is the whole
+    // fix for "the MCP server does not auto-initiate": port cleanup and
+    // the primary/secondary election used to run *before* this line, so
+    // under any port contention (a restarting predecessor, a second IDE)
+    // the client's `initialize` sat unread in the pipe for 5-11s, past
+    // IntelliJ AI Assistant's and Copilot's handshake deadline. Claude
+    // Code only worked because it usually started first and hit the
+    // port-free fast path.
     stdioMcpHandle = serveStdio(() => {
       mcpTransportConnected = true;
       return createAutoDomMcpServer();
@@ -8525,7 +8901,13 @@ if (STOP_ONLY) {
         process.stderr.write(`[AutoDOM] MCP stdio error: ${err.message}\n`);
       },
     });
+    process.stderr.write("[AutoDOM] MCP server running on stdio transport\n");
     diagLog("Official MCP SDK v2 stdio transport active");
+
+    // ─── bridge link SECOND, off the handshake path ──────────
+    // Deliberately not awaited. Tool calls arriving before the election
+    // settles wait on waitForBootstrap() inside callExtensionTool().
+    void bootstrapBridge();
 
     // ─── Optional stateless Streamable HTTP transport ─────────
     // --sse-port remains an input alias for compatibility, but old /sse and

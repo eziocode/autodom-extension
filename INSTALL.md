@@ -354,7 +354,8 @@ If AutoDOM causes noticeable CPU usage even without zombie processes, tune these
 
 | Variable | Default | What it does |
 |---|---|---|
-| `AUTODOM_HEARTBEAT_MS` | `15000` | Parent process liveness check interval (ms). Higher = less CPU. |
+| `AUTODOM_HEARTBEAT_MS` | `3000` | Parent/launcher liveness check interval (ms). Higher = less CPU, but an orphaned bridge holds the port for longer. |
+| `AUTODOM_BOOTSTRAP_WAIT` | `12000` | How long a tool call waits for the primary/proxy election to settle (ms). |
 | `AUTODOM_INACTIVITY_TIMEOUT` | `600000` | Session idle timeout (ms). `300000` = 5 min, `0` = never. |
 | `AUTODOM_TOOL_TIMEOUT` | `30000` | Max time per tool call (ms). |
 | `AUTODOM_WIRE_LOG` | `0` | Set to `1` only for debugging — writes every message to disk. |

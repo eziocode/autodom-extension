@@ -195,105 +195,16 @@ fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + "\n");
 NODE
 }
 
-upsert_jetbrains_store() {
-    local file="$1"
-    CONFIG_FILE="$file" SERVER_NAME="$SERVER_NAME" SERVER_PATH="$SERVER_PATH" TARGET_PORT="$TARGET_PORT" DEFAULT_PORT="$DEFAULT_PORT" node <<'NODE'
-const fs = require("fs");
-
-const file = process.env.CONFIG_FILE;
-const serverName = process.env.SERVER_NAME;
-const args = [process.env.SERVER_PATH];
-if (process.env.TARGET_PORT !== process.env.DEFAULT_PORT) {
-  args.push("--port", process.env.TARGET_PORT);
-}
-
-function decodeXmlAttr(text) {
-  return text
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&");
-}
-
-function encodeXmlAttr(text) {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-let servers = [];
-if (fs.existsSync(file)) {
-  const content = fs.readFileSync(file, "utf8");
-  const match = content.match(/<option name="servers" value="([^"]*)" \/>/);
-  if (match) {
-    try {
-      servers = JSON.parse(decodeXmlAttr(match[1]));
-    } catch (err) {
-      console.error(`Failed to parse JetBrains MCP store: ${file}: ${err.message}`);
-      process.exit(1);
-    }
-  }
-}
-
-if (!Array.isArray(servers)) servers = [];
-
-const nextEntry = {
-  name: serverName,
-  transport: {
-    type: "stdio",
-    command: "node",
-    args,
-  },
-};
-
-const existingIndex = servers.findIndex((entry) => entry && entry.name === serverName);
-if (existingIndex >= 0) {
-  servers[existingIndex] = nextEntry;
-} else {
-  servers.push(nextEntry);
-}
-
-const xml = `<application>\n  <component name="McpToolsStoreService">\n    <option name="servers" value="${encodeXmlAttr(JSON.stringify(servers))}" />\n  </component>\n</application>\n`;
-fs.writeFileSync(file, xml);
-NODE
-}
-
-ensure_jetbrains_ai_server() {
-    local file="$1"
-    CONFIG_FILE="$file" SERVER_NAME="$SERVER_NAME" node <<'NODE'
-const fs = require("fs");
-
-const file = process.env.CONFIG_FILE;
-const serverName = process.env.SERVER_NAME;
-const entry = `      <McpServerConfigurationProperties>\n        <option name="allowedToolsNames" />\n        <option name="enabled" value="true" />\n        <option name="name" value="${serverName}" />\n      </McpServerConfigurationProperties>`;
-
-let content = "";
-if (fs.existsSync(file)) {
-  content = fs.readFileSync(file, "utf8");
-}
-
-if (!content.trim()) {
-  content = `<application>\n  <component name="McpApplicationServerCommands" modifiable="true" autoEnableExternalChanges="true">\n    <commands>\n${entry}\n    </commands>\n    <urls />\n  </component>\n</application>\n`;
-  fs.writeFileSync(file, content);
-  process.exit(0);
-}
-
-if (content.includes(`<option name="name" value="${serverName}" />`)) {
-  process.exit(0);
-}
-
-if (content.includes("</commands>")) {
-  content = content.replace("</commands>", `${entry}\n    </commands>`);
-  fs.writeFileSync(file, content);
-  process.exit(0);
-}
-
-console.error(`Could not find </commands> in ${file}`);
-process.exit(1);
-NODE
+# Both JetBrains config files are written by scripts/jetbrains-mcp-upsert.mjs
+# so setup.ps1 can call the exact same implementation — the PowerShell
+# installer used to have no JetBrains branch at all.
+upsert_jetbrains_config() {
+    local options_dir="$1"
+    local args=(--options-dir "$options_dir" --name "$SERVER_NAME" --arg "$SERVER_PATH")
+    if [ "$TARGET_PORT" != "$DEFAULT_PORT" ]; then
+        args+=(--arg --port --arg "$TARGET_PORT")
+    fi
+    node "$SCRIPT_DIR/scripts/jetbrains-mcp-upsert.mjs" "${args[@]}" >/dev/null
 }
 
 echo ""
@@ -331,13 +242,37 @@ echo -e "${BLUE}[2/6]${NC} Cleaning up stale listeners on port ${TARGET_PORT}...
 
 ZOMBIES_KILLED=0
 
-STALE_PID=$(lsof -tiTCP:${TARGET_PORT} -sTCP:LISTEN 2>/dev/null || true)
-if [ -n "$STALE_PID" ]; then
-    kill "$STALE_PID" 2>/dev/null && ZOMBIES_KILLED=$((ZOMBIES_KILLED + 1))
+# One PID per line: lsof can report several listeners, and the old
+# `kill "$STALE_PID"` on a multi-line string simply failed. Each holder is
+# identified before being signalled — killing an unrelated user process
+# that happens to own the port is far worse than falling back to proxy mode.
+FOREIGN_HOLDER=0
+while read -r pid; do
+    [ -n "$pid" ] || continue
+    holder_cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    case "$holder_cmd" in
+        *autodom*index.js*|*autodom*cli.js*)
+            kill "$pid" 2>/dev/null && ZOMBIES_KILLED=$((ZOMBIES_KILLED + 1))
+            ;;
+        *)
+            FOREIGN_HOLDER=1
+            echo -e "${YELLOW}  ⚠ Port ${TARGET_PORT} held by PID $pid ($(printf '%s' "$holder_cmd" | cut -c1-60)) — not killing it; AutoDOM will use proxy mode${NC}"
+            ;;
+    esac
+done <<EOF
+$(lsof -tiTCP:${TARGET_PORT} -sTCP:LISTEN 2>/dev/null || true)
+EOF
+
+if [ "$ZOMBIES_KILLED" -gt 0 ]; then
     sleep 1
 fi
 
-rm -f "/tmp/autodom-bridge-${TARGET_PORT}.json" 2>/dev/null || true
+# Only clear the lock file once the holder is actually gone. Deleting a
+# live primary's lock file strands its auth token, and every secondary
+# then fails the proxy handshake.
+if [ "$FOREIGN_HOLDER" -eq 0 ] && ! lsof -tiTCP:${TARGET_PORT} -sTCP:LISTEN >/dev/null 2>&1; then
+    rm -f "/tmp/autodom-bridge-${TARGET_PORT}.json" 2>/dev/null || true
+fi
 
 if [ "$ZOMBIES_KILLED" -gt 0 ]; then
     echo -e "${GREEN}✓${NC} Killed $ZOMBIES_KILLED stale process(es)"
@@ -463,10 +398,7 @@ configure_jetbrains() {
         local options_dir="$dir/options"
         mkdir -p "$options_dir"
 
-        local mcp_file="$options_dir/McpToolsStoreService.xml"
-        local llm_mcp_file="$options_dir/llm.mcpServers.xml"
-
-        if upsert_jetbrains_store "$mcp_file" && ensure_jetbrains_ai_server "$llm_mcp_file"; then
+        if upsert_jetbrains_config "$options_dir"; then
             echo -e "${GREEN}  ✓ $ide_name${NC} (${SERVER_NAME})"
             CONFIGURED_COUNT=$((CONFIGURED_COUNT + 1))
         else

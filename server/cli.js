@@ -70,15 +70,21 @@ function getPkgVersion() {
   }
 }
 
+// Both `--port 9876` and `--port=9876` are accepted, matching index.js.
+// The equals form used to be dropped silently, so `--port=9877` bound the
+// default port and then collided with whatever already owned it.
 function hasArg(flag) {
-  return process.argv.includes(flag);
+  return (
+    process.argv.includes(flag) ||
+    process.argv.some((a) => a.startsWith(`${flag}=`))
+  );
 }
 
 function getArgValue(flag) {
   const idx = process.argv.indexOf(flag);
-  return idx >= 0 && idx + 1 < process.argv.length
-    ? process.argv[idx + 1]
-    : undefined;
+  if (idx >= 0 && idx + 1 < process.argv.length) return process.argv[idx + 1];
+  const inline = process.argv.find((a) => a.startsWith(`${flag}=`));
+  return inline ? inline.slice(flag.length + 1) : undefined;
 }
 
 function elapsed(startMs) {
@@ -419,8 +425,17 @@ async function main() {
     process.exit(1);
   }
 
-  // 2. Auto-install dependencies if missing
+  // 2. Dependencies. Auto-install only when a human is watching: on the
+  // stdio path (stdin is a pipe from an IDE) an `npm install` can block for
+  // up to 60s *before* the server exists, which the MCP client sees as a
+  // dead server rather than a slow one. Fail fast with instructions instead.
   if (!checkDependenciesInstalled()) {
+    if (!process.stdin.isTTY) {
+      log(`${fail} Dependencies are not installed and stdin is not a TTY.`);
+      log(`  ${arrow} Run: cd ${SERVER_DIR} && npm install`);
+      log(`  ${arrow} Or:  node ${SERVER_DIR}/cli.js --setup`);
+      process.exit(1);
+    }
     log(`${info} Dependencies not found — auto-installing...`);
     const ok = await installDependencies();
     if (!ok) {
@@ -443,17 +458,27 @@ async function main() {
 
   // ── Forward to the real server ─────────────────────────────
   // Pass through all arguments directly to index.js.
-  // This process replaces itself so the IDE talks directly to
-  // the MCP server — no extra process in the chain.
+  //
+  // Node cannot exec-replace itself, so this really is an extra process in
+  // the chain: the IDE's stdio FDs are inherited by the child, and if the
+  // IDE SIGKILLs *us* (which is what "Restart MCP server" does in some
+  // hosts) the child survives holding the WebSocket port. AUTODOM_LAUNCHER_PID
+  // lets the child's orphan watchdog notice that and exit, instead of
+  // squatting the port for the next instance to trip over. Configs written
+  // by setup.sh/setup.ps1 point at index.js directly and avoid this layer
+  // entirely; cli.js is for --setup/--doctor and manual `npx` use.
   const serverArgs = [INDEX_JS, ...argv.filter((a) => a !== "--setup" && a !== "--doctor" && a !== "--config")];
 
   const child = spawn(process.execPath, serverArgs, {
     stdio: "inherit",
     cwd: SERVER_DIR,
-    env: process.env,
+    env: { ...process.env, AUTODOM_LAUNCHER_PID: String(process.pid) },
   });
 
-  // Forward signals
+  // Forward signals. SIGHUP is deliberately NOT forwarded: it arrives on
+  // benign terminal/process-group changes while the stdio pipe is still
+  // valid, and killing the bridge there surfaces as a spurious
+  // "Transport closed" in the IDE.
   const forwardSignal = (sig) => {
     try {
       child.kill(sig);
@@ -461,7 +486,9 @@ async function main() {
   };
   process.on("SIGINT", () => forwardSignal("SIGINT"));
   process.on("SIGTERM", () => forwardSignal("SIGTERM"));
-  process.on("SIGHUP", () => forwardSignal("SIGHUP"));
+  process.on("SIGHUP", () => {
+    log(`${info} SIGHUP ignored — the server keeps running`);
+  });
 
   child.on("exit", (code, signal) => {
     process.exit(code ?? (signal ? 1 : 0));
