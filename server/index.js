@@ -1005,6 +1005,24 @@ if (BRIDGE_ONLY && INACTIVITY_TIMEOUT_MS > 0) {
   }, 30000).unref();
 }
 
+// The lock file is the only way a new instance learns the primary's auth
+// token. Peers delete a lock whose pid is dead, and that delete can land
+// just after a freshly elected primary wrote its own — leaving a live
+// primary nobody can join, so every later instance degrades. The primary
+// re-asserts the file whenever it is missing or names someone else.
+const LOCK_REASSERT_MS = 5000;
+setInterval(async () => {
+  if (bridgeRole !== BRIDGE_ROLE.PRIMARY || shutdownStarted) return;
+  try {
+    const lock = await readLockFile();
+    if (lock?.pid === process.pid && lock?.token === AUTH_TOKEN) return;
+    await writeLockFile();
+    process.stderr.write(
+      `[AutoDOM] Lock file ${lock ? "owned by PID " + lock.pid : "missing"} — re-asserted for primary PID ${process.pid}\n`,
+    );
+  } catch (_) {}
+}, LOCK_REASSERT_MS).unref();
+
 // Single source for autodom_diagnostics and the BRIDGE_STATUS WS reply.
 function collectBridgeStatus() {
   return {
@@ -7617,6 +7635,8 @@ server.addTool({
   },
 });
 
+const DIAGNOSTICS_EXTENSION_TIMEOUT_MS = 3000;
+
 // 16d. Diagnostics — a single-call health snapshot covering both this
 // bridge process and the connected Chrome extension. Designed to be the
 // first tool an agent calls when AutoDOM is misbehaving (e.g. IntelliJ
@@ -7642,7 +7662,16 @@ server.addTool({
     // of the snapshot is still useful for debugging.
     if (_isExtensionReady() || (!isPrimaryServer && _isProxyReady())) {
       try {
-        const extResult = await callExtensionTool("__diagnostics", {});
+        // Bounded: diagnostics must answer even when the extension (or the
+        // primary we proxy through) is slow or gone — setup's handshake
+        // check and agents call this first, and an unbounded wait here ran
+        // out the full tool timeout behind a contended election.
+        const extResult = await Promise.race([
+          callExtensionTool("__diagnostics", {}),
+          delay(DIAGNOSTICS_EXTENSION_TIMEOUT_MS).then(() => ({
+            error: `extension did not answer within ${DIAGNOSTICS_EXTENSION_TIMEOUT_MS}ms`,
+          })),
+        ]);
         if (extResult && !extResult.error) {
           snapshot.extension = extResult;
         } else if (extResult?.error) {

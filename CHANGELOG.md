@@ -4,6 +4,24 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 5.2.1
+
+### Fixed
+- `setup.sh` failed its handshake check ("timed out after 8000ms waiting
+  for tools/call") whenever other IDEs' bridges already held the port. The
+  election plus `autodom_diagnostics` could not finish in 8 s. The installers
+  now allow 20 s, and `autodom_diagnostics` waits at most 3 s for the
+  extension instead of the full tool timeout.
+- A live primary could end up with no lock file, so no new instance could
+  read its token and every later IDE session went `degraded`. A peer deleted
+  the dead predecessor's lock just after the new primary wrote its own. The
+  primary now re-asserts its lock file every 5 s.
+- `setup.sh` step 2 no longer kills the live primary (which set off that
+  race). It runs the same reaper as the extension's Fix, keeping the primary
+  and joined proxies and stopping only orphans and zombies.
+
+---
+
 ## 5.2.0
 
 ### Added

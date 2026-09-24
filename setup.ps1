@@ -180,7 +180,7 @@ Pop-Location
 # instance never became primary, and it broke whenever wording changed.
 Write-Step "Verifying server..."
 $selfTest = Join-Path $ScriptDir "scripts\mcp-selftest.mjs"
-$selfTestArgs = @($selfTest, $ServerPath, "--port", "$Port")
+$selfTestArgs = @($selfTest, $ServerPath, "--port", "$Port", "--timeout", "20000")
 if (-not $foreignHolder) { $selfTestArgs += @("--expect-role", "primary") }
 $verifyOut = ""
 try {

@@ -226,49 +226,55 @@ fi
 echo -e "${GREEN}✓${NC} Node.js $(node -v)"
 
 # ─── Step 2: Kill stale listeners ─────────────────────────────
-echo -e "${BLUE}[2/6]${NC} Cleaning up stale listeners on port ${TARGET_PORT}..."
+echo -e "${BLUE}[2/6]${NC} Cleaning up stale AutoDOM servers on port ${TARGET_PORT}..."
 
 ZOMBIES_KILLED=0
 
-# One PID per line: lsof can report several listeners, and the old
-# `kill "$STALE_PID"` on a multi-line string simply failed. Each holder is
-# identified before being signalled — killing an unrelated user process
-# that happens to own the port is far worse than falling back to proxy mode.
-FOREIGN_HOLDER=0
-while read -r pid; do
-    [ -n "$pid" ] || continue
-    holder_cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
-    case "$holder_cmd" in
-        *autodom*index.js*|*autodom*cli.js*)
-            kill "$pid" 2>/dev/null && ZOMBIES_KILLED=$((ZOMBIES_KILLED + 1))
-            ;;
-        *)
-            FOREIGN_HOLDER=1
-            echo -e "${YELLOW}  ⚠ Port ${TARGET_PORT} held by PID $pid ($(printf '%s' "$holder_cmd" | cut -c1-60)) — not killing it; AutoDOM will use proxy mode${NC}"
-            ;;
-    esac
-done <<EOF
-$(lsof -tiTCP:${TARGET_PORT} -sTCP:LISTEN 2>/dev/null || true)
-EOF
-
-if [ "$ZOMBIES_KILLED" -gt 0 ]; then
-    sleep 1
-fi
-
-# Only clear the lock file once the holder is actually gone. Deleting a
-# live primary's lock file strands its auth token, and every secondary
-# then fails the proxy handshake.
-# The server writes it under os.tmpdir(), which on macOS is the per-user
-# $TMPDIR (/var/folders/...), not /tmp — ask node rather than guessing.
-if [ "$FOREIGN_HOLDER" -eq 0 ] && ! lsof -tiTCP:${TARGET_PORT} -sTCP:LISTEN >/dev/null 2>&1; then
-    LOCK_DIR="$(node -e 'process.stdout.write(require("os").tmpdir())' 2>/dev/null || echo /tmp)"
-    rm -f "${LOCK_DIR}/autodom-bridge-${TARGET_PORT}.json" 2>/dev/null || true
-fi
-
-if [ "$ZOMBIES_KILLED" -gt 0 ]; then
-    echo -e "${GREEN}✓${NC} Killed $ZOMBIES_KILLED stale process(es)"
+# Preferred path: the reaper (server/native-host.js), the same policy the
+# extension's Fix uses. It keeps the live primary and every proxy joined to
+# it, and only kills orphans and zombies. Killing a live primary here used to
+# set off a re-election race that could leave the port owned by a bridge
+# with no lock file, which every later instance then failed to join.
+if [ -d "$SERVER_DIR/node_modules/ws" ] && [ -f "$SERVER_DIR/native-host.js" ] \
+    && FLUSH_OUT="$(node "$SERVER_DIR/native-host.js" --cli flush --port "$TARGET_PORT" 2>/dev/null)"; then
+    ZOMBIES_KILLED=$(printf '%s' "$FLUSH_OUT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).killed.length))}catch{process.stdout.write("0")}})')
 else
-    echo -e "${GREEN}✓${NC} No stale listeners found"
+    # First install (no node_modules yet): nothing live can depend on these
+    # servers' lock files, so fall back to stopping AutoDOM listeners whose
+    # launching parent is gone. Each holder is identified before being
+    # signalled — never kill an unrelated process that owns the port.
+    while read -r pid; do
+        [ -n "$pid" ] || continue
+        holder_cmd=$(ps -p "$pid" -o command= 2>/dev/null || true)
+        case "$holder_cmd" in
+            *autodom*index.js*|*autodom*cli.js*)
+                ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ' || true)
+                if [ -z "$ppid" ] || [ "$ppid" = "1" ] || ! kill -0 "$ppid" 2>/dev/null; then
+                    kill "$pid" 2>/dev/null && ZOMBIES_KILLED=$((ZOMBIES_KILLED + 1))
+                fi
+                ;;
+            *)
+                echo -e "${YELLOW}  ⚠ Port ${TARGET_PORT} held by PID $pid ($(printf '%s' "$holder_cmd" | cut -c1-60)) — not killing it; AutoDOM will use proxy mode${NC}"
+                ;;
+        esac
+    done <<EOF_PIDS
+$(lsof -tiTCP:${TARGET_PORT} -sTCP:LISTEN 2>/dev/null || true)
+EOF_PIDS
+    if [ "$ZOMBIES_KILLED" -gt 0 ]; then
+        sleep 1
+    fi
+    # The server writes its lock under os.tmpdir(), which on macOS is the
+    # per-user $TMPDIR, not /tmp. Clear it only once the port is free.
+    if ! lsof -tiTCP:${TARGET_PORT} -sTCP:LISTEN >/dev/null 2>&1; then
+        LOCK_DIR="$(node -e 'process.stdout.write(require("os").tmpdir())' 2>/dev/null || echo /tmp)"
+        rm -f "${LOCK_DIR}/autodom-bridge-${TARGET_PORT}.json" 2>/dev/null || true
+    fi
+fi
+
+if [ "$ZOMBIES_KILLED" -gt 0 ]; then
+    echo -e "${GREEN}✓${NC} Stopped $ZOMBIES_KILLED stale AutoDOM process(es)"
+else
+    echo -e "${GREEN}✓${NC} No stale AutoDOM processes found"
 fi
 
 # ─── Step 3: Install server dependencies ──────────────────────
@@ -313,7 +319,9 @@ echo -e "${BLUE}[5/6]${NC} Verifying server..."
 # A real MCP handshake via the same driver setup.ps1 uses. The role is not
 # pinned: other IDEs' live bridges may legitimately own the port, making
 # this instance a proxy — both roles are healthy.
-VERIFY_ARGS=("$SCRIPT_DIR/scripts/mcp-selftest.mjs" "$SERVER_PATH" --port "$TARGET_PORT")
+# 20s: a contended port (other IDEs' bridges) runs the bind ladder and proxy
+# rounds before autodom_diagnostics can answer — up to the 12s bootstrap wait.
+VERIFY_ARGS=("$SCRIPT_DIR/scripts/mcp-selftest.mjs" "$SERVER_PATH" --port "$TARGET_PORT" --timeout 20000)
 if ! VERIFY_OUTPUT="$(node "${VERIFY_ARGS[@]}" 2>&1)"; then
     echo -e "${RED}✗ Server failed MCP handshake verification${NC}"
     printf '%s\n' "$VERIFY_OUTPUT"
