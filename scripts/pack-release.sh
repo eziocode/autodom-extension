@@ -38,6 +38,8 @@ cp scripts/update-unpacked.mjs "$STAGE/scripts/"
 # them breaks setup inside the share bundle.
 cp scripts/jetbrains-mcp-upsert.mjs "$STAGE/scripts/"
 cp scripts/mcp-selftest.mjs "$STAGE/scripts/"
+# Registers the com.autodom.bridge native-messaging helper (Bridge check / Fix).
+cp scripts/native-host-install.mjs "$STAGE/scripts/"
 
 mkdir -p "$STAGE/enterprise"
 rsync -a --exclude '.DS_Store' enterprise/ "$STAGE/enterprise/"

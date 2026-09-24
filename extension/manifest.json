@@ -20,7 +20,8 @@
     "offscreen"
   ],
   "optional_permissions": [
-    "tabCapture"
+    "tabCapture",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "<all_urls>"

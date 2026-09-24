@@ -4,6 +4,45 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 5.2.0
+
+### Added
+- **Bridge check / Fix** in the popup's Status tab. Check reports the bridge
+  helper, the primary server, stale AutoDOM processes, the extension ↔ bridge
+  link, the port, the bridge's role and version, and the service-worker
+  keepalive. Fix reaps stale servers, starts a fresh bridge when none owns the
+  port, and reconnects. It runs on its own when the bridge drops.
+- `com.autodom.bridge` native-messaging helper (`server/native-host.js`).
+  `setup.sh` and `setup.ps1` register it per user, with no admin needed,
+  through `scripts/native-host-install.mjs`. It is what lets Fix kill and
+  start servers without a terminal. The extension asks for `nativeMessaging`
+  as an optional permission on the first Fix click, so updating does not
+  disable the extension over a new permission warning.
+- `node server/index.js --bridge-only`: a detached primary with no stdio
+  client. IDE-spawned instances join it as proxies. It exits after 10 minutes
+  with neither an extension nor a proxy connected.
+- The primary now knows its proxies. Proxies send `PROXY_HELLO`, and a
+  `BRIDGE_STATUS` WebSocket message returns the pid, role, version and proxy
+  list. `/health` now includes the role, pid and version.
+
+### Fixed
+- The bridge no longer stays down after Chrome suspends the MV3 service
+  worker. Reconnect backoff lived on `setTimeout`, which dies with the worker.
+  A 30 s `chrome.alarms` watchdog now re-kicks the connection. A Connect click
+  also survives worker restarts, not just the auto-connect toggle. The
+  offscreen keepalive is on by default while the bridge should run.
+- Stale servers piled up. A `DEGRADED` instance with a live IDE parent was
+  never reaped. The reaper (`server/bridge-reaper.js`) keeps the primary, the
+  port owner and joined proxies. It kills orphans, and gives other instances a
+  `SIGUSR2` nudge to rejoin before killing them.
+- On macOS, `setup.sh` deleted `/tmp/autodom-bridge-<port>.json`, but the
+  server writes the lock file under `$TMPDIR`. The stale lock was never
+  cleared.
+- `setup.sh` now uses `scripts/mcp-selftest.mjs` for its handshake check,
+  like `setup.ps1`.
+
+---
+
 ## 5.1.0
 
 ### Fixed

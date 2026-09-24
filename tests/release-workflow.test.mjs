@@ -38,14 +38,18 @@ test("share bundle includes verified unpacked updater implementation", async () 
 });
 
 test("share bundle ships the scripts its installers invoke", async () => {
-  // setup.sh and setup.ps1 shell out to both of these. If the bundle omits
+  // setup.sh and setup.ps1 shell out to all of these. If the bundle omits
   // one, setup fails only for share-bundle users — never in-repo.
   const [pack, sh, ps1] = await Promise.all([
     readFile(join(root, "scripts/pack-release.sh"), "utf8"),
     readFile(join(root, "setup.sh"), "utf8"),
     readFile(join(root, "setup.ps1"), "utf8"),
   ]);
-  for (const script of ["jetbrains-mcp-upsert.mjs", "mcp-selftest.mjs"]) {
+  for (const script of [
+    "jetbrains-mcp-upsert.mjs",
+    "mcp-selftest.mjs",
+    "native-host-install.mjs",
+  ]) {
     const referenced = sh.includes(script) || ps1.includes(script);
     assert.ok(referenced, `no installer references ${script}`);
     assert.match(

@@ -26,6 +26,8 @@
     --danger-bg: oklch(95% 0.03 25);
     --danger-border: oklch(82% 0.06 25);
     --warn: oklch(55% 0.14 85);
+    --warn-bg: oklch(96% 0.04 85);
+    --warn-border: oklch(84% 0.08 85);
 
     /* Focus ring */
     --focus-ring: oklch(55% 0.2 260);
@@ -62,6 +64,8 @@
         --danger-bg: oklch(20% 0.04 25);
         --danger-border: oklch(30% 0.06 25);
         --warn: oklch(70% 0.14 85);
+        --warn-bg: oklch(22% 0.04 85);
+        --warn-border: oklch(34% 0.07 85);
 
         --focus-ring: oklch(65% 0.2 260);
 
@@ -405,6 +409,11 @@ body {
     background: var(--danger-bg);
 }
 
+.status-card.warn {
+    border-color: var(--warn-border);
+    background: var(--warn-bg);
+}
+
 .status-indicator {
     display: flex;
     align-items: center;
@@ -425,6 +434,10 @@ body {
 .status-card.connected .status-dot {
     background: var(--success);
     box-shadow: 0 0 0 3px oklch(from var(--success) l c h / 20%);
+}
+
+.status-card.warn .status-dot {
+    background: var(--warn);
 }
 
 .status-card.error .status-dot {
@@ -1495,4 +1508,78 @@ body.embedded #aiChatBtn {
 }
 .accent-apply-status.is-visible {
     opacity: 1;
+}
+
+/* ─── Notices ───────────────────────────── */
+
+.notice-warn {
+    margin-top: 6px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background: var(--warn-bg);
+    color: var(--text);
+    border: 1px solid var(--warn-border);
+}
+
+.notice-warn .compact-btn {
+    margin-left: 6px;
+}
+
+.notice-warn code {
+    font-family: var(--mono);
+    font-size: 11px;
+    word-break: break-all;
+}
+
+/* ─── Bridge check ──────────────────────── */
+
+.bridge-check-actions {
+    gap: 6px;
+    margin-left: auto;
+}
+
+.bridge-check-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.bridge-check-list:empty {
+    display: none;
+}
+
+.bridge-check-row {
+    display: grid;
+    grid-template-columns: 7px 1fr;
+    column-gap: 8px;
+    align-items: baseline;
+    font-size: 12px;
+}
+
+.bridge-check-row .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    align-self: center;
+}
+
+.bridge-check-row.ok .dot { background: var(--success); }
+.bridge-check-row.warn .dot { background: var(--warn); }
+.bridge-check-row.fail .dot { background: var(--danger); }
+.bridge-check-row.step-ok .dot { background: var(--success); }
+.bridge-check-row.step-fail .dot { background: var(--danger); }
+
+.bridge-check-row .label {
+    font-weight: 600;
+    color: var(--text);
+}
+
+.bridge-check-row .detail {
+    grid-column: 2;
+    color: var(--text-secondary);
+    word-break: break-word;
 }

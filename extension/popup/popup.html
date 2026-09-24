@@ -86,27 +86,66 @@
                         <p class="field-hint">Default WebSocket port: 9876</p>
                         <div
                             id="portMismatchHint"
-                            class="field-hint"
-                            style="
-                                display: none;
-                                margin-top: 6px;
-                                padding: 6px 8px;
-                                border-radius: 4px;
-                                background: #fff4e5;
-                                color: #8a4a00;
-                                border: 1px solid #f0c789;
-                            "
+                            class="field-hint notice-warn"
+                            style="display: none"
                         >
                             <span id="portMismatchText"></span>
                             <button
                                 type="button"
                                 id="portMismatchFixBtn"
-                                class="secondary-btn"
-                                style="margin-left: 6px; padding: 2px 8px"
+                                class="secondary-btn compact-btn"
                             >
                                 Use detected port
                             </button>
                         </div>
+                    </section>
+
+                    <section class="panel" id="bridgeCheckPanel">
+                        <div class="panel-header">
+                            <span class="section-label">Bridge check</span>
+                            <div class="inline-row bridge-check-actions">
+                                <button
+                                    type="button"
+                                    id="bridgeCheckBtn"
+                                    class="secondary-btn compact-btn"
+                                >
+                                    Check
+                                </button>
+                                <button
+                                    type="button"
+                                    id="bridgeFixBtn"
+                                    class="secondary-btn compact-btn"
+                                    disabled
+                                >
+                                    Fix
+                                </button>
+                            </div>
+                        </div>
+                        <ul
+                            class="bridge-check-list"
+                            id="bridgeCheckList"
+                            aria-live="polite"
+                        ></ul>
+                        <div
+                            id="bridgeHelperHint"
+                            class="field-hint notice-warn"
+                            hidden
+                        >
+                            Fix can only reconnect until the bridge helper is
+                            installed. Run once, then restart the browser:
+                            <code id="bridgeHelperCommand"></code>
+                            <button
+                                type="button"
+                                id="copyBridgeHelperCommandBtn"
+                                class="secondary-btn compact-btn"
+                            >
+                                Copy
+                            </button>
+                        </div>
+                        <p class="field-hint" id="bridgeCheckMeta">
+                            Checks the extension, the bridge server, and stale
+                            AutoDOM processes.
+                        </p>
                     </section>
 
                     <section class="panel">

@@ -123,18 +123,6 @@ if [ "$TARGET_PORT" -ne "$DEFAULT_PORT" ]; then
     SERVER_ARGS+=("--port" "$TARGET_PORT")
 fi
 
-print_server_args_json() {
-    SERVER_PATH="$SERVER_PATH" TARGET_PORT="$TARGET_PORT" DEFAULT_PORT="$DEFAULT_PORT" node <<'NODE'
-const args = [process.env.SERVER_PATH];
-if (process.env.TARGET_PORT !== process.env.DEFAULT_PORT) {
-  args.push("--port", process.env.TARGET_PORT);
-}
-process.stdout.write(JSON.stringify(args));
-NODE
-}
-
-SERVER_ARGS_JSON="$(print_server_args_json)"
-
 print_mcp_config_json() {
     local root_key="$1"
     local schema="$2"
@@ -270,8 +258,11 @@ fi
 # Only clear the lock file once the holder is actually gone. Deleting a
 # live primary's lock file strands its auth token, and every secondary
 # then fails the proxy handshake.
+# The server writes it under os.tmpdir(), which on macOS is the per-user
+# $TMPDIR (/var/folders/...), not /tmp — ask node rather than guessing.
 if [ "$FOREIGN_HOLDER" -eq 0 ] && ! lsof -tiTCP:${TARGET_PORT} -sTCP:LISTEN >/dev/null 2>&1; then
-    rm -f "/tmp/autodom-bridge-${TARGET_PORT}.json" 2>/dev/null || true
+    LOCK_DIR="$(node -e 'process.stdout.write(require("os").tmpdir())' 2>/dev/null || echo /tmp)"
+    rm -f "${LOCK_DIR}/autodom-bridge-${TARGET_PORT}.json" 2>/dev/null || true
 fi
 
 if [ "$ZOMBIES_KILLED" -gt 0 ]; then
@@ -319,34 +310,12 @@ fi
 # ─── Step 5: Verify server starts ─────────────────────────────
 echo -e "${BLUE}[5/6]${NC} Verifying server..."
 
-VERIFY_OUTPUT="$(SERVER_ARGS_JSON="$SERVER_ARGS_JSON" node <<'NODE' 2>&1 || true
-(async () => {
-  const { Client } = await import("@modelcontextprotocol/client");
-  const { StdioClientTransport } = await import("@modelcontextprotocol/client/stdio");
-  const serverArgs = JSON.parse(process.env.SERVER_ARGS_JSON || "[]");
-  const transport = new StdioClientTransport({ command: "node", args: serverArgs });
-  const client = new Client(
-    { name: "autodom-setup", version: "1.0.0" },
-    { versionNegotiation: { mode: { pin: "2026-07-28" } } },
-  );
-  try {
-    await client.connect(transport);
-    const result = await client.listTools();
-    const toolsCount = Array.isArray(result.tools) ? result.tools.length : 0;
-    if (toolsCount < 1) throw new Error("MCP tools/list returned no tools");
-    console.log(`MCP tools/list returned ${toolsCount} tools`);
-  } finally {
-    await client.close().catch(() => {});
-  }
-})().catch((error) => {
-  console.error(error?.stack || error?.message || String(error));
-  process.exit(1);
-});
-NODE
-)"
-
-if ! printf '%s\n' "$VERIFY_OUTPUT" | grep -Eq '^MCP tools/list returned [1-9][0-9]* tools$'; then
-    echo -e "${RED}✗ Server failed MCP tools/list verification${NC}"
+# A real MCP handshake via the same driver setup.ps1 uses. The role is not
+# pinned: other IDEs' live bridges may legitimately own the port, making
+# this instance a proxy — both roles are healthy.
+VERIFY_ARGS=("$SCRIPT_DIR/scripts/mcp-selftest.mjs" "$SERVER_PATH" --port "$TARGET_PORT")
+if ! VERIFY_OUTPUT="$(node "${VERIFY_ARGS[@]}" 2>&1)"; then
+    echo -e "${RED}✗ Server failed MCP handshake verification${NC}"
     printf '%s\n' "$VERIFY_OUTPUT"
     exit 1
 fi
@@ -505,6 +474,29 @@ configure_gemini
 
 if [ "$CONFIGURED_COUNT" -eq 0 ]; then
     echo -e "${YELLOW}  ⚠ No supported IDE detected. Configure manually — see INSTALL.md${NC}"
+fi
+
+# ─── Bridge helper (native messaging) ─────────────────────────
+# Registers com.autodom.bridge so the extension's Bridge check / Fix can
+# reap stale AutoDOM servers and start a fresh one on its own — no more
+# re-running this script or restarting the browser when the bridge wedges.
+echo ""
+echo -e "${BLUE}[+]${NC} Registering bridge helper for the extension's Bridge check / Fix..."
+NATIVE_HOST_ARGS=(--server-dir "$SERVER_DIR")
+if [ -n "$EXTENSION_ID_OVERRIDE" ]; then
+    NATIVE_HOST_ARGS+=(--extension-id "$EXTENSION_ID_OVERRIDE")
+fi
+if node "$SCRIPT_DIR/scripts/native-host-install.mjs" "${NATIVE_HOST_ARGS[@]}" | sed 's/^/  /'; then
+    echo -e "${GREEN}✓${NC} Bridge helper registered (restart the browser once so it picks it up)"
+else
+    echo -e "${YELLOW}  ⚠ Bridge helper not registered — no supported Chromium browser profile found.${NC}"
+fi
+
+# Reap orphaned / zombie AutoDOM servers left behind by earlier sessions,
+# keeping the live primary and every proxy joined to it.
+if FLUSH_OUT="$(node "$SERVER_DIR/native-host.js" --cli flush 2>/dev/null)"; then
+    FLUSHED=$(printf '%s' "$FLUSH_OUT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).killed.length))}catch{process.stdout.write("0")}})')
+    echo -e "${GREEN}✓${NC} Stale AutoDOM servers reaped: ${FLUSHED}"
 fi
 
 # ─── Step 7 (optional): Enroll in Chromium auto-updates ───────

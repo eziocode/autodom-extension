@@ -6995,7 +6995,7 @@
         chrome.storage?.local?.get?.(
           ["autodomOffscreenKeepaliveEnabled"],
           (res) => {
-            const enabled = res?.autodomOffscreenKeepaliveEnabled === true;
+            const enabled = res?.autodomOffscreenKeepaliveEnabled !== false;
             addMessage(
               "assistant",
               `Offscreen keepalive is currently **${enabled ? "ON" : "OFF"}**.`,

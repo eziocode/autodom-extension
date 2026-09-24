@@ -69,6 +69,8 @@ const DOM = {
 
 let isRunning = false;
 let isConnected = false;
+let bridgeCheckVerdict = null; // last Bridge check verdict: ok | warn | fail
+let bridgeAutoCheck = null; // set by initBridgeCheck()
 
 const REFRESH_GLYPH = "↻";
 const UPDATE_LABEL = "Update";
@@ -999,6 +1001,8 @@ const _secretAreaName =
       addLog("Connected to MCP bridge server", "success");
     } else if (response.running) {
       addLog("MCP connection attempt in progress.", "info");
+      // The bridge is wanted but down — diagnose it right away.
+      bridgeAutoCheck?.();
     } else {
       addLog("Disconnected. Click Connect or enable auto-connect.", "info");
     }
@@ -2635,7 +2639,9 @@ function updateUI() {
     $("#connectBtnText").textContent = "Stop MCP";
     DOM.statusCard.className = isConnected
       ? "status-card connected"
-      : "status-card";
+      : bridgeCheckVerdict === "fail"
+        ? "status-card error"
+        : "status-card";
     DOM.statusLabel.textContent = isConnected ? "Connected" : "Connecting";
     DOM.statusDetail.textContent = isConnected
       ? `Bridge server on ws://127.0.0.1:${DOM.portInput.value}`
@@ -3169,6 +3175,165 @@ function initToolLogsTab() {
 }
 
 initToolLogsTab();
+
+// ─── Bridge check / Fix ──────────────────────────────────────
+// Asks the service worker to diagnose the extension ↔ bridge link (and,
+// through the com.autodom.bridge native helper, every AutoDOM server
+// process), then repairs it on demand: reap orphans/zombies, start a fresh
+// primary if none owns the port, reconnect.
+function initBridgeCheck() {
+  const checkBtn = $("#bridgeCheckBtn");
+  const fixBtn = $("#bridgeFixBtn");
+  const list = $("#bridgeCheckList");
+  const meta = $("#bridgeCheckMeta");
+  const helperHint = $("#bridgeHelperHint");
+  const helperCmd = $("#bridgeHelperCommand");
+  const copyBtn = $("#copyBridgeHelperCommandBtn");
+  if (!checkBtn || !fixBtn || !list) return;
+
+  let busy = false;
+  let lastAutoCheck = 0;
+
+  const renderRows = (rows, kind = "check") => {
+    list.innerHTML = rows
+      .map((r) => {
+        const cls = kind === "check" ? r.status : r.ok ? "step-ok" : "step-fail";
+        return (
+          `<li class="bridge-check-row ${cls}">` +
+          `<span class="dot" aria-hidden="true"></span>` +
+          `<span class="label">${escapeHtml(r.label)}</span>` +
+          `<span class="detail">${escapeHtml(r.detail || "")}</span>` +
+          `</li>`
+        );
+      })
+      .join("");
+  };
+
+  const renderCheck = (res, prefixRows = []) => {
+    if (!res?.ok || !Array.isArray(res.rows)) {
+      renderRows([{ label: "Check failed", status: "fail", detail: res?.error || "Background worker unavailable" }]);
+      fixBtn.disabled = false;
+      return;
+    }
+    bridgeCheckVerdict = res.verdict;
+    renderRows(res.rows);
+    if (prefixRows.length) {
+      list.insertAdjacentHTML(
+        "afterbegin",
+        prefixRows
+          .map(
+            (r) =>
+              `<li class="bridge-check-row ${r.ok ? "step-ok" : "step-fail"}">` +
+              `<span class="dot" aria-hidden="true"></span>` +
+              `<span class="label">Fix · ${escapeHtml(r.label)}</span>` +
+              `<span class="detail">${escapeHtml(r.detail || "")}</span></li>`,
+          )
+          .join(""),
+      );
+    }
+    fixBtn.disabled = !res.rows.some((r) => r.status !== "ok" && r.fixable);
+    if (helperHint && helperCmd) {
+      const command = `./setup.sh --extension-id ${res.extensionId}`;
+      helperCmd.textContent = command;
+      helperHint.hidden = res.helper;
+    }
+    if (meta) {
+      const label = { ok: "All good", warn: "Needs attention", fail: "Broken" }[res.verdict] || "";
+      meta.textContent = `${label} · port ${res.port} · checked ${new Date(res.checkedAt).toLocaleTimeString()}`;
+    }
+    updateUI();
+  };
+
+  const setBusy = (value, text) => {
+    busy = value;
+    checkBtn.disabled = value;
+    if (value) fixBtn.disabled = true;
+    if (value && meta && text) meta.textContent = text;
+  };
+
+  const runCheck = async () => {
+    if (busy) return;
+    setBusy(true, "Checking…");
+    try {
+      renderCheck(await sendRuntimeMessage({ type: "AUTODOM_BRIDGE_CHECK" }));
+    } finally {
+      busy = false;
+      checkBtn.disabled = false;
+    }
+  };
+
+  // Optional permission: asked on the Fix click (a user gesture) so an
+  // extension update never gets disabled over a new permission warning.
+  const ensureNativePermission = async () => {
+    try {
+      if (await chrome.permissions.contains({ permissions: ["nativeMessaging"] })) return true;
+      return await chrome.permissions.request({ permissions: ["nativeMessaging"] });
+    } catch (err) {
+      addLog(`Bridge helper permission: ${err?.message || err}`, "warn");
+      return false;
+    }
+  };
+
+  checkBtn.addEventListener("click", runCheck);
+
+  fixBtn.addEventListener("click", async () => {
+    if (busy) return;
+    const granted = await ensureNativePermission();
+    setBusy(true, "Fixing… (flush stale servers, restart bridge, reconnect)");
+    addLog("Bridge fix started", "info");
+    try {
+      const res = await sendRuntimeMessage({ type: "AUTODOM_BRIDGE_FIX" });
+      if (!res?.ok || !Array.isArray(res.steps)) {
+        renderRows([{ label: "Fix failed", status: "fail", detail: res?.error || "Background worker unavailable" }]);
+        addLog(`Bridge fix failed: ${res?.error || "unknown"}`, "error");
+        return;
+      }
+      if (!granted) {
+        res.steps.unshift({ label: "Helper permission", ok: false, detail: "Declined — Fix can only reconnect." });
+      }
+      for (const st of res.steps) {
+        addLog(`Bridge fix · ${st.label}: ${st.detail || (st.ok ? "ok" : "failed")}`, st.ok ? "success" : "warn");
+      }
+      renderCheck(res.check, res.steps);
+    } finally {
+      busy = false;
+      checkBtn.disabled = false;
+    }
+  });
+
+  if (copyBtn && helperCmd) {
+    copyBtn.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(helperCmd.textContent || "");
+        addLog("Setup command copied", "success");
+      } catch (err) {
+        addLog(`Copy failed: ${err?.message || err}`, "error");
+      }
+    });
+  }
+
+  // Check automatically when the Status tab opens and when the bridge
+  // drops, throttled so a reconnect storm doesn't queue checks.
+  const autoCheck = () => {
+    if (busy || Date.now() - lastAutoCheck < 15000) return;
+    lastAutoCheck = Date.now();
+    void runCheck();
+  };
+  document.addEventListener(TAB_ACTIVATED_EVENT, (event) => {
+    if (event.detail?.tab === "status") autoCheck();
+  });
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message?.type === "STATUS_UPDATE" && message.connected === false) autoCheck();
+    if (message?.type === "STATUS_UPDATE" && message.connected === true && bridgeCheckVerdict === "fail") {
+      // The link recovered on its own; refresh the stale failure rows.
+      lastAutoCheck = 0;
+      autoCheck();
+    }
+  });
+  bridgeAutoCheck = autoCheck;
+}
+
+initBridgeCheck();
 
 // ─── Security tab (Ask Before Act) ───────────────────────────
 function initSecurityTab() {

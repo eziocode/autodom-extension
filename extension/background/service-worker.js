@@ -39,6 +39,60 @@ let autoConnectEnabled = false;
 let lastConnectedPort = 9876;
 let autoConnectFallbackTried = false;
 let _sessionTimedOut = false; // Set when server or extension inactivity timeout fires
+
+// ─── Bridge watchdog ─────────────────────────────────────────
+// Reconnect backoff runs on setTimeout, which dies whenever Chrome suspends
+// the MV3 worker — so a bridge that restarted while the worker slept was
+// never retried until the user reopened the popup, re-ran setup.sh or
+// restarted the browser. A chrome.alarms tick survives suspension (it wakes
+// the worker) and re-kicks the connection every 30 s while the bridge
+// should be running.
+const BRIDGE_WATCHDOG_ALARM = "autodom-bridge-watchdog";
+// "User wants the bridge" must survive worker restarts (not just the
+// auto-connect toggle), but not a browser restart — session storage.
+const _runFlagStorage =
+  (typeof chrome !== "undefined" && chrome.storage?.session) ||
+  (typeof chrome !== "undefined" && chrome.storage?.local) ||
+  null;
+let bridgeInfo = null; // last BRIDGE_STATUS_RESPONSE from the connected bridge
+const _bridgeStatusWaiters = new Set();
+
+function _setShouldRunMcp(value) {
+  shouldRunMcp = !!value;
+  try {
+    _runFlagStorage?.set({ mcpShouldRun: shouldRunMcp });
+  } catch (_) {}
+  _syncBridgeWatchdog();
+}
+
+function _syncBridgeWatchdog() {
+  try {
+    if (!chrome.alarms?.create) return;
+    if (!shouldRunMcp) {
+      chrome.alarms.clear(BRIDGE_WATCHDOG_ALARM);
+      return;
+    }
+    chrome.alarms.get(BRIDGE_WATCHDOG_ALARM, (existing) => {
+      if (!existing) {
+        chrome.alarms.create(BRIDGE_WATCHDOG_ALARM, { periodInMinutes: 0.5 });
+      }
+    });
+  } catch (_) {}
+}
+
+function _bridgeWatchdogTick() {
+  if (!shouldRunMcp || isConnected || _sessionTimedOut) return;
+  if (ws && ws.readyState === WebSocket.CONNECTING) return;
+  _debugLog("[AutoDOM] Bridge watchdog: not connected — reconnecting");
+  connectWebSocket(_requestedPort || getCurrentPort());
+  void _syncOffscreenKeepalive("bridge_watchdog");
+}
+
+try {
+  chrome.alarms?.onAlarm?.addListener((alarm) => {
+    if (alarm && alarm.name === BRIDGE_WATCHDOG_ALARM) _bridgeWatchdogTick();
+  });
+} catch (_) {}
 const ACTIVITY_LOG_KEY = "autodomActivityLogs";
 const ACTIVITY_LOG_LIMIT = 250;
 const UPDATE_CHECK_ALARM_NAME = "autodom-periodic-update-check";
@@ -119,7 +173,10 @@ function _isOffscreenKeepaliveEnabled() {
     try {
       chrome.storage.local.get([OFFSCREEN_KEEPALIVE_STORAGE_KEY], (result) => {
         const stored = _storageResult(result, "offscreen keepalive setting");
-        resolve(stored[OFFSCREEN_KEEPALIVE_STORAGE_KEY] === true);
+        // On by default while the bridge should run: without it the MV3
+        // worker is suspended between keepalives and every setTimeout-based
+        // reconnect dies with it. Only an explicit `/offscreen off` disables.
+        resolve(stored[OFFSCREEN_KEEPALIVE_STORAGE_KEY] !== false);
       });
     } catch (_) {
       resolve(false);
@@ -3185,6 +3242,33 @@ const PORT_PROBE_TIMEOUT_MS = 1500;
 let _lastPortProbeAt = 0;
 let _portProbeInFlight = false;
 
+// Does an AutoDOM bridge accept our WebSocket on this port?
+function _probeWsPort(port, timeoutMs = PORT_PROBE_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let probe;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        probe && probe.close();
+      } catch (_) {}
+      resolve(ok);
+    };
+    const timer = setTimeout(() => done(false), timeoutMs);
+    try {
+      probe = new WebSocket(`ws://127.0.0.1:${port}`);
+    } catch (_) {
+      done(false);
+      return;
+    }
+    probe.onopen = () => done(true);
+    probe.onerror = () => done(false);
+    probe.onclose = () => done(false);
+  });
+}
+
 async function probeBridgePortMismatch(configuredPort) {
   if (_portProbeInFlight) return;
   const now = Date.now();
@@ -3194,29 +3278,7 @@ async function probeBridgePortMismatch(configuredPort) {
   try {
     const candidates = PORT_PROBE_RANGE.filter((p) => p !== configuredPort);
     for (const port of candidates) {
-      const found = await new Promise((resolve) => {
-        let settled = false;
-        let probe;
-        const done = (ok) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          try {
-            probe && probe.close();
-          } catch (_) {}
-          resolve(ok);
-        };
-        const timer = setTimeout(() => done(false), PORT_PROBE_TIMEOUT_MS);
-        try {
-          probe = new WebSocket(`ws://127.0.0.1:${port}`);
-        } catch (_) {
-          done(false);
-          return;
-        }
-        probe.onopen = () => done(true);
-        probe.onerror = () => done(false);
-        probe.onclose = () => done(false);
-      });
+      const found = await _probeWsPort(port);
       if (found) {
         chrome.storage.local.set({ mcpDetectedPort: port });
         broadcastStatus(
@@ -3400,7 +3462,7 @@ async function _onWsConn_SESSION_TIMEOUT(message) {
     if (!keepRetrying) {
       // Mark as timed out BEFORE disconnect so onclose treats this as a final stop
       _sessionTimedOut = true;
-      shouldRunMcp = false;
+      _setShouldRunMcp(false);
       stopAutoConnect();
     }
     stopInactivityTimer();
@@ -3658,6 +3720,12 @@ async function _onWsConn_SERVER_INFO(message) {
     _debugLog("[AutoDOM] Server path:", message.serverPath);
 }
 
+async function _onWsConn_BRIDGE_STATUS_RESPONSE(message) {
+    bridgeInfo = { ...(message.status || {}), receivedAt: Date.now() };
+    for (const waiter of _bridgeStatusWaiters) waiter(bridgeInfo);
+    _bridgeStatusWaiters.clear();
+}
+
 async function _onWsConn_PING(message) {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "PONG" }));
@@ -3677,6 +3745,7 @@ const _WS_CONN_MESSAGE_HANDLERS = Object.freeze({
   SESSION_TIMEOUT: _onWsConn_SESSION_TIMEOUT,
   TOOL_CALL: _onWsConn_TOOL_CALL,
   SERVER_INFO: _onWsConn_SERVER_INFO,
+  BRIDGE_STATUS_RESPONSE: _onWsConn_BRIDGE_STATUS_RESPONSE,
   PING: _onWsConn_PING,
 });
 
@@ -3738,6 +3807,10 @@ function connectWebSocket(port) {
       // Chrome extension right away, instead of waiting 20 s for the
       // first setInterval tick.
       ws.send(JSON.stringify({ type: "KEEPALIVE" }));
+      // Learn the bridge's pid/role/version for the Bridge check. Older
+      // servers ignore the unknown type, leaving bridgeInfo null.
+      bridgeInfo = null;
+      ws.send(JSON.stringify({ type: "BRIDGE_STATUS", id: "ext-open" }));
       startKeepAlive();
       if (!autoConnectEnabled) {
         startInactivityTimer();
@@ -3796,7 +3869,7 @@ function connectWebSocket(port) {
           "[AutoDOM] WebSocket closed after session timeout — not reconnecting",
         );
         _sessionTimedOut = false;
-        shouldRunMcp = false;
+        _setShouldRunMcp(false);
         stopAutoConnect();
         void _syncOffscreenKeepalive("session_timeout");
         broadcastStatus(false, "Session timed out due to inactivity", "warn");
@@ -3931,7 +4004,7 @@ function _kickBridgeConnect(reason = "chat_request") {
     const port = getCurrentPort();
     wsPort = port;
     _requestedPort = port;
-    shouldRunMcp = true;
+    _setShouldRunMcp(true);
     _startupRestoreOnly = false;
     _sessionTimedOut = false;
     chrome.storage.local.set({ mcpPort: port, mcpRunning: true });
@@ -4119,7 +4192,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const port = message.port || getCurrentPort();
     wsPort = port;
     _requestedPort = port;
-    shouldRunMcp = true;
+    _setShouldRunMcp(true);
     _startupRestoreOnly = false;
     _sessionTimedOut = false; // Clear timeout flag on fresh start
     chrome.storage.local.set({ mcpPort: port, mcpRunning: true });
@@ -4318,7 +4391,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "STOP_MCP") {
-    shouldRunMcp = false;
+    _setShouldRunMcp(false);
     autoConnectEnabled = false;
     autoConnectFallbackTried = false;
     stopAutoConnect();
@@ -4335,7 +4408,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     autoConnectFallbackTried = false;
     chrome.storage.local.set({ autoConnect });
     if (autoConnect) {
-      shouldRunMcp = true;
+      _setShouldRunMcp(true);
       _startupRestoreOnly = false;
       chrome.storage.local.set({ mcpRunning: true });
       if (isConnected) {
@@ -4348,7 +4421,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (isConnected) {
         startInactivityTimer();
       } else {
-        shouldRunMcp = false;
+        _setShouldRunMcp(false);
         stopAutoConnect();
         chrome.storage.local.set({ mcpRunning: false });
       }
@@ -8140,10 +8213,10 @@ function startAutoConnect(port, opts) {
       );
     }
     connectWebSocket(nextPort);
-    // Exponential backoff: 3s, 6s, 12s, max 30s
+    // Exponential backoff: 3s, 6s, 12s, max 30s (or opts.maxDelayMs)
     const nextDelay = Math.min(
       3000 * Math.pow(2, _autoConnectAttempt - 1),
-      30000,
+      Math.max(1000, Number(opts?.maxDelayMs) || 30000),
     );
     autoConnectInterval = setTimeout(tryConnect, nextDelay);
   };
@@ -8163,7 +8236,8 @@ function stopAutoConnect() {
 }
 
 // Restore desired state on service worker load.
-// Only the explicit auto-connect preference survives worker restarts.
+// The auto-connect preference and the session-scoped run flag (a Connect
+// click) survive worker restarts.
 chrome.storage.local.get(
   [
     "mcpPort",
@@ -8189,8 +8263,16 @@ chrome.storage.local.get(
     _requestedPort = port;
     lastConnectedPort =
       Number(stored.mcpLastConnectedPort || stored.serverPort || port) || port;
-    shouldRunMcp = autoConnect;
-    _startupRestoreOnly = autoConnect;
+    // A Connect click (auto-connect off) used to be forgotten whenever
+    // Chrome recycled the worker, silently dropping the bridge until the
+    // user noticed. The session-scoped run flag keeps it.
+    let runFlag = false;
+    try {
+      const flag = await _runFlagStorage?.get?.("mcpShouldRun");
+      runFlag = flag?.mcpShouldRun === true;
+    } catch (_) {}
+    _setShouldRunMcp(autoConnect || runFlag);
+    _startupRestoreOnly = shouldRunMcp;
 
     // Migrate legacy plaintext key (chrome.storage.local) → session storage.
     let apiKey = await _readApiKey();
@@ -8330,7 +8412,7 @@ chrome.runtime.onInstalled.addListener((details) => {
       const autoUpdate = stored[UPDATE_STORAGE_KEYS.autoUpdateEnabled] === true;
       const initialRunning = autoConnect;
 
-      shouldRunMcp = initialRunning;
+      _setShouldRunMcp(initialRunning);
       autoConnectFallbackTried = false;
       _startupRestoreOnly = false;
       wsPort = port;
@@ -9236,6 +9318,315 @@ try {
   _debugWarn("[AutoDOM SW] Update scheduler setup failed:", err?.message || err);
 }
 
+// ─── Bridge check / Fix ──────────────────────────────────────
+// Backs the popup's "Bridge check" panel. The check reads state from three
+// places: this worker (socket, watchdog, keepalive), the connected bridge
+// (BRIDGE_STATUS), and the com.autodom.bridge native-messaging helper that
+// setup.sh registers (every AutoDOM server process on the machine). Fix
+// uses the helper to reap orphans/zombies and start a fresh primary when
+// none is alive, then reconnects — the steps a user previously had to do
+// by re-running setup.sh or restarting the browser.
+const NATIVE_HOST_NAME = "com.autodom.bridge";
+const BRIDGE_FIX_CONNECT_TIMEOUT_MS = 8000;
+
+async function _hasNativeMessagingPermission() {
+  try {
+    return await chrome.permissions.contains({ permissions: ["nativeMessaging"] });
+  } catch (_) {
+    return false;
+  }
+}
+
+function _nativeHostRequest(cmd, extra = {}) {
+  return new Promise((resolve) => {
+    if (typeof chrome.runtime?.sendNativeMessage !== "function") {
+      resolve({ ok: false, unavailable: true, error: "nativeMessaging permission not granted" });
+      return;
+    }
+    try {
+      chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, { cmd, ...extra }, (res) => {
+        const err = chrome.runtime.lastError?.message;
+        if (err) resolve({ ok: false, unavailable: true, error: err });
+        else resolve(res || { ok: false, error: "empty reply from helper" });
+      });
+    } catch (err) {
+      resolve({ ok: false, unavailable: true, error: err?.message || String(err) });
+    }
+  });
+}
+
+function _requestBridgeStatus(timeoutMs = 2000) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const waiter = (info) => {
+      clearTimeout(timer);
+      resolve(info);
+    };
+    const timer = setTimeout(() => {
+      _bridgeStatusWaiters.delete(waiter);
+      resolve(null);
+    }, timeoutMs);
+    _bridgeStatusWaiters.add(waiter);
+    try {
+      ws.send(JSON.stringify({ type: "BRIDGE_STATUS", id: `ext-${Date.now()}` }));
+    } catch (_) {
+      _bridgeStatusWaiters.delete(waiter);
+      clearTimeout(timer);
+      resolve(null);
+    }
+  });
+}
+
+function _alarmExists(name) {
+  return new Promise((resolve) => {
+    try {
+      chrome.alarms.get(name, (a) => resolve(!!a));
+    } catch (_) {
+      resolve(false);
+    }
+  });
+}
+
+async function _runBridgeCheck() {
+  const port = _requestedPort || getCurrentPort();
+  const extVersion = chrome.runtime.getManifest?.().version || "";
+  const rows = [];
+  const row = (id, label, status, detail, fixable = false) =>
+    rows.push({ id, label, status, detail, fixable });
+
+  // 1. Native helper
+  const permitted = await _hasNativeMessagingPermission();
+  const helperVersion = permitted ? await _nativeHostRequest("version") : null;
+  const helper = !!helperVersion?.ok;
+  if (helper) {
+    row("helper", "Bridge helper", "ok", `v${helperVersion.version} (node ${helperVersion.node})`);
+  } else if (!permitted) {
+    row("helper", "Bridge helper", "warn", "Permission not granted yet — click Fix to allow it.", true);
+  } else {
+    row(
+      "helper",
+      "Bridge helper",
+      "warn",
+      `Not installed (${helperVersion?.error || "no reply"}). Run ./setup.sh once, then restart the browser.`,
+    );
+  }
+
+  // 2-3. Server processes (via helper)
+  let helperStatus = null;
+  if (helper) {
+    helperStatus = await _nativeHostRequest("status");
+    if (helperStatus?.ok) {
+      const onPort = (helperStatus.bridges || []).filter((b) => b.port === port);
+      const primaries = onPort.filter((b) => b.primary);
+      const stale = (helperStatus.bridges || []).filter(
+        (b) => b.verdict && b.verdict.action !== "keep",
+      );
+      const portInfo = helperStatus.ports?.[port];
+      if (primaries.length === 1 || (portInfo?.listening && portInfo?.lockAlive)) {
+        const p = primaries[0];
+        row(
+          "primary",
+          "Primary server",
+          "ok",
+          p
+            ? `PID ${p.pid} on port ${port}${p.bridgeOnly ? " (bridge-only)" : ""}, ${onPort.length - 1} other instance(s)`
+            : `Port ${port} owned by PID ${portInfo.lockPid}`,
+        );
+      } else if (portInfo?.listening) {
+        row("primary", "Primary server", "fail", `Port ${port} is held by a non-AutoDOM process (PID ${portInfo.listenerPid || "?"}).`);
+      } else {
+        row("primary", "Primary server", "fail", `Nothing is listening on port ${port}.`, true);
+      }
+      row(
+        "stale",
+        "Stale servers",
+        stale.length ? "warn" : "ok",
+        stale.length
+          ? `${stale.length} orphan/zombie AutoDOM process(es): ${stale.map((b) => `${b.pid} (${b.verdict.reason})`).join(", ")}`
+          : `${(helperStatus.bridges || []).length} AutoDOM process(es), none stale`,
+        stale.length > 0,
+      );
+    } else {
+      row("primary", "Primary server", "warn", `Helper status failed: ${helperStatus?.error || "unknown"}`);
+    }
+  }
+
+  // 4-5. Connection + port
+  const configuredLive = isConnected || (await _probeWsPort(port));
+  const otherLive = [];
+  if (!isConnected) {
+    for (const p of PORT_PROBE_RANGE) {
+      if (p !== port && (await _probeWsPort(p, 800))) otherLive.push(p);
+    }
+  }
+  if (isConnected) {
+    row("connection", "Extension ↔ bridge", "ok", `Connected on ws://127.0.0.1:${getCurrentPort()}`);
+  } else {
+    const why = _sessionTimedOut
+      ? "session timed out"
+      : shouldRunMcp
+        ? "reconnecting"
+        : "not started (Connect is off)";
+    row(
+      "connection",
+      "Extension ↔ bridge",
+      "fail",
+      `Not connected — ${why}. ${configuredLive ? `A bridge answers on ${port}.` : `No bridge answers on ${port}.`}`,
+      true,
+    );
+  }
+  if (!configuredLive && otherLive.length) {
+    row(
+      "port",
+      "Port",
+      "warn",
+      `Configured ${port}, but a bridge answers on ${otherLive.join(", ")}.`,
+      !helper,
+    );
+  }
+
+  // 6-7. Handshake + versions
+  if (isConnected) {
+    const info = (await _requestBridgeStatus()) || bridgeInfo;
+    if (info) {
+      row(
+        "handshake",
+        "Bridge status",
+        info.role === "primary" ? "ok" : "warn",
+        `PID ${info.pid}, role ${info.role}, ${info.proxies?.length || 0} proxy client(s)`,
+      );
+      if (info.version && extVersion && info.version !== extVersion) {
+        row("version", "Versions", "warn", `Extension ${extVersion} ≠ server ${info.version}. Update the server (setup.sh) or the extension.`);
+      } else {
+        row("version", "Versions", "ok", `Extension and server ${extVersion}`);
+      }
+    } else {
+      row("handshake", "Bridge status", "warn", "Bridge did not answer BRIDGE_STATUS — it is older than this extension. Update the server and restart your IDE.");
+    }
+  }
+
+  // 8. Worker keepalive
+  const watchdog = shouldRunMcp ? await _alarmExists(BRIDGE_WATCHDOG_ALARM) : true;
+  const offscreen = shouldRunMcp ? await _hasOffscreenDocumentOpen() : true;
+  row(
+    "keepalive",
+    "Service-worker keepalive",
+    watchdog && offscreen ? "ok" : "warn",
+    shouldRunMcp
+      ? `Watchdog alarm ${watchdog ? "on" : "missing"}, offscreen keepalive ${offscreen ? "on" : "off"}`
+      : "Idle (bridge not requested)",
+    !(watchdog && offscreen),
+  );
+
+  const worst = rows.some((r) => r.status === "fail")
+    ? "fail"
+    : rows.some((r) => r.status === "warn")
+      ? "warn"
+      : "ok";
+  return {
+    ok: true,
+    verdict: worst,
+    port,
+    helper,
+    connected: isConnected,
+    extensionId: chrome.runtime.id,
+    checkedAt: Date.now(),
+    rows,
+  };
+}
+
+async function _runBridgeFix() {
+  const steps = [];
+  const step = (label, ok, detail = "") => steps.push({ label, ok, detail });
+  let port = _requestedPort || getCurrentPort();
+
+  const helperPing = (await _hasNativeMessagingPermission())
+    ? await _nativeHostRequest("version")
+    : null;
+  const helper = !!helperPing?.ok;
+
+  if (helper) {
+    // restart = flush (orphans + zombies, primary and joined proxies kept)
+    // + start a detached --bridge-only primary if nothing owns the port.
+    const res = await _nativeHostRequest("restart", { port });
+    if (res?.ok) {
+      const killed = res.killed || [];
+      step(
+        "Flush stale servers",
+        true,
+        killed.length
+          ? `Stopped ${killed.map((k) => `${k.pid} (${k.reason})`).join(", ")}`
+          : "Nothing stale",
+      );
+      if (res.started) {
+        step(
+          "Start fresh bridge",
+          !!res.started.ready,
+          `PID ${res.started.pid} on port ${port}${res.started.ready ? "" : " (not ready yet)"}`,
+        );
+      } else if (res.error) {
+        step("Start fresh bridge", false, res.error);
+      } else {
+        step("Primary server", true, res.note || "Already running");
+      }
+    } else {
+      step("Flush stale servers", false, res?.error || "helper failed");
+    }
+  } else {
+    step(
+      "Bridge helper",
+      false,
+      "Not available — only reconnecting. Run ./setup.sh once to let Fix restart servers.",
+    );
+    // Without the helper we cannot start a server, so follow a live bridge
+    // on a neighbouring port if exactly one answers.
+    if (!(await _probeWsPort(port))) {
+      const live = [];
+      for (const p of PORT_PROBE_RANGE) {
+        if (p !== port && (await _probeWsPort(p, 800))) live.push(p);
+      }
+      if (live.length === 1) {
+        port = live[0];
+        chrome.storage.local.set({ mcpPort: port });
+        step("Switch port", true, `Bridge found on ${port}`);
+      }
+    }
+  }
+
+  // Reconnect from a clean slate.
+  _sessionTimedOut = false;
+  _startupRestoreOnly = false;
+  autoConnectFallbackTried = false;
+  wsPort = port;
+  _requestedPort = port;
+  _setShouldRunMcp(true);
+  chrome.storage.local.set({ mcpPort: port, mcpRunning: true });
+  stopAutoConnect();
+  if (ws && ws.readyState !== WebSocket.OPEN) {
+    try {
+      ws.onclose = null;
+      ws.close();
+    } catch (_) {}
+    ws = null;
+  }
+  void _syncOffscreenKeepalive("bridge_fix");
+  if (!isConnected) {
+    connectWebSocket(port);
+    startAutoConnect(port, { initialDelayMs: 1500, maxDelayMs: 5000 });
+  }
+  const deadline = Date.now() + BRIDGE_FIX_CONNECT_TIMEOUT_MS;
+  while (!isConnected && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  step(
+    "Reconnect",
+    isConnected,
+    isConnected ? `Connected on ws://127.0.0.1:${port}` : "Still not connected — see the check below",
+  );
+
+  return { ok: true, steps, check: await _runBridgeCheck() };
+}
+
 // Popup → service worker: forward a manual `update_available` result so the
 // badge appears even when the user triggered the check rather than the
 // browser's own scheduler.
@@ -9314,6 +9705,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       } catch (_) {}
       sendResponse({ ok: true });
     })();
+    return true;
+  }
+  if (msg && msg.type === "AUTODOM_BRIDGE_CHECK") {
+    _runBridgeCheck()
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+    return true;
+  }
+  if (msg && msg.type === "AUTODOM_BRIDGE_FIX") {
+    _runBridgeFix()
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
     return true;
   }
   if (msg && msg.type === "AUTODOM_SET_OFFSCREEN_KEEPALIVE") {

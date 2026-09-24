@@ -306,6 +306,27 @@ if ($Configured -eq 0) {
     Write-Warn "No supported IDE detected. Configure manually — see INSTALL.md."
 }
 
+# ── Bridge helper (native messaging) ─────────────────────────
+# Registers com.autodom.bridge (HKCU, no admin) so the extension's Bridge
+# check / Fix can reap stale AutoDOM servers and start a fresh one itself.
+Write-Step "Registering bridge helper for the extension's Bridge check / Fix..."
+$nativeInstaller = Join-Path $ScriptDir "scripts\native-host-install.mjs"
+$nativeArgs = @($nativeInstaller, "--server-dir", $ServerDir)
+if ($ExtensionId -and $ExtensionId -ne "kpjdffgogiajnkajnjneiboaincnaokf") {
+    $nativeArgs += @("--extension-id", $ExtensionId)
+}
+& node @nativeArgs | ForEach-Object { Write-Host "  $_" }
+if ($LASTEXITCODE -eq 0) {
+    Write-Ok "Bridge helper registered (restart the browser once so it picks it up)"
+} else {
+    Write-Warn "Bridge helper not registered — no supported Chromium browser found."
+}
+# Reap orphaned / zombie AutoDOM servers, keeping the live primary and its proxies.
+try {
+    $flush = & node (Join-Path $ServerDir "native-host.js") --cli flush 2>$null | Out-String | ConvertFrom-Json
+    Write-Ok "Stale AutoDOM servers reaped: $($flush.killed.Count)"
+} catch { }
+
 # ── 7. Silent extension install (zero-touch, default ON) ─────
 $AutoUpdateEnrolled = $false
 if ($NoAutoUpdate) {

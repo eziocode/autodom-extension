@@ -282,18 +282,27 @@ diagLog(
   `stdout: isTTY=${process.stdout.isTTY} writable=${process.stdout.writable}`,
 );
 
+// --bridge-only: a detached bridge with no stdio client, started by the
+// native-messaging helper (native-host.js) when the extension's "Fix" finds
+// no live primary. It owns the port so IDE-spawned instances join it as
+// proxies, and it lives by the extension/proxy connections instead of by a
+// parent process or stdin — neither exists for a detached daemon.
+const BRIDGE_ONLY = process.argv.includes("--bridge-only");
+
 // When the IDE closes its end of stdin, the stdio MCP transport is dead.
 // The bridge process must exit so the IDE can cleanly restart it.
 // Without this, the WebSocket server keeps the event loop alive and the
 // process becomes a zombie that the extension connects to but the IDE
 // can never talk to again — producing "Transport closed" on every tool.
 process.stdin.on("end", () => {
+  if (BRIDGE_ONLY) return;
   process.stderr.write(
     `[AutoDOM] stdin EOF — IDE disconnected, shutting down so it can restart us\n`,
   );
   void shutdown(0);
 });
 process.stdin.on("close", () => {
+  if (BRIDGE_ONLY) return;
   process.stderr.write(
     `[AutoDOM] stdin closed — IDE disconnected, shutting down so it can restart us\n`,
   );
@@ -345,6 +354,21 @@ process.on("SIGTERM", () => {
   process.stderr.write(`[AutoDOM] SIGTERM received, shutting down\n`);
   void shutdown(0);
 });
+// SIGUSR2 = "rejoin": the native-messaging helper sends it to an instance
+// that is neither the primary nor a connected proxy before deciding whether
+// to reap it. A degraded instance whose recovery budget ran out gets a
+// fresh election instead of being killed out from under a live IDE.
+// (SIGUSR1 is reserved by Node for the inspector.)
+if (process.platform !== "win32") {
+  process.on("SIGUSR2", () => {
+    process.stderr.write(
+      `[AutoDOM] SIGUSR2 received — re-running bridge election (role=${bridgeRole})\n`,
+    );
+    recoveryAttempts = 0;
+    recoveryWindowStart = Date.now();
+    void recoverBridge();
+  });
+}
 
 // ─── Parent Process Heartbeat Watchdog ───────────────────────
 // Periodically check if our parent process is still alive.
@@ -379,6 +403,9 @@ const _launcherPid = Number.parseInt(
   10,
 );
 const _heartbeatInterval = setInterval(() => {
+  // A detached --bridge-only daemon is reparented to launchd/init by
+  // design; it has no parent to outlive.
+  if (BRIDGE_ONLY) return;
   // Probe the *current* parent (which may have changed legitimately).
   // If we have no parent at all (PID 0) treat as orphan.
   const currentPpid = process.ppid;
@@ -952,6 +979,58 @@ const SERVER_VERSION = JSON.parse(
 ).version;
 const lockFilePath = join(tmpdir(), `autodom-bridge-${WS_PORT}.json`);
 
+// Proxy instances connected to us while we are primary: socket → { pid,
+// startedAt }. Populated by PROXY_HELLO. This is what lets BRIDGE_STATUS
+// (and the native-messaging reaper) tell a live IDE session apart from a
+// zombie that holds no link to anything.
+const proxyPeers = new Map();
+
+// Detached --bridge-only daemons have no IDE to decide their lifetime.
+// Exit once neither the extension nor any proxy has been connected for
+// the inactivity window; the extension keepalive and proxy links keep us
+// alive otherwise.
+if (BRIDGE_ONLY && INACTIVITY_TIMEOUT_MS > 0) {
+  let _bridgeOnlyIdleSince = Date.now();
+  setInterval(() => {
+    if (extensionSocket || proxyPeers.size > 0) {
+      _bridgeOnlyIdleSince = Date.now();
+      return;
+    }
+    if (Date.now() - _bridgeOnlyIdleSince >= INACTIVITY_TIMEOUT_MS) {
+      process.stderr.write(
+        `[AutoDOM] --bridge-only: no extension or proxy for ${INACTIVITY_TIMEOUT_MS / 60000} min — exiting\n`,
+      );
+      void shutdown(0);
+    }
+  }, 30000).unref();
+}
+
+// Single source for autodom_diagnostics and the BRIDGE_STATUS WS reply.
+function collectBridgeStatus() {
+  return {
+    pid: process.pid,
+    version: SERVER_VERSION,
+    clientId: MY_CLIENT_ID,
+    uptimeMs: Date.now() - _serverStartTime,
+    startedAt: new Date(_serverStartTime).toISOString(),
+    role: bridgeRole,
+    roleDetail: bridgeRoleDetail || undefined,
+    bridgeOnly: BRIDGE_ONLY,
+    bootstrapSettled,
+    recoveryAttempts,
+    wsPort: WS_PORT,
+    extensionConnected: _isExtensionReady(),
+    proxyConnected: !isPrimaryServer && _isProxyReady(),
+    proxies: [...proxyPeers.values()],
+    pendingCalls: pendingCalls.size,
+    reconnectGraceMs: RECONNECT_GRACE_MS,
+    toolTimeoutMs: TOOL_TIMEOUT,
+    nodeVersion: process.version,
+    lockFile: lockFilePath,
+    lastActivityAgoMs: Date.now() - lastActivityTime,
+  };
+}
+
 // ─── Inactivity Auto-Shutdown ────────────────────────────────
 // Kills the session after 10 minutes of no tool calls.
 // Any tool call or keepalive from the extension resets the timer.
@@ -980,9 +1059,11 @@ function startInactivityTimer() {
       // state machine — the IDE reports "Transport closed" and cannot
       // reconnect without a full restart.  Only shut down for inactivity
       // when no IDE transport is connected (e.g. standalone HTTP mode).
-      if (mcpTransportConnected) {
+      // Same for connected proxies: each one is an IDE session relying on
+      // us (the primary) to reach the extension.
+      if (mcpTransportConnected || proxyPeers.size > 0) {
         diagLog(
-          `Inactivity timeout reached (${idleMins}m) but MCP stdio transport is still active — skipping shutdown`,
+          `Inactivity timeout reached (${idleMins}m) but an MCP client (stdio or proxy) is still active — skipping shutdown`,
         );
         // Reset the timer so we don't log this warning every 30s
         lastActivityTime = Date.now();
@@ -1507,6 +1588,14 @@ async function cleanupStaleProcesses() {
         if (pid === process.pid) continue;
 
         const isBridge = await isBridgeProcess(pid);
+        if (isBridge && (await getProcessCommand(pid)).includes("--bridge-only")) {
+          // A detached --bridge-only daemon is reparented to launchd/init
+          // on purpose and manages its own lifetime — never "orphaned".
+          process.stderr.write(
+            `[AutoDOM] Port ${WS_PORT} owned by bridge-only daemon (PID ${pid}) — will use proxy mode\n`,
+          );
+          continue;
+        }
         if (isBridge) {
           // Decide whether this listening bridge is healthy before killing
           // it. Multiple MCP clients (Copilot Chat, AI Assistant, Codex,
@@ -1663,6 +1752,9 @@ async function cleanupStaleProcesses() {
 
         // Never reap the active bridge recorded in the lock file.
         if (lockOwnerPid && pid === lockOwnerPid) continue;
+
+        // --bridge-only daemons have PPID 1 by design (see BRIDGE_ONLY).
+        if (command.includes("--bridge-only")) continue;
 
         // Never reap a bridge serving a different port — it is not ours
         // to clean up, and its clients would see "Transport closed".
@@ -2052,6 +2144,18 @@ async function ensureProxyClientConnected() {
         process.stderr.write(
           "[AutoDOM] Proxy client connected to primary server.\n",
         );
+        // Identify ourselves so the primary can report us as a live
+        // (joined) session rather than a zombie.
+        try {
+          ws.send(
+            JSON.stringify({
+              type: "PROXY_HELLO",
+              pid: process.pid,
+              startedAt: new Date(_serverStartTime).toISOString(),
+              version: SERVER_VERSION,
+            }),
+          );
+        } catch (_) {}
         _signalProxyReady();
         finish(true);
       });
@@ -2169,6 +2273,7 @@ function setupWssConnection(wss) {
 
     socket.on("close", () => {
       clearInterval(_pingInterval);
+      proxyPeers.delete(socket);
       if (socket === extensionSocket) {
         extensionSocket = null;
         process.stderr.write("[AutoDOM] Chrome extension disconnected\n");
@@ -3325,7 +3430,40 @@ async function _runSelfUpdateInBackground(socket, id) {
   }
 }
 
+// ── PROXY_HELLO ──────────────────────────────────────────────
+// A secondary instance announcing itself right after connecting.
+function _handleProxyHello(socket, message) {
+  const pid = Number.parseInt(message.pid, 10);
+  if (!(pid > 0) || socket === extensionSocket) return;
+  proxyPeers.set(socket, {
+    pid,
+    startedAt: typeof message.startedAt === "string" ? message.startedAt : null,
+    version: typeof message.version === "string" ? message.version : null,
+  });
+  diagLog(`proxy peer registered pid=${pid} (total ${proxyPeers.size})`);
+}
+
+// ── BRIDGE_STATUS ────────────────────────────────────────────
+// Asked by the extension (bridge check) and the native-messaging helper.
+// Reachable only through verifyClient (extension origin or bearer token).
+function _handleBridgeStatus(socket, message) {
+  try {
+    socket.send(
+      JSON.stringify({
+        type: "BRIDGE_STATUS_RESPONSE",
+        id: message.id,
+        status: {
+          ...collectBridgeStatus(),
+          recentErrors: _toolErrorBuf.slice(-5),
+        },
+      }),
+    );
+  } catch (_) {}
+}
+
 const _WS_MESSAGE_HANDLERS = Object.freeze({
+  PROXY_HELLO: _handleProxyHello,
+  BRIDGE_STATUS: _handleBridgeStatus,
   SELF_UPDATE: _handleSelfUpdate,
   AI_CHAT_ABORT: _handleAiChatAbort,
   CHECK_CLI_BINARY: _handleCheckCliBinary,
@@ -7494,24 +7632,7 @@ server.addTool({
   execute: async () => {
     await ensureBridgeReadyForDiagnostics();
     const snapshot = {
-      bridge: {
-        pid: process.pid,
-        clientId: MY_CLIENT_ID,
-        uptimeMs: Date.now() - _serverStartTime,
-        role: bridgeRole,
-        roleDetail: bridgeRoleDetail || undefined,
-        bootstrapSettled,
-        recoveryAttempts,
-        wsPort: WS_PORT,
-        extensionConnected: _isExtensionReady(),
-        proxyConnected: !isPrimaryServer && _isProxyReady(),
-        pendingCalls: pendingCalls.size,
-        reconnectGraceMs: RECONNECT_GRACE_MS,
-        toolTimeoutMs: TOOL_TIMEOUT,
-        nodeVersion: process.version,
-        lockFile: lockFilePath,
-        lastActivityAgoMs: Date.now() - lastActivityTime,
-      },
+      bridge: collectBridgeStatus(),
       recentToolErrors: _toolErrorBuf.slice(-10),
       recentToolCalls: toolCallLog.slice(-10),
       extension: null,
@@ -8784,6 +8905,9 @@ async function startHttpApiServer(port) {
     if (req.method === "GET" && pathname === "/health") {
       return sendJson(200, {
         status: "ok",
+        role: bridgeRole,
+        pid: process.pid,
+        version: SERVER_VERSION,
         extensionConnected: _isExtensionReady(),
         uptime: Math.floor((Date.now() - _serverStartTime) / 1000),
         wsPort: WS_PORT,
@@ -8893,21 +9017,34 @@ if (STOP_ONLY) {
     // IntelliJ AI Assistant's and Copilot's handshake deadline. Claude
     // Code only worked because it usually started first and hit the
     // port-free fast path.
-    stdioMcpHandle = serveStdio(() => {
-      mcpTransportConnected = true;
-      return createAutoDomMcpServer();
-    }, {
-      onerror: (err) => {
-        process.stderr.write(`[AutoDOM] MCP stdio error: ${err.message}\n`);
-      },
-    });
-    process.stderr.write("[AutoDOM] MCP server running on stdio transport\n");
-    diagLog("Official MCP SDK v2 stdio transport active");
+    if (!BRIDGE_ONLY) {
+      stdioMcpHandle = serveStdio(() => {
+        mcpTransportConnected = true;
+        return createAutoDomMcpServer();
+      }, {
+        onerror: (err) => {
+          process.stderr.write(`[AutoDOM] MCP stdio error: ${err.message}\n`);
+        },
+      });
+      process.stderr.write("[AutoDOM] MCP server running on stdio transport\n");
+      diagLog("Official MCP SDK v2 stdio transport active");
+    } else {
+      process.stderr.write("[AutoDOM] --bridge-only: no stdio transport\n");
+    }
 
     // ─── bridge link SECOND, off the handshake path ──────────
     // Deliberately not awaited. Tool calls arriving before the election
     // settles wait on waitForBootstrap() inside callExtensionTool().
-    void bootstrapBridge();
+    void bootstrapBridge().then((role) => {
+      // A bridge-only daemon exists to own the port. If someone else
+      // already does, it would just be one more idle proxy — leave.
+      if (BRIDGE_ONLY && role !== BRIDGE_ROLE.PRIMARY) {
+        process.stderr.write(
+          `[AutoDOM] --bridge-only: another primary owns port ${WS_PORT} (role=${role}) — exiting\n`,
+        );
+        void shutdown(0);
+      }
+    });
 
     // ─── Optional stateless Streamable HTTP transport ─────────
     // --sse-port remains an input alias for compatibility, but old /sse and
@@ -8963,6 +9100,9 @@ if (STOP_ONLY) {
             res.end(
               JSON.stringify({
                 status: "ok",
+                role: bridgeRole,
+                pid: process.pid,
+                version: SERVER_VERSION,
                 extensionConnected: _isExtensionReady(),
                 transport: "streamable-http-stateless",
                 protocolVersion: "2026-07-28",
