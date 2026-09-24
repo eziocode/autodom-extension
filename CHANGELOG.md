@@ -4,6 +4,12 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 5.2.2
+
+- Version bump only. The code is the same as 5.2.1.
+
+---
+
 ## 5.2.1
 
 ### Fixed
