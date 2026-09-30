@@ -36,7 +36,11 @@ test("readDiskVersion tolerates a missing or half-written package.json", async (
 test("preflightServer refuses a server that cannot start yet", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "autodom-pre-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  const index = join(dir, "index.js");
+  // .mjs (plus type:module, as in the real server/) so `node --check` never
+  // has to guess the module type: on the CI's Node 22 the broken file below
+  // was not rejected when the type had to be detected.
+  const index = join(dir, "index.mjs");
+  await writeFile(join(dir, "package.json"), '{"type": "module"}');
   assert.match(preflightServer(index).reason, /index\.js missing/);
   await writeFile(index, "export const x = 1;\n");
   assert.match(preflightServer(index).reason, /dependency ws not installed/);
