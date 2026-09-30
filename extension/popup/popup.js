@@ -64,6 +64,7 @@ const DOM = {
   rateLimitWindow: $("#rateLimitWindow"),
   rateLimitSettings: $("#rateLimitSettings"),
   confirmSubmitToggle: $("#confirmSubmitToggle"),
+  tabIsolationToggle: $("#tabIsolationToggle"),
   popupToast: $("#popupToast"),
 };
 
@@ -966,7 +967,11 @@ const _secretAreaName =
   const guardrails = await readLocalStorage([
     "rateLimitConfig",
     "confirmBeforeSubmitConfig",
+    "isolationEnabled",
   ], "guardrails");
+  // Tab-group isolation is on unless the user switched it off.
+  if (DOM.tabIsolationToggle)
+    DOM.tabIsolationToggle.checked = guardrails.isolationEnabled !== false;
   if (guardrails.rateLimitConfig) {
     if (DOM.rateLimitToggle)
       DOM.rateLimitToggle.checked = !!guardrails.rateLimitConfig.enabled;
@@ -2588,6 +2593,12 @@ if (DOM.confirmSubmitToggle) {
       type: "UPDATE_GUARDRAILS",
       confirmBeforeSubmit: DOM.confirmSubmitToggle.checked,
     });
+  });
+}
+
+if (DOM.tabIsolationToggle) {
+  DOM.tabIsolationToggle.addEventListener("change", () => {
+    chrome.storage.local.set({ isolationEnabled: DOM.tabIsolationToggle.checked });
   });
 }
 

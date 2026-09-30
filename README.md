@@ -38,6 +38,8 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server + Chromium ex
 ### 🧰 Full Browser Tool Suite
 DOM queries, navigation, network logs, cookies, tabs, JS eval, screenshots, Playwright-compatible aliases — all exposed over MCP.
 
+Runs in its own background tab group, so you can keep using the same browser while an agent works.
+
 </td>
 <td width="50%">
 
@@ -196,6 +198,8 @@ Pass these via `env` in your MCP config block.
 | `AUTODOM_BOOTSTRAP_WAIT` | `12000` | Tool-call wait for the primary/proxy election to settle (ms) |
 | `AUTODOM_TOOL_TIMEOUT` | `30000` | Per-tool-call timeout (ms) |
 | `AUTODOM_INACTIVITY_TIMEOUT` | `600000` | Idle session timeout; `0` disables |
+| `AUTODOM_ISOLATION` | `1` | `0` makes this bridge opt out of tab-group isolation (agent follows the active tab, as before) |
+| `AUTODOM_ISOLATION_IDLE_MS` | `300000` | Idle time before an unfinished session's AutoDOM tabs are closed; `0` disables |
 | `AUTODOM_DEBUG` | `0` | `1` for verbose stderr logs |
 | `AUTODOM_WIRE_LOG` | `0` | `1` to log every wire frame |
 
@@ -328,6 +332,7 @@ The bridge is a single-file Node.js server (`index.js`) built on the official **
 | **Lockfile** | Stored in OS temp dir with `0600` permissions. Contains port, PID, server path, and auth token |
 | **Message batching** | Outgoing WS frames are micro-batched in a short window to reduce overhead |
 | **Session lifecycle** | Heartbeat pings (`AUTODOM_HEARTBEAT_MS`), inactivity timeout, and graceful `--stop` flag |
+| **Tab isolation** | Automation runs in its own `AutoDOM` tab group (background tabs, never activated). A tab of yours is touched only when adopted with `pin_tab`. `finish_session`, IDE disconnect, or an idle timeout closes the tabs AutoDOM opened and restores adopted ones |
 
 #### 🟢 Chrome Extension (`extension/`)
 

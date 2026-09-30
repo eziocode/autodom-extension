@@ -4,6 +4,42 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 5.3.0
+
+### Added
+- **Tab-group isolation.** AutoDOM now works in its own "AutoDOM" browser tab
+  group and no longer takes over the tab you are using. Before, tools such as
+  `switch_tab`, `open_new_tab`, `wait_for_new_tab` and `switch_to_popup` moved
+  the browser's focus, and with no pin the agent acted on whatever tab was
+  active, so you and the agent could not work in the same browser at once.
+  - `navigate` and `open_new_tab` open background tabs inside the group.
+    Nothing is activated or focused.
+  - A tab of yours is touched only when the agent adopts it explicitly with
+    `pin_tab {tabId}` (or `switch_tab {tabId}`). It is moved into the group.
+  - New `finish_session` tool. It closes the tabs AutoDOM opened, removes the
+    group, and puts adopted tabs back at their original window, position and
+    group. It also runs by itself when the IDE disconnects, when the bridge
+    stops (after a 30 s reconnect grace), and after 5 minutes without tool
+    calls.
+  - `list_tabs` lists only the AutoDOM group by default; `all:true` also shows
+    your tabs (read-only). `switch_tab` takes `focus:true`, `close_tab` takes
+    `force:true`, and `pin_tab` takes `adoptActive:true`.
+  - Screenshots of a background tab use the DevTools protocol, and
+    `set_viewport` emulates the viewport instead of resizing your window.
+  - Turn it off in the popup ("Work in a separate AutoDOM tab group") or per
+    bridge with `AUTODOM_ISOLATION=0`. `AUTODOM_ISOLATION_IDLE_MS` sets the
+    idle timeout. Requests typed into the in-page chat panel still act on the
+    page you are looking at.
+- New `tabGroups` extension permission.
+
+### Changed
+- With isolation on, a tab-bound tool called before AutoDOM has a tab returns
+  `NO_AUTODOM_TAB` instead of silently using your active tab. Agents that
+  relied on "work on the page I have open" now call `pin_tab` (with `tabId` or
+  `adoptActive:true`) first.
+
+---
+
 ## 5.2.2
 
 - Version bump only. The code is the same as 5.2.1.

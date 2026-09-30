@@ -38,6 +38,7 @@ import { promises as fs, readFileSync, rmSync, createWriteStream } from "fs";
 import { tmpdir } from "os";
 import { join, isAbsolute, resolve as resolvePath } from "path";
 import { promisify } from "util";
+import { AsyncLocalStorage } from "async_hooks";
 import { randomBytes, timingSafeEqual } from "crypto";
 
 // Local Playwright/Node automation backends were intentionally removed: AutoDOM
@@ -636,6 +637,31 @@ function safeTokenEqual(a, b) {
 const CONFIRM_MODE =
   hasArg("--confirm-mode") || process.env.AUTODOM_CONFIRM_MODE === "true";
 
+// Tab-group isolation: the extension keeps AutoDOM's work in its own
+// browser tab group and never takes over the tab the user is using.
+// AUTODOM_ISOLATION=0 (or --no-isolation) makes this bridge opt out;
+// AUTODOM_ISOLATION_IDLE_MS overrides how long an idle session keeps its
+// tabs before they are closed. Both ride on every TOOL_CALL frame.
+const ISOLATION_DISABLED =
+  hasArg("--no-isolation") ||
+  /^(0|false|off|no)$/i.test(process.env.AUTODOM_ISOLATION || "");
+const ISOLATION_IDLE_MS = (() => {
+  const n = parseInt(process.env.AUTODOM_ISOLATION_IDLE_MS || "", 10);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+})();
+// Requests that originate from the user typing in the in-page chat panel
+// act on the page the user is looking at, so they bypass isolation.
+const userTabRequestContext = new AsyncLocalStorage();
+function isolationFrameFields() {
+  const bypass = userTabRequestContext.getStore()?.userTab === true;
+  return {
+    ...(ISOLATION_DISABLED || bypass ? { isolation: false } : {}),
+    ...(ISOLATION_IDLE_MS !== undefined
+      ? { isolationIdleMs: ISOLATION_IDLE_MS }
+      : {}),
+  };
+}
+
 let pendingConfirmations = new Map(); // id → { tool, params, domain, tier, timestamp }
 let confirmIdCounter = 0;
 
@@ -794,6 +820,7 @@ const TOOL_TIERS = new Map([
   ["pin_tab", "read"],
   ["unpin_tab", "read"],
   ["get_pinned_tab", "read"],
+  ["finish_session", "read"],
   ["autodom_diagnostics", "read"],
   ["get_recording", "read"],
   ["get_session_summary", "read"],
@@ -969,6 +996,18 @@ function sendToExtensionImmediate(messageObj) {
   } else if (extensionSocket && extensionSocket.readyState === 1) {
     extensionSocket.send(JSON.stringify(messageObj));
   }
+}
+
+// Tell the extension a client's session is over (its bridge exited or its
+// proxy link dropped) so it can release that client's AutoDOM tab group.
+// Best effort: if the extension is gone, its own disconnect grace and idle
+// sweep clean up.
+function notifyClientGone(clientId) {
+  try {
+    if (extensionSocket && extensionSocket.readyState === 1) {
+      extensionSocket.send(JSON.stringify({ type: "CLIENT_GONE", clientId }));
+    }
+  } catch (_) {}
 }
 
 // ─── WebSocket Server (for Chrome extension) ─────────────────
@@ -1386,6 +1425,13 @@ async function shutdown(code = 0) {
     );
     process.exit(code);
   }, 3000).unref();
+
+  // Release this bridge's AutoDOM tab group before the sockets are torn
+  // down, and give the frame a moment to flush.
+  if (extensionSocket && extensionSocket.readyState === 1) {
+    notifyClientGone(MY_CLIENT_ID);
+    await delay(75);
+  }
 
   // Destroy every open WebSocket connection first, then close the server.
   // wss.close() only stops accepting NEW connections — existing sockets
@@ -2168,6 +2214,7 @@ async function ensureProxyClientConnected() {
           ws.send(
             JSON.stringify({
               type: "PROXY_HELLO",
+              clientId: MY_CLIENT_ID,
               pid: process.pid,
               startedAt: new Date(_serverStartTime).toISOString(),
               version: SERVER_VERSION,
@@ -2291,6 +2338,10 @@ function setupWssConnection(wss) {
 
     socket.on("close", () => {
       clearInterval(_pingInterval);
+      // A secondary IDE bridge went away: tell the extension so it can
+      // close the tabs that session opened and restore the ones it borrowed.
+      const gonePeer = proxyPeers.get(socket);
+      if (gonePeer?.clientId) notifyClientGone(gonePeer.clientId);
       proxyPeers.delete(socket);
       if (socket === extensionSocket) {
         extensionSocket = null;
@@ -3140,6 +3191,10 @@ function _handleInternalProxyCall(socket, message) {
       id: internalId,
       tool: message.tool,
       params,
+      ...(message.isolation === false ? { isolation: false } : {}),
+      ...(Number.isFinite(message.isolationIdleMs)
+        ? { isolationIdleMs: message.isolationIdleMs }
+        : {}),
     });
   };
 
@@ -3455,6 +3510,8 @@ function _handleProxyHello(socket, message) {
   if (!(pid > 0) || socket === extensionSocket) return;
   proxyPeers.set(socket, {
     pid,
+    clientId:
+      typeof message.clientId === "string" ? message.clientId.slice(0, 64) : null,
     startedAt: typeof message.startedAt === "string" ? message.startedAt : null,
     version: typeof message.version === "string" ? message.version : null,
   });
@@ -3486,7 +3543,10 @@ const _WS_MESSAGE_HANDLERS = Object.freeze({
   AI_CHAT_ABORT: _handleAiChatAbort,
   CHECK_CLI_BINARY: _handleCheckCliBinary,
   INSTALL_CLI_PACKAGE: _handleInstallCliPackage,
-  AI_CHAT_REQUEST: _handleAiChatRequest,
+  AI_CHAT_REQUEST: (socket, message) =>
+    userTabRequestContext.run({ userTab: true }, () =>
+      _handleAiChatRequest(socket, message),
+    ),
   INTERNAL_PROXY_CALL: _handleInternalProxyCall,
   TOOL_RESULT: _handleToolResult,
   KEEPALIVE: _handleKeepaliveOrPong,
@@ -3633,6 +3693,7 @@ function callExtensionTool(tool, params, options = {}) {
               id,
               tool,
               params,
+              ...isolationFrameFields(),
             }),
           );
         } catch (err) {
@@ -3783,6 +3844,7 @@ function callExtensionTool(tool, params, options = {}) {
         id,
         tool,
         params,
+        ...isolationFrameFields(),
       });
     } catch (err) {
       pendingCalls.delete(id);
@@ -6385,7 +6447,8 @@ function createAutoDomMcpServer() {
     { name: "autodom", version: SERVER_VERSION },
     {
       instructions:
-        "Inspect page state before UI actions. Use explicit identifiers returned by tools across calls; MCP transport sessions are not application state.",
+        "Inspect page state before UI actions. Use explicit identifiers returned by tools across calls; MCP transport sessions are not application state. " +
+        "AutoDOM works in its own background tab group and never takes over the tab the user is using: navigate/open_new_tab open tabs in that group, and a user's tab is only touched when you adopt it explicitly with pin_tab {tabId}. Call finish_session when the task is done to close the tabs AutoDOM opened and put any adopted tab back.",
       cacheHints: {
         "server/discover": { ttlMs: 60000, cacheScope: "public" },
         "tools/list": { ttlMs: 60000, cacheScope: "public" },
@@ -7564,13 +7627,19 @@ server.addTool({
 server.addTool({
   name: "list_tabs",
   description:
-    "List all open browser tabs with their IDs, titles, URLs, and active status. Essential for multi-tab workflows.",
+    "List open browser tabs with their IDs, titles, URLs, and active status. With tab isolation on (default) this lists only the AutoDOM tab group; pass all:true to also see the user's own tabs (read-only) so one can be adopted with pin_tab. Essential for multi-tab workflows.",
   parameters: z.object({
     currentWindow: z
       .boolean()
       .optional()
       .default(true)
       .describe("Only list tabs in the current window"),
+    all: z
+      .boolean()
+      .optional()
+      .describe(
+        "Include the user's own tabs, not just AutoDOM's tab group (tab isolation mode). Listing never modifies them.",
+      ),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("list_tabs", params);
@@ -7593,13 +7662,19 @@ server.addTool({
 server.addTool({
   name: "pin_tab",
   description:
-    "Pin a browser tab to this MCP client so subsequent tool calls always target it, even if the user clicks another tab in the same window. Auto-pinning happens after a successful navigate/open_new_tab; call this only to re-pin after PINNED_TAB_GONE or to pin a tab without navigating. Pass tabId to pin a specific tab, omit it to pin the currently active tab.",
+    "Pin a browser tab to this MCP client so subsequent tool calls always target it, even if the user clicks another tab in the same window. Auto-pinning happens after a successful navigate/open_new_tab; call this only to re-pin after PINNED_TAB_GONE or to pin a tab without navigating. Pass tabId to pin a specific tab. With tab isolation on (default), pinning a tab the user owns ADOPTS it: it is moved into the AutoDOM tab group and put back where it was on unpin_tab / finish_session. Only adopt a user tab when the user asked you to work in it.",
   parameters: z.object({
     tabId: z
       .number()
       .optional()
       .describe(
-        "Specific tab id (from list_tabs) to pin. Omit to pin whatever tab is currently active in the focused window.",
+        "Specific tab id (from list_tabs) to pin. Without tab isolation, omitting it pins whatever tab is currently active in the focused window. With isolation, omitting it re-pins AutoDOM's own most recent tab.",
+      ),
+    adoptActive: z
+      .boolean()
+      .optional()
+      .describe(
+        "Isolation mode only: adopt the tab the user is currently looking at. Use only when the user asked you to work on the page they have open.",
       ),
   }),
   execute: async (params) => {
@@ -7613,7 +7688,7 @@ server.addTool({
 server.addTool({
   name: "unpin_tab",
   description:
-    "Release this MCP client's pinned tab. After unpin_tab, subsequent tool calls target whatever tab is currently active. Use this when you want AutoDOM to follow the user's focus again.",
+    "Release this MCP client's pinned tab. Without tab isolation, subsequent tool calls then target whatever tab is currently active. With tab isolation (default), an adopted user tab is put back where it was, a tab AutoDOM opened stays in the AutoDOM group, and further tab-bound calls need navigate/open_new_tab/pin_tab first.",
   parameters: z.object({}),
   execute: async () => {
     const result = await callExtensionTool("__unpin_tab", {});
@@ -7631,6 +7706,18 @@ server.addTool({
   parameters: z.object({}),
   execute: async () => {
     const result = await callExtensionTool("__get_pinned_tab", {});
+    return stringifyToolResult(result);
+  },
+});
+
+// 16c'. Finish the session — release this client's AutoDOM tab group.
+server.addTool({
+  name: "finish_session",
+  description:
+    "Call when the browsing task is complete. Closes every tab AutoDOM opened for this session, removes the AutoDOM tab group, and puts any tab you adopted from the user (via pin_tab/switch_tab) back exactly where it was. Also clears the pin. Safe to call repeatedly. Sessions are also released automatically when the IDE disconnects or after a period of inactivity.",
+  parameters: z.object({}),
+  execute: async () => {
+    const result = await callExtensionTool("__finish_session", {});
     return stringifyToolResult(result);
   },
 });
@@ -7689,10 +7776,21 @@ server.addTool({
 server.addTool({
   name: "switch_tab",
   description:
-    "Switch to a different browser tab by its ID or index. Use after list_tabs or wait_for_new_tab.",
+    "Switch AutoDOM's working target to a different browser tab by its ID or index. Use after list_tabs or wait_for_new_tab. With tab isolation on (default) this does NOT bring the tab to the foreground: it only re-targets subsequent tool calls, and switching to a tab the user owns adopts it into the AutoDOM group. Pass focus:true only if the user asked to see the tab.",
   parameters: z.object({
     tabId: z.number().optional().describe("Tab ID to switch to"),
-    index: z.number().optional().describe("Tab index to switch to (0-based)"),
+    index: z
+      .number()
+      .optional()
+      .describe(
+        "Tab index to switch to (0-based). With tab isolation this indexes AutoDOM's own tabs.",
+      ),
+    focus: z
+      .boolean()
+      .optional()
+      .describe(
+        "Also activate the tab and focus its window (tab isolation mode only; off by default).",
+      ),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("switch_tab", params);
@@ -7704,7 +7802,7 @@ server.addTool({
 server.addTool({
   name: "wait_for_new_tab",
   description:
-    "Wait for a new tab to be opened (e.g. after clicking a link that opens in a new tab). Auto-switches to the new tab.",
+    "Wait for a new tab to be opened (e.g. after clicking a link that opens in a new tab). Auto-targets the new tab. With tab isolation on, only tabs opened by AutoDOM's own tabs count, and the tab joins the AutoDOM group without stealing focus.",
   parameters: z.object({
     timeout: z
       .number()
@@ -7727,9 +7825,15 @@ server.addTool({
 server.addTool({
   name: "close_tab",
   description:
-    "Close a specific browser tab by its ID. Use list_tabs to find the tab ID first.",
+    "Close a specific browser tab by its ID. Use list_tabs to find the tab ID first. With tab isolation on, only tabs in the AutoDOM group can be closed; closing an adopted user tab just puts it back unless force:true.",
   parameters: z.object({
     tabId: z.number().describe("ID of the tab to close"),
+    force: z
+      .boolean()
+      .optional()
+      .describe(
+        "Really close an adopted user tab instead of restoring it (tab isolation mode). Only when the user asked for it to be closed.",
+      ),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("close_tab", params);
@@ -8051,14 +8155,17 @@ server.addTool({
 // 36. Open new tab
 server.addTool({
   name: "open_new_tab",
-  description: "Open a new browser tab with a URL.",
+  description:
+    "Open a new browser tab with a URL. With tab isolation on (default) the tab opens in the background inside the AutoDOM tab group and becomes the working target; the user's focus never moves.",
   parameters: z.object({
     url: z.string().describe("URL to open"),
     active: z
       .boolean()
       .optional()
       .default(true)
-      .describe("Bring tab to foreground"),
+      .describe(
+        "Bring tab to foreground (ignored when tab isolation is on)",
+      ),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("open_new_tab", params);
@@ -8278,6 +8385,8 @@ server.addTool({
       {
         pendingCount: pendingChatRequests.size,
         requests: requests,
+        note:
+          "These requests come from the page the user has open. Tab isolation keeps AutoDOM off the user's tab by default, so to act on that page call pin_tab with adoptActive:true (or its tabId) first, and finish_session afterwards to put it back.",
       },
       null,
       2,

@@ -10,6 +10,7 @@
     "alarms",
     "scripting",
     "tabs",
+    "tabGroups",
     "storage",
     "debugger",
     "cookies",

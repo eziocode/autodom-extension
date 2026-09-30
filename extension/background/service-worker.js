@@ -25,6 +25,9 @@ try {
   if (typeof importScripts === "function" && !globalThis.AutoDOMActionGate) {
     importScripts("action-gate.js");
   }
+  if (typeof importScripts === "function" && !globalThis.AutoDOMTabGroup) {
+    importScripts("tab-isolation.js");
+  }
 } catch (_) {
   // Already loaded (Firefox path) — ignore.
 }
@@ -91,6 +94,64 @@ function _bridgeWatchdogTick() {
 try {
   chrome.alarms?.onAlarm?.addListener((alarm) => {
     if (alarm && alarm.name === BRIDGE_WATCHDOG_ALARM) _bridgeWatchdogTick();
+  });
+} catch (_) {}
+
+// ─── Tab-isolation lifecycle ─────────────────────────────────
+// Idle sweep: an agent that never calls finish_session must not leave tabs
+// behind. The alarm only exists while some client still owns tabs.
+const ISOLATION_SWEEP_ALARM = "autodom-tab-isolation-sweep";
+// Bridge socket drops (restart, blip) get this long to come back before the
+// session's tabs are released.
+const ISOLATION_DISCONNECT_GRACE_MS = 30000;
+let _isolationDisconnectTimer = null;
+
+function _ensureIsolationSweepAlarm() {
+  try {
+    chrome.alarms?.get?.(ISOLATION_SWEEP_ALARM, (existing) => {
+      if (!existing) {
+        chrome.alarms.create(ISOLATION_SWEEP_ALARM, { periodInMinutes: 0.5 });
+      }
+    });
+  } catch (_) {}
+}
+
+async function _isolationSweepTick() {
+  const Tab = globalThis.AutoDOMTabGroup;
+  if (!Tab) return;
+  await Tab.ready();
+  await Tab.sweepIdle();
+  if (Tab.snapshot().length === 0) {
+    try {
+      chrome.alarms.clear(ISOLATION_SWEEP_ALARM);
+    } catch (_) {}
+  }
+}
+
+function _cancelIsolationDisconnectRelease() {
+  if (_isolationDisconnectTimer) {
+    clearTimeout(_isolationDisconnectTimer);
+    _isolationDisconnectTimer = null;
+  }
+}
+
+function _scheduleIsolationDisconnectRelease() {
+  _cancelIsolationDisconnectRelease();
+  if (!globalThis.AutoDOMTabGroup?.snapshot().length) return;
+  _isolationDisconnectTimer = setTimeout(() => {
+    _isolationDisconnectTimer = null;
+    if (isConnected) return;
+    globalThis.AutoDOMTabGroup?.releaseAll("bridge_disconnected").catch(() => {});
+  }, ISOLATION_DISCONNECT_GRACE_MS);
+}
+
+try {
+  chrome.alarms?.onAlarm?.addListener((alarm) => {
+    if (alarm && alarm.name === ISOLATION_SWEEP_ALARM) void _isolationSweepTick();
+  });
+  // Service worker restarted with tabs still owned → resume sweeping.
+  void globalThis.AutoDOMTabGroup?.ready().then(() => {
+    if (globalThis.AutoDOMTabGroup.snapshot().length) _ensureIsolationSweepAlarm();
   });
 } catch (_) {}
 const ACTIVITY_LOG_KEY = "autodomActivityLogs";
@@ -1225,10 +1286,23 @@ function _safeJsonParse(s) {
 
 // When the agent successfully switches/opens a tab, follow it for
 // subsequent calls. Falls back silently for unexpected result shapes.
-function _maybeRepinAgentTab(toolName, rawResult) {
+function _maybeRepinAgentTab(toolName, rawResult, params) {
   if (!rawResult || rawResult.error) return;
   let newTabId = null;
   let newWindowId = null;
+  if (_agentRunContext?.isolated) {
+    // Bridge call under tab isolation (e.g. inside batch_actions): keep the
+    // isolation context and move this client's pin along with it.
+    const next = _repinTargetFromResult(toolName, params || {}, rawResult);
+    if (next != null) {
+      const win = rawResult.windowId ?? rawResult.tab?.windowId ?? rawResult.newTab?.windowId ?? null;
+      _agentRunContext = { ..._agentRunContext, tabId: next, windowId: win };
+      if (_agentRunContext.clientId) {
+        _setClientPin(_agentRunContext.clientId, { id: next, windowId: win });
+      }
+    }
+    return;
+  }
   if (toolName === "switch_tab" || toolName === "open_new_tab") {
     newTabId =
       rawResult.tabId ??
@@ -1266,6 +1340,90 @@ function _maybeRepinAgentTab(toolName, rawResult) {
 //     bridges no longer block each other.
 const _clientPins = new Map();
 // clientId -> { tabId: number|null, windowId, lastUrl, lastTitle, pinnedAt }
+
+// ─── Tab-group isolation glue (see tab-isolation.js) ────────
+// While isolation is on, a bridge call runs with an _agentRunContext of
+// { tabId, windowId, clientId, isolated:true } so every tool helper resolves
+// to the client's own tab and never to the user's active tab.
+const NO_AUTODOM_TAB_MESSAGE =
+  "NO_AUTODOM_TAB: AutoDOM has no tab for this client yet (tab isolation is on, so it never uses the tab you are looking at). " +
+  "Call navigate or open_new_tab to work in a new background tab in the AutoDOM group, " +
+  "or pin_tab with a tabId (see list_tabs all:true) to adopt one of the user's tabs.";
+
+function _AutoDOMTabGroup() {
+  return globalThis.AutoDOMTabGroup || null;
+}
+
+// Clients whose current call asked to bypass isolation (server flag
+// AUTODOM_ISOLATION=0, or a request typed into the in-page chat panel).
+// Refreshed on every TOOL_CALL frame.
+const _isolationOptOut = new Set();
+
+async function _isolationOn(clientId) {
+  const Tab = _AutoDOMTabGroup();
+  return !!(
+    clientId &&
+    Tab &&
+    !_isolationOptOut.has(clientId) &&
+    (await Tab.isEnabled())
+  );
+}
+
+// Tools that create a tab when the client has none yet.
+function _isTabCreatingCall(toolName, params) {
+  if (toolName === "open_new_tab") return true;
+  if (toolName === "browser_tabs") {
+    return String(params?.action || "").toLowerCase() === "new";
+  }
+  if (toolName === "navigate" || toolName === "browser_navigate") {
+    return typeof params?.url === "string" && params.url.length > 0;
+  }
+  if (toolName === "batch_actions") {
+    const first = Array.isArray(params?.actions) ? params.actions[0] : null;
+    const args = first?.args || first?.params || {};
+    return _isTabCreatingCall(String(first?.tool || first?.name || ""), args);
+  }
+  return false;
+}
+
+// Navigation with no tab yet: AutoDOM opens a blank background tab first
+// and navigates there, so the user's tab is never the navigation target.
+function _needsPrecreatedTab(toolName, params) {
+  if (toolName === "batch_actions") {
+    const first = Array.isArray(params?.actions) ? params.actions[0] : null;
+    return _needsPrecreatedTab(
+      String(first?.tool || first?.name || ""),
+      first?.args || first?.params || {},
+    );
+  }
+  return (
+    (toolName === "navigate" || toolName === "browser_navigate") &&
+    _isTabCreatingCall(toolName, params)
+  );
+}
+
+// Tools whose success moves the client's working tab (they used to
+// activate/focus it; under isolation they only re-target the pin).
+function _repinTargetFromResult(toolName, params, result) {
+  if (!result || result.error || result.success === false) return null;
+  switch (toolName) {
+    case "switch_tab":
+    case "open_new_tab":
+      return result.tabId ?? null;
+    case "browser_tabs": {
+      const a = String(params?.action || "").toLowerCase();
+      return a === "new" || a === "select" ? (result.tabId ?? null) : null;
+    }
+    case "wait_for_new_tab":
+      return params?.switchTo === false ? null : (result.newTab?.id ?? null);
+    case "switch_to_popup":
+    case "wait_for_popup":
+      if (toolName === "wait_for_popup" && params?.switchTo === false) return null;
+      return result.activeTab?.id ?? null;
+    default:
+      return null;
+  }
+}
 
 const _AUTOPIN_TOOLS = new Set([
   "navigate",
@@ -1331,6 +1489,7 @@ async function _handlePinTabTool(clientId, params) {
   if (!clientId) {
     return { error: "pin_tab requires a clientId on the wire (bridge version mismatch?)" };
   }
+  const isolated = await _isolationOn(clientId);
   let tab = null;
   if (params && params.tabId != null) {
     try {
@@ -1338,10 +1497,45 @@ async function _handlePinTabTool(clientId, params) {
     } catch (err) {
       return { error: `pin_tab: tabId ${params.tabId} not found` };
     }
+  } else if (isolated) {
+    // No tabId: keep working in the tab AutoDOM already owns. Adopting the
+    // user's active tab must be an explicit request (tabId, or
+    // adoptActive:true) so the user's page is never taken by accident.
+    const own = _AutoDOMTabGroup().list(clientId).owned;
+    if (own.length) {
+      tab = await chrome.tabs.get(own[own.length - 1]).catch(() => null);
+    }
+    if (!tab && params?.adoptActive === true) {
+      [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    }
+    if (!tab) {
+      return {
+        error:
+          "pin_tab: AutoDOM tab isolation is on and this client has no tab yet. " +
+          "Pass tabId (see list_tabs all:true) to adopt one of the user's tabs, " +
+          "pass adoptActive:true to adopt the tab the user is looking at, or call " +
+          "navigate/open_new_tab to work in a new background tab.",
+      };
+    }
   } else {
     const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!active) return { error: "pin_tab: no active tab to pin" };
     tab = active;
+  }
+  let adopted = false;
+  if (isolated) {
+    try {
+      const other = _AutoDOMTabGroup().clientOwning(tab.id);
+      if (other && other !== clientId) {
+        return {
+          error: `pin_tab: tab ${tab.id} belongs to another AutoDOM client's group (${other}).`,
+        };
+      }
+      adopted = (await _AutoDOMTabGroup().adoptTab(clientId, tab.id)).adopted;
+      tab = await chrome.tabs.get(tab.id);
+    } catch (err) {
+      return { error: `pin_tab: could not adopt tab ${tab.id}: ${err.message}` };
+    }
   }
   const entry = _setClientPin(clientId, tab);
   return {
@@ -1351,13 +1545,34 @@ async function _handlePinTabTool(clientId, params) {
     windowId: entry.windowId,
     url: entry.lastUrl,
     title: entry.lastTitle,
+    ...(isolated ? { isolated: true, adopted } : {}),
   };
 }
 
-function _handleUnpinTabTool(clientId) {
+async function _handleUnpinTabTool(clientId) {
   if (!clientId) return { error: "unpin_tab requires a clientId" };
+  const pin = _getClientPin(clientId);
   const had = _clientPins.delete(clientId);
-  return { unpinned: had, clientId };
+  let restored = false;
+  if (had && pin?.tabId != null && (await _isolationOn(clientId))) {
+    // An adopted user tab goes back where it was; a tab AutoDOM created
+    // stays in the group until finish_session.
+    restored = await _AutoDOMTabGroup().releaseAdopted(clientId, pin.tabId);
+  }
+  return { unpinned: had, clientId, ...(restored ? { restored: true } : {}) };
+}
+
+// Synthetic finish_session: end this client's session. Closes the tabs
+// AutoDOM created, ungroups/restores tabs it adopted, drops the pin.
+async function _handleFinishSessionTool(clientId) {
+  if (!clientId) return { error: "finish_session requires a clientId" };
+  _clientPins.delete(clientId);
+  const Tab = _AutoDOMTabGroup();
+  if (!Tab || !Tab.supported()) {
+    return { finished: true, isolated: false, closed: [], restored: [] };
+  }
+  const { closed, restored } = await Tab.release(clientId, "finish_session");
+  return { finished: true, isolated: true, closed, restored };
 }
 
 function _handleGetPinnedTabTool(clientId) {
@@ -3201,9 +3416,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       _activeAgentRun.panelTabId = null;
     }
     if (_agentRunContext && _agentRunContext.tabId === tabId) {
-      _agentRunContext = _agentRunContext.windowId != null
-        ? { windowId: _agentRunContext.windowId }
-        : null;
+      _agentRunContext = _agentRunContext.isolated
+        ? { ..._agentRunContext, tabId: null }
+        : _agentRunContext.windowId != null
+          ? { windowId: _agentRunContext.windowId }
+          : null;
     }
     // Per-clientId pins: keep the entry (so we can surface
     // PINNED_TAB_GONE with lastUrl) but clear the live tabId.
@@ -3466,7 +3683,7 @@ async function _onWsConn_SESSION_TIMEOUT(message) {
       stopAutoConnect();
     }
     stopInactivityTimer();
-    disconnectWebSocket();
+    disconnectWebSocket(); // also releases AutoDOM's tab group
     chrome.storage.local.set({ mcpRunning: keepRetrying });
     // Explicitly hide border and chat on ALL tabs (including non-active)
     broadcastToAllTabs([
@@ -3486,6 +3703,15 @@ async function _onWsConn_SESSION_TIMEOUT(message) {
     // Also send explicit MCP stop to all tabs so chat-panel tears down
     broadcastMcpStopToAllTabs();
     return;
+}
+
+// The bridge process behind `clientId` exited (IDE closed / MCP stopped):
+// its session is over, so release the tabs it owned.
+async function _onWsConn_CLIENT_GONE(message) {
+    const clientId = message?.clientId;
+    if (!clientId) return;
+    _clientPins.delete(clientId);
+    await globalThis.AutoDOMTabGroup?.release(clientId, "client_gone");
 }
 
 async function _onWsConn_TOOL_CALL(message) {
@@ -3513,6 +3739,13 @@ async function _onWsConn_TOOL_CALL(message) {
       const clientId = message.clientId || null;
       const toolName = message.tool;
       const params = message.params || {};
+      if (clientId) {
+        if (message.isolation === false) _isolationOptOut.add(clientId);
+        else _isolationOptOut.delete(clientId);
+      }
+      if (Number.isFinite(message.isolationIdleMs)) {
+        _AutoDOMTabGroup()?.configure({ idleMs: message.isolationIdleMs });
+      }
 
       // Synthetic pin_tab / unpin_tab / get_pinned_tab — handled
       // here because they need direct access to the calling
@@ -3521,7 +3754,12 @@ async function _onWsConn_TOOL_CALL(message) {
       if (toolName === "__pin_tab" || toolName === "pin_tab") {
         result = await _handlePinTabTool(clientId, params);
       } else if (toolName === "__unpin_tab" || toolName === "unpin_tab") {
-        result = _handleUnpinTabTool(clientId);
+        result = await _handleUnpinTabTool(clientId);
+      } else if (
+        toolName === "__finish_session" ||
+        toolName === "finish_session"
+      ) {
+        result = await _handleFinishSessionTool(clientId);
       } else if (
         toolName === "__get_pinned_tab" ||
         toolName === "get_pinned_tab"
@@ -3562,8 +3800,14 @@ async function _onWsConn_TOOL_CALL(message) {
             };
           }
         } catch (_) {}
+        const Tab = _AutoDOMTabGroup();
         result = {
           pins,
+          tabIsolation: {
+            supported: !!Tab?.supported(),
+            enabled: Tab ? await Tab.isEnabled() : false,
+            clients: Tab ? Tab.snapshot() : [],
+          },
           tabCount,
           activeTab,
           callingClientId: clientId,
@@ -3583,10 +3827,31 @@ async function _onWsConn_TOOL_CALL(message) {
             undefined,
         };
       } else {
+        const Tab = _AutoDOMTabGroup();
+        const isolated = await _isolationOn(clientId);
+        let autoCreatedTabId = null;
+
         // Resolve pinned tab for this client (if any).
         let pinCtx = null;
         if (clientId) {
-          const resolved = await _resolveClientPin(clientId);
+          let resolved = await _resolveClientPin(clientId);
+          if (isolated && resolved?.tab && !Tab.ownsTab(clientId, resolved.tab.id)) {
+            // A pin left over from before isolation was on (or set by an
+            // in-panel chat request) points at a tab AutoDOM has not been
+            // asked to touch. Drop it rather than act on the user's page.
+            _clientPins.delete(clientId);
+            resolved = null;
+          }
+          if (
+            resolved?.gone &&
+            isolated &&
+            _isTabCreatingCall(toolName, params)
+          ) {
+            // The tool is about to create a fresh tab anyway — drop the
+            // dead pin instead of failing with PINNED_TAB_GONE.
+            _clientPins.delete(clientId);
+            resolved = null;
+          }
           if (resolved?.gone) {
             result = {
               error: "PINNED_TAB_GONE",
@@ -3603,7 +3868,56 @@ async function _onWsConn_TOOL_CALL(message) {
           }
         }
 
-        if (result === undefined) {
+        // Isolation: navigate with no tab yet opens a background tab in the
+        // AutoDOM group and works there — never on the user's tab.
+        if (
+          result === undefined &&
+          isolated &&
+          !pinCtx &&
+          _needsPrecreatedTab(toolName, params)
+        ) {
+          try {
+            const created = await Tab.createOwnedTab(clientId, {
+              url: "about:blank",
+            });
+            _setClientPin(clientId, created);
+            pinCtx = { tabId: created.id, windowId: created.windowId ?? null };
+            autoCreatedTabId = created.id;
+          } catch (createErr) {
+            result = {
+              error: `Could not create an AutoDOM tab: ${createErr?.message || createErr}`,
+            };
+          }
+        }
+
+        if (result === undefined && isolated) {
+          const isoCtx = {
+            tabId: pinCtx?.tabId ?? null,
+            windowId: pinCtx?.windowId ?? null,
+            clientId,
+            isolated: true,
+          };
+          Tab.beginCall(clientId);
+          try {
+            result = await _withAgentTabContext(isoCtx, () =>
+              handleToolCallWithRecording(toolName, params, message.id),
+            );
+          } finally {
+            Tab.endCall(clientId);
+          }
+          _ensureIsolationSweepAlarm();
+          if (autoCreatedTabId != null && result && typeof result === "object") {
+            result.autoCreatedTab = true;
+            result.tabId = result.tabId ?? autoCreatedTabId;
+          }
+          // Tools that used to activate/focus a tab now only re-target
+          // this client's working tab.
+          const nextTabId = _repinTargetFromResult(toolName, params, result);
+          if (nextTabId != null) {
+            const nextTab = await chrome.tabs.get(nextTabId).catch(() => null);
+            if (nextTab) _setClientPin(clientId, nextTab);
+          }
+        } else if (result === undefined) {
           if (pinCtx) {
             result = await _withAgentTabContext(pinCtx, () =>
               handleToolCallWithRecording(toolName, params, message.id),
@@ -3744,6 +4058,7 @@ const _WS_CONN_MESSAGE_HANDLERS = Object.freeze({
   INACTIVITY_WARNING: _onWsConn_INACTIVITY_WARNING,
   SESSION_TIMEOUT: _onWsConn_SESSION_TIMEOUT,
   TOOL_CALL: _onWsConn_TOOL_CALL,
+  CLIENT_GONE: _onWsConn_CLIENT_GONE,
   SERVER_INFO: _onWsConn_SERVER_INFO,
   BRIDGE_STATUS_RESPONSE: _onWsConn_BRIDGE_STATUS_RESPONSE,
   PING: _onWsConn_PING,
@@ -3792,6 +4107,7 @@ function connectWebSocket(port) {
 
     ws.onopen = () => {
       isConnected = true;
+      _cancelIsolationDisconnectRelease();
       _startupRestoreOnly = false;
       autoConnectFallbackTried = false;
       lastConnectedPort = getCurrentPort();
@@ -3862,6 +4178,9 @@ function connectWebSocket(port) {
       _debugLog(
         `[AutoDOM] WebSocket disconnected: code=${event.code}, reason=${event.reason}, wasClean=${event.wasClean}`,
       );
+      // Give a restarting bridge time to reconnect before dropping the
+      // session's tab group; the idle sweep is the backstop.
+      _scheduleIsolationDisconnectRelease();
 
       // Any close transitions the extension into a fully stopped state.
       if (_sessionTimedOut) {
@@ -3990,6 +4309,8 @@ function disconnectWebSocket() {
     ws = null;
   }
   isConnected = false;
+  _cancelIsolationDisconnectRelease();
+  globalThis.AutoDOMTabGroup?.releaseAll("disconnect").catch(() => {});
   chrome.storage.local.set({ mcpRunning: false });
   broadcastStatus(false, "Disconnected", "info");
   // Hide session border and chat panel on all tabs
@@ -5458,7 +5779,7 @@ async function toolBrowserWaitFor(params = {}) {
 
 async function toolBrowserTabs(params = {}) {
   const action = String(params.action || "list").toLowerCase();
-  if (action === "list") return toolListTabs({ currentWindow: params.currentWindow === true });
+  if (action === "list") return toolListTabs({ currentWindow: params.currentWindow === true, all: params.all });
   if (action === "new") {
     return toolOpenNewTab({ url: params.url || "about:blank", active: true });
   }
@@ -5730,8 +6051,17 @@ async function handleToolCall(tool, params, id) {
 
   // ─── Per-Domain Rate Limiting ────────────────────────────
   try {
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-    const tab = tabs[0];
+    let tab;
+    if (_agentRunContext?.isolated) {
+      // Rate-limit the tab the agent is actually driving, not the one
+      // the user happens to be looking at.
+      tab =
+        _agentRunContext.tabId != null
+          ? await chrome.tabs.get(_agentRunContext.tabId).catch(() => null)
+          : null;
+    } else {
+      tab = (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
+    }
     const domain = getDomainFromTab(tab);
     const rateCheck = checkRateLimit(domain);
     if (!rateCheck.allowed) {
@@ -5789,6 +6119,18 @@ async function handleToolCall(tool, params, id) {
 // ─── Helper: Get active tab ──────────────────────────────────
 
 async function getActiveTab() {
+  // Tab-group isolation: a bridge call resolves ONLY to the tab this
+  // client owns/adopted. Never fall back to whatever the user is looking at.
+  if (_agentRunContext?.isolated) {
+    if (_agentRunContext.tabId != null) {
+      try {
+        return await chrome.tabs.get(_agentRunContext.tabId);
+      } catch (_) {
+        _agentRunContext = { ..._agentRunContext, tabId: null };
+      }
+    }
+    throw new Error(NO_AUTODOM_TAB_MESSAGE);
+  }
   const pinnedWindowId = _agentRunContext?.windowId;
   if (_agentRunContext?.tabId != null) {
     try {
@@ -5996,6 +6338,55 @@ async function toolTypeText(params) {
 }
 
 // 4. Screenshot
+// Capture a tab that is not the visible one in its window. Headed Chrome
+// can leave Page.captureScreenshot pending for a hidden tab, so CDP gets a
+// short deadline; the fallback activates the tab for one capture and puts
+// the user's tab back right away (no window focus change).
+const BACKGROUND_CAPTURE_CDP_TIMEOUT_MS = 4000;
+async function _captureBackgroundTab(tab, params) {
+  const jpeg = /^jpe?g$/i.test(String(params?.format || ""));
+  try {
+    await ensureDebugger(tab.id);
+    let timer;
+    const res = await Promise.race([
+      chrome.debugger.sendCommand(
+        { tabId: tab.id },
+        "Page.captureScreenshot",
+        jpeg
+          ? { format: "jpeg", quality: params?.quality || 80, fromSurface: true }
+          : { format: "png", fromSurface: true },
+      ),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("CDP capture timed out")),
+          BACKGROUND_CAPTURE_CDP_TIMEOUT_MS,
+        );
+      }),
+    ]).finally(() => clearTimeout(timer));
+    if (res?.data) {
+      return `data:image/${jpeg ? "jpeg" : "png"};base64,${res.data}`;
+    }
+  } catch (_) {
+    // fall through to the brief-activation capture
+  }
+  const [previous] = await chrome.tabs.query({
+    active: true,
+    windowId: tab.windowId,
+  });
+  try {
+    await chrome.tabs.update(tab.id, { active: true });
+    await new Promise((r) => setTimeout(r, 150));
+    return await chrome.tabs.captureVisibleTab(tab.windowId, {
+      format: jpeg ? "jpeg" : "png",
+      quality: params?.quality || 80,
+    });
+  } finally {
+    if (previous && previous.id !== tab.id) {
+      await chrome.tabs.update(previous.id, { active: true }).catch(() => {});
+    }
+  }
+}
+
 async function toolScreenshot(params) {
   const tab = await getActiveTab();
 
@@ -6113,10 +6504,18 @@ async function toolScreenshot(params) {
     // current paint, so we MUST wait long enough for the compositor.
     await new Promise((r) => setTimeout(r, 120));
 
-    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-      format: params?.format || "png",
-      quality: params?.quality || 80,
-    });
+    let dataUrl = null;
+    if (_isolatedClientId() && !tab.active) {
+      // The agent's tab sits in the background (we never activate it), so
+      // captureVisibleTab would photograph whatever the user is viewing.
+      dataUrl = await _captureBackgroundTab(tab, params);
+    }
+    if (!dataUrl) {
+      dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
+        format: params?.format || "png",
+        quality: params?.quality || 80,
+      });
+    }
     return { success: true, screenshot: dataUrl };
   } catch (err) {
     return { error: `Screenshot failed: ${err.message}` };
@@ -6535,9 +6934,25 @@ async function toolGetConsoleLogs(params) {
 async function toolListTabs(params) {
   const allTabs = await chrome.tabs.query({});
   const listIndexById = new Map(allTabs.map((t, listIndex) => [t.id, listIndex]));
-  const tabs = params?.currentWindow === false
+  let tabs = params?.currentWindow === false
     ? allTabs
     : await chrome.tabs.query({ currentWindow: true });
+  // Tab isolation: by default only the AutoDOM group is listed. `all:true`
+  // also lists the user's own tabs (read-only) so one can be picked for
+  // pin_tab; listing never touches them.
+  const isoClient = _isolatedClientId();
+  let owned = null;
+  let adopted = null;
+  if (isoClient) {
+    const mine = _AutoDOMTabGroup().list(isoClient);
+    owned = new Set(mine.owned);
+    adopted = new Set(mine.adopted);
+    if (params?.all === true) {
+      tabs = allTabs;
+    } else {
+      tabs = allTabs.filter((t) => owned.has(t.id) || adopted.has(t.id));
+    }
+  }
   return {
     tabs: tabs.map((t) => ({
       id: t.id,
@@ -6548,22 +6963,74 @@ async function toolListTabs(params) {
       active: t.active,
       status: t.status,
       windowId: t.windowId,
+      ...(isoClient
+        ? {
+            groupId: t.groupId ?? -1,
+            autodomOwned: owned.has(t.id),
+            autodomAdopted: adopted.has(t.id),
+          }
+        : {}),
     })),
     count: tabs.length,
+    ...(isoClient ? { isolated: true, scope: params?.all === true ? "all" : "autodom-group" } : {}),
   };
+}
+
+// clientId of the bridge call in flight when tab isolation is on, else null.
+function _isolatedClientId() {
+  return _agentRunContext?.isolated ? _agentRunContext.clientId || null : null;
 }
 
 // 17. Switch to a tab by ID or index
 async function toolSwitchTab(params) {
   const { tabId, index } = params;
+  const isoClient = _isolatedClientId();
   let targetTab;
   if (tabId) {
     targetTab = await chrome.tabs.get(tabId);
   } else if (typeof index === "number") {
-    const tabs = await chrome.tabs.query({ currentWindow: true });
-    targetTab = tabs[index];
+    if (isoClient) {
+      // Under isolation an index only addresses the client's own tabs.
+      const mine = _AutoDOMTabGroup().managedTabIds(isoClient);
+      const all = await chrome.tabs.query({});
+      targetTab = all.filter((t) => mine.has(t.id))[index];
+    } else {
+      const tabs = await chrome.tabs.query({ currentWindow: true });
+      targetTab = tabs[index];
+    }
   }
   if (!targetTab) return { error: "Tab not found" };
+  if (isoClient) {
+    const Tab = _AutoDOMTabGroup();
+    let adopted = false;
+    if (!Tab.ownsTab(isoClient, targetTab.id)) {
+      const other = Tab.clientOwning(targetTab.id);
+      if (other) {
+        return {
+          error: `Tab ${targetTab.id} belongs to another AutoDOM client's group (${other}).`,
+        };
+      }
+      // Explicit tabId from the agent = the user asked for this tab.
+      adopted = (await Tab.adoptTab(isoClient, targetTab.id)).adopted;
+      targetTab = await chrome.tabs.get(targetTab.id);
+    }
+    // Isolation: switching only re-targets the agent. The browser's
+    // focus stays where the user has it unless focus:true is passed.
+    if (params.focus === true) {
+      await chrome.tabs.update(targetTab.id, { active: true });
+      await chrome.windows.update(targetTab.windowId, { focused: true });
+    }
+    return {
+      success: true,
+      tabId: targetTab.id,
+      title: targetTab.title,
+      url: targetTab.url,
+      windowId: targetTab.windowId,
+      isolated: true,
+      adopted,
+      focused: params.focus === true,
+    };
+  }
   await chrome.tabs.update(targetTab.id, { active: true });
   await chrome.windows.update(targetTab.windowId, { focused: true });
   return {
@@ -6577,6 +7044,7 @@ async function toolSwitchTab(params) {
 // 18. Wait for a new tab to open (e.g. after clicking a link with target=_blank)
 async function toolWaitForNewTab(params) {
   const timeout = params?.timeout || 10000;
+  const isoClient = _isolatedClientId();
   const existingTabs = await chrome.tabs.query({});
   const existingIds = new Set(existingTabs.map((t) => t.id));
 
@@ -6595,11 +7063,24 @@ async function toolWaitForNewTab(params) {
 
     const listener = async (tab) => {
       if (!existingIds.has(tab.id) && !resolved) {
+        // Isolation: only tabs opened by one of this client's tabs count.
+        // A tab the user opens meanwhile must not be picked up (and later
+        // closed) by the agent.
+        if (isoClient) {
+          const Tab = _AutoDOMTabGroup();
+          if (tab.openerTabId == null || !Tab.ownsTab(isoClient, tab.openerTabId)) {
+            return;
+          }
+        }
         resolved = true;
         clearTimeout(timer);
         chrome.tabs.onCreated.removeListener(listener);
-        // Optionally switch to the new tab
-        if (params?.switchTo !== false) {
+        if (isoClient) {
+          // Belongs to the session now; the caller re-targets to it. No
+          // activation, no window focus.
+          await _AutoDOMTabGroup().claimTab(isoClient, tab.id).catch(() => {});
+        } else if (params?.switchTo !== false) {
+          // Optionally switch to the new tab
           await chrome.tabs.update(tab.id, { active: true });
           await chrome.windows.update(tab.windowId, { focused: true });
         }
@@ -6623,6 +7104,24 @@ async function toolWaitForNewTab(params) {
 async function toolCloseTab(params) {
   const { tabId } = params;
   if (!tabId) return { error: "tabId is required" };
+  const isoClient = _isolatedClientId();
+  if (isoClient) {
+    const Tab = _AutoDOMTabGroup();
+    if (!Tab.ownsTab(isoClient, tabId)) {
+      return {
+        error:
+          `Tab ${tabId} is not in the AutoDOM group, so it is protected. ` +
+          "Adopt it first with pin_tab {tabId}, then close_tab {tabId, force:true} if the user really wants it closed.",
+      };
+    }
+    const r = await Tab.closeManagedTab(isoClient, tabId, {
+      force: params.force === true,
+    });
+    if (r.restored) {
+      // An adopted user tab is put back, not closed.
+      return { success: true, released: true, restoredTabId: tabId };
+    }
+  }
   try {
     // Safety guard: never let AutoDOM close the last tab in a window.
     // If it is the last tab, create a replacement first so the browser
@@ -6640,7 +7139,7 @@ async function toolCloseTab(params) {
         await chrome.tabs.create({
           windowId: targetTab.windowId,
           url: "about:blank",
-          active: true,
+          active: !isoClient,
         });
       } catch (createErr) {
         return {
@@ -7621,6 +8120,21 @@ async function toolExecuteAsyncScript(params) {
 async function toolSetViewport(params) {
   const tab = await getActiveTab();
   const { width, height } = params;
+  if (_isolatedClientId()) {
+    // Resizing the browser window would resize the user's window. Emulate
+    // the viewport on the agent's tab instead.
+    try {
+      await ensureDebugger(tab.id);
+      await chrome.debugger.sendCommand(
+        { tabId: tab.id },
+        "Emulation.setDeviceMetricsOverride",
+        { width, height, deviceScaleFactor: 0, mobile: false },
+      );
+      return { success: true, width, height, method: "emulation" };
+    } catch (err) {
+      return { error: `Set viewport failed: ${err.message}` };
+    }
+  }
   try {
     const win = await chrome.windows.get(tab.windowId);
     await chrome.windows.update(tab.windowId, {
@@ -7642,6 +8156,22 @@ async function toolSetViewport(params) {
 async function toolOpenNewTab(params) {
   const { url, active } = params;
   try {
+    const isoClient = _isolatedClientId();
+    if (isoClient) {
+      // Background tab inside the AutoDOM group; `active` is ignored so
+      // the user's focus never moves.
+      const tab = await _AutoDOMTabGroup().createOwnedTab(isoClient, { url });
+      return {
+        success: true,
+        tabId: tab.id,
+        url: tab.pendingUrl || tab.url || url,
+        title: tab.title,
+        status: tab.status,
+        windowId: tab.windowId,
+        groupId: tab.groupId ?? -1,
+        isolated: true,
+      };
+    }
     const tab = await chrome.tabs.create({ url, active: active !== false });
     return {
       success: true,
@@ -11038,7 +11568,7 @@ async function toolBatchActions(params) {
       }
 
       const result = await executeAgentTool(tool, args);
-      _maybeRepinAgentTab(tool, result);
+      _maybeRepinAgentTab(tool, result, args);
       results.push({ step: i, tool, args, result });
       if (stopOnError && (!result?.ok || result?.error || result?.blocked || result?.denied)) {
         break;
@@ -11146,14 +11676,18 @@ async function toolSwitchToPopup(params) {
   const { windowId, tabId } = params;
   if (!windowId) return { error: "windowId is required" };
   try {
-    await chrome.windows.update(windowId, { focused: true });
-    if (tabId) {
-      await chrome.tabs.update(tabId, { active: true });
-    } else {
-      // Activate the first tab in the window
-      const tabs = await chrome.tabs.query({ windowId });
-      if (tabs.length > 0) {
-        await chrome.tabs.update(tabs[0].id, { active: true });
+    // Isolation: re-target only. The popup is not raised over the user's
+    // window and no tab is activated.
+    if (!_isolatedClientId()) {
+      await chrome.windows.update(windowId, { focused: true });
+      if (tabId) {
+        await chrome.tabs.update(tabId, { active: true });
+      } else {
+        // Activate the first tab in the window
+        const tabs = await chrome.tabs.query({ windowId });
+        if (tabs.length > 0) {
+          await chrome.tabs.update(tabs[0].id, { active: true });
+        }
       }
     }
     const win = await chrome.windows.get(windowId, { populate: true });
@@ -11193,6 +11727,7 @@ async function toolClosePopup(params) {
 // Wait for a new popup/window to appear
 async function toolWaitForPopup(params) {
   const timeout = params?.timeout || 10000;
+  const isoClient = _isolatedClientId();
   const existingWindows = await chrome.windows.getAll();
   const existingIds = new Set(existingWindows.map((w) => w.id));
 
@@ -11220,7 +11755,7 @@ async function toolWaitForPopup(params) {
           populate: true,
         });
         // Optionally switch focus to the new popup
-        if (params?.switchTo !== false) {
+        if (params?.switchTo !== false && !isoClient) {
           await chrome.windows.update(win.id, { focused: true });
         }
         const activeTab = (updatedWin.tabs || []).find((t) => t.active);

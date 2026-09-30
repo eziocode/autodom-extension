@@ -55,6 +55,7 @@ jobs:
           node test/test-proxy-reconnect.cjs
           node test/test-concurrency.cjs
           node test/e2e.cjs
+          node test/test-isolation-lifecycle.cjs
 
       - name: Build Chrome zip
         run: bash scripts/build-chrome.sh
