@@ -14,6 +14,8 @@
  *   --crx-sha256    <64 hex chars>    env: CRX_SHA256
  *   --zip-url       <https://…/.zip>  env: ZIP_URL
  *   --zip-sha256    <64 hex chars>    env: ZIP_SHA256
+ *   --share-url     <https://…/.zip>  env: SHARE_URL     (optional, with sha256)
+ *   --share-sha256  <64 hex chars>    env: SHARE_SHA256  (optional, with url)
  *   --published-at  <ISO timestamp>   env: PUBLISHED_AT (default: now)
  *   --out-dir       <path>            default: dist/update-manifests
  *
@@ -79,6 +81,10 @@ function main() {
   const crxSha256 = args["crx-sha256"] || process.env.CRX_SHA256;
   const zipUrl = args["zip-url"] || process.env.ZIP_URL;
   const zipSha256 = args["zip-sha256"] || process.env.ZIP_SHA256;
+  // The share bundle (server + extension) lets an installed bridge update its
+  // own server. Optional so metadata for releases without one stays valid.
+  const shareUrl = args["share-url"] || process.env.SHARE_URL;
+  const shareSha256 = args["share-sha256"] || process.env.SHARE_SHA256;
   const publishedAt = args["published-at"] || process.env.PUBLISHED_AT || new Date().toISOString();
   const outDir = resolve(ROOT, args["out-dir"] || "dist/update-manifests");
 
@@ -101,6 +107,9 @@ function main() {
   if (!/^https:\/\//i.test(zipUrl)) errors.push("ZIP URL must use HTTPS");
   if (!/^[a-f0-9]{64}$/i.test(crxSha256 || "")) errors.push("CRX SHA-256 must be 64 hex chars");
   if (!/^[a-f0-9]{64}$/i.test(zipSha256 || "")) errors.push("ZIP SHA-256 must be 64 hex chars");
+  if (Boolean(shareUrl) !== Boolean(shareSha256)) errors.push("share bundle needs both --share-url and --share-sha256");
+  if (shareUrl && !/^https:\/\//i.test(shareUrl)) errors.push("SHARE URL must use HTTPS");
+  if (shareSha256 && !/^[a-f0-9]{64}$/i.test(shareSha256)) errors.push("SHARE SHA-256 must be 64 hex chars");
   if (!Number.isFinite(Date.parse(publishedAt))) errors.push("published-at must be an ISO timestamp");
   if (errors.length) {
     console.error("[build-update-manifests] aborting:");
@@ -129,6 +138,9 @@ function main() {
     artifacts: {
       crx: { url: crxUrl, sha256: crxSha256.toLowerCase() },
       zip: { url: zipUrl, sha256: zipSha256.toLowerCase() },
+      ...(shareUrl
+        ? { share: { url: shareUrl, sha256: shareSha256.toLowerCase() } }
+        : {}),
     },
   };
   const jsonPath = join(outDir, "updates.json");
@@ -139,6 +151,7 @@ function main() {
   console.log(`[build-update-manifests]   chrome ext id = ${extensionId}`);
   console.log(`[build-update-manifests]   crx url       = ${crxUrl}`);
   console.log(`[build-update-manifests]   zip url       = ${zipUrl}`);
+  if (shareUrl) console.log(`[build-update-manifests]   share url     = ${shareUrl}`);
   console.log(`[build-update-manifests]   metadata      = ${jsonPath}`);
 }
 

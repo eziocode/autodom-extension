@@ -56,6 +56,9 @@ jobs:
           node test/test-concurrency.cjs
           node test/e2e.cjs
           node test/test-isolation-lifecycle.cjs
+          node test/test-self-restart.cjs
+          node test/test-self-restart-fleet.cjs
+          node test/test-server-self-update.cjs
 
       - name: Build Chrome zip
         run: bash scripts/build-chrome.sh

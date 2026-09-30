@@ -16,7 +16,13 @@ import { deflateRawSync } from "node:zlib";
 
 import {
   OFFICIAL_REMOTE_PATTERN,
+  atomicReplaceDirectories,
   atomicReplaceDirectory,
+  bundleArtifact,
+  dependenciesUnchanged,
+  installServerDependencies,
+  locateStagedBundle,
+  prepareStagedServerDependencies,
   extractZipArchive,
   classifyInstallRoot,
   compareExtensionVersions,
@@ -576,4 +582,174 @@ test("classifyInstallRoot ignores untracked files, which every real install has"
     run.calls.some((c) => c.args.includes("--untracked-files=no")),
     "cleanliness must be judged on tracked changes only",
   );
+});
+
+
+// ── share bundle (server + extension) ──────────────────────────
+
+const SHARE_URL =
+  "https://github.com/eziocode/autodom-extension/releases/download/v4.2.1/autodom-4.2.1-share.zip";
+
+test("bundleArtifact is optional and accepts only the canonical release URL", () => {
+  assert.equal(bundleArtifact(metadata()), null, "older releases have no bundle");
+  assert.deepEqual(
+    bundleArtifact(
+      metadata({
+        artifacts: { share: { url: SHARE_URL, sha256: "C".repeat(64) } },
+      }),
+    ),
+    { url: SHARE_URL, sha256: "c".repeat(64) },
+  );
+  for (const share of [
+    { url: "https://evil.example/autodom-4.2.1-share.zip", sha256: "c".repeat(64) },
+    { url: SHARE_URL.replace("4.2.1-share", "9.9.9-share"), sha256: "c".repeat(64) },
+    { url: SHARE_URL, sha256: "nope" },
+    {},
+  ]) {
+    assert.throws(
+      () => bundleArtifact(metadata({ artifacts: { share } })),
+      /share-bundle metadata failed validation/,
+    );
+  }
+});
+
+async function makeBundle(root, version, { lock = "lock-a", serverFiles = true } = {}) {
+  const top = join(root, `autodom-${version}-share`);
+  await makeExtension(join(top, "extension"), version);
+  await mkdir(join(top, "server"), { recursive: true });
+  await writeFile(join(top, "server/package.json"), JSON.stringify({ version }));
+  await writeFile(join(top, "server/package-lock.json"), lock);
+  if (serverFiles) {
+    for (const f of ["index.js", "self-restart.js", "update-utils.js"]) {
+      await writeFile(join(top, "server", f), "// " + version);
+    }
+  }
+  return top;
+}
+
+test("locateStagedBundle validates both halves for the requested version", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "autodom-bundle-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await makeBundle(root, "5.4.0");
+  const staged = await locateStagedBundle(root, "5.4.0");
+  assert.equal(staged.serverDir, join(root, "autodom-5.4.0-share", "server"));
+  assert.equal(staged.extensionDir, join(root, "autodom-5.4.0-share", "extension"));
+
+  // Wrong server version inside an otherwise fine bundle.
+  const bad = await mkdtemp(join(tmpdir(), "autodom-bundle-"));
+  t.after(() => rm(bad, { recursive: true, force: true }));
+  await makeBundle(bad, "5.4.0");
+  await writeFile(
+    join(bad, "autodom-5.4.0-share/server/package.json"),
+    JSON.stringify({ version: "5.3.0" }),
+  );
+  await assert.rejects(() => locateStagedBundle(bad, "5.4.0"), /server version 5.3.0/);
+
+  // Missing server file (a truncated bundle must never go live).
+  const partial = await mkdtemp(join(tmpdir(), "autodom-bundle-"));
+  t.after(() => rm(partial, { recursive: true, force: true }));
+  await makeBundle(partial, "5.4.0", { serverFiles: false });
+  await assert.rejects(() => locateStagedBundle(partial, "5.4.0"));
+
+  // Bundle for another version than the one requested.
+  await assert.rejects(() => locateStagedBundle(root, "5.5.0"));
+});
+
+test("prepareStagedServerDependencies reuses node_modules when the lockfile is unchanged", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "autodom-deps-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const oldDir = join(root, "old");
+  const newDir = join(root, "new");
+  for (const dir of [oldDir, newDir]) {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "package-lock.json"), "same");
+  }
+  await mkdir(join(oldDir, "node_modules/ws"), { recursive: true });
+  await writeFile(join(oldDir, "node_modules/ws/index.js"), "ws");
+  assert.equal(await dependenciesUnchanged(oldDir, newDir), true);
+  const calls = [];
+  const res = await prepareStagedServerDependencies(
+    { oldServerDir: oldDir, newServerDir: newDir },
+    { run: async (...a) => calls.push(a) },
+  );
+  assert.equal(res.method, "reused");
+  assert.equal(calls.length, 0, "no npm when nothing changed");
+  assert.equal(await readFile(join(newDir, "node_modules/ws/index.js"), "utf8"), "ws");
+});
+
+test("prepareStagedServerDependencies installs from the new lockfile when dependencies changed", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "autodom-deps-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const oldDir = join(root, "old");
+  const newDir = join(root, "new");
+  await mkdir(join(oldDir, "node_modules"), { recursive: true });
+  await mkdir(newDir, { recursive: true });
+  await writeFile(join(oldDir, "package-lock.json"), "v1");
+  await writeFile(join(newDir, "package-lock.json"), "v2");
+  const calls = [];
+  const res = await prepareStagedServerDependencies(
+    { oldServerDir: oldDir, newServerDir: newDir },
+    { run: async (cmd, args, opts) => calls.push([cmd, args, opts.cwd]) },
+  );
+  assert.equal(res.method, "npm ci");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "npm");
+  assert.deepEqual(calls[0][1].slice(0, 2), ["ci", "--omit=dev"]);
+  assert.equal(calls[0][2], newDir);
+});
+
+test("installServerDependencies falls back to npm install and surfaces a real failure", async () => {
+  const calls = [];
+  const res = await installServerDependencies("/x", async (cmd, args) => {
+    calls.push(args[0]);
+    if (args[0] === "ci") throw new Error("no lockfile");
+  });
+  assert.equal(res.method, "npm install");
+  assert.deepEqual(calls, ["ci", "install"]);
+  await assert.rejects(
+    () => installServerDependencies("/x", async () => { throw new Error("offline"); }),
+    /offline/,
+  );
+});
+
+test("atomicReplaceDirectories swaps every pair and drops the backups", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "autodom-swap-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pairs = [];
+  for (const name of ["server", "extension"]) {
+    await mkdir(join(root, name), { recursive: true });
+    await writeFile(join(root, name, "v"), "old");
+    await mkdir(join(root, `${name}-new`), { recursive: true });
+    await writeFile(join(root, `${name}-new`, "v"), "new");
+    pairs.push({
+      currentDir: join(root, name),
+      stagingDir: join(root, `${name}-new`),
+      backupDir: join(root, `${name}-bak`),
+    });
+  }
+  await atomicReplaceDirectories(pairs);
+  for (const name of ["server", "extension"]) {
+    assert.equal(await readFile(join(root, name, "v"), "utf8"), "new");
+    await assert.rejects(() => access(join(root, `${name}-bak`)));
+  }
+});
+
+test("atomicReplaceDirectories rolls back the pairs already swapped when a later one fails", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "autodom-swap-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, "server"), { recursive: true });
+  await writeFile(join(root, "server/v"), "old-server");
+  await mkdir(join(root, "server-new"), { recursive: true });
+  await writeFile(join(root, "server-new/v"), "new-server");
+  await mkdir(join(root, "extension"), { recursive: true });
+  await writeFile(join(root, "extension/v"), "old-ext");
+  // extension staging dir does not exist → its swap fails after server went live
+  await assert.rejects(() =>
+    atomicReplaceDirectories([
+      { currentDir: join(root, "server"), stagingDir: join(root, "server-new"), backupDir: join(root, "server-bak") },
+      { currentDir: join(root, "extension"), stagingDir: join(root, "missing"), backupDir: join(root, "ext-bak") },
+    ]),
+  );
+  assert.equal(await readFile(join(root, "server/v"), "utf8"), "old-server", "server put back");
+  assert.equal(await readFile(join(root, "extension/v"), "utf8"), "old-ext", "extension put back");
 });

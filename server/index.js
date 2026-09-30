@@ -21,15 +21,28 @@ import {
   toNodeHandler,
 } from "@modelcontextprotocol/node";
 import {
+  atomicReplaceDirectories,
   atomicReplaceDirectory,
+  bundleArtifact,
   classifyInstallRoot,
   compareExtensionVersions,
   downloadVerifiedArchive,
   extractZipArchive,
   gitUpdateToTag,
+  installServerDependencies,
+  locateStagedBundle,
+  lockfileHash,
+  prepareStagedServerDependencies,
   validateStagedExtension,
   validateUpdateMetadata,
 } from "./update-utils.js";
+import {
+  createHandshakeTap,
+  isNewerVersion,
+  preflightServer,
+  readDiskVersion,
+  startRelay,
+} from "./self-restart.js";
 import { WebSocketServer, WebSocket } from "ws";
 import { z } from "zod";
 import { fileURLToPath } from "url";
@@ -545,7 +558,11 @@ const BLOCKED_DOMAINS = (
 //      user can read it. Clients send it via `?token=` query string.
 const AUTH_TOKEN =
   process.env.AUTODOM_TOKEN || randomBytes(32).toString("hex");
-const MY_CLIENT_ID = "mcp_" + randomBytes(8).toString("hex");
+// An in-place restart (see restartInPlace) hands this id to its successor so
+// the extension keeps the same pins and AutoDOM tab group across the swap.
+const MY_CLIENT_ID = /^mcp_[a-f0-9]{16}$/.test(process.env.AUTODOM_CLIENT_ID || "")
+  ? process.env.AUTODOM_CLIENT_ID
+  : "mcp_" + randomBytes(8).toString("hex");
 const WS_MAX_MESSAGE_BYTES = 32 * 1024 * 1024;
 const DEFAULT_CHROME_EXTENSION_ID = "kpjdffgogiajnkajnjneiboaincnaokf";
 
@@ -1067,6 +1084,17 @@ function collectBridgeStatus() {
   return {
     pid: process.pid,
     version: SERVER_VERSION,
+    // Newer server on disk than the code this process is running (an
+    // update landed but this bridge has not restarted onto it yet).
+    ...(() => {
+      const fresh = serverFreshness();
+      return {
+        diskVersion: fresh.diskVersion,
+        staleOnDisk: fresh.staleOnDisk,
+        autoRestart: SELF_RESTART_ENABLED,
+        restartedFrom: fresh.restartedFrom,
+      };
+    })(),
     clientId: MY_CLIENT_ID,
     uptimeMs: Date.now() - _serverStartTime,
     startedAt: new Date(_serverStartTime).toISOString(),
@@ -1412,27 +1440,10 @@ async function stopExistingBridge(reason) {
   return await stopBridgeProcess(existingPid, reason);
 }
 
-async function shutdown(code = 0) {
-  if (shutdownStarted) return;
-  shutdownStarted = true;
-
-  // Hard exit safety net — if graceful cleanup hangs for any reason
-  // (e.g. a WebSocket connection keeps the event loop alive), force-kill
-  // ourselves so the IDE can restart a fresh process.
-  setTimeout(() => {
-    process.stderr.write(
-      `[AutoDOM] Graceful shutdown timed out, forcing exit\n`,
-    );
-    process.exit(code);
-  }, 3000).unref();
-
-  // Release this bridge's AutoDOM tab group before the sockets are torn
-  // down, and give the frame a moment to flush.
-  if (extensionSocket && extensionSocket.readyState === 1) {
-    notifyClientGone(MY_CLIENT_ID);
-    await delay(75);
-  }
-
+// Close every listener and connection this bridge owns. Shared by shutdown()
+// and the in-place restart, which must free the port and the lock file for
+// its successor before that starts.
+async function closeBridgeResources({ closeStdio }) {
   // Destroy every open WebSocket connection first, then close the server.
   // wss.close() only stops accepting NEW connections — existing sockets
   // stay alive and keep the event loop running, creating zombies.
@@ -1473,14 +1484,232 @@ async function shutdown(code = 0) {
     await mcpHttpHandler.close().catch(() => {});
     mcpHttpHandler = null;
   }
-  if (stdioMcpHandle) {
+  if (closeStdio && stdioMcpHandle) {
     await stdioMcpHandle.close().catch(() => {});
     stdioMcpHandle = null;
     mcpTransportConnected = false;
   }
 
   await removeLockFileIfOwned();
+}
+
+async function shutdown(code = 0) {
+  // After an in-place restart this process is only a relay; shutting down
+  // means stopping the process that does the real work.
+  if (supervisedChild) {
+    supervisorShutdown(code);
+    return;
+  }
+  // A restart is mid-flight: finish the handoff, then honour the request.
+  if (restartInProgress) {
+    pendingShutdownCode = code;
+    return;
+  }
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+
+  // Hard exit safety net — if graceful cleanup hangs for any reason
+  // (e.g. a WebSocket connection keeps the event loop alive), force-kill
+  // ourselves so the IDE can restart a fresh process.
+  setTimeout(() => {
+    process.stderr.write(
+      `[AutoDOM] Graceful shutdown timed out, forcing exit\n`,
+    );
+    process.exit(code);
+  }, 3000).unref();
+
+  // Release this bridge's AutoDOM tab group before the sockets are torn
+  // down, and give the frame a moment to flush.
+  if (extensionSocket && extensionSocket.readyState === 1) {
+    notifyClientGone(MY_CLIENT_ID);
+    await delay(75);
+  }
+
+  await closeBridgeResources({ closeStdio: true });
   process.exit(code);
+}
+
+// ─── In-place restart onto a newer version ───────────────────
+// An update replaces server/ on disk, but bridges that are already running
+// keep executing the old code. They are owned by IDEs (spawned over stdio),
+// so they are not killed: a stale bridge starts a fresh process from the new
+// files and stays behind as a relay for the IDE's pipes (self-restart.js).
+// Detached --bridge-only daemons simply respawn themselves.
+const SERVER_PACKAGE_JSON = fileURLToPath(new URL("./package.json", import.meta.url));
+const SELF_RESTART_ENABLED =
+  !hasArg("--no-auto-restart") &&
+  !/^(0|false|off|no)$/i.test(process.env.AUTODOM_AUTO_RESTART || "");
+const envMs = (name, fallback) => {
+  const n = parseInt(process.env[name] || "", 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+};
+const SELF_RESTART_CHECK_MS = envMs("AUTODOM_RESTART_CHECK_MS", 60_000);
+// A new version must be seen for this long before we act, so a git checkout
+// or copy that is still in progress is never mistaken for a finished update.
+const SELF_RESTART_SETTLE_MS = envMs("AUTODOM_RESTART_SETTLE_MS", 10_000);
+const SELF_RESTART_IDLE_MS = envMs("AUTODOM_RESTART_IDLE_MS", 3_000);
+
+let supervisedChild = null;
+let supervisedRelay = null;
+let restartInProgress = false;
+let pendingShutdownCode = null;
+let stdioHandshakeTap = null;
+let _staleSeenAt = 0;
+let _restartRetryAt = 0;
+let _supervisorStopping = false;
+
+function serverFreshness() {
+  const diskVersion = readDiskVersion(SERVER_PACKAGE_JSON);
+  return {
+    version: SERVER_VERSION,
+    diskVersion,
+    stale: SELF_RESTART_ENABLED ? isNewerVersion(diskVersion, SERVER_VERSION) : false,
+    staleOnDisk: isNewerVersion(diskVersion, SERVER_VERSION),
+    restartInProgress,
+    supervising: !!supervisedChild,
+    restartedFrom: process.env.AUTODOM_RESTARTED_FROM || null,
+  };
+}
+
+function bridgeIdleForRestart() {
+  if (pendingCalls.size > 0) return false;
+  if (Date.now() - lastActivityTime < SELF_RESTART_IDLE_MS) return false;
+  // A legacy stdio handshake must be fully seen so it can be replayed.
+  if (!BRIDGE_ONLY && stdioHandshakeTap && !stdioHandshakeTap.settled) return false;
+  return true;
+}
+
+function supervisorShutdown(code) {
+  if (_supervisorStopping) return;
+  _supervisorStopping = true;
+  try {
+    supervisedRelay?.end();
+  } catch (_) {}
+  try {
+    supervisedChild.kill("SIGTERM");
+  } catch (_) {}
+  setTimeout(() => process.exit(code), 4000).unref?.();
+}
+
+async function restartInPlace(reason) {
+  if (!SELF_RESTART_ENABLED || restartInProgress || shutdownStarted || supervisedChild) {
+    return false;
+  }
+  const fresh = serverFreshness();
+  if (!fresh.stale) return false;
+  const preflight = preflightServer(serverPath);
+  if (!preflight.ok) {
+    process.stderr.write(
+      `[AutoDOM] Newer server ${fresh.diskVersion} is on disk but not ready (${preflight.reason}) — staying on ${SERVER_VERSION}\n`,
+    );
+    return false;
+  }
+
+  restartInProgress = true;
+  process.stderr.write(
+    `[AutoDOM] Restarting onto v${fresh.diskVersion} (running v${SERVER_VERSION}; ${reason})\n`,
+  );
+  const args = process.argv.slice(2);
+  const env = {
+    ...process.env,
+    AUTODOM_CLIENT_ID: MY_CLIENT_ID,
+    AUTODOM_RESTARTED_FROM: SERVER_VERSION,
+  };
+  try {
+    if (BRIDGE_ONLY) {
+      delete env.AUTODOM_LAUNCHER_PID;
+      // No client to serve: free the port, start the successor, leave.
+      shutdownStarted = true;
+      await closeBridgeResources({ closeStdio: false });
+      const daemon = spawn(process.execPath, [serverPath, ...args], {
+        detached: true,
+        stdio: "ignore",
+        env,
+      });
+      daemon.unref();
+      process.exit(0);
+    }
+
+    // Stop reading the client's pipe *before* the successor exists: bytes
+    // sent from now on wait in the pipe for the relay. removeAllListeners
+    // (instead of closing the MCP handle) avoids the SDK writing teardown
+    // frames to a client that is not supposed to notice anything.
+    const handshake = stdioHandshakeTap?.handshake || [];
+    stdioHandshakeTap?.stop();
+    process.stdin.removeAllListeners("data");
+    process.stdin.pause();
+
+    shutdownStarted = true; // silences the lock re-assert timer
+    await closeBridgeResources({ closeStdio: false });
+
+    env.AUTODOM_LAUNCHER_PID = String(process.pid);
+    const child = spawn(process.execPath, [serverPath, ...args], {
+      stdio: ["pipe", "pipe", "inherit"],
+      env,
+    });
+    supervisedChild = child;
+    child.on("exit", (exitCode) => process.exit(exitCode ?? 0));
+    child.on("error", (err) => {
+      process.stderr.write(`[AutoDOM] Successor failed to start: ${err.message}\n`);
+      process.exit(1);
+    });
+    supervisedRelay = startRelay({
+      child,
+      stdin: process.stdin,
+      stdout: process.stdout,
+      handshake,
+      onLog: (msg) => process.stderr.write(`[AutoDOM] relay: ${msg}\n`),
+    });
+    process.stdin.resume();
+    restartInProgress = false;
+    if (pendingShutdownCode !== null) supervisorShutdown(pendingShutdownCode);
+    return true;
+  } catch (err) {
+    process.stderr.write(`[AutoDOM] In-place restart failed: ${err?.message || err}\n`);
+    // We may already have torn things down; the honest recovery is to exit
+    // so the IDE starts us again from the new files.
+    process.exit(1);
+  }
+}
+
+// Called on a timer, after an update lands, and on request from the
+// extension. Restarts only when a newer version has been on disk for a
+// moment and nothing is in flight.
+async function maybeRestartForUpdate(reason, { force = false } = {}) {
+  if (!SELF_RESTART_ENABLED || restartInProgress || supervisedChild || shutdownStarted) {
+    return false;
+  }
+  const fresh = serverFreshness();
+  if (!fresh.stale) {
+    _staleSeenAt = 0;
+    return false;
+  }
+  const now = Date.now();
+  if (!_staleSeenAt) _staleSeenAt = now;
+  if (!force && now - _staleSeenAt < SELF_RESTART_SETTLE_MS) return false;
+  if (!force && !bridgeIdleForRestart()) return false;
+  if (force && !bridgeIdleForRestart()) {
+    // Requested restart, but a call is in flight: try again shortly.
+    if (now >= _restartRetryAt) {
+      _restartRetryAt = now + 2000;
+      setTimeout(() => void maybeRestartForUpdate(reason, { force: true }), 2500).unref?.();
+    }
+    return false;
+  }
+  return restartInPlace(reason);
+}
+
+// Tell every joined proxy to run its own stale check, then check ourselves.
+function requestFleetRestartCheck(reason) {
+  for (const peer of proxyPeers.keys()) {
+    try {
+      if (peer.readyState === 1) {
+        peer.send(JSON.stringify({ type: "BRIDGE_CHECK_STALE", reason }));
+      }
+    } catch (_) {}
+  }
+  // Give the proxies a beat to hear it before we drop their link.
+  setTimeout(() => void maybeRestartForUpdate(reason, { force: true }), 800).unref?.();
 }
 
 let proxyClient = null; // If we are a secondary instance, we connect to the primary instance here
@@ -2287,6 +2516,13 @@ async function ensureProxyClientConnected() {
               pendingCalls.delete(message.id);
               pending.resolve(message.result);
             }
+          } else if (message?.type === "BRIDGE_CHECK_STALE") {
+            // The primary just applied an update: run our own stale check
+            // now instead of waiting for the next tick.
+            void maybeRestartForUpdate(
+              `primary: ${String(message.reason || "update")}`,
+              { force: true },
+            );
           }
         } catch (e) {}
       });
@@ -3255,6 +3491,7 @@ function _handleKeepaliveOrPong(socket, message) {
           type: "SERVER_INFO",
           serverPath: fileURLToPath(import.meta.url),
           port: WS_PORT,
+          version: SERVER_VERSION,
         }),
       );
     } catch (_) {}
@@ -3314,34 +3551,63 @@ function _gitInstallRefusalReason(install, installRoot) {
 }
 
 function _handleSelfUpdate(socket, message) {
+  // scope "server": keep extension/ alone (a managed install's extension is
+  // updated by the browser) and bring only server/ up to date.
+  const scope = message?.scope === "server" ? "server" : "all";
+  if (/^(0|false|off|no)$/i.test(process.env.AUTODOM_SERVER_SELF_UPDATE || "")) {
+    try {
+      socket.send(JSON.stringify({
+        type: "SELF_UPDATE_RESULT",
+        id: message.id,
+        scope,
+        ok: false,
+        error: "Server self-update is disabled by AUTODOM_SERVER_SELF_UPDATE=0.",
+      }));
+    } catch (_) {}
+    return;
+  }
   // Kick off the download as a background task so the WebSocket message
   // handler returns immediately. Progress and completion are reported via
   // separate SELF_UPDATE_PROGRESS / SELF_UPDATE_RESULT messages.
-  _runSelfUpdateInBackground(socket, message.id).catch(() => {});
+  _runSelfUpdateInBackground(socket, message.id, { scope }).catch(() => {});
 }
 
-async function _runSelfUpdateInBackground(socket, id) {
+let _selfUpdateRunning = false;
+
+async function _runSelfUpdateInBackground(socket, id, { scope = "all" } = {}) {
   const DOWNLOAD_TIMEOUT_MS = 4 * 60 * 1000; // 4 minutes
+  // Both are test hooks. Artifact URLs are still validated against the
+  // canonical release URL first; the base override only redirects where the
+  // already-validated, checksummed bytes are fetched from.
   const UPDATE_METADATA_URL =
+    process.env.AUTODOM_UPDATE_METADATA_URL ||
     "https://eziocode.github.io/autodom-extension/updates.json";
+  const RELEASE_DOWNLOAD_PREFIX =
+    "https://github.com/eziocode/autodom-extension/releases/download/";
 
   const reply = (payload) => {
-    try { socket.send(JSON.stringify({ type: "SELF_UPDATE_RESULT", id, ...payload })); } catch (_) {}
+    try { socket.send(JSON.stringify({ type: "SELF_UPDATE_RESULT", id, scope, ...payload })); } catch (_) {}
   };
   const sendProgress = (progress, bytes, total, status) => {
     try { socket.send(JSON.stringify({ type: "SELF_UPDATE_PROGRESS", id, progress, bytes, total, status })); } catch (_) {}
   };
+  if (_selfUpdateRunning) {
+    reply({ ok: false, error: "An update is already in progress." });
+    return;
+  }
+  _selfUpdateRunning = true;
 
   let tmpZip = null;
   let stagingDir = null;
   let backupDir = null;
   try {
-    const extDir = resolvePath(serverPath, "..", "..", "extension");
-    const installRoot = resolvePath(extDir, "..");
+    const serverDir = resolvePath(serverPath, "..");
+    const installRoot = resolvePath(serverDir, "..");
+    const extDir = join(installRoot, "extension");
     try {
       await fs.access(join(extDir, "manifest.json"));
     } catch {
-      reply({ ok: false, error: `Extension folder not found at ${extDir}. Start the bridge from the AutoDOM share folder.` });
+      reply({ ok: false, error: `AutoDOM install folder not recognised at ${installRoot} (no extension/ next to server/). Start the bridge from the AutoDOM share folder or clone.` });
       return;
     }
 
@@ -3374,6 +3640,7 @@ async function _runSelfUpdateInBackground(socket, id) {
       url: zipUrl,
       sha256: expectedSha256,
     } = validateUpdateMetadata(metadata, DEFAULT_CHROME_EXTENSION_ID);
+    const bundle = bundleArtifact(metadata);
 
     const currentManifest = JSON.parse(
       await fs.readFile(join(extDir, "manifest.json"), "utf8"),
@@ -3382,14 +3649,24 @@ async function _runSelfUpdateInBackground(socket, id) {
     const currentVersion = /^\d+\.\d+\.\d+(\.\d+)?$/.test(manifestVersion)
       ? manifestVersion
       : "0.0.0";
-    if (compareExtensionVersions(currentVersion, latestVersion) >= 0) {
+    const serverOnDisk = readDiskVersion(SERVER_PACKAGE_JSON) || SERVER_VERSION;
+    const needExtension =
+      scope === "all" && compareExtensionVersions(currentVersion, latestVersion) < 0;
+    const needServer = compareExtensionVersions(serverOnDisk, latestVersion) < 0;
+
+    if (!needExtension && !needServer) {
       sendProgress(100, 0, 0, `Already on v${currentVersion}`);
       reply({
         ok: true,
         method: install.kind === "git" ? "git" : "zip",
         version: currentVersion,
         alreadyCurrent: true,
+        serverUpdated: false,
+        extensionUpdated: false,
       });
+      // Files may already be current while this process is not (an earlier
+      // update replaced them): move every stale bridge onto them.
+      requestFleetRestartCheck("update-check");
       return;
     }
 
@@ -3397,14 +3674,45 @@ async function _runSelfUpdateInBackground(socket, id) {
     // server/ together and leaves the checkout in a coherent state, which an
     // extension-only ZIP overwrite cannot do inside a repository.
     if (install.kind === "git") {
+      const lockBefore = await lockfileHash(serverDir);
       sendProgress(20, 0, 0, `Fetching v${latestVersion} from Git…`);
       const { tag, commit } = await gitUpdateToTag(installRoot, latestVersion);
+      if ((await lockfileHash(serverDir)) !== lockBefore) {
+        sendProgress(70, 0, 0, "Installing server dependencies…");
+        await installServerDependencies(serverDir);
+      }
       sendProgress(100, 0, 0, `Checked out ${tag}`);
-      reply({ ok: true, method: "git", version: latestVersion, tag, commit });
+      reply({
+        ok: true,
+        method: "git",
+        version: latestVersion,
+        tag,
+        commit,
+        serverUpdated: true,
+        extensionUpdated: true,
+      });
+      requestFleetRestartCheck("self-update");
       return;
     }
 
     tmpZip = join(tmpdir(), `autodom-update-${Date.now()}.zip`);
+    // Prefer the full share bundle (server + extension). Releases from before
+    // it existed only have the Chrome zip, which can update the extension.
+    const archive = bundle || { url: zipUrl, sha256: expectedSha256 };
+    if (!bundle && !needExtension) {
+      // Only the server is behind, but this release ships no server bundle.
+      sendProgress(100, 0, 0, "No server bundle published for this release");
+      reply({
+        ok: true,
+        method: "zip",
+        version: currentVersion,
+        alreadyCurrent: true,
+        serverUpdated: false,
+        extensionUpdated: false,
+        note: `Release v${latestVersion} does not include a server bundle.`,
+      });
+      return;
+    }
 
     sendProgress(5, 0, 0, `Starting download of v${latestVersion}…`);
 
@@ -3414,7 +3722,15 @@ async function _runSelfUpdateInBackground(socket, id) {
 
     let zipRes;
     try {
-      zipRes = await fetch(zipUrl, { signal: controller.signal });
+      zipRes = await fetch(
+        process.env.AUTODOM_UPDATE_DOWNLOAD_BASE
+          ? archive.url.replace(
+              RELEASE_DOWNLOAD_PREFIX,
+              process.env.AUTODOM_UPDATE_DOWNLOAD_BASE,
+            )
+          : archive.url,
+        { signal: controller.signal },
+      );
     } catch (err) {
       clearTimeout(downloadTimer);
       throw err;
@@ -3433,7 +3749,7 @@ async function _runSelfUpdateInBackground(socket, id) {
       const download = await downloadVerifiedArchive(
         zipRes,
         tmpZip,
-        expectedSha256,
+        archive.sha256,
         {
           onProgress: ({ downloaded: bytes, contentLength: total }) => {
             downloaded = bytes;
@@ -3455,8 +3771,7 @@ async function _runSelfUpdateInBackground(socket, id) {
                   `Downloading… ${mb} / ${totalMb} MB`,
                 );
               }
-            } else if (downloaded - lastReportedBytes >= 512 * 1024) {
-              // Chunked transfer: report every 512 KiB.
+            } else if (downloaded - lastReportedBytes >= 524288) {
               lastReportedBytes = downloaded;
               const mb = (downloaded / 1048576).toFixed(1);
               const pct = Math.min(
@@ -3475,10 +3790,52 @@ async function _runSelfUpdateInBackground(socket, id) {
     }
 
     sendProgress(88, downloaded, contentLength, "Validating…");
-    stagingDir = await fs.mkdtemp(join(installRoot, ".autodom-extension-update-"));
+    stagingDir = await fs.mkdtemp(join(installRoot, ".autodom-update-"));
     await extractZipArchive(tmpZip, stagingDir);
-    await validateStagedExtension(stagingDir, latestVersion);
 
+    if (bundle) {
+      const staged = await locateStagedBundle(stagingDir, latestVersion);
+      if (needServer) {
+        // Dependencies go in BEFORE anything goes live: if this fails the
+        // running server is untouched.
+        sendProgress(90, downloaded, contentLength, "Preparing server…");
+        await prepareStagedServerDependencies({
+          oldServerDir: serverDir,
+          newServerDir: staged.serverDir,
+        });
+      }
+      sendProgress(94, downloaded, contentLength, "Installing atomically…");
+      const stamp = Date.now();
+      const pairs = [];
+      if (needServer) {
+        pairs.push({
+          currentDir: serverDir,
+          stagingDir: staged.serverDir,
+          backupDir: join(installRoot, `.autodom-server-backup-${stamp}`),
+        });
+      }
+      if (needExtension) {
+        pairs.push({
+          currentDir: extDir,
+          stagingDir: staged.extensionDir,
+          backupDir: join(installRoot, `.autodom-extension-backup-${stamp}`),
+        });
+      }
+      await atomicReplaceDirectories(pairs);
+      sendProgress(100, downloaded, contentLength, "Complete");
+      reply({
+        ok: true,
+        method: "bundle",
+        version: latestVersion,
+        serverUpdated: needServer,
+        extensionUpdated: needExtension,
+      });
+      if (needServer) requestFleetRestartCheck("self-update");
+      return;
+    }
+
+    // Legacy release without a share bundle: the Chrome zip is extension-only.
+    await validateStagedExtension(stagingDir, latestVersion);
     sendProgress(94, downloaded, contentLength, "Installing atomically…");
     backupDir = join(installRoot, `.autodom-extension-backup-${Date.now()}`);
     await atomicReplaceDirectory(extDir, stagingDir, backupDir);
@@ -3486,17 +3843,24 @@ async function _runSelfUpdateInBackground(socket, id) {
     backupDir = null;
 
     sendProgress(100, downloaded, contentLength, "Complete");
-    reply({ ok: true, method: "zip", version: latestVersion });
+    reply({
+      ok: true,
+      method: "zip",
+      version: latestVersion,
+      serverUpdated: false,
+      extensionUpdated: true,
+    });
   } catch (err) {
     reply({ ok: false, error: err?.message || String(err) });
   } finally {
+    _selfUpdateRunning = false;
     if (tmpZip) { try { await fs.unlink(tmpZip); } catch (_) {} }
     if (stagingDir) {
       try { await fs.rm(stagingDir, { recursive: true, force: true }); } catch (_) {}
     }
     if (backupDir) {
       try {
-        const extDir = resolvePath(serverPath, "..", "..", "extension");
+        const extDir = join(resolvePath(serverPath, "..", ".."), "extension");
         await fs.access(extDir).catch(async () => fs.rename(backupDir, extDir));
       } catch (_) {}
     }
@@ -3536,7 +3900,28 @@ function _handleBridgeStatus(socket, message) {
   } catch (_) {}
 }
 
+// ── RESTART_STALE ────────────────────────────────────────────
+// The extension's "Fix" (and the post-update flow) asks the primary to move
+// every stale bridge onto the version on disk. Proxies are told over their
+// link; each one decides for itself whether it is actually stale.
+function _handleRestartStale(socket, message) {
+  const fresh = serverFreshness();
+  try {
+    socket.send(
+      JSON.stringify({
+        type: "RESTART_STALE_RESULT",
+        id: message.id,
+        ...fresh,
+        proxiesNotified: proxyPeers.size,
+        restarting: fresh.stale,
+      }),
+    );
+  } catch (_) {}
+  requestFleetRestartCheck("extension-request");
+}
+
 const _WS_MESSAGE_HANDLERS = Object.freeze({
+  RESTART_STALE: _handleRestartStale,
   PROXY_HELLO: _handleProxyHello,
   BRIDGE_STATUS: _handleBridgeStatus,
   SELF_UPDATE: _handleSelfUpdate,
@@ -9156,6 +9541,9 @@ if (STOP_ONLY) {
     // Code only worked because it usually started first and hit the
     // port-free fast path.
     if (!BRIDGE_ONLY) {
+      // Remember the client's MCP handshake so an in-place restart can
+      // replay it to the successor process.
+      stdioHandshakeTap = createHandshakeTap(process.stdin);
       stdioMcpHandle = serveStdio(() => {
         mcpTransportConnected = true;
         return createAutoDomMcpServer();
@@ -9183,6 +9571,17 @@ if (STOP_ONLY) {
         void shutdown(0);
       }
     });
+
+    // ─── Keep up with updates on disk ─────────────────────────
+    // A newer server/ than the code we are running means an update landed
+    // while this bridge was alive; move onto it without anyone running
+    // setup.sh or restarting the IDE.
+    if (SELF_RESTART_ENABLED) {
+      setInterval(
+        () => void maybeRestartForUpdate("new version on disk"),
+        SELF_RESTART_CHECK_MS,
+      ).unref();
+    }
 
     // ─── Optional stateless Streamable HTTP transport ─────────
     // --sse-port remains an input alias for compatibility, but old /sse and

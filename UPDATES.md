@@ -185,7 +185,8 @@ maintainer pushes git tag vX.Y.Z
    • re-validate the embedded Chrome `key` (already in source manifest)
    • build chrome zip
    • crx-pack signed CRX with CHROME_CRX_PRIVATE_KEY
-   • upload + verify signed CRX and unpacked ZIP
+   • pack the share bundle (server + extension)
+   • upload + verify signed CRX, unpacked ZIP and share bundle
    • node scripts/build-update-manifests.mjs
             │
             ├──► gh-pages branch (updates.xml + updates.json)
@@ -198,6 +199,7 @@ maintainer pushes git tag vX.Y.Z
             └──► GitHub Release vX.Y.Z
                   • autodom-X.Y.Z.crx ◀───────┘
                   • autodom-chrome-X.Y.Z.zip
+                  • autodom-X.Y.Z-share.zip   (server + extension)
 ```
 
 Stable URL (never changes across releases):
@@ -209,9 +211,37 @@ Stable URL (never changes across releases):
 streams the ZIP into a bounded temporary file, verifies its digest, validates
 the staged manifest, and swaps directories atomically with rollback.
 
-Managed installs take the CRX branch; unpacked installs take the bridge branch,
-which reads the same `updates.json` and then either replaces `extension/` from
-the verified ZIP or checks the clone out at the release tag.
+Managed installs take the CRX branch for the extension; unpacked installs take
+the bridge branch, which reads the same `updates.json` and then either replaces
+`extension/` and `server/` from the verified share bundle or checks the clone
+out at the release tag.
+
+### The server updates itself too
+
+The bridge server is a separate program from the extension, so the browser's
+own update never touched it. Nothing needs `setup.sh` after an update any more:
+
+1. **Server catches up to the extension.** When the extension connects to a bridge
+   that is older than itself, the bridge downloads the share bundle named in
+   `updates.json`, verifies its SHA-256, installs dependencies into the staged
+   copy (reusing `node_modules` when `package-lock.json` is unchanged), and swaps
+   `server/` atomically. If any step fails the running server is left untouched.
+   Managed installs do this without asking; unpacked installs follow the
+   *Auto-apply updates* switch. A clone is moved to the release tag with Git.
+2. **Running bridges restart onto the new files.** A bridge that sees a newer
+   `server/` on disk waits until it is idle, then starts a fresh process and stays
+   behind as a relay for the IDE's pipes, so the IDE keeps the same connection.
+   The MCP handshake is replayed to the new process. `--bridge-only` daemons
+   respawn themselves. Other IDEs' bridges are told over their link and do the
+   same.
+
+**Bridge check → Fix** does both on demand. Bridges older than this feature
+cannot do either, so the move to the first release that has it needs one manual
+step: get the new files (`git pull`, or unzip the new share bundle over the old
+folder and run `./setup.sh`) and restart the MCP server in your IDE. From then
+on they take care of themselves.
+
+Opt out with `AUTODOM_AUTO_RESTART=0` and/or `AUTODOM_SERVER_SELF_UPDATE=0`.
 
 For maintainer-side setup (signing keys, gh-pages bootstrap), see
 [`docs/RELEASE-SIGNING.md`](docs/RELEASE-SIGNING.md).

@@ -57,3 +57,30 @@ test("build-update-manifests rejects unsafe metadata", async (t) => {
     (error) => /CRX URL must use HTTPS/.test(error.stderr) && /SHA-256/.test(error.stderr),
   );
 });
+
+test("build-update-manifests publishes the optional share bundle and rejects half of it", async (t) => {
+  const out = await mkdtemp(join(tmpdir(), "autodom-manifest-share-"));
+  t.after(() => rm(out, { recursive: true, force: true }));
+  const shareUrl = `https://github.com/eziocode/autodom-extension/releases/download/v${version}/autodom-${version}-share.zip`;
+  const base = [
+    script,
+    "--version", version,
+    "--extension-id", id,
+    "--crx-url", crxUrl,
+    "--crx-sha256", "a".repeat(64),
+    "--zip-url", zipUrl,
+    "--zip-sha256", "b".repeat(64),
+    "--out-dir", out,
+  ];
+  await execFileAsync(process.execPath, [...base, "--share-url", shareUrl, "--share-sha256", "C".repeat(64)]);
+  const json = JSON.parse(await readFile(join(out, "updates.json"), "utf8"));
+  assert.deepEqual(json.artifacts.share, { url: shareUrl, sha256: "c".repeat(64) });
+
+  await assert.rejects(execFileAsync(process.execPath, [...base, "--share-url", shareUrl]));
+  await assert.rejects(execFileAsync(process.execPath, [...base, "--share-url", "http://x/y.zip", "--share-sha256", "c".repeat(64)]));
+
+  // Without a bundle the metadata has no `share` key at all.
+  await execFileAsync(process.execPath, base);
+  const plain = JSON.parse(await readFile(join(out, "updates.json"), "utf8"));
+  assert.equal("share" in plain.artifacts, false);
+});

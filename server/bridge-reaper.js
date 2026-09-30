@@ -10,7 +10,8 @@
  * Policy ("orphans + zombies"):
  *   keep  — the primary that owns a port (lock owner / reported primary),
  *           proxies that primary lists as connected, --bridge-only daemons
- *           that own their port, and instances still starting up.
+ *           that own their port, relays (a bridge whose child is a bridge,
+ *           left behind by an in-place restart) and instances still starting up.
  *   kill  — bridges whose launching parent is gone (PPID 1 or dead parent).
  *   nudge — everything else: a live-parent instance that is neither the
  *           primary nor a joined proxy (e.g. DEGRADED after its recovery
@@ -76,6 +77,16 @@ export function decideReap({
     if (lock && lock.pid && !lock.alive) staleLocks.push(Number(portKey));
   }
 
+  // After an in-place restart the IDE's original process lives on as a relay
+  // for a fresh bridge process (self-restart.js). It holds no port and joins
+  // nothing, so it looks like a zombie — but it is the process the IDE
+  // tracks, and killing it would take the live bridge down with it. A bridge
+  // that is the parent of another bridge is such a relay.
+  const relayFor = new Map();
+  for (const b of bridges) {
+    if (b.ppid && bridges.some((o) => o.pid === b.ppid)) relayFor.set(b.ppid, b.pid);
+  }
+
   for (const b of bridges) {
     const port = b.port ?? portFromCommand(b.command);
     const primary = primaries[port];
@@ -85,6 +96,10 @@ export function decideReap({
 
     if (primary && primary.pid === b.pid) {
       keep.push({ ...entry, reason: "primary" });
+      continue;
+    }
+    if (relayFor.has(b.pid)) {
+      keep.push({ ...entry, reason: `relay for pid ${relayFor.get(b.pid)}` });
       continue;
     }
     if (!primary && lock && lock.alive && lock.pid === b.pid) {

@@ -188,6 +188,7 @@ const UPDATE_STORAGE_KEYS = {
   lastCheckSource: "autodomLastUpdateCheckSource",
   autoUpdateEnabled: "autodomAutoUpdateEnabled",
   autoUpdateApplyAttemptAt: "autodomAutoUpdateApplyAttemptAt",
+  serverSyncAttemptAt: "autodomServerSyncAttemptAt",
   periodicChecksEnabled: "autodomPeriodicUpdateChecksEnabled",
 };
 let _updateCheckInFlight = null;
@@ -3454,40 +3455,41 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 // port surfaces a precise actionable status. Throttled so failed
 // reconnect storms don't open many parallel probe sockets.
 const PORT_PROBE_RANGE = [9876, 9877, 9878, 9879, 9880];
-const PORT_PROBE_THROTTLE_MS = 30000;
+// A refused WebSocket handshake is logged by Chrome as an extension error
+// (chrome://extensions → Errors) no matter how it is caught, so the
+// background probe stays quiet unless the configured port has stayed down.
+const PORT_PROBE_THROTTLE_MS = 5 * 60 * 1000;
+const PORT_PROBE_MIN_FAILURES = 3;
 const PORT_PROBE_TIMEOUT_MS = 1500;
+let _connectFailureStreak = 0; // consecutive failed connects; reset on open
 let _lastPortProbeAt = 0;
 let _portProbeInFlight = false;
 
-// Does an AutoDOM bridge accept our WebSocket on this port?
-function _probeWsPort(port, timeoutMs = PORT_PROBE_TIMEOUT_MS) {
-  return new Promise((resolve) => {
-    let settled = false;
-    let probe;
-    const done = (ok) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        probe && probe.close();
-      } catch (_) {}
-      resolve(ok);
-    };
-    const timer = setTimeout(() => done(false), timeoutMs);
-    try {
-      probe = new WebSocket(`ws://127.0.0.1:${port}`);
-    } catch (_) {
-      done(false);
-      return;
-    }
-    probe.onopen = () => done(true);
-    probe.onerror = () => done(false);
-    probe.onclose = () => done(false);
-  });
+// Is a WebSocket server listening on this port? A plain HTTP request is
+// enough: the bridge's `ws` server answers a non-upgrade request with
+// "426 Upgrade Required", while a dead port refuses the connection. Unlike
+// `new WebSocket(...)`, a refused fetch does not land in the extension's
+// Errors list with a stack trace pointing at the probe.
+async function _probeWsPort(port, timeoutMs = PORT_PROBE_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    await fetch(`http://127.0.0.1:${port}/`, {
+      mode: "no-cors",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function probeBridgePortMismatch(configuredPort) {
   if (_portProbeInFlight) return;
+  if (_connectFailureStreak < PORT_PROBE_MIN_FAILURES) return;
   const now = Date.now();
   if (now - _lastPortProbeAt < PORT_PROBE_THROTTLE_MS) return;
   _portProbeInFlight = true;
@@ -3544,12 +3546,18 @@ async function _onWsConn_SELF_UPDATE_RESULT(message) {
           // replaced from the verified archive) — surfaced in diagnostics.
           method: message.method || "unknown",
           alreadyCurrent: message.alreadyCurrent === true,
+          serverUpdated: message.serverUpdated === true,
+          extensionUpdated: message.extensionUpdated !== false,
         },
       },
       "self-update complete",
     );
-    // Reload regardless of whether the popup is still open.
-    setTimeout(() => { try { chrome.runtime.reload(); } catch (_) {} }, 600);
+    // Reload regardless of whether the popup is still open — but only when
+    // extension files actually changed. A server-only update (managed
+    // install) or an "already current" answer must not reload the extension.
+    if (message.extensionUpdated !== false && message.alreadyCurrent !== true) {
+      setTimeout(() => { try { chrome.runtime.reload(); } catch (_) {} }, 600);
+    }
   } else {
     await _writeUpdateStorage(
       { [UPDATE_STORAGE_KEYS.selfUpdate]: { state: "failed", error: message.error || "Unknown error" } },
@@ -4032,6 +4040,39 @@ async function _onWsConn_SERVER_INFO(message) {
       serverPath: message.serverPath,
     });
     _debugLog("[AutoDOM] Server path:", message.serverPath);
+    if (message.version) {
+      void _maybeSyncServerToExtension(String(message.version)).catch(() => {});
+    }
+}
+
+// RESTART_STALE_RESULT: the bridge's answer to "move every stale bridge
+// onto the version on disk".
+const _restartStaleWaiters = new Set();
+async function _onWsConn_RESTART_STALE_RESULT(message) {
+  for (const waiter of _restartStaleWaiters) waiter(message);
+  _restartStaleWaiters.clear();
+}
+
+function _requestRestartStale(timeoutMs = 3000) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const waiter = (msg) => {
+      clearTimeout(timer);
+      resolve(msg);
+    };
+    const timer = setTimeout(() => {
+      _restartStaleWaiters.delete(waiter);
+      resolve(null);
+    }, timeoutMs);
+    _restartStaleWaiters.add(waiter);
+    try {
+      ws.send(JSON.stringify({ type: "RESTART_STALE", id: `ext-${Date.now()}` }));
+    } catch (_) {
+      _restartStaleWaiters.delete(waiter);
+      clearTimeout(timer);
+      resolve(null);
+    }
+  });
 }
 
 async function _onWsConn_BRIDGE_STATUS_RESPONSE(message) {
@@ -4061,6 +4102,7 @@ const _WS_CONN_MESSAGE_HANDLERS = Object.freeze({
   CLIENT_GONE: _onWsConn_CLIENT_GONE,
   SERVER_INFO: _onWsConn_SERVER_INFO,
   BRIDGE_STATUS_RESPONSE: _onWsConn_BRIDGE_STATUS_RESPONSE,
+  RESTART_STALE_RESULT: _onWsConn_RESTART_STALE_RESULT,
   PING: _onWsConn_PING,
 });
 
@@ -4107,6 +4149,7 @@ function connectWebSocket(port) {
 
     ws.onopen = () => {
       isConnected = true;
+      _connectFailureStreak = 0;
       _cancelIsolationDisconnectRelease();
       _startupRestoreOnly = false;
       autoConnectFallbackTried = false;
@@ -4291,7 +4334,10 @@ function connectWebSocket(port) {
       // Port-mismatch guardrail: when the configured port is unreachable,
       // probe nearby ports for a live bridge so the user gets a precise
       // status ("extension is set to X, bridge is on Y") instead of a
-      // generic "connection refused" loop. Throttled internally.
+      // generic "connection refused" loop. Throttled internally, and only
+      // after several consecutive failures so a bridge restart is not
+      // mistaken for a wrong port.
+      _connectFailureStreak += 1;
       probeBridgePortMismatch(getCurrentPort());
     };
   } catch (err) {
@@ -9376,7 +9422,7 @@ async function _maybeAutoApplyPendingUpdate(pending, source) {
 // For those installs the MCP bridge does the update on disk instead. Both the
 // popup button and the automatic path below funnel through here so the
 // "downloading" marker is always written before the frame is sent.
-async function _startBridgeSelfUpdate(source) {
+async function _startBridgeSelfUpdate(source, { scope = "all" } = {}) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     return { ok: false, error: "Bridge not connected. Click Connect first." };
   }
@@ -9390,12 +9436,13 @@ async function _startBridgeSelfUpdate(source) {
         progress: 0,
         startedAt: Date.now(),
         source: source || "unknown",
+        scope,
       },
     },
     "self-update init",
   );
   try {
-    ws.send(JSON.stringify({ type: "SELF_UPDATE", id }));
+    ws.send(JSON.stringify({ type: "SELF_UPDATE", id, scope }));
   } catch (err) {
     await _writeUpdateStorage(
       { [UPDATE_STORAGE_KEYS.selfUpdate]: { state: "failed", error: err.message } },
@@ -9460,6 +9507,62 @@ async function _maybeAutoSelfUpdateViaBridge(details, source) {
     },
     `bridge_auto_update:${source || "unknown"}`,
   ).catch(() => {});
+  return started.ok;
+}
+
+// The bridge server is a separate program from the extension and is not
+// touched by the browser's own extension updates. When the extension is
+// ahead of the server it is talking to (Chrome just updated it, or a clone
+// was moved to a new tag), have the bridge bring itself up to date — no
+// setup.sh. The bridge then restarts onto the new files by itself.
+//
+// Managed installs update their extension without asking, so the server
+// follows without asking too. An unpacked ("development") install keeps the
+// user's Auto-apply updates switch in charge.
+const SERVER_SYNC_COOLDOWN_MS = 10 * 60 * 1000;
+async function _maybeSyncServerToExtension(serverVersion, { force = false } = {}) {
+  const extVersion = chrome.runtime.getManifest()?.version || "";
+  if (!serverVersion || !extVersion) return false;
+  if (_compareExtensionVersions(serverVersion, extVersion) >= 0) return false;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  if (!force && _activeAgentRun) {
+    _debugLog(`[AutoDOM SW] Deferring server update ${serverVersion} → ${extVersion}; agent run is active`);
+    return false;
+  }
+  if (!force) {
+    // The new files may already be on disk with only the running process
+    // behind (git pull, an earlier update). It restarts itself; nothing to
+    // download.
+    const info = await _requestBridgeStatus();
+    if (info?.staleOnDisk) return false;
+  }
+  const stored = await _readUpdateStorage(
+    [
+      UPDATE_STORAGE_KEYS.autoUpdateEnabled,
+      UPDATE_STORAGE_KEYS.serverSyncAttemptAt,
+      UPDATE_STORAGE_KEYS.selfUpdate,
+    ],
+    "server sync settings",
+  );
+  if (stored[UPDATE_STORAGE_KEYS.selfUpdate]?.state === "downloading") return false;
+  const installType = await _getUpdateInstallType();
+  const isDevelopment = installType === "development";
+  if (!force && isDevelopment && stored[UPDATE_STORAGE_KEYS.autoUpdateEnabled] !== true) {
+    return false;
+  }
+  const now = Date.now();
+  const last = Number(stored[UPDATE_STORAGE_KEYS.serverSyncAttemptAt]) || 0;
+  if (!force && now - last < SERVER_SYNC_COOLDOWN_MS) return false;
+  await _writeUpdateStorage(
+    { [UPDATE_STORAGE_KEYS.serverSyncAttemptAt]: now },
+    "server sync marker",
+  );
+  _debugLog(
+    `[AutoDOM SW] Server ${serverVersion} is behind extension ${extVersion} — updating the bridge (${installType})`,
+  );
+  const started = await _startBridgeSelfUpdate("auto:server-behind", {
+    scope: isDevelopment ? "all" : "server",
+  });
   return started.ok;
 }
 
@@ -10025,8 +10128,24 @@ async function _runBridgeCheck() {
         info.role === "primary" ? "ok" : "warn",
         `PID ${info.pid}, role ${info.role}, ${info.proxies?.length || 0} proxy client(s)`,
       );
-      if (info.version && extVersion && info.version !== extVersion) {
-        row("version", "Versions", "warn", `Extension ${extVersion} ≠ server ${info.version}. Update the server (setup.sh) or the extension.`);
+      if (info.staleOnDisk) {
+        row(
+          "version",
+          "Versions",
+          "warn",
+          `Server files are v${info.diskVersion}, but this bridge process still runs v${info.version}. It restarts itself when idle — click Fix to do it now.`,
+          true,
+        );
+      } else if (info.version && extVersion && _compareExtensionVersions(info.version, extVersion) < 0) {
+        row(
+          "version",
+          "Versions",
+          "warn",
+          `Server v${info.version} is older than extension v${extVersion}. AutoDOM updates the server by itself — click Fix to do it now.`,
+          true,
+        );
+      } else if (info.version && extVersion && info.version !== extVersion) {
+        row("version", "Versions", "ok", `Extension v${extVersion}, server v${info.version} (server is newer)`);
       } else {
         row("version", "Versions", "ok", `Extension and server ${extVersion}`);
       }
@@ -10069,6 +10188,42 @@ async function _runBridgeFix() {
   const steps = [];
   const step = (label, ok, detail = "") => steps.push({ label, ok, detail });
   let port = _requestedPort || getCurrentPort();
+
+  // Bring every bridge onto the newest server files, with no setup.sh:
+  // fetch a missing server update, then have stale processes restart onto it.
+  if (isConnected) {
+    const info = (await _requestBridgeStatus()) || bridgeInfo;
+    if (info?.version && info.autoRestart === undefined && _compareExtensionVersions(info.version, chrome.runtime.getManifest().version) < 0) {
+      // Bridges from before in-place updates cannot replace themselves.
+      step(
+        "Update server",
+        false,
+        `Bridge v${info.version} predates self-updating. Update it once (git pull, bash update.sh, or ./setup.sh); from then on it updates itself.`,
+      );
+    } else if (info?.version && (await _maybeSyncServerToExtension(String(info.version), { force: true }))) {
+      // The bridge downloads and replaces server/ itself, then restarts.
+      const t0 = Date.now();
+      while (Date.now() - t0 < 60000) {
+        await new Promise((r) => setTimeout(r, 500));
+        const st = (await _readUpdateStorage([UPDATE_STORAGE_KEYS.selfUpdate], "fix wait"))[UPDATE_STORAGE_KEYS.selfUpdate];
+        if (st && st.state !== "downloading") break;
+      }
+      step("Update server", true, "Downloaded and installed the matching server");
+    }
+    const res = await _requestRestartStale();
+    if (res) {
+      step(
+        "Restart stale bridges",
+        true,
+        res.stale
+          ? `Moving ${res.version} → ${res.diskVersion}${res.proxiesNotified ? ` (and ${res.proxiesNotified} other IDE bridge(s))` : ""}`
+          : res.proxiesNotified
+            ? `This bridge is current; asked ${res.proxiesNotified} other IDE bridge(s) to check`
+            : "Already running the newest server",
+      );
+      if (res.stale || res.proxiesNotified) await new Promise((r) => setTimeout(r, 3500));
+    }
+  }
 
   const helperPing = (await _hasNativeMessagingPermission())
     ? await _nativeHostRequest("version")

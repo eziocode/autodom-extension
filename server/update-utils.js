@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve as resolvePath } from "node:path";
 import { inflateRawSync } from "node:zlib";
 
@@ -34,6 +34,160 @@ export function validateUpdateMetadata(metadata, expectedExtensionId) {
     throw new Error("Published update metadata failed validation");
   }
   return { version, url, sha256 };
+}
+
+// ── Share-bundle (server + extension) updates ─────────────────
+// The release publishes autodom-<version>-share.zip next to the Chrome zip:
+// the full install (server/ and extension/). Older releases have no such
+// artifact, so its metadata is optional and validated separately from the
+// Chrome zip that validateUpdateMetadata() guards.
+export function bundleArtifact(metadata) {
+  const share = metadata?.artifacts?.share;
+  if (share === undefined || share === null) return null;
+  const version = String(metadata?.version || "");
+  const url = String(share?.url || "");
+  const sha256 = String(share?.sha256 || "").toLowerCase();
+  const expectedUrl =
+    `https://github.com/eziocode/autodom-extension/releases/download/v${version}/` +
+    `autodom-${version}-share.zip`;
+  if (url !== expectedUrl || !/^[a-f0-9]{64}$/.test(sha256)) {
+    throw new Error("Published share-bundle metadata failed validation");
+  }
+  return { url, sha256 };
+}
+
+/**
+ * The bundle zip holds one top-level folder, autodom-<version>-share/.
+ * Find it (never trust a path from the archive beyond that) and make sure
+ * both halves are for the version we asked for and complete enough to run.
+ */
+export async function locateStagedBundle(
+  stagingDir,
+  expectedVersion,
+  fsApi = { access, readFile },
+) {
+  const root = join(stagingDir, `autodom-${expectedVersion}-share`);
+  const readVersion = async (file) =>
+    String(JSON.parse(await fsApi.readFile(file, "utf8")).version || "");
+  const serverVersion = await readVersion(join(root, "server", "package.json"));
+  if (serverVersion !== expectedVersion) {
+    throw new Error(
+      `Update bundle server version ${serverVersion || "(missing)"} does not match ${expectedVersion}`,
+    );
+  }
+  for (const required of ["server/index.js", "server/self-restart.js", "server/update-utils.js"]) {
+    await fsApi.access(join(root, required));
+  }
+  await validateStagedExtension(join(root, "extension"), expectedVersion, fsApi);
+  return { root, serverDir: join(root, "server"), extensionDir: join(root, "extension") };
+}
+
+async function sha256OfFile(file) {
+  try {
+    return createHash("sha256").update(await readFile(file)).digest("hex");
+  } catch (_) {
+    return null;
+  }
+}
+
+/** Do both server dirs pin exactly the same dependency tree? */
+export async function dependenciesUnchanged(oldServerDir, newServerDir) {
+  const [oldLock, newLock] = await Promise.all([
+    sha256OfFile(join(oldServerDir, "package-lock.json")),
+    sha256OfFile(join(newServerDir, "package-lock.json")),
+  ]);
+  return !!oldLock && oldLock === newLock;
+}
+
+export function defaultRunCommand(command, args, { cwd, timeout = 180_000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const win = process.platform === "win32";
+    execFile(
+      win && command === "npm" ? "npm.cmd" : command,
+      args,
+      { cwd, timeout, shell: win, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        if (error) {
+          error.message = `${command} ${args.join(" ")}: ${String(stderr || error.message).trim().split("\n").slice(-3).join(" | ")}`;
+          reject(error);
+        } else {
+          resolve({ stdout, stderr });
+        }
+      },
+    );
+  });
+}
+
+/** Install runtime dependencies from the lockfile (falls back to `install`). */
+export async function installServerDependencies(serverDir, run = defaultRunCommand) {
+  const flags = ["--omit=dev", "--no-audit", "--no-fund", "--silent"];
+  try {
+    await run("npm", ["ci", ...flags], { cwd: serverDir });
+    return { method: "npm ci" };
+  } catch (_) {
+    await run("npm", ["install", ...flags], { cwd: serverDir });
+    return { method: "npm install" };
+  }
+}
+
+/** Hash of server/package-lock.json, to tell whether dependencies changed. */
+export function lockfileHash(serverDir) {
+  return sha256OfFile(join(serverDir, "package-lock.json"));
+}
+
+/**
+ * Give a staged server/ its node_modules before it goes live. Reuse the
+ * current install's when the lockfile is identical (no network, instant);
+ * otherwise install from the new lockfile. A failure here aborts the update
+ * while the old server is still untouched.
+ */
+export async function prepareStagedServerDependencies(
+  { oldServerDir, newServerDir },
+  { run = defaultRunCommand, copy = cp, exists = access } = {},
+) {
+  const oldModules = join(oldServerDir, "node_modules");
+  let haveOld = true;
+  try {
+    await exists(oldModules);
+  } catch (_) {
+    haveOld = false;
+  }
+  if (haveOld && (await dependenciesUnchanged(oldServerDir, newServerDir))) {
+    await copy(oldModules, join(newServerDir, "node_modules"), {
+      recursive: true,
+      verbatimSymlinks: true,
+    });
+    return { method: "reused" };
+  }
+  return installServerDependencies(newServerDir, run);
+}
+
+/**
+ * Swap several directories as one unit: either every `staging` replaces its
+ * `current`, or — if any step fails — everything already swapped is put back.
+ */
+export async function atomicReplaceDirectories(
+  pairs,
+  fsApi = { rename, rm },
+) {
+  const done = [];
+  try {
+    for (const pair of pairs) {
+      await fsApi.rename(pair.currentDir, pair.backupDir);
+      done.push(pair);
+      await fsApi.rename(pair.stagingDir, pair.currentDir);
+    }
+  } catch (error) {
+    for (const pair of done.reverse()) {
+      // If the staging dir already went live, move it aside first.
+      await fsApi.rm(pair.currentDir, { recursive: true, force: true }).catch(() => {});
+      await fsApi.rename(pair.backupDir, pair.currentDir).catch(() => {});
+    }
+    throw error;
+  }
+  for (const pair of pairs) {
+    await fsApi.rm(pair.backupDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 export async function isGitWorktree(installRoot, fsApi = { access }) {

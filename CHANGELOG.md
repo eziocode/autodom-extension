@@ -4,6 +4,56 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 5.4.0
+
+### Added
+- **The server now updates and restarts itself — no more `setup.sh` after an
+  update.** Two gaps used to leave the bridge on old code after the extension
+  had updated: running bridges were never restarted onto new files, and a
+  share-bundle install only ever replaced `extension/`, never `server/`.
+  - **Restart in place.** A bridge that finds a newer `server/` on disk (an
+    update landed, `git pull`, a self-update) waits until it is idle, starts a
+    fresh process from the new files, and stays behind as a relay for the
+    IDE's pipes. The IDE keeps the same PID and the same open connection, the
+    MCP handshake is replayed to the new process, and the client id (so the
+    AutoDOM tab group and pins) carries over. Detached `--bridge-only`
+    daemons respawn themselves. A new version is used only after it has been
+    on disk a moment and passes a syntax and dependency check, so a
+    half-written update never takes a working bridge down.
+  - **Server self-update.** Releases now publish `autodom-<version>-share.zip`
+    (server + extension) with a SHA-256 in `updates.json`. When the extension
+    is ahead of the server it is talking to (Chrome updated it, or a clone
+    moved to a new tag), the bridge downloads the bundle, verifies it,
+    installs dependencies *before* anything goes live (reusing `node_modules`
+    when the lockfile is unchanged), swaps `server/` atomically with rollback,
+    and restarts. Managed installs update the server without asking, as they
+    already do for the extension; unpacked installs follow the "Auto-apply
+    updates" switch. The extension is reloaded only when its own files
+    changed.
+  - **Bridge check / Fix.** Bridge check now says exactly what is wrong ("server
+    files are v5.4.0 but this process still runs v5.3.0") instead of "run
+    setup.sh", and Fix brings the server up to date and restarts stale
+    bridges, including other IDEs'.
+  - Opt-outs: `AUTODOM_AUTO_RESTART=0`, `AUTODOM_SERVER_SELF_UPDATE=0`.
+- Bridge status reports `diskVersion` and `staleOnDisk`.
+
+### Fixed
+- The extension's port probe logged `WebSocket connection to
+  'ws://127.0.0.1:9878/' failed: ERR_CONNECTION_REFUSED` into the Errors page
+  every 30 s while the bridge was down. It now uses a plain HTTP request (a
+  refused one is not recorded as an extension error), waits for three failed
+  connects, and runs at most every 5 minutes.
+- The bridge reaper no longer treats the relay left by an in-place restart as
+  a zombie.
+
+### Note for existing installs
+Bridges older than this release cannot restart or update themselves, so the
+move to this version needs one manual step: get the new files (`git pull`, or
+unzip the new share bundle over the old folder and run `./setup.sh`) and
+restart the MCP server in your IDE. From then on updates apply on their own.
+
+---
+
 ## 5.3.0
 
 ### Added

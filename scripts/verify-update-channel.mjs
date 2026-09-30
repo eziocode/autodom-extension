@@ -48,7 +48,10 @@ if (!xml.includes(`version='${metadata.version}'`) && !xml.includes(`version="${
   fail("updates.xml version does not match updates.json");
 }
 
-for (const kind of ["crx", "zip"]) {
+// The share bundle is optional in the schema, but once a release publishes
+// one it must download and match its checksum like the others.
+const kinds = ["crx", "zip", ...(metadata?.artifacts?.share ? ["share"] : [])];
+for (const kind of kinds) {
   const artifact = metadata?.artifacts?.[kind];
   if (!artifact || !/^https:\/\//.test(artifact.url || "")) fail(`invalid ${kind} URL`);
   if (!/^[a-f0-9]{64}$/.test(artifact.sha256 || "")) fail(`invalid ${kind} SHA-256`);

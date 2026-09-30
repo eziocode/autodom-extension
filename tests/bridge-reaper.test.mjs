@@ -143,3 +143,30 @@ test("the port listener is kept even when its lock file is missing", () => {
   const second = decideReap({ ...snap, nudged: [1, 2] });
   assert.equal(second.kill.length, 0);
 });
+
+test("a relay left behind by an in-place restart is kept, not reaped as a zombie", () => {
+  // pid 10 is the process the IDE spawned; after a restart it only relays for
+  // pid 11, which is the real (joined) proxy. Killing 10 would kill 11 too.
+  const v = decideReap({
+    bridges: [
+      bridge(1),
+      bridge(10, { ppid: 700 }),
+      bridge(11, { ppid: 10 }),
+    ],
+    locks: { 9876: { pid: 1, alive: true } },
+    primaries: { 9876: { pid: 1, proxies: [11] } },
+  });
+  assert.deepEqual(pids(v.keep), [1, 10, 11]);
+  assert.equal(v.kill.length, 0);
+  assert.equal(v.nudge.length, 0);
+  assert.match(v.keep.find((e) => e.pid === 10).reason, /relay for pid 11/);
+});
+
+test("a lone unjoined bridge is still nudged (relay rule needs a child bridge)", () => {
+  const v = decideReap({
+    bridges: [bridge(1), bridge(2)],
+    locks: { 9876: { pid: 1, alive: true } },
+    primaries: { 9876: { pid: 1, proxies: [] } },
+  });
+  assert.equal(v.nudge.length + v.kill.length, 1);
+});

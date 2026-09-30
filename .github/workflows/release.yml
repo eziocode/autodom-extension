@@ -171,6 +171,11 @@ jobs:
           shred -u /tmp/autodom.pem
           ls -lh "dist/autodom-${V}.crx"
 
+      # The share bundle (server/ + extension/) is what lets an installed
+      # bridge update its own server without anyone re-running setup.sh.
+      - name: Pack share bundle
+        run: bash scripts/pack-release.sh
+
       - name: Compute release checksums
         id: sums
         env:
@@ -178,8 +183,10 @@ jobs:
         run: |
           CRX_SHA256="$(sha256sum "dist/autodom-${V}.crx" | awk '{print $1}')"
           ZIP_SHA256="$(sha256sum "dist/autodom-chrome-${V}.zip" | awk '{print $1}')"
+          SHARE_SHA256="$(sha256sum "dist/autodom-${V}-share.zip" | awk '{print $1}')"
           echo "crx_sha256=$CRX_SHA256" >> "$GITHUB_OUTPUT"
           echo "zip_sha256=$ZIP_SHA256" >> "$GITHUB_OUTPUT"
+          echo "share_sha256=$SHARE_SHA256" >> "$GITHUB_OUTPUT"
 
       # Another packaging workflow or a maintainer may create the release at
       # the same time. Treat that race as success, then upload with --clobber.
@@ -195,13 +202,14 @@ jobs:
           gh release upload "v${V}" \
             "dist/autodom-${V}.crx" \
             "dist/autodom-chrome-${V}.zip" \
+            "dist/autodom-${V}-share.zip" \
             --clobber
 
       - name: Verify uploaded release assets
         env:
           V: ${{ steps.ver.outputs.version }}
         run: |
-          for asset in "autodom-${V}.crx" "autodom-chrome-${V}.zip"; do
+          for asset in "autodom-${V}.crx" "autodom-chrome-${V}.zip" "autodom-${V}-share.zip"; do
             curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
               --output /dev/null \
               "https://github.com/${AUTODOM_REPO_SLUG}/releases/download/v${V}/${asset}"
@@ -212,6 +220,7 @@ jobs:
           V: ${{ steps.ver.outputs.version }}
           CRX_SHA256: ${{ steps.sums.outputs.crx_sha256 }}
           ZIP_SHA256: ${{ steps.sums.outputs.zip_sha256 }}
+          SHARE_SHA256: ${{ steps.sums.outputs.share_sha256 }}
         run: |
           node scripts/build-update-manifests.mjs \
             --version "$V" \
@@ -220,6 +229,8 @@ jobs:
             --crx-sha256 "$CRX_SHA256" \
             --zip-url "https://github.com/${AUTODOM_REPO_SLUG}/releases/download/v${V}/autodom-chrome-${V}.zip" \
             --zip-sha256 "$ZIP_SHA256" \
+            --share-url "https://github.com/${AUTODOM_REPO_SLUG}/releases/download/v${V}/autodom-${V}-share.zip" \
+            --share-sha256 "$SHARE_SHA256" \
             --out-dir dist/update-manifests
 
       - name: Publish update manifests to GitHub Pages
@@ -262,6 +273,7 @@ jobs:
             echo
             echo "- CRX: \`dist/autodom-${{ steps.ver.outputs.version }}.crx\`"
             echo "- Chrome zip: \`dist/autodom-chrome-${{ steps.ver.outputs.version }}.zip\`"
+            echo "- Share bundle (server + extension): \`dist/autodom-${{ steps.ver.outputs.version }}-share.zip\`"
             echo "- updates.xml + updates.json published to \`gh-pages\`."
             echo
             echo "Existing installs will pick up this version on their next scheduled update check."

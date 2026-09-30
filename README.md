@@ -198,6 +198,8 @@ Pass these via `env` in your MCP config block.
 | `AUTODOM_BOOTSTRAP_WAIT` | `12000` | Tool-call wait for the primary/proxy election to settle (ms) |
 | `AUTODOM_TOOL_TIMEOUT` | `30000` | Per-tool-call timeout (ms) |
 | `AUTODOM_INACTIVITY_TIMEOUT` | `600000` | Idle session timeout; `0` disables |
+| `AUTODOM_AUTO_RESTART` | `1` | `0` stops a bridge from restarting itself onto a newer `server/` found on disk |
+| `AUTODOM_SERVER_SELF_UPDATE` | `1` | `0` stops the bridge from downloading and installing its own server update |
 | `AUTODOM_ISOLATION` | `1` | `0` makes this bridge opt out of tab-group isolation (agent follows the active tab, as before) |
 | `AUTODOM_ISOLATION_IDLE_MS` | `300000` | Idle time before an unfinished session's AutoDOM tabs are closed; `0` disables |
 | `AUTODOM_DEBUG` | `0` | `1` for verbose stderr logs |
