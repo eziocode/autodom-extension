@@ -4,6 +4,22 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 5.4.1
+
+### Fixed
+- **Fix did nothing for bridges from before 5.4.0.** They cannot restart
+  themselves, and Fix (and `setup.sh`) only reaped orphans and zombies, so the
+  old primary was kept ("a live primary already owns the port") and the
+  version warning never cleared. Bridge check now lists them under *Old
+  bridges*, and Fix / `setup.sh` (`native-host --upgrade`) restart them onto
+  the installed files. Only Fix and `setup.sh` do this, never the background
+  watcher, because stopping an IDE's bridge drops that IDE's MCP connection
+  until it reconnects. Bridges from 5.4.0 on restart themselves and are never
+  killed.
+- Plain `flush` still leaves working bridges alone; `--upgrade` is opt-in.
+
+---
+
 ## 5.4.0
 
 ### Added

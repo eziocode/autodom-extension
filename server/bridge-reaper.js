@@ -149,3 +149,54 @@ export function decideReap({
 
   return { keep, nudge, kill, staleLocks };
 }
+
+// ── Bridges that cannot restart themselves ───────────────────
+// From this version on a bridge moves onto newer server files by itself
+// (self-restart.js). Older ones keep running their old code forever after an
+// update, and no message can change that: only replacing the process does.
+// This is the one policy that restarts a *working* bridge, so it is applied
+// only when the user asked for it (Fix, setup.sh), never in the background.
+export const SELF_RESTART_MIN_VERSION = "5.4.0";
+
+function cmpVersion(a, b) {
+  const x = String(a).split(".").map(Number);
+  const y = String(b).split(".").map(Number);
+  for (let i = 0; i < Math.max(x.length, y.length); i += 1) {
+    const d = (x[i] || 0) - (y[i] || 0);
+    if (d !== 0) return Math.sign(d);
+  }
+  return 0;
+}
+
+/**
+ * @param {object} snapshot
+ * @param {Array<{pid:number, port?:number, command?:string}>} snapshot.bridges
+ * @param {Record<number, string|null>} snapshot.versions running version by pid
+ * @param {string} snapshot.diskVersion server version installed on disk
+ * @returns {Array<{pid:number, port:number, version:string, reason:string}>}
+ *          bridges running code older than the disk AND unable to update
+ *          themselves. Empty unless the disk version can itself self-restart
+ *          (otherwise a restart would just land on old code again).
+ */
+export function decideLegacyRestart({
+  bridges = [],
+  versions = {},
+  diskVersion,
+  minVersion = SELF_RESTART_MIN_VERSION,
+} = {}) {
+  if (!diskVersion || cmpVersion(diskVersion, minVersion) < 0) return [];
+  const out = [];
+  for (const b of bridges) {
+    const version = versions[b.pid];
+    if (!version) continue; // unknown: never guess
+    if (cmpVersion(version, minVersion) >= 0) continue; // restarts itself
+    if (cmpVersion(version, diskVersion) >= 0) continue; // already current
+    out.push({
+      pid: b.pid,
+      port: b.port ?? portFromCommand(b.command),
+      version,
+      reason: `runs v${version}, cannot restart itself (installed v${diskVersion})`,
+    });
+  }
+  return out;
+}

@@ -236,8 +236,15 @@ ZOMBIES_KILLED=0
 # set off a re-election race that could leave the port owned by a bridge
 # with no lock file, which every later instance then failed to join.
 if [ -d "$SERVER_DIR/node_modules/ws" ] && [ -f "$SERVER_DIR/native-host.js" ] \
-    && FLUSH_OUT="$(node "$SERVER_DIR/native-host.js" --cli flush --port "$TARGET_PORT" 2>/dev/null)"; then
-    ZOMBIES_KILLED=$(printf '%s' "$FLUSH_OUT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).killed.length))}catch{process.stdout.write("0")}})')
+    && FLUSH_OUT="$(node "$SERVER_DIR/native-host.js" --cli flush --upgrade --port "$TARGET_PORT" 2>/dev/null)"; then
+    ZOMBIES_KILLED=$(printf '%s' "$FLUSH_OUT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const r=JSON.parse(s);process.stdout.write(String(r.killed.length+(r.restarted||[]).length))}catch{process.stdout.write("0")}})')
+    # Bridges from before 5.4.0 cannot move onto new files by themselves, so a
+    # fresh install restarts them (an IDE reconnects on its next use). From
+    # 5.4.0 on, bridges restart themselves and this never applies again.
+    OLD_RESTARTED=$(printf '%s' "$FLUSH_OUT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String((JSON.parse(s).restarted||[]).length))}catch{process.stdout.write("0")}})')
+    if [ "${OLD_RESTARTED:-0}" -gt 0 ]; then
+        echo -e "${GREEN}✓${NC} Restarted ${OLD_RESTARTED} bridge(s) that were still running old code — reload the AutoDOM MCP server in your IDE if it does not reconnect on its own"
+    fi
 else
     # First install (no node_modules yet): nothing live can depend on these
     # servers' lock files, so fall back to stopping AutoDOM listeners whose
@@ -502,7 +509,7 @@ fi
 
 # Reap orphaned / zombie AutoDOM servers left behind by earlier sessions,
 # keeping the live primary and every proxy joined to it.
-if FLUSH_OUT="$(node "$SERVER_DIR/native-host.js" --cli flush 2>/dev/null)"; then
+if FLUSH_OUT="$(node "$SERVER_DIR/native-host.js" --cli flush --upgrade 2>/dev/null)"; then
     FLUSHED=$(printf '%s' "$FLUSH_OUT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).killed.length))}catch{process.stdout.write("0")}})')
     echo -e "${GREEN}✓${NC} Stale AutoDOM servers reaped: ${FLUSHED}"
 fi

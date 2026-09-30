@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  decideLegacyRestart,
+  SELF_RESTART_MIN_VERSION,
   decideReap,
   parseEtime,
   portFromCommand,
@@ -169,4 +171,42 @@ test("a lone unjoined bridge is still nudged (relay rule needs a child bridge)",
     primaries: { 9876: { pid: 1, proxies: [] } },
   });
   assert.equal(v.nudge.length + v.kill.length, 1);
+});
+
+test("legacy restart picks bridges that run old code and cannot restart themselves", () => {
+  const v = decideLegacyRestart({
+    bridges: [bridge(1), bridge(2), bridge(3), bridge(4), bridge(5, { port: 9877 })],
+    versions: { 1: "5.3.0", 2: "5.2.2", 3: "5.4.0", 4: "5.4.1", 5: "5.3.0" },
+    diskVersion: "5.4.1",
+  });
+  // 3 is self-restarting (it moves onto the new files by itself); 4 is current.
+  assert.deepEqual(pids(v), [1, 2, 5]);
+  assert.equal(v[0].port, 9876);
+  assert.equal(v.find((e) => e.pid === 5).port, 9877);
+  assert.match(v[0].reason, /cannot restart itself/);
+});
+
+test("legacy restart never guesses: unknown versions and downgrades are left alone", () => {
+  assert.deepEqual(
+    decideLegacyRestart({
+      bridges: [bridge(1), bridge(2)],
+      versions: { 1: null }, // unreachable / did not report
+      diskVersion: "5.4.0",
+    }),
+    [],
+  );
+  // Disk older than a running bridge: a restart would be a downgrade.
+  assert.deepEqual(
+    decideLegacyRestart({ bridges: [bridge(1)], versions: { 1: "5.3.0" }, diskVersion: "5.2.2" }),
+    [],
+  );
+});
+
+test("legacy restart does nothing when the installed server could not restart itself either", () => {
+  // Restarting onto pre-self-restart files would just land on old code again.
+  assert.equal(SELF_RESTART_MIN_VERSION, "5.4.0");
+  assert.deepEqual(
+    decideLegacyRestart({ bridges: [bridge(1)], versions: { 1: "5.2.0" }, diskVersion: "5.3.0" }),
+    [],
+  );
 });

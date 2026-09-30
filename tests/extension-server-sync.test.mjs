@@ -67,3 +67,17 @@ test("Bridge check explains version drift instead of pointing at setup.sh", () =
   assert.match(sw, /Server files are v\$\{info\.diskVersion\}, but this bridge process still runs/);
   assert.match(sw, /is older than extension v\$\{extVersion\}\. AutoDOM updates the server by itself/);
 });
+
+test("Fix restarts old bridges through the helper and Bridge check flags them", () => {
+  assert.match(sw, /_nativeHostRequest\("restart", \{ port, upgrade: true \}\)/);
+  assert.match(sw, /"Restart old bridges"/);
+  assert.match(sw, /row\(\s*"legacy",\s*"Old bridges"/);
+  // The helper is looked up before the version logic so the messages can say
+  // whether Fix is able to restart the bridge.
+  const fix = sw.slice(sw.indexOf("async function _runBridgeFix"));
+  assert.ok(fix.indexOf("const helperPing") < fix.indexOf("legacyBridge"), "helper known first");
+  // A bridge that predates self-updating gets a truthful message, and is not
+  // sent RESTART_STALE (it would just time out).
+  assert.match(fix, /const res = legacyBridge \? null : await _requestRestartStale\(\)/);
+  assert.match(sw, /predates self-updating and cannot update itself|predates self-updating, so it cannot update itself/);
+});

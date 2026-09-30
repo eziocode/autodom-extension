@@ -323,7 +323,7 @@ if ($LASTEXITCODE -eq 0) {
 }
 # Reap orphaned / zombie AutoDOM servers, keeping the live primary and its proxies.
 try {
-    $flush = & node (Join-Path $ServerDir "native-host.js") --cli flush 2>$null | Out-String | ConvertFrom-Json
+    $flush = & node (Join-Path $ServerDir "native-host.js") --cli flush --upgrade 2>$null | Out-String | ConvertFrom-Json
     Write-Ok "Stale AutoDOM servers reaped: $($flush.killed.Count)"
 } catch { }
 

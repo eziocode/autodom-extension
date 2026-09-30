@@ -10070,13 +10070,25 @@ async function _runBridgeCheck() {
       } else {
         row("primary", "Primary server", "fail", `Nothing is listening on port ${port}.`, true);
       }
+      // Bridges from before self-restart keep running their old code after
+      // an update; only replacing the process helps.
+      const legacy = (helperStatus.legacyStale || []).filter((b) => !port || b.port === port);
+      if (legacy.length) {
+        row(
+          "legacy",
+          "Old bridges",
+          "warn",
+          `${legacy.length} bridge(s) still run v${[...new Set(legacy.map((b) => b.version))].join("/")} (installed: v${helperStatus.diskVersion}) and cannot restart themselves: PID ${legacy.map((b) => b.pid).join(", ")}. Fix restarts them; IDEs reconnect on next use.`,
+          true,
+        );
+      }
       row(
         "stale",
         "Stale servers",
         stale.length ? "warn" : "ok",
         stale.length
           ? `${stale.length} orphan/zombie AutoDOM process(es): ${stale.map((b) => `${b.pid} (${b.verdict.reason})`).join(", ")}`
-          : `${(helperStatus.bridges || []).length} AutoDOM process(es), none stale`,
+          : `${(helperStatus.bridges || []).length} AutoDOM process(es), none orphaned or zombie`,
         stale.length > 0,
       );
     } else {
@@ -10141,7 +10153,9 @@ async function _runBridgeCheck() {
           "version",
           "Versions",
           "warn",
-          `Server v${info.version} is older than extension v${extVersion}. AutoDOM updates the server by itself — click Fix to do it now.`,
+          info.autoRestart === undefined
+            ? `Server v${info.version} is older than extension v${extVersion} and predates self-updating, so it cannot update itself. Click Fix to restart it${helper ? "" : " (needs the bridge helper: run ./setup.sh once)"}.`
+            : `Server v${info.version} is older than extension v${extVersion}. AutoDOM updates the server by itself — click Fix to do it now.`,
           true,
         );
       } else if (info.version && extVersion && info.version !== extVersion) {
@@ -10189,16 +10203,28 @@ async function _runBridgeFix() {
   const step = (label, ok, detail = "") => steps.push({ label, ok, detail });
   let port = _requestedPort || getCurrentPort();
 
+  const helperPing = (await _hasNativeMessagingPermission())
+    ? await _nativeHostRequest("version")
+    : null;
+  const helper = !!helperPing?.ok;
+
   // Bring every bridge onto the newest server files, with no setup.sh:
   // fetch a missing server update, then have stale processes restart onto it.
   if (isConnected) {
     const info = (await _requestBridgeStatus()) || bridgeInfo;
-    if (info?.version && info.autoRestart === undefined && _compareExtensionVersions(info.version, chrome.runtime.getManifest().version) < 0) {
-      // Bridges from before in-place updates cannot replace themselves.
+    const legacyBridge =
+      info?.version &&
+      info.autoRestart === undefined &&
+      _compareExtensionVersions(info.version, chrome.runtime.getManifest().version) < 0;
+    if (legacyBridge) {
+      // Bridges from before in-place updates cannot replace themselves. The
+      // helper step below restarts them onto the installed files.
       step(
-        "Update server",
-        false,
-        `Bridge v${info.version} predates self-updating. Update it once (git pull, bash update.sh, or ./setup.sh); from then on it updates itself.`,
+        "Old bridge",
+        helper,
+        helper
+          ? `Bridge v${info.version} predates self-updating — restarting it below.`
+          : `Bridge v${info.version} predates self-updating and cannot restart itself. Run ./setup.sh once (it registers the helper Fix needs), or reload the AutoDOM MCP server in your IDE.`,
       );
     } else if (info?.version && (await _maybeSyncServerToExtension(String(info.version), { force: true }))) {
       // The bridge downloads and replaces server/ itself, then restarts.
@@ -10210,7 +10236,7 @@ async function _runBridgeFix() {
       }
       step("Update server", true, "Downloaded and installed the matching server");
     }
-    const res = await _requestRestartStale();
+    const res = legacyBridge ? null : await _requestRestartStale();
     if (res) {
       step(
         "Restart stale bridges",
@@ -10225,16 +10251,19 @@ async function _runBridgeFix() {
     }
   }
 
-  const helperPing = (await _hasNativeMessagingPermission())
-    ? await _nativeHostRequest("version")
-    : null;
-  const helper = !!helperPing?.ok;
-
   if (helper) {
     // restart = flush (orphans + zombies, primary and joined proxies kept)
     // + start a detached --bridge-only primary if nothing owns the port.
-    const res = await _nativeHostRequest("restart", { port });
+    const res = await _nativeHostRequest("restart", { port, upgrade: true });
     if (res?.ok) {
+      const restartedOld = res.restarted || [];
+      if (restartedOld.length) {
+        step(
+          "Restart old bridges",
+          true,
+          `Restarted ${restartedOld.map((r) => `${r.pid} (v${r.version})`).join(", ")}. IDEs reconnect on their next use; reload the AutoDOM MCP server in an IDE that does not.`,
+        );
+      }
       const killed = res.killed || [];
       step(
         "Flush stale servers",

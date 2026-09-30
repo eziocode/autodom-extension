@@ -13,10 +13,12 @@
  * and talks to it with the native-messaging framing: 4-byte little-endian
  * length + UTF-8 JSON, both directions.
  *
- * Requests:  { cmd: "version" | "status" | "flush" | "restart", port? }
+ * Requests:  { cmd: "version" | "status" | "flush" | "restart", port?, upgrade? }
+ *            upgrade:true also restarts bridges that run older code than the
+ *            installed server and cannot restart themselves (pre-5.4.0).
  *
  * CLI (setup scripts, debugging):
- *   node native-host.js --cli status|flush|restart|version [--port N]
+ *   node native-host.js --cli status|flush|restart|version [--port N] [--upgrade]
  */
 
 import { execFile, spawn } from "child_process";
@@ -29,6 +31,7 @@ import { promisify } from "util";
 import { WebSocket } from "ws";
 import {
   DEFAULT_PORT,
+  decideLegacyRestart,
   decideReap,
   parseEtime,
   portFromCommand,
@@ -216,6 +219,8 @@ async function scan() {
   const primaries = {};
   const listeners = {};
   const ports_ = {};
+  const versions = {}; // pid → running server version (as the bridge reports it)
+  const statuses = {};
   await Promise.all(
     [...ports].map(async (port) => {
       const [lock, listening, owner] = await Promise.all([
@@ -234,6 +239,11 @@ async function scan() {
               pid: status.pid,
               proxies: (status.proxies || []).map((p) => p.pid),
             };
+            statuses[port] = status;
+            if (status.version) versions[status.pid] = status.version;
+            for (const p of status.proxies || []) {
+              if (p.pid && p.version) versions[p.pid] = p.version;
+            }
           }
         }
       }
@@ -246,7 +256,7 @@ async function scan() {
       };
     }),
   );
-  return { bridges, locks, primaries, listeners, ports: ports_ };
+  return { bridges, locks, primaries, listeners, ports: ports_, versions, statuses };
 }
 
 function summarize(snapshot, verdict) {
@@ -255,8 +265,15 @@ function summarize(snapshot, verdict) {
     for (const v of verdict[k]) byPid.set(v.pid, { action: k, reason: v.reason });
   }
   return {
+    diskVersion: VERSION,
+    legacyStale: decideLegacyRestart({
+      bridges: snapshot.bridges,
+      versions: snapshot.versions || {},
+      diskVersion: VERSION,
+    }),
     bridges: snapshot.bridges.map((b) => ({
       pid: b.pid,
+      version: (snapshot.versions || {})[b.pid] || null,
       ppid: b.ppid,
       port: b.port,
       ageMs: b.ageMs,
@@ -310,7 +327,58 @@ async function applyVerdict(verdict) {
   return results;
 }
 
-async function flush(port) {
+// Restart bridges that run older code than what is installed and cannot
+// restart themselves. Stopping one of these drops an IDE's MCP connection
+// (the IDE owns the process), so this runs only when asked for.
+async function upgradeLegacy(port) {
+  const snap = await scan();
+  const targets = decideLegacyRestart({
+    bridges: snap.bridges.filter((b) => !port || b.port === port),
+    versions: snap.versions,
+    diskVersion: VERSION,
+  });
+  // The primary last, so proxies are not left electing a new (old) primary.
+  const primaryPids = new Set(Object.values(snap.primaries).map((p) => p.pid));
+  targets.sort((a, b) => Number(primaryPids.has(a.pid)) - Number(primaryPids.has(b.pid)));
+  const restarted = [];
+  for (const t of targets) {
+    const r = await killPid(t.pid);
+    log(`upgrade-restart pid=${t.pid} port=${t.port} (${t.reason}) → ${r.killed}`);
+    if (r.killed) restarted.push({ ...t, ...r });
+  }
+  // Bridges that can restart themselves just need telling.
+  for (const [p, status] of Object.entries(snap.statuses || {})) {
+    if (port && Number(p) !== port) continue;
+    const lock = await readLock(Number(p));
+    if (status?.staleOnDisk && lock?.token && isAlive(status.pid)) {
+      sendRestartStale(Number(p), lock.token);
+    }
+  }
+  return restarted;
+}
+
+// Fire-and-forget RESTART_STALE to a primary that supports it.
+function sendRestartStale(port, token) {
+  try {
+    const ws = new WebSocket(
+      `ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}`,
+    );
+    const done = () => {
+      try {
+        ws.terminate();
+      } catch {}
+    };
+    ws.on("open", () => {
+      ws.send(JSON.stringify({ type: "RESTART_STALE", id: "native-host" }));
+      setTimeout(done, 1000);
+    });
+    ws.on("error", done);
+  } catch {}
+}
+
+async function flush(port, { upgrade = false } = {}) {
+  const restarted = upgrade ? await upgradeLegacy(port) : [];
+  if (restarted.length) await delay(500);
   const scope = (v) => (port ? v.port === port : true);
   let snap = await scan();
   let verdict = decideReap(snap);
@@ -349,6 +417,7 @@ async function flush(port) {
   const after = await scan();
   return {
     killed: killed.filter((k) => k.killed),
+    restarted,
     nudged,
     after: summarize(after, decideReap(after)),
   };
@@ -386,8 +455,8 @@ async function startBridgeOnly(port) {
   return child.pid;
 }
 
-async function restart(port = DEFAULT_PORT) {
-  const flushed = await flush(port);
+async function restart(port = DEFAULT_PORT, options = {}) {
+  const flushed = await flush(port, options);
   const portInfo = flushed.after.ports[port];
   const hasPrimary = flushed.after.bridges.some(
     (b) => b.port === port && b.primary,
@@ -432,9 +501,13 @@ async function handle(req) {
       case "status":
         return { ok: true, version: VERSION, ...(await status()) };
       case "flush":
-        return { ok: true, version: VERSION, ...(await flush(port)) };
+        return { ok: true, version: VERSION, ...(await flush(port, { upgrade: req?.upgrade === true })) };
       case "restart":
-        return { ok: true, version: VERSION, ...(await restart(port || DEFAULT_PORT)) };
+        return {
+          ok: true,
+          version: VERSION,
+          ...(await restart(port || DEFAULT_PORT, { upgrade: req?.upgrade === true })),
+        };
       default:
         return { ok: false, error: `unknown cmd: ${cmd}` };
     }
@@ -493,7 +566,7 @@ const argv = process.argv.slice(2);
 if (argv[0] === "--cli") {
   const portIdx = argv.indexOf("--port");
   const port = portIdx >= 0 ? argv[portIdx + 1] : undefined;
-  handle({ cmd: argv[1] || "status", port }).then((res) => {
+  handle({ cmd: argv[1] || "status", port, upgrade: argv.includes("--upgrade") }).then((res) => {
     process.stdout.write(JSON.stringify(res, null, 2) + "\n");
     process.exit(res.ok ? 0 : 1);
   });
