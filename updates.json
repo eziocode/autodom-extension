@@ -1,20 +1,20 @@
 {
   "schemaVersion": 1,
   "extensionId": "kpjdffgogiajnkajnjneiboaincnaokf",
-  "version": "6.0.0",
-  "publishedAt": "2026-10-01T19:40:06.806Z",
+  "version": "6.1.0",
+  "publishedAt": "2026-10-01T20:06:19.427Z",
   "artifacts": {
     "crx": {
-      "url": "https://github.com/eziocode/autodom-extension/releases/download/v6.0.0/autodom-6.0.0.crx",
-      "sha256": "1e013a3a593d2981c3456db12cb56404712a6b09330c12181520cb65919cd0a9"
+      "url": "https://github.com/eziocode/autodom-extension/releases/download/v6.1.0/autodom-6.1.0.crx",
+      "sha256": "430a7dbff214aaadafbb40db2328f9556ba27c97fde285133424d893951f6ec8"
     },
     "zip": {
-      "url": "https://github.com/eziocode/autodom-extension/releases/download/v6.0.0/autodom-chrome-6.0.0.zip",
-      "sha256": "abe7850b70bf22bc71c30662f255d0c7c4118af8d462ece3800e12ecd7dae5b6"
+      "url": "https://github.com/eziocode/autodom-extension/releases/download/v6.1.0/autodom-chrome-6.1.0.zip",
+      "sha256": "329b31b02427e6e5245a7c33391b01c11adde580e5b5dc5b03429f3c302f6aad"
     },
     "share": {
-      "url": "https://github.com/eziocode/autodom-extension/releases/download/v6.0.0/autodom-6.0.0-share.zip",
-      "sha256": "1a9b57a97ee4d44ed932500c023f394568e8e16d0e769b88a003be279154d78c"
+      "url": "https://github.com/eziocode/autodom-extension/releases/download/v6.1.0/autodom-6.1.0-share.zip",
+      "sha256": "53e1630b4abd3993ba2e9610dc721b322822a6ec03354d2c04fd2969aaa9e793"
     }
   }
 }
