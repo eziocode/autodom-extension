@@ -57,6 +57,7 @@ import { tmpdir } from "os";
 import { join, isAbsolute, resolve as resolvePath } from "path";
 import { promisify } from "util";
 import { AsyncLocalStorage } from "async_hooks";
+import { VIEWER_URI, VIEWER_MIME, VIEWER_HTML } from "./viewer-app.js";
 import {
   saveWorkflowFile,
   deleteWorkflowFile,
@@ -935,6 +936,8 @@ const TOOL_TIERS = new Map([
   ["workflow_from_recording", "read"],
   ["run_list", "read"],
   ["run_get", "read"],
+  ["run_report_view", "read"],
+  ["workflow_view", "read"],
   ["schedule_list", "read"],
   ["webmcp_list_tools", "read"],
   ["audit_query", "read"],
@@ -1005,6 +1008,8 @@ const TOOL_TIERS = new Map([
   ["print_to_pdf", "destructive"],
   // Replays every recorded step (form fills, submits, navigation).
   ["workflow_run", "destructive"],
+  ["workflow_run_many", "destructive"],
+  ["run_undo", "destructive"],
   // Schedules replay workflows unattended later.
   ["schedule_create", "destructive"],
   ["schedule_update", "destructive"],
@@ -1190,6 +1195,7 @@ function collectBridgeStatus() {
         staleOnDisk: fresh.staleOnDisk,
         autoRestart: SELF_RESTART_ENABLED,
         restartedFrom: fresh.restartedFrom,
+        supervising: fresh.supervising,
       };
     })(),
     clientId: MY_CLIENT_ID,
@@ -2274,8 +2280,14 @@ function bindWebSocketServer() {
 // port stays occupied; any other bind failure propagates to the caller.
 async function tryBecomePrimary() {
   for (let attempt = 0; ; attempt++) {
+    if (bridgeHandedOver()) return false;
     try {
       const wss = await bindWebSocketServer();
+      if (bridgeHandedOver()) {
+        // The handover started while we were binding: give the port back.
+        await new Promise((resolve) => wss.close(() => resolve()));
+        return false;
+      }
       webSocketServer = wss;
       setBridgeRole(BRIDGE_ROLE.PRIMARY);
       writeLockFile().catch((err) => {
@@ -2360,7 +2372,17 @@ let recoveryPromise = null;
 let recoveryAttempts = 0;
 let recoveryWindowStart = Date.now();
 
+// True once this process is shutting down or has handed its clients to a
+// successor (self-restart). Such a process must never re-run the election:
+// closing its own proxy link during the handover would otherwise make it
+// bind the port again and sit there as an old-version primary that ignores
+// every later restart request.
+function bridgeHandedOver() {
+  return shutdownStarted || restartInProgress || !!supervisedChild;
+}
+
 function recoverBridge() {
+  if (bridgeHandedOver()) return Promise.resolve(false);
   if (bridgeRole === BRIDGE_ROLE.PRIMARY) return Promise.resolve(true);
   if (recoveryPromise) return recoveryPromise;
 
@@ -6871,7 +6893,7 @@ function normalizeMcpToolResult(value) {
 // ─── tools/list payload ──────────────────────────────────────
 // The SDK derives each inputSchema from its zod schema, and zod always
 // stamps a top-level `$schema` on the result. That is ~5.8KB of dead
-// weight across 127 tools, and more importantly some MCP clients run
+// weight across 131 tools, and more importantly some MCP clients run
 // incoming schemas through a sanitizer that rejects or mangles an
 // explicit `$schema` for a draft it does not recognize. There is no
 // conversion hook (standardSchemaToJsonSchema is internal to the SDK and
@@ -6888,7 +6910,7 @@ function normalizeMcpToolResult(value) {
 // Plan B if this override ever breaks: register via the SDK's exported
 // `fromJsonSchema()` with pre-stripped JSON Schema. That is the supported
 // route, but it swaps zod validation for the SDK's generic JSON Schema
-// validator on all 127 tools, losing zod defaults/coercion/transform.
+// validator on all 131 tools, losing zod defaults/coercion/transform.
 let _toolListPayload = null;
 
 function _stripSchemaKeyword(node) {
@@ -6917,10 +6939,12 @@ function _jsonSchemaForTool(parameters) {
 
 function toolListPayload() {
   if (!_toolListPayload) {
-    _toolListPayload = toolDefinitions.map(({ name, description, parameters }) => ({
+    _toolListPayload = toolDefinitions.map(({ name, description, parameters, _meta }) => ({
       name,
       description,
       inputSchema: _jsonSchemaForTool(parameters),
+      // Only the MCP App viewer tools carry _meta (ui.resourceUri).
+      ...(_meta ? { _meta } : {}),
     }));
   }
   return _toolListPayload;
@@ -6969,6 +6993,27 @@ function createAutoDomMcpServer() {
       },
     );
   }
+
+  // The MCP App view that run_report_view / workflow_view point at.
+  mcpServer.registerResource(
+    "autodom-viewer",
+    VIEWER_URI,
+    {
+      title: "AutoDOM workflow viewer",
+      description: "Interactive report for workflow runs, batches and saved workflows.",
+      mimeType: VIEWER_MIME,
+    },
+    async (uri) => ({
+      contents: [
+        {
+          uri: uri.href,
+          mimeType: VIEWER_MIME,
+          text: VIEWER_HTML,
+          _meta: { ui: { prefersBorder: true } },
+        },
+      ],
+    }),
+  );
 
   // Must come after the registration loop: registerTool() installs the
   // SDK's own tools/list handler on first call. setRequestHandler
@@ -8963,12 +9008,19 @@ server.addTool({
 server.addTool({
   name: "workflow_run",
   description:
-    "Replay a saved workflow without an LLM. mode 'heal' (default) re-finds elements that moved or were renamed and saves the healed locator so later runs are deterministic again; 'strict' fails instead. Supply values for {{variables}} (secrets are required). Waits up to waitMs for the result; longer runs return a runId to poll with run_get. Returns a step-by-step report with before/after page diffs. Stopping a run does not undo steps that already ran.",
+    "Replay a saved workflow without an LLM. mode 'heal' (default) re-finds elements that moved or were renamed (heuristics, then your AI provider, then a screenshot with numbered boxes) and saves the healed locator so later runs are deterministic again; 'strict' fails instead; 'dry' only checks that every step's target can be found, without clicking or typing. Supply values for {{variables}} (secrets are required). Waits up to waitMs for the result; longer runs return a runId to poll with run_get. Returns a step-by-step report with before/after page diffs. Stopping a run does not undo steps that already ran.",
   parameters: z.object({
     id: z.string().optional().describe("Workflow id or exact name"),
     workflow: z.union([z.string(), z.record(z.string(), z.any())]).optional().describe("Run an unsaved workflow (object, JSON or Markdown routine)"),
     variables: z.record(z.string(), z.any()).optional(),
-    mode: z.enum(["heal", "strict"]).optional().default("heal"),
+    mode: z
+      .enum(["heal", "strict", "dry"])
+      .optional()
+      .default("heal")
+      .describe("heal = self-heal moved elements; strict = fail instead; dry = resolve every step against the page without clicking or typing"),
+    vision: z.boolean().optional().describe("Allow the vision fallback (screenshot + numbered boxes to your AI provider) when other healing fails; default on if a provider is configured"),
+    newTab: z.boolean().optional().describe("Run in a fresh background AutoDOM tab, closed afterwards unless keepTab"),
+    keepTab: z.boolean().optional(),
     wait: z.boolean().optional().default(true),
     waitMs: z.coerce.number().optional().describe("How long to wait for completion (capped below the bridge tool timeout)"),
     stepTimeoutMs: z.coerce.number().optional().describe("Per-step element wait, default 8000"),
@@ -8979,6 +9031,52 @@ server.addTool({
     const waitMs = Math.min(Number(params.waitMs) || cap, cap);
     return stringifyToolResult(await callExtensionTool("workflow_run", { ...params, waitMs }));
   },
+});
+
+server.addTool({
+  name: "workflow_run_many",
+  description:
+    "Run several saved workflows at once, each in its own background AutoDOM tab (default 3 at a time, max 5), and return one combined report. Each entry may carry its own variables. Longer batches return a batchId to poll with run_get { batchId } or stop with run_cancel { batchId }.",
+  parameters: z.object({
+    runs: z
+      .array(
+        z.object({
+          id: z.string().describe("Workflow id or exact name"),
+          variables: z.record(z.string(), z.any()).optional(),
+          mode: z.enum(["heal", "strict", "dry"]).optional(),
+        }),
+      )
+      .min(1)
+      .max(20),
+    variables: z.record(z.string(), z.any()).optional().describe("Defaults applied to every run; per-run variables win"),
+    concurrency: z.coerce.number().optional().default(3),
+    mode: z.enum(["heal", "strict", "dry"]).optional().default("heal"),
+    vision: z.boolean().optional(),
+    keepTabs: z.boolean().optional().default(false),
+    wait: z.boolean().optional().default(true),
+    waitMs: z.coerce.number().optional(),
+    stepTimeoutMs: z.coerce.number().optional(),
+  }),
+  execute: async (params) => {
+    const cap = Math.max(1000, TOOL_TIMEOUT - 4000);
+    const waitMs = Math.min(Number(params.waitMs) || cap, cap);
+    return stringifyToolResult(await callExtensionTool("workflow_run_many", { ...params, waitMs }));
+  },
+});
+
+server.addTool({
+  name: "run_undo",
+  description:
+    "Reverse what a workflow run changed, where that is safe: typed values, selects and checkboxes go back to what they held before (sensitive fields only if they were empty), storage keys and cookies the run added are removed, and navigation can be stepped back with navigation:true. Clicks, submitted forms and anything the site did server-side cannot be undone and are listed under irreversible. Use dryRun:true to preview. Undo data is kept in memory for the 20 most recent runs.",
+  parameters: z.object({
+    runId: z.string(),
+    steps: z.array(z.number().int()).optional().describe("Only these 0-based step indexes"),
+    include: z.array(z.enum(["fields", "storage", "cookies", "navigation"])).optional().describe("Default: fields, storage, cookies"),
+    navigation: z.boolean().optional().describe("Also step the tab back through navigations"),
+    dryRun: z.boolean().optional().default(false),
+    tabId: z.number().optional(),
+  }),
+  execute: async (params) => stringifyToolResult(await callExtensionTool("run_undo", params)),
 });
 
 server.addTool({
@@ -9029,16 +9127,91 @@ server.addTool({
 
 server.addTool({
   name: "run_get",
-  description: "Get a workflow run report: per-step result, locator strategy used, heals, before/after page diffs and the failure reason.",
-  parameters: z.object({ runId: z.string() }),
+  description: "Get a workflow run report (per-step result, locator strategy used, heals, before/after page diffs, failure reason, and what can be undone), or with batchId the combined report of a workflow_run_many batch.",
+  parameters: z.object({
+    runId: z.string().optional(),
+    batchId: z.string().optional(),
+  }),
   execute: async (params) => stringifyToolResult(await callExtensionTool("run_get", params)),
 });
 
 server.addTool({
   name: "run_cancel",
-  description: "Cancel a running workflow (or all running workflows when runId is omitted). Steps that already ran are not undone.",
-  parameters: z.object({ runId: z.string().optional() }),
+  description: "Cancel a running workflow, a whole batch (batchId), or all running workflows when neither is given. Steps that already ran are not undone; see run_undo.",
+  parameters: z.object({ runId: z.string().optional(), batchId: z.string().optional() }),
   execute: async (params) => stringifyToolResult(await callExtensionTool("run_cancel", params)),
+});
+
+// ─── MCP App viewer (ui://autodom/viewer.html) ────────────────
+// Hosts that render MCP Apps show these as an interactive report; every
+// other host shows the plain-text summary returned alongside.
+const VIEWER_META = { ui: { resourceUri: VIEWER_URI } };
+
+function _runSummaryText(r) {
+  const lines = [
+    `${r.workflowName || "Workflow"} — ${r.status}` +
+      (r.durationMs != null ? ` in ${(r.durationMs / 1000).toFixed(1)}s` : "") +
+      (r.healed ? `, self-healed ${r.healed}` : ""),
+  ];
+  for (const st of r.steps || []) {
+    const mark = st.unchecked ? "·" : st.skipped ? "↷" : st.ok ? "✓" : "✗";
+    lines.push(
+      `${mark} ${st.index + 1}. ${st.action} ${st.target || ""}` +
+        (st.healed ? ` [healed: ${st.healed}]` : "") +
+        (st.wouldHealTo ? ` [would heal to ${st.wouldHealTo}]` : "") +
+        (st.error ? ` — ${st.error}` : ""),
+    );
+  }
+  if (r.error) lines.push("", r.error);
+  return lines.join("\n");
+}
+
+server.addTool({
+  name: "run_report_view",
+  description:
+    "Show a workflow run report (or a workflow_run_many batch) as an interactive timeline in hosts that support MCP Apps: steps, locator strategy, self-heals, before/after page diffs, a screenshot where it failed, and buttons to preview an undo or re-check the workflow. Other hosts get the same report as text.",
+  _meta: VIEWER_META,
+  parameters: z.object({
+    runId: z.string().optional(),
+    batchId: z.string().optional(),
+  }),
+  execute: async (params) => {
+    const got = await callExtensionTool("run_get", params);
+    if (!got?.ok) return stringifyToolResult(got);
+    if (params.batchId) {
+      const { ok, ...batch } = got;
+      const text =
+        `Batch ${batch.batchId}: ${batch.status} — ${batch.passed} passed, ${batch.failed} failed, ${batch.running} running\n` +
+        batch.runs.map((r) => `${r.index + 1}. ${r.workflow}: ${r.status}${r.error ? ` — ${r.error}` : ""}`).join("\n");
+      return { content: [{ type: "text", text }], structuredContent: { kind: "batch", batch } };
+    }
+    const { ok, ...report } = got;
+    return {
+      content: [{ type: "text", text: _runSummaryText(report) }],
+      structuredContent: { kind: "run", report },
+    };
+  },
+});
+
+server.addTool({
+  name: "workflow_view",
+  description:
+    "Show a saved workflow as a readable timeline (steps, variables with defaults, healed locators) in hosts that support MCP Apps; other hosts get a text outline.",
+  _meta: VIEWER_META,
+  parameters: z.object({ id: z.string().describe("Workflow id or exact name") }),
+  execute: async (params) => {
+    const got = await callExtensionTool("workflow_get", params);
+    if (!got?.ok) return stringifyToolResult(got);
+    const wf = got.workflow;
+    const text =
+      `${wf.name} — ${wf.steps.length} steps` +
+      (wf.variables?.length ? `; variables: ${wf.variables.map((v) => v.name + (v.secret ? " (secret)" : "")).join(", ")}` : "") +
+      "\n" +
+      wf.steps
+        .map((s, i) => `${i + 1}. ${s.action} ${s.url || s.locator?.accessibleName || s.locator?.label || s.locator?.text || s.locator?.css || ""}`)
+        .join("\n");
+    return { content: [{ type: "text", text }], structuredContent: { kind: "workflow", workflow: wf } };
+  },
 });
 
 // ─── Audit log + approval rules ───────────────────────────────

@@ -126,6 +126,8 @@
     // Replaying a workflow performs every recorded step; recording
     // captures typed values. Always confirm.
     "workflow_run",
+    "workflow_run_many",
+    "run_undo",
     "workflow_record_start",
     "webmcp_call_tool",
   ]);

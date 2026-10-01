@@ -70,6 +70,19 @@ function fakeExtension(msg) {
         workflow: { id: "wf_e2e", name: "E2E", steps: 1 },
         full: { id: "wf_e2e", name: "E2E", steps: [{ action: "navigate", url: "https://x.test" }], variables: [] },
       };
+    case "run_get":
+      return {
+        ok: true,
+        runId: "run_1",
+        workflowId: "wf_e2e",
+        workflowName: "E2E",
+        status: "passed",
+        mode: "heal",
+        trigger: "mcp",
+        durationMs: 1200,
+        healed: 1,
+        steps: [{ index: 0, action: "click", target: 'button "Go"', ok: true, strategy: "role", healed: "heuristic", durationMs: 40 }],
+      };
     case "workflow_export":
       return { ok: true, format: "playwright", filename: "e2e.spec.ts", content: "// generated" };
     default:
@@ -171,6 +184,24 @@ async function main() {
   assert(decisions.includes("click:held_for_confirmation:false"), "audit has the hold: " + decisions);
   assert(decisions.includes("click:executed:true"), "audit has the confirmed run: " + decisions);
   assert(!decisions.some((d) => d.startsWith("take_snapshot")), "read-only calls are not audited by default");
+
+  // MCP App viewer: tool _meta, ui:// resource, structured result.
+  const listId = nextId++;
+  server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: listId, method: "tools/list", params: { _meta: LEGACY_META } }) + "\n");
+  for (let i = 0; i < 60 && !responses.has(listId); i++) await sleep(50);
+  const tools = responses.get(listId).result.tools;
+  const viewerTool = tools.find((t) => t.name === "run_report_view");
+  assert(viewerTool?._meta?.ui?.resourceUri === "ui://autodom/viewer.html", "run_report_view advertises ui.resourceUri");
+  assert(!tools.find((t) => t.name === "click")._meta, "ordinary tools carry no _meta");
+  const resId = nextId++;
+  server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: resId, method: "resources/read", params: { uri: "ui://autodom/viewer.html", _meta: LEGACY_META } }) + "\n");
+  for (let i = 0; i < 60 && !responses.has(resId); i++) await sleep(50);
+  const content = responses.get(resId).result.contents[0];
+  assert(content.mimeType === "text/html;profile=mcp-app", "viewer mime type: " + content.mimeType);
+  assert(/ui\/initialize/.test(content.text) && /tool-result/.test(content.text), "viewer speaks the MCP Apps protocol");
+  const view = await call("run_report_view", { runId: "run_1" });
+  assert(view.result.structuredContent?.kind === "run", "structured run report: " + JSON.stringify(view));
+  assert(/E2E — passed in 1.2s, self-healed 1/.test(text(view)), "text fallback summary: " + text(view));
 
   ext.close();
 }

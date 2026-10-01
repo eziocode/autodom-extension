@@ -68,6 +68,11 @@ position.
 - If one element is a clear winner, AutoDOM acts on it.
 - If the winner is not clear, and a direct AI provider is configured in the
   popup, the model picks from a compact list of candidates.
+- If that fails too, AutoDOM takes a **screenshot with numbered boxes** drawn
+  on every on-screen control and asks the model which box fulfils the step.
+  This needs a vision-capable model (GPT-4o class, Claude, or an Ollama
+  vision model), and the boxes are removed again straight afterwards. Pass
+  `vision: false` to turn it off.
 
 A healed locator is **saved back to the workflow** (the previous one is kept
 under `previous`), so the next run is deterministic again. Use
@@ -90,6 +95,48 @@ Retrieving reports:
 - `/runs` in the chat panel and `run_list` over MCP show recent reports.
 
 > Stopping or cancelling a run does not undo the steps that already ran.
+
+### Dry run
+
+`workflow_run { id, mode: "dry" }` (or `/replay <name> dry`) checks that every
+step's target can still be found, **without clicking or typing anything**.
+
+- Page loads at the very start of the workflow do happen, so there is a page
+  to check.
+- Checking stops at the first step that could change the page (a click or key
+  press), because later targets may not exist yet. Those steps are reported
+  as *not checked*. Pass `checkAll: true` to keep going on a best-effort basis.
+- The result is `dry_ok`, `dry_needs_heal` (a target moved but a replay would
+  self-heal, and the report says to what) or `dry_broken`.
+- Dry runs do not need secret variables and do not count towards a
+  workflow's run statistics.
+
+### Undo
+
+Every run keeps what it needs to reverse its safe changes. `run_undo { runId }`
+(or `/undo`) puts back:
+
+- typed values, selects and checkboxes, to what they held before. A password
+  field is only restored if it was empty before; its earlier value is never
+  recorded.
+- storage keys and cookies the run **added** (only when the step stayed on the
+  same site, so other sites' data is never touched)
+- navigation, with `navigation: true`: the tab steps back through the pages
+  the run visited
+
+Use `dryRun: true` (`/undo preview`) first to see what would happen. Clicks,
+submitted forms and anything the site did on its server cannot be undone;
+they are listed under `irreversible`. Undo data is kept in memory only, for
+the 20 most recent runs, and is lost when the browser closes.
+
+### Parallel runs
+
+`workflow_run_many { runs: [{ id, variables }, …], concurrency: 3 }` runs
+several workflows at once, each in its own background AutoDOM tab, which is
+closed afterwards (`keepTabs: true` keeps them). At most 5 run at a time and
+20 per batch. You get one combined report; a long batch returns a `batchId`
+to poll with `run_get { batchId }` or stop with `run_cancel { batchId }`.
+A single `workflow_run` also takes `newTab: true` to run in a fresh tab.
 
 ## 3. Export and import
 
@@ -244,6 +291,18 @@ variables control it:
 
 - `AUTODOM_AUDIT=0` turns the log off.
 - `AUTODOM_AUDIT=all` also records read-only calls.
+
+## 8. Interactive reports (MCP Apps)
+
+`run_report_view { runId }` and `workflow_view { id }` return an interactive
+page in hosts that support **MCP Apps**: a timeline of steps with the locator
+strategy, heals, before/after diffs and the failure screenshot, plus buttons
+to preview an undo and to re-check the workflow. `run_report_view { batchId }`
+shows a parallel batch as a table. Hosts that do not render MCP Apps show the
+same report as plain text, so the tools are safe to call anywhere.
+
+The page is served as `ui://autodom/viewer.html`, runs in the host's sandbox
+with no network access, and only talks to AutoDOM through the host.
 
 ## Environment
 

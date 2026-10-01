@@ -102,18 +102,19 @@ test("tools/list is client-safe: no $schema, object roots, no -32601 probes", as
 });
 
 test("hand-built tools/list stays equivalent to the SDK's shape", async () => {
-  // toolListPayload() maps only name/description/inputSchema, which is
-  // sound only while no tool declares richer metadata. If one does, the
-  // override would silently drop it.
+  // toolListPayload() maps name/description/inputSchema (plus _meta, which
+  // the MCP App viewer tools use for ui.resourceUri), which is sound only
+  // while no tool declares richer metadata. If one does, the override would
+  // silently drop it.
   const source = await readFile(SERVER, "utf8");
   const start = source.indexOf("const toolDefinitions = [];");
   assert.notEqual(start, -1);
+  assert.match(source, /\.\.\.\(_meta \? \{ _meta \} : \{\}\)/, "toolListPayload must pass _meta through");
   for (const key of [
     "annotations",
     "outputSchema",
     "icons",
     "execution",
-    "_meta",
   ]) {
     assert.doesNotMatch(
       source.slice(start),

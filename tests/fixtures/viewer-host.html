@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Mock MCP Apps host</title>
+<style>body{margin:12px;font:13px system-ui}iframe{width:760px;height:620px;border:1px solid #888;border-radius:8px}</style>
+<p>Mock host for the AutoDOM viewer. <code id="log"></code></p>
+<iframe id="f" sandbox="allow-scripts"></iframe>
+<script type="module">
+  import { VIEWER_HTML } from "/server/viewer-app.js";
+  const kinds = {
+    run: { kind: "run", report: {
+      runId: "run_1", workflowId: "wf_1", workflowName: "Weekly report", status: "passed", mode: "heal", trigger: "schedule", durationMs: 4310, healed: 1,
+      steps: [
+        { index: 0, action: "navigate", target: "https://example.com/login", ok: true, durationMs: 820 },
+        { index: 1, action: "fill", target: 'textbox "Email address"', ok: true, strategy: "name", undoable: ["field"], durationMs: 60, diff: { contentChanged: true, elementDelta: 0 } },
+        { index: 2, action: "click", target: 'button "Sign in"', ok: true, strategy: "role", healed: "vision", durationMs: 2100, undoable: ["cookies", "navigation"], diff: { url: { from: "https://example.com/login", to: "https://example.com/home" }, contentChanged: true, elementDelta: 42, cookies: { added: ["session"], removed: [] } } },
+        { index: 3, action: "click", target: 'button "Export"', ok: false, error: "element not found", irreversible: "clicks and key presses cannot be undone automatically", durationMs: 8000 },
+      ], error: "Step 4 (Click button \"Export\") failed: element not found", note: "Stopping a run does not undo steps that already ran." } },
+    batch: { kind: "batch", batch: { batchId: "batch_1", status: "failed", concurrency: 3, total: 3, passed: 2, failed: 1, running: 0, runs: [
+      { index: 0, workflow: "Weekly report", runId: "r1", status: "passed", durationMs: 4300, healed: 1 },
+      { index: 1, workflow: "Health check", runId: "r2", status: "passed", durationMs: 2100, healed: 0 },
+      { index: 2, workflow: "Invoice sync", runId: "r3", status: "failed", durationMs: 9100, healed: 0, error: "Step 2 failed: element not found" } ] } },
+    workflow: { kind: "workflow", workflow: { name: "Weekly report", description: "Downloads the weekly report", startUrl: "https://example.com/login",
+      variables: [{ name: "email_address", default: "me@example.com", description: "Value for textbox \"Email address\"" }, { name: "password", secret: true, description: "Value for password" }],
+      steps: [{ action: "navigate", url: "https://example.com/login" }, { action: "fill", value: "{{email_address}}", locator: { role: "textbox", accessibleName: "Email address" } }, { action: "click", locator: { role: "button", accessibleName: "Sign in", healedAt: Date.now() } }] } },
+  };
+  const kind = new URLSearchParams(location.search).get("kind") || "run";
+  const f = document.getElementById("f");
+  const log = [];
+  window.addEventListener("message", (e) => {
+    if (e.source !== f.contentWindow) return;
+    const m = e.data;
+    log.push(m.method || "response");
+    document.getElementById("log").textContent = log.join(" → ");
+    if (m.method === "ui/initialize") {
+      f.contentWindow.postMessage({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: "2026-01-26", hostInfo: { name: "mock", version: "1" }, hostCapabilities: {}, hostContext: { theme: new URLSearchParams(location.search).get("theme") || "light" } } }, "*");
+    } else if (m.method === "ui/notifications/initialized") {
+      f.contentWindow.postMessage({ jsonrpc: "2.0", method: "ui/notifications/tool-result", params: { content: [{ type: "text", text: "summary" }], structuredContent: kinds[kind] } }, "*");
+    } else if (m.method === "tools/call") {
+      f.contentWindow.postMessage({ jsonrpc: "2.0", id: m.id, result: { content: [{ type: "text", text: JSON.stringify({ ok: true, dryRun: true, undone: 0, results: [{ step: 2, type: "field", status: "would_undo" }, { step: 3, type: "cookies", status: "would_undo" }], irreversible: [{ step: 4, what: "click button Export" }] }) }] } }, "*");
+    }
+  });
+  f.srcdoc = VIEWER_HTML;
+</script>

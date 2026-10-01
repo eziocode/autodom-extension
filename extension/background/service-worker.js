@@ -1392,7 +1392,7 @@ function _isTabCreatingCall(toolName, params) {
   if (toolName === "navigate" || toolName === "browser_navigate") {
     return typeof params?.url === "string" && params.url.length > 0;
   }
-  if (toolName === "workflow_run") return params?.tabId == null;
+  if (toolName === "workflow_run") return params?.tabId == null && params?.newTab !== true;
   if (toolName === "workflow_record_start") {
     return typeof params?.url === "string" && params.url.length > 0;
   }
@@ -6104,7 +6104,9 @@ try {
         return _captureBackgroundTab(tab, { format: "jpeg", quality: 60 });
       },
       openRunTab: _openWorkflowRunTab,
+      closeRunTab: (tabId) => _closeRunTab(tabId),
       llmPick: _workflowLlmPick,
+      visionPick: _workflowVisionPick,
     });
     for (const [name, fn] of Object.entries(workflowEngine.handlers)) {
       TOOL_HANDLERS.set(name, fn);
@@ -6123,6 +6125,33 @@ async function _openWorkflowRunTab() {
     return Tab.createOwnedTab(WORKFLOW_RUNNER_CLIENT_ID, { url: "about:blank" });
   }
   return chrome.tabs.create({ url: "about:blank", active: false });
+}
+
+function _directProviderUsable() {
+  const provider = String(aiProviderSettings?.source || "").toLowerCase();
+  const hasKey = !!String(aiProviderSettings?.apiKey || "").trim();
+  return (
+    (provider === "ollama" && aiProviderSettings?.enabled === true) ||
+    ((provider === "openai" || provider === "anthropic") && hasKey)
+  );
+}
+
+// Vision self-heal: the configured direct provider looks at a screenshot
+// with numbered boxes and names the element. Needs a vision-capable model.
+async function _workflowVisionPick({ prompt, image }) {
+  if (!_directProviderUsable()) return null;
+  const provider = String(aiProviderSettings.source).toLowerCase();
+  const model = _effectiveConfiguredProviderModel(aiProviderSettings, null);
+  const message = _buildUserMessageForProvider(prompt, [{ dataUrl: image }], provider);
+  const result = await globalThis.AutoDOMProviders.callDirectProvider(provider, {
+    apiKey: String(aiProviderSettings.apiKey || "").trim(),
+    baseUrl: aiProviderSettings.baseUrl,
+    model,
+    messagesOverride: [{ role: "user", ...message }],
+    providerInfo: { model, provider },
+    debug: _debugLog,
+  });
+  return result?.response || "";
 }
 
 // Self-heal fallback: ask the user's configured direct provider to pick an
@@ -6153,22 +6182,17 @@ async function _scheduledWorkflowRun(workflowId, opts = {}) {
     variables: opts.variables || {},
     trigger: opts.trigger || "schedule",
     newTab: true,
+    keepTab: opts.keepTab === true,
   });
   if (!started.ok) return { ...started, status: "failed" };
-  const report = await started.promise;
-  if (!opts.keepTab) await _closeRunTab(report.tabId);
-  return report;
+  return started.promise;
 }
 
 // Prompt shortcuts on a schedule run the in-extension agent loop, which
 // needs a direct AI provider (the IDE path has no one to answer headless).
 async function _scheduledPromptRun(prompt) {
   const provider = String(aiProviderSettings?.source || "").toLowerCase();
-  const hasKey = !!String(aiProviderSettings?.apiKey || "").trim();
-  const usable =
-    (provider === "ollama" && aiProviderSettings?.enabled === true) ||
-    ((provider === "openai" || provider === "anthropic") && hasKey);
-  if (!usable) {
+  if (!_directProviderUsable()) {
     return { error: "Scheduled prompts need a direct AI provider (OpenAI, Anthropic or Ollama) configured in the AutoDOM popup. Schedule a recorded workflow instead to run without an LLM." };
   }
   const runTab = await _openWorkflowRunTab();
@@ -10588,11 +10612,22 @@ async function _runBridgeCheck() {
         `PID ${info.pid}, role ${info.role}, ${info.proxies?.length || 0} proxy client(s)`,
       );
       if (info.staleOnDisk) {
+        // A bridge that should restart itself but is stuck (self-restart
+        // off, or an old relay that kept the port) needs the helper.
+        const stuck =
+          info.autoRestart === false ||
+          info.supervising === true ||
+          (helperStatus?.legacyStale || []).some((b) => b.pid === info.pid);
         row(
           "version",
           "Versions",
           "warn",
-          `Server files are v${info.diskVersion}, but this bridge process still runs v${info.version}. It restarts itself when idle — click Fix to do it now.`,
+          `Server files are v${info.diskVersion}, but this bridge process still runs v${info.version}. ` +
+            (!stuck
+              ? "It restarts itself when idle — click Fix to do it now."
+              : helper
+                ? "It cannot restart itself — click Fix to restart it (IDEs reconnect on next use)."
+                : "It cannot restart itself. Run ./setup.sh once so Fix can restart it, or reload the AutoDOM MCP server in your IDE."),
           true,
         );
       } else if (info.version && extVersion && _compareExtensionVersions(info.version, extVersion) < 0) {
@@ -10673,7 +10708,14 @@ async function _runBridgeFix() {
           ? `Bridge v${info.version} predates self-updating — restarting it below.`
           : `Bridge v${info.version} predates self-updating and cannot restart itself. Run ./setup.sh once (it registers the helper Fix needs), or reload the AutoDOM MCP server in your IDE.`,
       );
-    } else if (info?.version && (await _maybeSyncServerToExtension(String(info.version), { force: true }))) {
+    } else if (
+      info?.version &&
+      // Files already on disk (git pull, earlier update): only a restart is
+      // needed, never a second download.
+      !(info.staleOnDisk && info.diskVersion &&
+        _compareExtensionVersions(String(info.diskVersion), chrome.runtime.getManifest().version) >= 0) &&
+      (await _maybeSyncServerToExtension(String(info.version), { force: true }))
+    ) {
       // The bridge downloads and replaces server/ itself, then restarts.
       const t0 = Date.now();
       while (Date.now() - t0 < 60000) {
@@ -10784,6 +10826,19 @@ async function _runBridgeFix() {
     isConnected,
     isConnected ? `Connected on ws://127.0.0.1:${port}` : "Still not connected — see the check below",
   );
+
+  if (isConnected) {
+    const after = await _requestBridgeStatus();
+    if (after?.staleOnDisk) {
+      step(
+        "Server version",
+        false,
+        helper
+          ? `Bridge PID ${after.pid} still runs v${after.version} (files are v${after.diskVersion}). Reload the AutoDOM MCP server in your IDE, or run ./setup.sh.`
+          : `Bridge still runs v${after.version} (files are v${after.diskVersion}). Run ./setup.sh once so Fix can restart it, or reload the AutoDOM MCP server in your IDE.`,
+      );
+    }
+  }
 
   return { ok: true, steps, check: await _runBridgeCheck() };
 }

@@ -304,7 +304,7 @@
     const RESERVED = new Set([
       "help", "dom", "screenshot", "ss", "snap", "snapshot", "info", "extract", "click", "type", "nav", "navigate",
       "goto", "js", "exec", "eval", "run", "playwright", "selenium", "auto", "quick", "offscreen", "teach",
-      "workflows", "wf", "replay", "export", "shortcut", "shortcuts", "schedule", "schedules", "runs", "rules",
+      "workflows", "wf", "replay", "undo", "export", "shortcut", "shortcuts", "schedule", "schedules", "runs", "rules",
     ]);
 
     const handlers = {

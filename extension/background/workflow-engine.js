@@ -32,7 +32,7 @@
   // Serialized into the tab. Must be self-contained. Installs
   // globalThis.__autodomWfLib once per document (idempotent).
   function _pageWfLib() {
-    const VERSION = 3;
+    const VERSION = 4;
     if (globalThis.__autodomWfLib && globalThis.__autodomWfLib.v === VERSION) {
       return { ok: true, cached: true };
     }
@@ -507,6 +507,90 @@
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+    // What the field held before a step changed it, so a run can be undone.
+    // Sensitive fields only record whether they were empty (never the value).
+    const prevOf = (el, step) => {
+      try {
+        if (step.action === "fill") {
+          const cur = el.isContentEditable && !isField(el) ? el.textContent || "" : String(el.value == null ? "" : el.value);
+          if (isSensitive(el)) return cur === "" ? { kind: "value", value: "" } : { kind: "none", reason: "sensitive field had a value" };
+          return { kind: "value", value: cur.slice(0, 2000) };
+        }
+        if (step.action === "select") return { kind: "value", value: String(el.value == null ? "" : el.value) };
+        if (step.action === "check") {
+          return { kind: "check", value: "checked" in el ? !!el.checked : el.getAttribute("aria-checked") === "true" };
+        }
+      } catch (_) {}
+      return null;
+    };
+
+    // Resolve without acting (dry run). Reports what a run would do.
+    const resolveOnly = (step) => {
+      if (step.action === "assert") {
+        const res = checkAssert(step.assert);
+        return { ok: true, found: !!res.ok, note: res.ok ? "assertion holds now" : "assertion does not hold on the current page" };
+      }
+      if (!step.locator) return { ok: true, found: true, note: "no target" };
+      const hit = resolve(step.locator);
+      if (!hit) return { ok: true, found: false };
+      return {
+        ok: true,
+        found: true,
+        strategy: hit.strategy,
+        ambiguous: !!hit.ambiguous,
+        matches: hit.count,
+        visible: visible(hit.el),
+        target: describe(hit.el, { light: true }),
+      };
+    };
+
+    // Vision fallback: number the on-screen interactive elements so a vision
+    // model can name one. Boxes are removed again with clearMarks().
+    const MARK_ID = "__autodom_wf_marks";
+    const clearMarks = () => {
+      const old = document.getElementById(MARK_ID);
+      if (old) old.remove();
+      return { ok: true };
+    };
+    const markCandidates = (limit, nearBbox) => {
+      clearMarks();
+      if (nearBbox && Number.isFinite(nearBbox.y)) {
+        const top = Math.max(0, nearBbox.y - innerHeight / 2);
+        if (Math.abs(top - (globalThis.scrollY || 0)) > innerHeight / 3) globalThis.scrollTo(0, top);
+      }
+      const layer = document.createElement("div");
+      layer.id = MARK_ID;
+      layer.setAttribute("data-autodom-ui", "");
+      layer.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483647;";
+      const marks = [];
+      for (const el of collectInteractive(limit || 120)) {
+        if (!visible(el)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth) continue;
+        const n = marks.length + 1;
+        const box = document.createElement("div");
+        box.style.cssText = "position:fixed;border:2px solid #e11d48;box-sizing:border-box;left:" + r.left + "px;top:" + r.top + "px;width:" + r.width + "px;height:" + r.height + "px;";
+        const tag = document.createElement("span");
+        tag.textContent = String(n);
+        tag.style.cssText = "position:absolute;left:-2px;top:-14px;background:#e11d48;color:#fff;font:700 11px/12px system-ui,sans-serif;padding:0 3px;border-radius:2px;";
+        box.appendChild(tag);
+        layer.appendChild(box);
+        marks.push({ n, ref: refOf(el), ...describe(el, { light: true }) });
+        if (marks.length >= 60) break;
+      }
+      document.documentElement.appendChild(layer);
+      return { ok: true, marks, viewport: { w: innerWidth, h: innerHeight } };
+    };
+
+    // Remove storage keys a step added (undo). Only for the recorded origin.
+    const removeStorage = (origin, local, session) => {
+      if (origin && location.origin !== origin) return { ok: false, error: "page origin changed (" + location.origin + ")" };
+      let removed = 0;
+      for (const k of local || []) { try { localStorage.removeItem(k); removed++; } catch (_) {} }
+      for (const k of session || []) { try { sessionStorage.removeItem(k); removed++; } catch (_) {} }
+      return { ok: true, removed };
+    };
+
     // Resolve the step's target (polling until timeout) and act on it.
     const runStep = async (step, timeoutMs) => {
       const deadline = Date.now() + Math.max(200, timeoutMs || 5000);
@@ -535,6 +619,7 @@
         await sleep(150);
       } while (Date.now() < deadline);
       if (!hit) return { ok: false, notFound: true, error: "element not found" };
+      const prev = prevOf(hit.el, step);
       const res = act(hit.el, step);
       return {
         ...res,
@@ -542,14 +627,16 @@
         ambiguous: !!hit.ambiguous,
         matches: hit.count,
         after: describe(hit.el),
+        ...(prev ? { prev } : {}),
       };
     };
 
     const actOnRef = (ref, step) => {
       const el = byRef(ref);
       if (!el) return { ok: false, error: "stale or unknown ref: " + ref };
+      const prev = prevOf(el, step);
       const res = act(el, step);
-      return { ...res, strategy: "ref", after: describe(el) };
+      return { ...res, strategy: "ref", after: describe(el), ...(prev ? { prev } : {}) };
     };
 
     // Cheap page digest for before/after step diffs.
@@ -700,6 +787,10 @@
       act,
       actOnRef,
       runStep,
+      resolveOnly,
+      markCandidates,
+      clearMarks,
+      removeStorage,
       digest,
       startRecording,
       stopRecording,
@@ -728,6 +819,22 @@
   function _pageWfCandidates(limit) {
     const L = globalThis.__autodomWfLib;
     return L ? { ok: true, candidates: L.candidates(limit) } : { ok: false, error: "workflow lib not loaded" };
+  }
+  function _pageWfResolveOnly(step) {
+    const L = globalThis.__autodomWfLib;
+    return L ? L.resolveOnly(step) : { ok: false, error: "workflow lib not loaded" };
+  }
+  function _pageWfMark(limit, nearBbox) {
+    const L = globalThis.__autodomWfLib;
+    return L ? L.markCandidates(limit, nearBbox) : { ok: false, error: "workflow lib not loaded" };
+  }
+  function _pageWfClearMarks() {
+    const L = globalThis.__autodomWfLib;
+    return L ? L.clearMarks() : { ok: true };
+  }
+  function _pageWfRemoveStorage(origin, local, session) {
+    const L = globalThis.__autodomWfLib;
+    return L ? L.removeStorage(origin, local, session) : { ok: false, error: "workflow lib not loaded" };
   }
   function _pageWfDigest() {
     const L = globalThis.__autodomWfLib;
@@ -1196,6 +1303,10 @@
   const RUNS_KEY = "autodom.workflowRuns";
   const REC_KEY = "autodom.wf.recording";
   const MAX_RUNS = 200;
+  const UNDO_KEY = "autodom.runUndo";
+  const MAX_UNDO_RUNS = 20;
+  const UNDO_GROUP = { field: "fields", storage: "storage", cookies: "cookies", navigation: "navigation" };
+  const MAY_CHANGE_PAGE = new Set(["click", "dblclick", "press"]);
 
   function makeEngine(ctx) {
     const storage = ctx.storage || (globalThis.chrome && chrome.storage);
@@ -1206,7 +1317,9 @@
     let rec = null; // { nonce, tabId, steps, startedAt, startUrl, agentNavUrls }
     let lastDraft = null;
     const runs = new Map(); // runId → live run
+    const batches = new Map(); // batchId → parallel batch
     let persistTimer = null;
+    let persistChain = Promise.resolve(); // serialises stats read-modify-write across parallel runs
 
     // ── storage ──
     async function loadAll() {
@@ -1432,7 +1545,38 @@
       }
     }
 
-    async function healStep(tabId, step) {
+    // Last resort: screenshot with numbered boxes on every on-screen control;
+    // a vision model names the box that fulfils the step.
+    async function visionPickCandidate(tabId, step) {
+      if (typeof ctx.visionPick !== "function" || typeof ctx.captureScreenshot !== "function") return null;
+      try {
+        const marked = await exec(tabId, _pageWfMark, [120, step.locator && step.locator.bbox]);
+        if (!marked || !marked.ok || !marked.marks.length) return null;
+        const image = await ctx.captureScreenshot(tabId);
+        if (!image) return null;
+        const lines = marked.marks.map((m) => {
+          const name = m.accessibleName || m.label || m.placeholder || m.text || "";
+          return `${m.n}: ${m.role || m.tag}${name ? ` "${String(name).slice(0, 60)}"` : ""}`;
+        });
+        const prompt =
+          "The screenshot has red numbered boxes on the page's interactive elements. A recorded browser step no longer matches the page.\n" +
+          `Step: ${stepSentence(step)}\n` +
+          `Recorded target: ${JSON.stringify({ role: step.locator && step.locator.role, name: step.locator && (step.locator.accessibleName || step.locator.label || step.locator.text), tag: step.locator && step.locator.tag })}\n` +
+          "Boxes:\n" + lines.join("\n") +
+          '\nWhich box is the element the step should act on? Answer with only its number, or "none".';
+        const answer = String((await ctx.visionPick({ prompt, image })) || "").trim();
+        if (/^none\b/i.test(answer)) return null;
+        const m = answer.match(/\b(\d{1,3})\b/);
+        return m ? marked.marks.find((x) => x.n === Number(m[1])) || null : null;
+      } catch (err) {
+        log("[AutoDOM WF] vision heal failed:", err && err.message);
+        return null;
+      } finally {
+        try { await exec(tabId, _pageWfClearMarks, []); } catch (_) {}
+      }
+    }
+
+    async function healStep(tabId, step, opts) {
       const res = await exec(tabId, _pageWfCandidates, [300]);
       const list = (res && res.candidates) || [];
       if (!list.length) return null;
@@ -1443,10 +1587,177 @@
         const viaLlm = await llmPickCandidate(step, pool.length ? pool : list);
         if (viaLlm) chosen = { candidate: viaLlm, via: "llm" };
       }
+      if (!chosen && !(opts && opts.vision === false)) {
+        const viaVision = await visionPickCandidate(tabId, step);
+        if (viaVision) chosen = { candidate: viaVision, via: "vision" };
+      }
       if (!chosen) return null;
       const acted = await exec(tabId, _pageWfActOnRef, [chosen.candidate.ref, step]);
       if (!acted || !acted.ok) return null;
       return { ...acted, healedVia: chosen.via, score: chosen.score };
+    }
+
+    function serialized(fn) {
+      const next = persistChain.then(fn, fn);
+      persistChain = next.catch(() => {});
+      return next;
+    }
+
+    const originOf = (url) => {
+      try { return new URL(url).origin; } catch (_) { return ""; }
+    };
+
+    // What would reverse this step. Storage and cookie deltas only count when
+    // the page stayed on the same origin (a new origin's keys are not ours).
+    function undoOpsFor(step, res, before, after, diff) {
+      const ops = [];
+      if (["fill", "select", "check"].includes(step.action) && res && res.prev && res.prev.kind !== "none") {
+        ops.push({
+          type: "field",
+          step: { action: step.action, locator: (res.after || step.locator), value: res.prev.value },
+        });
+      }
+      const sameOrigin = before && after && originOf(before.url) && originOf(before.url) === originOf(after.url);
+      if (diff && sameOrigin) {
+        const local = (diff.localStorage && diff.localStorage.added) || [];
+        const session = (diff.sessionStorage && diff.sessionStorage.added) || [];
+        if (local.length || session.length) ops.push({ type: "storage", origin: originOf(after.url), local, session });
+        const names = (diff.cookies && diff.cookies.added) || [];
+        if (names.length) ops.push({ type: "cookies", url: after.url, names });
+      }
+      if (diff && diff.url) ops.push({ type: "navigation", from: diff.url.from, to: diff.url.to });
+      return ops;
+    }
+
+    // Undo data is RAM-only (session storage): it can hold earlier field values.
+    async function saveUndo(runId, info) {
+      if (!storage.session) return;
+      const got = await storage.session.get(UNDO_KEY);
+      const map = (got && got[UNDO_KEY]) || {};
+      map[runId] = { ...info, createdAt: Date.now() };
+      const keep = Object.entries(map).sort((a, b) => b[1].createdAt - a[1].createdAt).slice(0, MAX_UNDO_RUNS);
+      await storage.session.set({ [UNDO_KEY]: Object.fromEntries(keep) });
+    }
+    async function getUndo(runId) {
+      if (!storage.session) return null;
+      const got = await storage.session.get(UNDO_KEY);
+      return ((got && got[UNDO_KEY]) || {})[runId] || null;
+    }
+
+    // Dry run: resolve every step against the page without acting. Stops
+    // checking once a step could change the page (click / key press) because
+    // later targets may not exist yet; checkAll:true keeps going best-effort.
+    async function runDry(wf, params, tab, values, closeIfOwned) {
+      const runId = newId("run");
+      const report = {
+        runId,
+        workflowId: wf.id,
+        workflowName: wf.name,
+        trigger: params.trigger || "manual",
+        ...(params.batchId ? { batchId: params.batchId } : {}),
+        mode: "dry",
+        status: "running",
+        tabId: tab.id,
+        startedAt: Date.now(),
+        finishedAt: null,
+        durationMs: null,
+        healed: 0,
+        steps: [],
+        summary: null,
+        error: null,
+        note: "Dry run: nothing was clicked, typed or changed. Page loads at the start of the workflow are performed.",
+      };
+      const live = { report, cancel: false, paused: false, wf };
+      runs.set(runId, live);
+      const promise = (async () => {
+        try {
+          let canCheck = true;
+          let leading = true;
+          const timeout = Math.max(300, Math.min(15000, Number(params.stepTimeoutMs) || 1500));
+          for (let i = 0; i < wf.steps.length; i++) {
+            if (live.cancel) { report.status = "cancelled"; break; }
+            const raw = wf.steps[i];
+            const step = { ...raw, value: substitute(raw.value, values), url: substitute(raw.url, values) };
+            if (raw.assert) step.assert = { ...raw.assert, value: substitute(raw.assert.value, values) };
+            const entry = { index: i, action: step.action, target: step.action === "navigate" ? step.url : describeTarget(step.locator), ok: true };
+            report.steps.push(entry);
+            if (step.action === "navigate") {
+              if (canCheck && leading && params.load !== false) {
+                await chrome.tabs.update(tab.id, { url: step.url });
+                await settle(tab.id, 300);
+                entry.note = "page loaded";
+              } else {
+                entry.unchecked = "navigates away; later steps depend on it";
+                canCheck = params.checkAll === true ? canCheck : false;
+              }
+              continue;
+            }
+            if (["wait", "upload", "scroll"].includes(step.action)) continue;
+            leading = false;
+            if (!canCheck) { entry.unchecked = "depends on an earlier step that changes the page"; continue; }
+            let found = null;
+            const deadline = Date.now() + timeout;
+            do {
+              await injectLib(tab.id);
+              found = await exec(tab.id, _pageWfResolveOnly, [step]);
+              if (found && found.found) break;
+              await sleep(250);
+            } while (Date.now() < deadline);
+            if (found && found.found) {
+              entry.strategy = found.strategy;
+              if (found.ambiguous) entry.ambiguous = true;
+              if (found.note) entry.note = found.note;
+              if (found.visible === false) entry.note = "found but not visible";
+            } else {
+              entry.ok = false;
+              entry.error = step.action === "assert" ? (found && found.note) || "assertion does not hold" : "element not found";
+              if (step.action !== "assert" && step.locator) {
+                const cands = await exec(tab.id, _pageWfCandidates, [300]);
+                const pick = pickHeuristic(step.locator, (cands && cands.candidates) || []);
+                if (pick) {
+                  entry.wouldHealTo = describeTarget(pick.candidate);
+                  entry.healScore = pick.score;
+                } else if (typeof ctx.visionPick === "function" && params.vision !== false) {
+                  entry.maybeHealable = "no confident match; a vision model would be asked at run time";
+                }
+              }
+            }
+            if (MAY_CHANGE_PAGE.has(step.action) && params.checkAll !== true) canCheck = false;
+          }
+          const checked = report.steps.filter((s) => !s.unchecked && !["navigate", "wait", "upload", "scroll"].includes(s.action));
+          const missing = checked.filter((s) => !s.ok);
+          const healable = missing.filter((s) => s.wouldHealTo);
+          report.summary = {
+            steps: report.steps.length,
+            checked: checked.length,
+            unchecked: report.steps.filter((s) => s.unchecked).length,
+            found: checked.length - missing.length,
+            missing: missing.length,
+            healable: healable.length,
+          };
+          if (report.status === "running") {
+            report.status = !missing.length ? "dry_ok" : missing.length === healable.length ? "dry_needs_heal" : "dry_broken";
+            if (missing.length) {
+              report.error = `${missing.length} of ${checked.length} checked steps would not find their target` +
+                (healable.length ? ` (${healable.length} could self-heal)` : "") + ".";
+            }
+          }
+        } catch (err) {
+          report.status = "failed";
+          report.error = String((err && err.message) || err);
+        } finally {
+          report.finishedAt = Date.now();
+          report.durationMs = report.finishedAt - report.startedAt;
+          try { await serialized(() => pushRun(report)); } catch (_) {}
+          await closeIfOwned();
+          if (typeof params.onDone === "function") {
+            try { params.onDone(report); } catch (_) {}
+          }
+        }
+        return report;
+      })();
+      live.promise = promise;
+      return { ok: true, runId, promise, report };
     }
 
     async function resolveRunTab(params) {
@@ -1459,19 +1770,28 @@
       params = params || {};
       const errors = validateWorkflow(wf);
       if (errors.length) return { ok: false, error: "Invalid workflow", details: errors };
+      const mode = params.mode === "strict" ? "strict" : params.mode === "dry" ? "dry" : "heal";
       const { values, missing } = resolveVariables(wf, params.variables || {});
-      if (missing.length) {
+      // A dry run never types anything, so secrets are not needed for it.
+      if (missing.length && mode !== "dry") {
         return { ok: false, error: `Missing values for variables: ${missing.join(", ")}`, missing };
       }
-      const mode = params.mode === "strict" ? "strict" : "heal";
       const stepTimeoutMs = Math.max(500, Math.min(60000, Number(params.stepTimeoutMs) || 8000));
       const tab = await resolveRunTab(params);
+      const openedHere = !!(params.newTab && params.tabId == null);
+      const closeIfOwned = async () => {
+        if (openedHere && !params.keepTab && typeof ctx.closeRunTab === "function") {
+          try { await ctx.closeRunTab(tab.id); } catch (_) {}
+        }
+      };
+      if (mode === "dry") return runDry(wf, params, tab, values, closeIfOwned);
       const runId = newId("run");
       const report = {
         runId,
         workflowId: wf.id,
         workflowName: wf.name,
         trigger: params.trigger || "manual",
+        ...(params.batchId ? { batchId: params.batchId } : {}),
         mode,
         status: "running",
         tabId: tab.id,
@@ -1485,6 +1805,7 @@
       };
       const live = { report, cancel: false, paused: false, wf };
       runs.set(runId, live);
+      const undoSteps = [];
       const promise = (async () => {
         let dirty = false;
         try {
@@ -1517,7 +1838,7 @@
                 await injectLib(tab.id);
                 res = await exec(tab.id, _pageWfRunStep, [step, step.timeoutMs || stepTimeoutMs]);
                 if ((!res || !res.ok) && res && res.notFound && mode === "heal" && step.locator) {
-                  const healed = await healStep(tab.id, step);
+                  const healed = await healStep(tab.id, step, { vision: params.vision });
                   if (healed) {
                     res = healed;
                     entry.healed = healed.healedVia;
@@ -1541,6 +1862,17 @@
             const after = params.diffs === false ? null : await safeDigest(tab.id);
             const diff = diffDigest(before, after);
             if (diff) entry.diff = diff;
+            if (entry.ok && !entry.skipped) {
+              const ops = undoOpsFor(step, res, before, after, diff);
+              if (ops.length) {
+                undoSteps.push({ index: i, label: stepSentence(raw), ops });
+                entry.undoable = ops.map((o) => o.type);
+              } else if (res && res.prev && res.prev.kind === "none") {
+                entry.irreversible = res.prev.reason;
+              } else if (MAY_CHANGE_PAGE.has(step.action)) {
+                entry.irreversible = "clicks and key presses cannot be undone automatically";
+              }
+            }
             if (!entry.ok) {
               entry.error = (res && res.error) || "step failed";
               if (step.optional) {
@@ -1563,20 +1895,24 @@
           report.finishedAt = Date.now();
           report.durationMs = report.finishedAt - report.startedAt;
           try {
-            const stored = wf.id ? await getWorkflow(wf.id) : null;
-            if (stored) {
-              stored.stats = stored.stats || { runs: 0, passes: 0, heals: 0 };
-              stored.stats.runs++;
-              if (report.status === "passed") stored.stats.passes++;
-              stored.stats.heals += report.healed;
-              stored.lastRun = { runId, status: report.status, at: report.finishedAt, durationMs: report.durationMs };
-              if (dirty) stored.steps = wf.steps;
-              await putWorkflow(stored);
-            }
-            await pushRun(report);
+            await serialized(async () => {
+              const stored = wf.id ? await getWorkflow(wf.id) : null;
+              if (stored) {
+                stored.stats = stored.stats || { runs: 0, passes: 0, heals: 0 };
+                stored.stats.runs++;
+                if (report.status === "passed") stored.stats.passes++;
+                stored.stats.heals += report.healed;
+                stored.lastRun = { runId, status: report.status, at: report.finishedAt, durationMs: report.durationMs };
+                if (dirty) stored.steps = wf.steps;
+                await putWorkflow(stored);
+              }
+              await pushRun(report);
+            });
+            if (undoSteps.length) await saveUndo(runId, { tabId: tab.id, workflowName: wf.name, steps: undoSteps });
           } catch (err) {
             log("[AutoDOM WF] persist run failed:", err && err.message);
           }
+          await closeIfOwned();
           if (typeof params.onDone === "function") {
             try { params.onDone(report); } catch (_) {}
           }
@@ -1641,7 +1977,7 @@
           hint: `Still running after ${waitMs} ms. Poll run_get { runId: "${started.runId}" }, or run_cancel to stop it.`,
         };
       }
-      return { ok: done.status === "passed", ...done };
+      return { ok: ["passed", "dry_ok", "dry_needs_heal"].includes(done.status), ...done };
     }
 
     function progressOf(report) {
@@ -1649,7 +1985,155 @@
       return { done: report.steps.filter((s) => s.ok).length, total, current: report.steps.length };
     }
 
+    function batchView(b) {
+      const items = b.items.map((it) => {
+        const live = it.runId ? runs.get(it.runId) : null;
+        const r = live ? live.report : it.report;
+        return {
+          index: it.index,
+          workflow: it.workflow,
+          runId: it.runId || null,
+          status: r ? r.status : it.status,
+          durationMs: r ? r.durationMs : null,
+          healed: r ? r.healed : 0,
+          error: (r && r.error) || it.error || null,
+        };
+      });
+      const count = (st) => items.filter((i) => i.status === st).length;
+      const running = items.filter((i) => i.status === "running" || i.status === "queued").length;
+      const failed = items.filter((i) => ["failed", "dry_broken"].includes(i.status)).length;
+      return {
+        batchId: b.batchId,
+        status: running ? "running" : b.cancel ? "cancelled" : failed ? "failed" : "passed",
+        concurrency: b.concurrency,
+        total: items.length,
+        passed: count("passed") + count("dry_ok") + count("dry_needs_heal"),
+        failed,
+        running,
+        runs: items,
+      };
+    }
+
+    async function runMany(params) {
+      params = params || {};
+      const specs = Array.isArray(params.runs) ? params.runs : [];
+      if (!specs.length) return { ok: false, error: "runs must list at least one { id, variables? } entry" };
+      if (specs.length > 20) return { ok: false, error: "At most 20 runs per batch" };
+      const concurrency = Math.max(1, Math.min(5, Number(params.concurrency) || 3));
+      const batch = { batchId: newId("batch"), startedAt: Date.now(), concurrency, cancel: false, items: [] };
+      specs.forEach((sp, index) =>
+        batch.items.push({ index, workflow: String((sp && (sp.id || sp.name)) || "?"), status: "queued", runId: null }),
+      );
+      batches.set(batch.batchId, batch);
+      let next = 0;
+      const worker = async () => {
+        while (!batch.cancel && next < specs.length) {
+          const i = next++;
+          const sp = specs[i] || {};
+          const item = batch.items[i];
+          const wf = await findWorkflow(sp.id || sp.name);
+          if (!wf) { item.status = "failed"; item.error = `Workflow not found: ${item.workflow}`; continue; }
+          item.workflow = wf.name;
+          const started = await runWorkflow(wf, {
+            variables: { ...(params.variables || {}), ...(sp.variables || {}) },
+            mode: sp.mode || params.mode,
+            vision: params.vision,
+            stepTimeoutMs: params.stepTimeoutMs,
+            newTab: true,
+            keepTab: params.keepTabs === true,
+            trigger: "parallel",
+            batchId: batch.batchId,
+          });
+          if (!started.ok) { item.status = "failed"; item.error = started.error; continue; }
+          item.runId = started.runId;
+          item.status = "running";
+          item.report = await started.promise;
+          item.status = item.report.status;
+        }
+      };
+      batch.promise = Promise.all(Array.from({ length: Math.min(concurrency, specs.length) }, worker)).then(() => {
+        batch.finishedAt = Date.now();
+        // Runs that never started because the batch was cancelled.
+        for (const it of batch.items) if (it.status === "queued") it.status = "cancelled";
+      });
+      const waitMs = params.wait === false ? 0 : Math.max(0, Math.min(Number(params.waitMs) || 25000, 120000));
+      if (waitMs) await Promise.race([batch.promise, sleep(waitMs)]);
+      const view = batchView(batch);
+      return {
+        ok: view.status !== "failed",
+        ...view,
+        ...(view.status === "running"
+          ? { hint: `Still running. Poll run_get { batchId: "${batch.batchId}" } or stop it with run_cancel { batchId }.` }
+          : {}),
+      };
+    }
+
+    async function runUndo(params) {
+      const info = await getUndo(params && params.runId);
+      if (!info) {
+        return { ok: false, error: "No undo data for this run. It is kept in memory for the 20 most recent runs and is lost when the browser closes." };
+      }
+      const tabId = params.tabId != null ? params.tabId : info.tabId;
+      try { await chrome.tabs.get(tabId); } catch (_) {
+        return { ok: false, error: "The tab this run used is gone, so its changes cannot be reversed from here." };
+      }
+      const wanted = new Set(["fields", "storage", "cookies"]);
+      if (params.navigation === true) wanted.add("navigation");
+      if (Array.isArray(params.include)) { wanted.clear(); params.include.forEach((x) => wanted.add(x)); }
+      const only = Array.isArray(params.steps) ? new Set(params.steps.map(Number)) : null;
+      const plan = info.steps.filter((st) => !only || only.has(st.index)).slice().reverse();
+      const results = [];
+      for (const st of plan) {
+        for (const op of st.ops) {
+          const group = UNDO_GROUP[op.type];
+          const item = { step: st.index + 1, what: st.label, type: op.type };
+          if (!wanted.has(group)) { results.push({ ...item, status: "skipped", reason: `${group} not included` }); continue; }
+          if (params.dryRun === true) { results.push({ ...item, status: "would_undo" }); continue; }
+          try {
+            if (op.type === "field") {
+              await injectLib(tabId);
+              const r = await exec(tabId, _pageWfRunStep, [op.step, 2000]);
+              results.push({ ...item, status: r && r.ok ? "undone" : "failed", ...(r && r.ok ? {} : { reason: (r && r.error) || "target not found" }) });
+            } else if (op.type === "storage") {
+              await injectLib(tabId);
+              const r = await exec(tabId, _pageWfRemoveStorage, [op.origin, op.local, op.session]);
+              results.push({ ...item, status: r && r.ok ? "undone" : "failed", detail: r && r.ok ? `${r.removed} key(s) removed` : (r && r.error) });
+            } else if (op.type === "cookies") {
+              let removed = 0;
+              for (const name of op.names) {
+                try { if (await chrome.cookies.remove({ url: op.url, name })) removed++; } catch (_) {}
+              }
+              results.push({ ...item, status: removed ? "undone" : "failed", detail: `${removed}/${op.names.length} cookie(s) removed` });
+            } else if (op.type === "navigation") {
+              await chrome.tabs.goBack(tabId);
+              await settle(tabId, 300);
+              results.push({ ...item, status: "undone", detail: `back from ${op.to}` });
+            }
+          } catch (err) {
+            results.push({ ...item, status: "failed", reason: String((err && err.message) || err) });
+          }
+        }
+      }
+      const live = (await runGet({ runId: params.runId })) || {};
+      const irreversible = (live.steps || [])
+        .filter((x) => x.irreversible && (!only || only.has(x.index)))
+        .map((x) => ({ step: x.index + 1, what: `${x.action} ${x.target}`, why: x.irreversible }));
+      const undone = results.filter((r) => r.status === "undone").length;
+      return {
+        ok: !results.some((r) => r.status === "failed"),
+        dryRun: params.dryRun === true,
+        undone,
+        results,
+        irreversible,
+        note: "Only changes AutoDOM can safely reverse (typed values, checkboxes, selects, storage keys and cookies it added, optionally navigation) are undone. Submitted forms, clicks and anything the site did server-side are not.",
+      };
+    }
+
     async function runGet(params) {
+      if (params && params.batchId) {
+        const b = batches.get(params.batchId);
+        return b ? { ok: true, ...batchView(b) } : { ok: false, error: `Batch not found: ${params.batchId}` };
+      }
       const id = params && params.runId;
       const live = runs.get(id);
       if (live) return { ok: true, ...live.report, progress: progressOf(live.report), paused: live.paused };
@@ -1671,6 +2155,8 @@
           workflowId: r.workflowId,
           workflowName: r.workflowName,
           status: r.status,
+          mode: r.mode,
+          batchId: r.batchId,
           trigger: r.trigger,
           startedAt: r.startedAt,
           durationMs: r.durationMs,
@@ -1681,7 +2167,14 @@
     }
 
     function setRunState(params, patch) {
-      const ids = params && params.runId ? [params.runId] : [...runs.keys()];
+      if (params && params.batchId) {
+        const b = batches.get(params.batchId);
+        if (!b) return [];
+        if (patch.cancel) b.cancel = true;
+        const ids = b.items.map((it) => it.runId).filter(Boolean);
+        return setRunState({ ...params, batchId: undefined, runIds: ids }, patch);
+      }
+      const ids = params && params.runIds ? params.runIds : params && params.runId ? [params.runId] : [...runs.keys()];
       const hit = [];
       for (const id of ids) {
         const live = runs.get(id);
@@ -1734,11 +2227,14 @@
         if (params && params.save) await putWorkflow(draft);
         return { ok: true, saved: !!(params && params.save), workflow: draft, markdown: toMarkdown(draft) };
       },
+      workflow_run_many: runMany,
+      run_undo: runUndo,
       run_get: runGet,
       run_list: runList,
       run_cancel: async (params) => {
         const hit = setRunState(params, { cancel: true, paused: false });
-        return { ok: hit.length > 0, cancelled: hit, note: "Stopping a run does not undo steps that already ran." };
+        const batchFound = !!(params && params.batchId && batches.has(params.batchId));
+        return { ok: hit.length > 0 || batchFound, cancelled: hit, note: "Stopping a run does not undo steps that already ran." };
       },
       run_pause: async (params) => ({ ok: true, paused: setRunState(params, { paused: true }) }),
       run_resume: async (params) => ({ ok: true, resumed: setRunState(params, { paused: false }) }),
@@ -1832,6 +2328,10 @@
       _pageWfActOnRef,
       _pageWfCandidates,
       _pageWfDigest,
+      _pageWfResolveOnly,
+      _pageWfMark,
+      _pageWfClearMarks,
+      _pageWfRemoveStorage,
     },
   };
 })();

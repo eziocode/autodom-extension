@@ -25,7 +25,7 @@ const DISK_VERSION = JSON.parse(fs.readFileSync(path.join(REAL, "package.json"),
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "autodom-legacy-"));
 const DIR = path.join(ROOT, "autodom", "server");
 fs.mkdirSync(DIR, { recursive: true });
-for (const f of ["index.js", "self-restart.js", "update-utils.js", "bridge-reaper.js", "native-host.js", "automation-store.js", "package.json"]) {
+for (const f of ["index.js", "self-restart.js", "update-utils.js", "bridge-reaper.js", "native-host.js", "automation-store.js", "viewer-app.js", "package.json"]) {
   fs.copyFileSync(path.join(REAL, f), path.join(DIR, f));
 }
 fs.symlinkSync(path.join(REAL, "node_modules"), path.join(DIR, "node_modules"));

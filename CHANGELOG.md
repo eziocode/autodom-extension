@@ -4,6 +4,50 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 6.1.0
+
+### Added
+- **Vision fallback for self-heal.** When locators, heuristics and the text
+  model all fail to find a moved element, AutoDOM screenshots the page with
+  numbered boxes on every on-screen control and asks your direct AI provider
+  (needs a vision-capable model) which box fulfils the step. The boxes are
+  removed again immediately. `vision: false` turns it off.
+- **Dry run.** `workflow_run { mode: "dry" }` / `/replay <name> dry` checks
+  that every step's target can be found without clicking or typing, and says
+  what would self-heal. It checks up to the first step that could change the
+  page (`checkAll: true` goes on best-effort).
+- **Undo.** `run_undo` / `/undo` reverses what a run changed where that is
+  safe: typed values, selects and checkboxes, storage keys and cookies the run
+  added (same site only), and optionally navigation. Clicks and submitted
+  forms are reported as not undoable. Undo data is RAM-only, for the last 20
+  runs.
+- **Parallel runs.** `workflow_run_many` runs workflows side by side, each in
+  its own background tab (up to 5 at once, 20 per batch), with one combined
+  report, `run_get { batchId }` and `run_cancel { batchId }`.
+  `workflow_run { newTab: true }` runs one in a fresh tab.
+- **MCP App viewer.** `run_report_view` and `workflow_view` render an
+  interactive report in hosts that support MCP Apps (`ui://autodom/viewer.html`):
+  step timeline, strategy and heal chips, page diffs, failure screenshot, and
+  buttons to preview an undo or dry-check the workflow. Other hosts get a text
+  summary.
+- `run_list` now includes each run's `mode` and `batchId`.
+
+### Changed
+- **Take over button redesigned.** It is now a small, translucent icon beside
+  the MCP badge that expands to "Take over" only on hover or keyboard focus,
+  so it no longer sits over page content. While you are in control it becomes
+  a calm, near-opaque "In control · Hand back" pill that stays readable on any
+  page. It follows light/dark mode, can be dragged out of the way (the
+  position is remembered), and lives in a closed shadow root so page styles
+  cannot change it.
+- Run statistics are updated one run at a time, so many runs of the same
+  workflow in parallel no longer lose counts.
+- A run that opens its own tab now closes it itself (scheduled runs behave as
+  before).
+- The public MCP inventory grows from 127 to 131 tools.
+
+---
+
 ## 6.0.0
 
 ### Added

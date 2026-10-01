@@ -52,7 +52,7 @@ Floating sidebar or inline overlay — talk to your AI agent without leaving the
 <td>
 
 ### 🎓 Teach Once, Replay Forever
-Record a task (`/teach`), replay it without an LLM (`/replay`), and let it self-heal when the page changes. Export to Playwright or a readable Markdown routine. Schedule it daily or every N minutes. [Guide →](docs/WORKFLOWS.md)
+Record a task (`/teach`), replay it without an LLM (`/replay`), and let it self-heal when the page changes, even by looking at a screenshot. Dry-run, undo, run several at once, export to Playwright or a readable Markdown routine, and schedule it. [Guide →](docs/WORKFLOWS.md)
 
 </td>
 <td>

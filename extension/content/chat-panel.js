@@ -1710,7 +1710,8 @@
     { command: "/quick", insert: "/quick ", description: "Quick mode: compact commands, faster execution (lightning mode)" },
     { command: "/teach", insert: "/teach", description: "Teach a task: record it now, /teach <name> again to save" },
     { command: "/workflows", insert: "/workflows", description: "List saved workflows" },
-    { command: "/replay", insert: "/replay ", description: "Replay a saved workflow: /replay <name|id> [{vars}]" },
+    { command: "/replay", insert: "/replay ", description: "Replay a saved workflow: /replay <name|id> [dry] [{vars}]" },
+    { command: "/undo", insert: "/undo", description: "Undo the last run's reversible changes: /undo [preview] [navigation]" },
     { command: "/export", insert: "/export ", description: "Export a workflow: /export <name|id> playwright|markdown|json" },
     { command: "/shortcut", insert: "/shortcut ", description: "Save a prompt as /<name>: /shortcut add <name> <prompt>" },
     { command: "/schedules", insert: "/schedules", description: "List scheduled runs" },
@@ -5941,13 +5942,27 @@
         case "wf":
           return { type: "workflow", op: "list" };
         case "replay": {
-          // /replay <name or id> [{"var":"value"}]
+          // /replay <name or id> [dry] [{"var":"value"}]
           const m = rest.trim().match(/^(.*?)\s*(\{[\s\S]*\})?$/);
+          let name = (m && m[1] ? m[1] : rest).trim();
+          const dry = /\s+dry$/i.test(name) || /^dry\s+/i.test(name);
+          name = name.replace(/\s+dry$/i, "").replace(/^dry\s+/i, "").trim();
           return {
             type: "workflow",
             op: "replay",
-            id: (m && m[1] ? m[1] : rest).trim(),
+            id: name,
+            dry,
             variables: m && m[2] ? tryParseJSON(m[2]) : {},
+          };
+        }
+        case "undo": {
+          const words = rest.toLowerCase().split(/\s+/).filter(Boolean);
+          return {
+            type: "workflow",
+            op: "undo",
+            preview: words.includes("preview") || words.includes("dry"),
+            navigation: words.includes("navigation"),
+            runId: words.find((w) => /^run_/.test(w)) || "",
           };
         }
         case "export": {
@@ -7058,7 +7073,8 @@
       "  /offscreen on|off|status \u2014 Toggle SW keepalive mode\n" +
       "  /teach [name] \u2014 Record a task; run again to stop and save it\n" +
       "  /workflows \u2014 List saved workflows\n" +
-      "  /replay <name|id> [{vars}] \u2014 Replay a workflow (self-heals)\n" +
+      "  /replay <name|id> [dry] [{vars}] \u2014 Replay a workflow (self-heals); dry only checks targets\n" +
+      "  /undo [preview] [navigation] \u2014 Reverse the last run's typed values, storage and cookies\n" +
       "  /export <name|id> playwright|markdown|json \u2014 Export a workflow\n" +
       "  /shortcut add <name> <prompt> \u2014 Save a prompt as /<name> (list, rm <name>)\n" +
       "  /schedules \u2014 Scheduled runs (create them from your IDE agent: schedule_create)\n" +
@@ -7573,14 +7589,17 @@
   }
 
   function _workflowReport(run) {
-    const icon = run.status === "passed" ? "✅" : run.status === "running" ? "⏳" : "❌";
+    const icon = ["passed", "dry_ok"].includes(run.status) ? "✅" : ["running", "dry_needs_heal"].includes(run.status) ? "⏳" : "❌";
     const lines = [`${icon} **${run.workflowName || "Workflow"}** — ${run.status}` +
       (run.durationMs != null ? ` in ${(run.durationMs / 1000).toFixed(1)}s` : "") +
       (run.healed ? ` · self-healed ${run.healed} step${run.healed === 1 ? "" : "s"}` : "")];
     for (const st of run.steps || []) {
-      lines.push(`${st.ok ? "✓" : st.skipped ? "↷" : "✗"} ${st.index + 1}. ${st.action} ${st.target || ""}` +
-        (st.healed ? ` _(healed via ${st.healed})_` : "") + (st.error ? ` — ${st.error}` : ""));
+      lines.push(`${st.unchecked ? "·" : st.ok ? "✓" : st.skipped ? "↷" : "✗"} ${st.index + 1}. ${st.action} ${st.target || ""}` +
+        (st.healed ? ` _(healed via ${st.healed})_` : "") +
+        (st.wouldHealTo ? ` _(would heal to ${st.wouldHealTo})_` : "") +
+        (st.unchecked ? " _(not checked)_" : "") + (st.error ? ` — ${st.error}` : ""));
     }
+    if (run.mode === "dry") lines.push("", "_Dry run: nothing was clicked or typed._");
     if (run.error) lines.push("", run.error);
     if (run.status === "running") lines.push("", "Still running — `/workflows` shows the last result when it finishes.");
     return lines.join("\n");
@@ -7677,7 +7696,12 @@
         _setBusy(true);
         showTyping();
         try {
-          const run = await callTool("workflow_run", { id: command.id, variables: command.variables || {}, waitMs: 120000 });
+          const run = await callTool("workflow_run", {
+            id: command.id,
+            variables: command.variables || {},
+            ...(command.dry ? { mode: "dry" } : {}),
+            waitMs: 120000,
+          });
           if (run && run.missing) return say(`This workflow needs values for: ${run.missing.map((n) => "`" + n + "`").join(", ")}.\n\nExample: \`/replay ${command.id} ${JSON.stringify(Object.fromEntries(run.missing.map((n) => [n, "..."])))}\``);
           if (!run || (!run.runId && run.error)) return say("Replay failed: " + ((run && run.error) || "unknown"));
           return say(_workflowReport(run));
@@ -7685,6 +7709,29 @@
           hideTyping();
           _setBusy(false);
         }
+      }
+      if (command.op === "undo") {
+        let runId = command.runId;
+        if (!runId) {
+          const recent = await callTool("run_list", { limit: 10 });
+          const last = recent && recent.runs && recent.runs.find((r) => r.status !== "running" && r.mode !== "dry");
+          if (!last) return say("No finished run to undo.");
+          runId = last.runId;
+        }
+        const r = await callTool("run_undo", { runId, dryRun: command.preview, navigation: command.navigation });
+        if (!r || (r.error && !r.results)) return say("Undo failed: " + ((r && r.error) || "unknown"));
+        const lines = [command.preview ? "**Undo preview** (nothing changed)" : `**Undo** — ${r.undone} change(s) reversed`];
+        for (const x of r.results || []) {
+          lines.push(`${x.status === "undone" ? "✓" : x.status === "failed" ? "✗" : "•"} step ${x.step} · ${x.type} · ${String(x.status).replace(/_/g, " ")}` +
+            (x.detail ? ` (${x.detail})` : "") + (x.reason ? ` — ${x.reason}` : ""));
+        }
+        if (!(r.results || []).length) lines.push("Nothing to undo.");
+        if ((r.irreversible || []).length) {
+          lines.push("", "**Cannot be undone:**");
+          for (const x of r.irreversible) lines.push(`- step ${x.step}: ${x.what} — ${x.why}`);
+        }
+        if (command.preview) lines.push("", "Run `/undo` to apply" + (command.navigation ? "" : ", `/undo navigation` to also step back through pages") + ".");
+        return say(lines.join("\n"));
       }
       if (command.op === "schedules") {
         const r = await callTool("schedule_list", {});

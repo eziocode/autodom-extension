@@ -75,7 +75,7 @@ export async function locateStagedBundle(
       `Update bundle server version ${serverVersion || "(missing)"} does not match ${expectedVersion}`,
     );
   }
-  for (const required of ["server/index.js", "server/self-restart.js", "server/update-utils.js", "server/automation-store.js"]) {
+  for (const required of ["server/index.js", "server/self-restart.js", "server/update-utils.js", "server/automation-store.js", "server/viewer-app.js"]) {
     await fsApi.access(join(root, required));
   }
   await validateStagedExtension(join(root, "extension"), expectedVersion, fsApi);
