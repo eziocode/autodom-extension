@@ -181,16 +181,40 @@ function cmpVersion(a, b) {
 export function decideLegacyRestart({
   bridges = [],
   versions = {},
+  statuses = {},
   diskVersion,
   minVersion = SELF_RESTART_MIN_VERSION,
 } = {}) {
   if (!diskVersion || cmpVersion(diskVersion, minVersion) < 0) return [];
+  const statusByPid = new Map();
+  for (const st of Object.values(statuses || {})) {
+    if (st?.pid) statusByPid.set(st.pid, st);
+  }
   const out = [];
   for (const b of bridges) {
     const version = versions[b.pid];
     if (!version) continue; // unknown: never guess
-    if (cmpVersion(version, minVersion) >= 0) continue; // restarts itself
     if (cmpVersion(version, diskVersion) >= 0) continue; // already current
+    if (cmpVersion(version, minVersion) >= 0) {
+      // Can restart itself in principle. Still stuck when it is a primary
+      // that will not: self-restart switched off, or a relay that already
+      // spawned its successor but grabbed the port back during the handover
+      // (it then ignores every RESTART_STALE because it is "supervising").
+      const st = statusByPid.get(b.pid);
+      if (!st?.staleOnDisk) continue;
+      const relay =
+        st.supervising === true || bridges.some((c) => c.ppid === b.pid);
+      if (st.autoRestart !== false && !relay) continue;
+      out.push({
+        pid: b.pid,
+        port: b.port ?? portFromCommand(b.command),
+        version,
+        reason: relay
+          ? `runs v${version} as a relay that kept the port after restarting (installed v${diskVersion})`
+          : `runs v${version} with self-restart off (installed v${diskVersion})`,
+      });
+      continue;
+    }
     out.push({
       pid: b.pid,
       port: b.port ?? portFromCommand(b.command),

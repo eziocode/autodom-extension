@@ -210,3 +210,23 @@ test("legacy restart does nothing when the installed server could not restart it
     [],
   );
 });
+
+test("legacy restart catches self-restarting primaries that are stuck", () => {
+  const st = (pid, extra = {}) => ({ pid, role: "primary", staleOnDisk: true, autoRestart: true, ...extra });
+  const v = decideLegacyRestart({
+    // 1: relay whose successor (10) is its child; 2: self-restart off;
+    // 3: stale but healthy — restarts itself when idle; 4: reports supervising.
+    bridges: [bridge(1), bridge(10, { ppid: 1 }), bridge(2, { port: 9877 }), bridge(3, { port: 9878 }), bridge(4, { port: 9879 })],
+    versions: { 1: "5.4.1", 10: "6.0.0", 2: "5.4.1", 3: "5.4.1", 4: "5.4.1" },
+    statuses: {
+      9876: st(1),
+      9877: st(2, { autoRestart: false }),
+      9878: st(3),
+      9879: st(4, { supervising: true }),
+    },
+    diskVersion: "6.0.0",
+  });
+  assert.deepEqual(pids(v), [1, 2, 4]);
+  assert.match(v.find((e) => e.pid === 1).reason, /relay that kept the port/);
+  assert.match(v.find((e) => e.pid === 2).reason, /self-restart off/);
+});

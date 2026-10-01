@@ -269,6 +269,7 @@ function summarize(snapshot, verdict) {
     legacyStale: decideLegacyRestart({
       bridges: snapshot.bridges,
       versions: snapshot.versions || {},
+      statuses: snapshot.statuses || {},
       diskVersion: VERSION,
     }),
     bridges: snapshot.bridges.map((b) => ({
@@ -335,6 +336,7 @@ async function upgradeLegacy(port) {
   const targets = decideLegacyRestart({
     bridges: snap.bridges.filter((b) => !port || b.port === port),
     versions: snap.versions,
+    statuses: snap.statuses,
     diskVersion: VERSION,
   });
   // The primary last, so proxies are not left electing a new (old) primary.
