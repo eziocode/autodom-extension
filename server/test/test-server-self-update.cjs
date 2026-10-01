@@ -22,7 +22,7 @@ fs.rmSync(LOCK, { force: true });
 
 const REAL = path.resolve(__dirname, "..");
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "autodom-selfupdate-"));
-const SERVER_FILES = ["index.js", "self-restart.js", "update-utils.js", "bridge-reaper.js", "native-host.js", "package.json", "package-lock.json"];
+const SERVER_FILES = ["index.js", "self-restart.js", "update-utils.js", "bridge-reaper.js", "native-host.js", "automation-store.js", "package.json", "package-lock.json"];
 const EXT_ID = "kpjdffgogiajnkajnjneiboaincnaokf";
 const CANON = "https://github.com/eziocode/autodom-extension/releases/download";
 

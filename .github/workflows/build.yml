@@ -60,6 +60,7 @@ jobs:
           node test/test-self-restart-fleet.cjs
           node test/test-server-self-update.cjs
           node test/test-legacy-upgrade.cjs
+          node test/test-automation-e2e.cjs
 
       - name: Build Chrome zip
         run: bash scripts/build-chrome.sh

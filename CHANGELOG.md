@@ -4,6 +4,72 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 6.0.0
+
+### Added
+- **Teach a task, replay it without an LLM.** A new workflow engine replaces
+  the old one-slot macro recorder. `/teach` in the chat panel (or
+  `workflow_record_start` / `workflow_record_stop`) records clicks, typing,
+  selects, checkboxes, Enter/Escape and navigations, whether you or the agent
+  drive the page.
+  - Every target is stored as a locator bundle: test id, id, name, role and
+    accessible name, label, placeholder, text, CSS, XPath, position and the
+    shadow-DOM path. Auto-generated ids are ignored.
+  - Typed values become `{{variables}}`. Password-like fields become secret
+    variables and are never stored.
+  - `workflow_run` / `/replay` resolves each step from the most to the least
+    stable locator.
+  - **Self-heal:** when the page changed, a heuristic matcher (and, if one
+    is configured, your direct AI provider) picks the element, and the
+    healed locator is saved so the next run is deterministic again.
+  - Run reports show the strategy used, any heals, before/after page diffs
+    (URL, content, storage and cookie keys) and a screenshot on failure.
+  - `workflow_export` produces a Playwright test (`getByRole` / `getByTestId`,
+    variables from `AUTODOM_*` environment variables), a readable Markdown
+    routine that can be imported again, or JSON. Saved workflows are mirrored
+    to `~/.autodom/workflows/`.
+  - New tools: `workflow_record_start`, `workflow_record_stop`,
+    `workflow_save`, `workflow_list`, `workflow_get`, `workflow_delete`,
+    `workflow_run`, `workflow_export`, `workflow_from_recording`,
+    `run_list`, `run_get`, `run_cancel`.
+- **Scheduled runs.** `schedule_create` runs a workflow (or, with a direct AI
+  provider, a prompt) every N minutes, daily or weekly in a background
+  AutoDOM tab. Failures raise a desktop notification. A run missed while the
+  browser was closed fires once at the next start-up. Also
+  `schedule_list`, `schedule_update` and `schedule_delete`, plus `/schedules`
+  and `/runs` in the chat panel.
+- **Saved shortcuts:** `/shortcut add <name> <prompt>` turns a prompt into its
+  own `/<name>` command.
+- **Compact snapshots with refs.** `take_snapshot { mode: "interactive" }`
+  lists only actionable elements, one line each (`@e5 button "Sign in"`), as
+  plain text. `click`, `type_text`, `hover`, `select_option` and
+  `press_key` accept `ref: "@e5"`. `browser_snapshot` defaults to this mode
+  when it has no target, and the `browser_*` aliases accept a Playwright-MCP
+  `ref`.
+- **WebMCP:** `webmcp_list_tools` and `webmcp_call_tool` call tools a site
+  registered through `document.modelContext` (Chrome origin trial 149–156).
+- **Approval rules:** `/rules add deny|ask|allow <site> [write|destructive|any]`.
+  Agents can read the rules (`approval_rules`) but cannot change them. An
+  `ask` rule holds the call for `confirm_action`, or, for MCP 2026-07-28
+  clients that support elicitation, asks inline via `inputRequired` with a
+  signed, single-use approval. Confirm mode uses the same inline prompt.
+- **Take over / Hand back** button on the session border. It pauses workflow
+  runs on that tab and defers agent calls with `USER_TAKEOVER` until you hand
+  back.
+- **Audit log:** write and destructive calls are appended to
+  `~/.autodom/audit/YYYY-MM-DD.jsonl` with secrets redacted, and are
+  searchable with `audit_query`. Set `AUTODOM_AUDIT=0` to turn it off or
+  `=all` to include reads.
+- New `notifications` permission, used for scheduled-run alerts. Chrome
+  shows no prompt for it.
+
+### Changed
+- The chat panel's record button now records a workflow instead of a macro.
+  The old `macro_*` agent tools are unchanged.
+- The public MCP inventory grows from 107 to 127 tools.
+
+---
+
 ## 5.4.1
 
 ### Fixed

@@ -1093,6 +1093,13 @@
   } catch (_) {
     // media-tools.js not loaded — catalog stays as-is.
   }
+  try {
+    if (globalThis.AutoDOMWorkflow && Array.isArray(globalThis.AutoDOMWorkflow.catalog)) {
+      for (const t of globalThis.AutoDOMWorkflow.catalog) TOOL_CATALOG.push(t);
+    }
+  } catch (_) {
+    // workflow-engine.js not loaded — catalog stays as-is.
+  }
 
   // ─── Per-provider formatters ────────────────────────────
 

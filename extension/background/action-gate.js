@@ -75,6 +75,15 @@
     "image_get_data",
     "macro_record_stop",
     "tab_recording_status",
+    // Workflow engine reads.
+    "workflow_list",
+    "workflow_get",
+    "workflow_export",
+    "workflow_record_stop",
+    "run_list",
+    "run_get",
+    "schedule_list",
+    "webmcp_list_tools",
   ]);
 
   // Anything in this list bypasses a site's "allow mutating" rule and is
@@ -114,6 +123,11 @@
     "macro_replay",
     "tab_recording_start",
     "tab_recording_stop",
+    // Replaying a workflow performs every recorded step; recording
+    // captures typed values. Always confirm.
+    "workflow_run",
+    "workflow_record_start",
+    "webmcp_call_tool",
   ]);
 
   function classify(toolName, params = {}) {
@@ -354,8 +368,82 @@
     }
   }
 
+  // ── Per-site approval rules for bridge (IDE agent) calls ──
+  // [{ match: "*.bank.com" | "github.com" | "*", tier: "any"|"write"|"destructive",
+  //    policy: "allow"|"ask"|"deny", tools?: ["navigate", ...] }]
+  // First matching rule wins. No match = the default behaviour.
+  const APPROVAL_RULES_KEY = "autodom.approvalRules";
+  const RULE_TIERS = new Set(["any", "write", "destructive"]);
+  const RULE_POLICIES = new Set(["allow", "ask", "deny"]);
+
+  function tierOf(toolName, params) {
+    const c = classify(toolName, params);
+    return c === "safe-read" ? "read" : c === "mutating" ? "write" : "destructive";
+  }
+
+  function hostMatches(pattern, host) {
+    const p = String(pattern || "").trim().toLowerCase();
+    const h = String(host || "").toLowerCase();
+    if (!p) return false;
+    if (p === "*") return true;
+    if (!h) return false;
+    const bare = p.startsWith("*.") ? p.slice(2) : p;
+    return h === bare || h.endsWith("." + bare);
+  }
+
+  function normalizeRules(rules) {
+    const out = [];
+    const errors = [];
+    (Array.isArray(rules) ? rules : []).forEach((r, i) => {
+      const rule = {
+        match: String((r && r.match) || "").trim().toLowerCase(),
+        tier: String((r && r.tier) || "write").toLowerCase(),
+        policy: String((r && r.policy) || "").toLowerCase(),
+      };
+      if (Array.isArray(r && r.tools) && r.tools.length) rule.tools = r.tools.map(String);
+      if (!rule.match || !/^(\*|(\*\.)?[a-z0-9.-]+)$/.test(rule.match)) errors.push(`rule ${i + 1}: match must be "*", "example.com" or "*.example.com"`);
+      if (!RULE_TIERS.has(rule.tier)) errors.push(`rule ${i + 1}: tier must be any, write or destructive`);
+      if (!RULE_POLICIES.has(rule.policy)) errors.push(`rule ${i + 1}: policy must be allow, ask or deny`);
+      out.push(rule);
+    });
+    return { rules: out, errors };
+  }
+
+  function matchApprovalRule(rules, { host, tier, tool }) {
+    for (const r of rules || []) {
+      if (!hostMatches(r.match, host)) continue;
+      if (r.tools && r.tools.length && !r.tools.includes(tool)) continue;
+      if (r.tier === "write" && tier === "read") continue;
+      if (r.tier === "destructive" && tier !== "destructive") continue;
+      return r;
+    }
+    return null;
+  }
+
+  async function getApprovalRules() {
+    try {
+      const got = await chrome.storage.local.get(APPROVAL_RULES_KEY);
+      return (got && got[APPROVAL_RULES_KEY]) || [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  async function setApprovalRules(rules) {
+    const { rules: clean, errors } = normalizeRules(rules);
+    if (errors.length) return { ok: false, error: errors.join("; ") };
+    await chrome.storage.local.set({ [APPROVAL_RULES_KEY]: clean });
+    return { ok: true, rules: clean };
+  }
+
   globalThis.AutoDOMActionGate = {
     classify,
+    tierOf,
+    hostMatches,
+    normalizeRules,
+    matchApprovalRule,
+    getApprovalRules,
+    setApprovalRules,
     normalizeOrigin,
     resolveDecision,
     requestDecision,

@@ -19,6 +19,9 @@ try {
   if (typeof importScripts === "function" && !globalThis.AutoDOMMediaTools) {
     importScripts("media-tools.js");
   }
+  if (typeof importScripts === "function" && !globalThis.AutoDOMWorkflow) {
+    importScripts("workflow-engine.js");
+  }
   if (typeof importScripts === "function" && !globalThis.AutoDOMAgent) {
     importScripts("agent-tools.js");
   }
@@ -27,6 +30,9 @@ try {
   }
   if (typeof importScripts === "function" && !globalThis.AutoDOMTabGroup) {
     importScripts("tab-isolation.js");
+  }
+  if (typeof importScripts === "function" && !globalThis.AutoDOMScheduler) {
+    importScripts("scheduler.js");
   }
 } catch (_) {
   // Already loaded (Firefox path) — ignore.
@@ -1221,6 +1227,13 @@ async function executeAgentTool(toolName, params) {
     }
   } catch (_) {}
 
+  if (toolName === "approval_rules_set" || toolName === "takeover_set") {
+    return { ok: false, error: `${toolName} can only be changed by the user from the chat panel.` };
+  }
+  if (_gateTab && _takeoverTabs.has(_gateTab.id) && globalThis.AutoDOMActionGate?.tierOf?.(toolName, params) !== "read") {
+    return { ok: false, error: "USER_TAKEOVER: the user has taken control of this tab. Wait until they hand it back." };
+  }
+
   // ── ActionGate: Ask Before Act ──────────────────────────────
   const Gate = globalThis.AutoDOMActionGate;
   if (Gate && _agentBatchDepth === 0) {
@@ -1379,6 +1392,10 @@ function _isTabCreatingCall(toolName, params) {
   if (toolName === "navigate" || toolName === "browser_navigate") {
     return typeof params?.url === "string" && params.url.length > 0;
   }
+  if (toolName === "workflow_run") return params?.tabId == null;
+  if (toolName === "workflow_record_start") {
+    return typeof params?.url === "string" && params.url.length > 0;
+  }
   if (toolName === "batch_actions") {
     const first = Array.isArray(params?.actions) ? params.actions[0] : null;
     const args = first?.args || first?.params || {};
@@ -1398,7 +1415,10 @@ function _needsPrecreatedTab(toolName, params) {
     );
   }
   return (
-    (toolName === "navigate" || toolName === "browser_navigate") &&
+    (toolName === "navigate" ||
+      toolName === "browser_navigate" ||
+      toolName === "workflow_run" ||
+      toolName === "workflow_record_start") &&
     _isTabCreatingCall(toolName, params)
   );
 }
@@ -3908,7 +3928,10 @@ async function _onWsConn_TOOL_CALL(message) {
           Tab.beginCall(clientId);
           try {
             result = await _withAgentTabContext(isoCtx, () =>
-              handleToolCallWithRecording(toolName, params, message.id),
+              handleToolCallWithRecording(toolName, params, message.id, {
+                bridge: true,
+                confirmed: message.confirmed === true,
+              }),
             );
           } finally {
             Tab.endCall(clientId);
@@ -3928,13 +3951,17 @@ async function _onWsConn_TOOL_CALL(message) {
         } else if (result === undefined) {
           if (pinCtx) {
             result = await _withAgentTabContext(pinCtx, () =>
-              handleToolCallWithRecording(toolName, params, message.id),
+              handleToolCallWithRecording(toolName, params, message.id, {
+                bridge: true,
+                confirmed: message.confirmed === true,
+              }),
             );
           } else {
             result = await handleToolCallWithRecording(
               toolName,
               params,
               message.id,
+              { bridge: true, confirmed: message.confirmed === true },
             );
           }
 
@@ -4423,6 +4450,24 @@ function stopKeepAlive() {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "SW_KEEPALIVE") {
     sendResponse({ ok: true });
+    return false;
+  }
+
+  // Take over / hand back button on the session border.
+  if (message.type === "AUTODOM_TAKEOVER" && sender?.tab?.id != null) {
+    _setTakeover(sender.tab.id, message.on !== false).then(sendResponse, (err) =>
+      sendResponse({ ok: false, error: String(err?.message || err) }),
+    );
+    return true;
+  }
+  if (message.type === "AUTODOM_TAKEOVER_QUERY" && sender?.tab?.id != null) {
+    sendResponse({ takeover: _takeoverTabs.has(sender.tab.id) });
+    return false;
+  }
+
+  // Workflow recorder steps (fire-and-forget from the recording tab).
+  if (message.type === "AUTODOM_WF_STEP") {
+    try { workflowEngine?.onRuntimeMessage(message, sender); } catch (_) {}
     return false;
   }
 
@@ -5964,6 +6009,19 @@ const TOOL_HANDLERS = new Map([
   ["clear_cookies", toolClearCookies],
   ["print_to_pdf", toolPrintToPdf],
   ["emulate_media", toolEmulateMedia],
+  // ─── Approval rules + take-over (user-controlled) ─────────
+  ["approval_rules_get", async () => ({ ok: true, rules: (await globalThis.AutoDOMActionGate?.getApprovalRules?.()) || [] })],
+  ["approval_rules_set", async (params) => globalThis.AutoDOMActionGate.setApprovalRules(params?.rules || [])],
+  [
+    "takeover_set",
+    async (params) => {
+      const tabId = params?.tabId ?? (await getActiveTab()).id;
+      return _setTakeover(tabId, params?.on !== false);
+    },
+  ],
+  // ─── WebMCP (page-registered agent tools) ─────────────────
+  ["webmcp_list_tools", toolWebMcpListTools],
+  ["webmcp_call_tool", toolWebMcpCallTool],
   // ─── Playwright MCP compatibility aliases ─────────────────
   ["browser_snapshot", toolBrowserSnapshot],
   ["browser_click", toolBrowserClick],
@@ -6024,6 +6082,165 @@ try {
   }
 } catch (mtErr) {
   _debugWarn("[AutoDOM SW] Failed to wire media tools:", mtErr && mtErr.message);
+}
+
+// ─── Workflow engine (workflow-engine.js) ───────────────────
+// Record → saved workflow → deterministic replay with self-heal. Runs
+// resolve their tab once at start and then address it by id, so they
+// keep working after the bridge call that started them has returned.
+const WORKFLOW_RUNNER_CLIENT_ID = "autodom-workflow-runner";
+let workflowEngine = null;
+try {
+  if (globalThis.AutoDOMWorkflow?.makeEngine) {
+    workflowEngine = globalThis.AutoDOMWorkflow.makeEngine({
+      getActiveTab,
+      executeInTab,
+      waitForTabComplete,
+      storage: chrome.storage,
+      log: _debugWarn,
+      getSessionRecording: async () => sessionRecording,
+      captureScreenshot: async (tabId) => {
+        const tab = await chrome.tabs.get(tabId);
+        return _captureBackgroundTab(tab, { format: "jpeg", quality: 60 });
+      },
+      openRunTab: _openWorkflowRunTab,
+      llmPick: _workflowLlmPick,
+    });
+    for (const [name, fn] of Object.entries(workflowEngine.handlers)) {
+      TOOL_HANDLERS.set(name, fn);
+    }
+    workflowEngine.hydrate().catch(() => {});
+  }
+} catch (wfErr) {
+  _debugWarn("[AutoDOM SW] Failed to wire workflow engine:", wfErr && wfErr.message);
+}
+
+// Background tab for unattended runs: in the AutoDOM group when isolation
+// is on, never the tab the user is looking at.
+async function _openWorkflowRunTab() {
+  const Tab = _AutoDOMTabGroup();
+  if (Tab && (await Tab.isEnabled())) {
+    return Tab.createOwnedTab(WORKFLOW_RUNNER_CLIENT_ID, { url: "about:blank" });
+  }
+  return chrome.tabs.create({ url: "about:blank", active: false });
+}
+
+// Self-heal fallback: ask the user's configured direct provider to pick an
+// element when the heuristic matcher is not confident. No provider → null.
+async function _workflowLlmPick(prompt) {
+  const provider = String(aiProviderSettings?.source || "").toLowerCase();
+  if (!aiProviderSettings?.enabled || !["openai", "anthropic", "ollama"].includes(provider)) {
+    return null;
+  }
+  const result = await _callDirectProvider(provider, prompt, {}, []);
+  return result?.response || result?.text || "";
+}
+
+// ─── Scheduled runs + saved shortcuts (scheduler.js) ────────
+// Scheduled workflow runs open a background tab (in the AutoDOM group when
+// isolation is on) and close it afterwards unless the schedule keeps it.
+async function _closeRunTab(tabId) {
+  try {
+    await _AutoDOMTabGroup()?.closeManagedTab?.(WORKFLOW_RUNNER_CLIENT_ID, tabId, { force: true });
+  } catch (_) {}
+  try { await chrome.tabs.remove(tabId); } catch (_) {}
+}
+
+async function _scheduledWorkflowRun(workflowId, opts = {}) {
+  const wf = await workflowEngine?.findWorkflow(workflowId);
+  if (!wf) return { ok: false, status: "failed", error: `Workflow not found: ${workflowId}` };
+  const started = await workflowEngine.runWorkflow(wf, {
+    variables: opts.variables || {},
+    trigger: opts.trigger || "schedule",
+    newTab: true,
+  });
+  if (!started.ok) return { ...started, status: "failed" };
+  const report = await started.promise;
+  if (!opts.keepTab) await _closeRunTab(report.tabId);
+  return report;
+}
+
+// Prompt shortcuts on a schedule run the in-extension agent loop, which
+// needs a direct AI provider (the IDE path has no one to answer headless).
+async function _scheduledPromptRun(prompt) {
+  const provider = String(aiProviderSettings?.source || "").toLowerCase();
+  const hasKey = !!String(aiProviderSettings?.apiKey || "").trim();
+  const usable =
+    (provider === "ollama" && aiProviderSettings?.enabled === true) ||
+    ((provider === "openai" || provider === "anthropic") && hasKey);
+  if (!usable) {
+    return { error: "Scheduled prompts need a direct AI provider (OpenAI, Anthropic or Ollama) configured in the AutoDOM popup. Schedule a recorded workflow instead to run without an LLM." };
+  }
+  const runTab = await _openWorkflowRunTab();
+  try {
+    return await runAgentLoop({
+      providerType: provider,
+      text: prompt,
+      context: {},
+      conversationHistory: [],
+      initialTabId: runTab?.id,
+      modelOverride: _effectiveConfiguredProviderModel(aiProviderSettings, null),
+      attachments: [],
+      mode: null,
+      responseStyle: "concise",
+    });
+  } finally {
+    if (runTab?.id != null) await _closeRunTab(runTab.id);
+  }
+}
+
+let workflowScheduler = null;
+try {
+  if (globalThis.AutoDOMScheduler?.makeScheduler && workflowEngine) {
+    workflowScheduler = globalThis.AutoDOMScheduler.makeScheduler({
+      storage: chrome.storage,
+      alarms: chrome.alarms,
+      log: _debugWarn,
+      findWorkflow: (ref) => workflowEngine.findWorkflow(ref),
+      runWorkflow: _scheduledWorkflowRun,
+      runPrompt: _scheduledPromptRun,
+      notify: (title, message) =>
+        new Promise((resolve) => {
+          if (!chrome.notifications?.create) return resolve(false);
+          chrome.notifications.create(
+            {
+              type: "basic",
+              iconUrl: chrome.runtime.getURL("icons/icon128.png"),
+              title,
+              message,
+            },
+            () => {
+              void chrome.runtime.lastError;
+              resolve(true);
+            },
+          );
+        }),
+    });
+    for (const [name, fn] of Object.entries(workflowScheduler.handlers)) {
+      TOOL_HANDLERS.set(name, fn);
+    }
+    chrome.alarms?.onAlarm?.addListener((alarm) => {
+      if (String(alarm?.name || "").startsWith(globalThis.AutoDOMScheduler.ALARM_PREFIX)) {
+        workflowScheduler.onAlarm(alarm).catch((err) =>
+          _debugWarn("[AutoDOM sched] run failed:", err?.message || err),
+        );
+      }
+    });
+    workflowScheduler.reconcile().catch((err) =>
+      _debugWarn("[AutoDOM sched] reconcile failed:", err?.message || err),
+    );
+  }
+} catch (schedErr) {
+  _debugWarn("[AutoDOM SW] Failed to wire scheduler:", schedErr && schedErr.message);
+}
+
+if (chrome.webNavigation?.onCommitted) {
+  chrome.webNavigation.onCommitted.addListener((details) => {
+    try { workflowEngine?.onNavigationCommitted(details); } catch (_) {}
+  });
+  chrome.webNavigation.onCompleted.addListener((details) => {
+    workflowEngine?.onNavigationCompleted(details)?.catch?.(() => {});
+  });
 }
 
 // Offscreen recorder bridge. The offscreen document owns the MediaStream
@@ -6304,6 +6521,8 @@ async function toolNavigate(params) {
 
 // 2. Click
 async function toolClick(params) {
+  const ref = _refParam(params);
+  if (ref) return _actByRef(ref, { action: params?.dblClick ? "dblclick" : "click" });
   const tab = await getActiveTab();
   const { selector, text, dblClick } = params;
   return await executeInTab(
@@ -6347,9 +6566,13 @@ async function toolClick(params) {
 
 // 3. Type text
 async function toolTypeText(params) {
+  const clearFirst = params?.clearFirst ?? params?.clear ?? false;
+  const ref = _refParam(params);
+  if (ref) {
+    return _actByRef(ref, { action: "fill", value: params?.text ?? "", append: !clearFirst });
+  }
   const tab = await getActiveTab();
   const { selector, text } = params;
-  const clearFirst = params?.clearFirst ?? params?.clear ?? false;
   return await executeInTab(
     tab.id,
     (selector, text, clearFirst) => {
@@ -6381,6 +6604,143 @@ async function toolTypeText(params) {
     },
     [selector, text, clearFirst || false],
   );
+}
+
+// ─── Compact interactive snapshot + @eN refs ─────────────────
+// take_snapshot {mode:"interactive"} lists only actionable elements, one
+// line each ("@e12 button \"Save\""). The refs live in the extension's
+// isolated world for the current document and are accepted as `ref` by
+// click / type_text / hover / select_option until the page navigates.
+function _refParam(params) {
+  const raw =
+    params?.ref ??
+    (typeof params?.selector === "string" && /^@e\d+$/.test(params.selector.trim())
+      ? params.selector
+      : null);
+  if (raw == null || raw === "") return null;
+  const m = /^@?(e\d+)$/.exec(String(raw).trim());
+  return m ? m[1] : null;
+}
+
+async function _actByRef(ref, step) {
+  const P = globalThis.AutoDOMWorkflow?._page;
+  if (!P) return { error: "workflow engine not loaded" };
+  const tab = await getActiveTab();
+  await executeInTab(tab.id, P._pageWfLib, [], "ISOLATED");
+  const res = await executeInTab(tab.id, P._pageWfActOnRef, [ref, step], "ISOLATED");
+  if (!res?.ok) {
+    return {
+      error: res?.error || `Action on @${ref} failed`,
+      hint: "Refs expire when the page navigates or re-renders. Call take_snapshot {mode:\"interactive\"} again for fresh refs.",
+    };
+  }
+  return {
+    success: true,
+    ref: "@" + ref,
+    target: globalThis.AutoDOMWorkflow.describeTarget(res.after),
+    ...(res.note ? { note: res.note } : {}),
+  };
+}
+
+async function _interactiveSnapshot(params) {
+  const W = globalThis.AutoDOMWorkflow;
+  if (!W) return { error: "workflow engine not loaded" };
+  const tab = await getActiveTab();
+  await executeInTab(tab.id, W._page._pageWfLib, [], "ISOLATED");
+  const limit = Math.max(10, Math.min(1000, Number(params?.limit) || 300));
+  const res = await executeInTab(tab.id, W._page._pageWfCandidates, [limit], "ISOLATED");
+  const all = res?.candidates || [];
+  const shown = params?.includeHidden ? all : all.filter((c) => c.visible !== false);
+  let webmcp = 0;
+  try {
+    const listed = await Promise.race([
+      executeInTab(tab.id, _pageWebMcpList, [], "MAIN"),
+      new Promise((r) => setTimeout(() => r(null), 800)),
+    ]);
+    webmcp = listed?.tools?.length || 0;
+  } catch (_) {}
+  const header = [`Page: ${tab.title || ""} — ${tab.url || ""}`];
+  if (webmcp) header.push(`WebMCP: this page exposes ${webmcp} tool${webmcp === 1 ? "" : "s"} (webmcp_list_tools / webmcp_call_tool)`);
+  const lines = shown.map(W.compactLine);
+  const footer = `(${shown.length} interactive elements${all.length >= limit ? `, capped at ${limit}` : ""}. Pass ref:"@eN" to click, type_text, hover or select_option.)`;
+  return {
+    mode: "interactive",
+    url: tab.url,
+    title: tab.title,
+    count: shown.length,
+    webmcpTools: webmcp,
+    snapshot: [...header, ...lines, footer].join("\n"),
+  };
+}
+
+// ─── WebMCP bridge ───────────────────────────────────────────
+// Pages can register their own agent tools with
+// document.modelContext.registerTool() (Chrome origin trial 149–156;
+// navigator.modelContext is the deprecated entry point). These run in the
+// page's MAIN world because the tools are page objects.
+async function _pageWebMcpList() {
+  const pick = (t) => ({
+    name: t.name,
+    description: t.description || "",
+    inputSchema: typeof t.inputSchema === "string" ? (() => { try { return JSON.parse(t.inputSchema); } catch (_) { return t.inputSchema; } })() : t.inputSchema || null,
+    annotations: t.annotations || {},
+  });
+  try {
+    const mc = document.modelContext || navigator.modelContext;
+    if (mc && typeof mc.getTools === "function") {
+      const tools = await mc.getTools();
+      return { ok: true, supported: true, api: document.modelContext ? "document.modelContext" : "navigator.modelContext", tools: Array.from(tools || []).map(pick) };
+    }
+    const testing = navigator.modelContextTesting;
+    if (testing && typeof testing.listTools === "function") {
+      const tools = await testing.listTools();
+      return { ok: true, supported: true, api: "navigator.modelContextTesting", tools: Array.from(tools || []).map(pick) };
+    }
+    return { ok: true, supported: !!mc, tools: [] };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  }
+}
+
+async function _pageWebMcpCall(name, args) {
+  const jsonSafe = (v) => {
+    try {
+      const text = typeof v === "string" ? v : JSON.stringify(v);
+      return text && text.length > 50000 ? text.slice(0, 50000) + "…[truncated]" : v;
+    } catch (_) {
+      return String(v);
+    }
+  };
+  try {
+    const mc = document.modelContext || navigator.modelContext;
+    if (mc && typeof mc.getTools === "function" && typeof mc.executeTool === "function") {
+      const tools = Array.from((await mc.getTools()) || []);
+      const tool = tools.find((t) => t.name === name);
+      if (!tool) return { ok: false, error: `No WebMCP tool named ${name}`, available: tools.map((t) => t.name) };
+      const result = await mc.executeTool(tool, args || {});
+      return { ok: true, tool: name, result: jsonSafe(result) };
+    }
+    const testing = navigator.modelContextTesting;
+    if (testing && typeof testing.executeTool === "function") {
+      const result = await testing.executeTool(name, JSON.stringify(args || {}));
+      return { ok: true, tool: name, result: jsonSafe(result) };
+    }
+    return { ok: false, error: "This page does not expose WebMCP tools (document.modelContext unavailable)." };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  }
+}
+
+async function toolWebMcpListTools() {
+  const tab = await getActiveTab();
+  const res = await executeInTab(tab.id, _pageWebMcpList, [], "MAIN");
+  return { ...res, url: tab.url, count: res?.tools?.length || 0 };
+}
+
+async function toolWebMcpCallTool(params) {
+  if (!params?.name) return { error: "name is required" };
+  const tab = await getActiveTab();
+  return executeInTab(tab.id, _pageWebMcpCall, [String(params.name), params.arguments || params.args || {}], "MAIN");
 }
 
 // 4. Screenshot
@@ -6572,6 +6932,7 @@ async function toolScreenshot(params) {
 
 // 5. Take snapshot (DOM/a11y tree)
 async function toolSnapshot(params) {
+  if (params?.mode === "interactive") return _interactiveSnapshot(params);
   const tab = await getActiveTab();
   const autoScroll = params?.autoScroll || false;
   const maxScrolls = Number.isFinite(params?.maxScrolls) ? params.maxScrolls : 12;
@@ -6737,6 +7098,8 @@ async function toolFillForm(params) {
 
 // 8. Hover
 async function toolHover(params) {
+  const ref = _refParam(params);
+  if (ref) return _actByRef(ref, { action: "hover" });
   const tab = await getActiveTab();
   const { selector } = params;
   return await executeInTab(
@@ -6759,6 +7122,8 @@ async function toolHover(params) {
 
 // 9. Press key
 async function toolPressKey(params) {
+  const ref = _refParam(params);
+  if (ref) return _actByRef(ref, { action: "press", key: params?.key || "Enter" });
   const tab = await getActiveTab();
   const { key, selector } = params;
   return await executeInTab(
@@ -7255,6 +7620,10 @@ async function toolScroll(params) {
 
 // 21. Select option from <select>
 async function toolSelectOption(params) {
+  const ref = _refParam(params);
+  if (ref) {
+    return _actByRef(ref, { action: "select", value: params?.value ?? "", optionText: params?.text || "" });
+  }
   const tab = await getActiveTab();
   const { selector, value, text, index } = params;
   return await executeInTab(
@@ -8531,7 +8900,84 @@ const _originalHandleToolCall = handleToolCall;
 // We patch it inline via the existing handleToolCall since it's referenced by name
 
 // Hook: record every tool call into session
-async function handleToolCallWithRecording(tool, params, id) {
+// ─── Bridge-call policy: user take-over + per-site approval rules ──
+// While the user has taken over a tab, agent calls that would change it
+// are deferred with USER_TAKEOVER so the agent waits instead of fighting
+// the user. Approval rules (action-gate.js) can deny a call or ask for
+// confirmation; "ask" is turned into a confirm_action hold by the bridge.
+const _takeoverTabs = new Set();
+const TAKEOVER_KEY = "autodom.takeoverTabs";
+try {
+  chrome.storage.session?.get(TAKEOVER_KEY).then((got) => {
+    for (const id of got?.[TAKEOVER_KEY] || []) _takeoverTabs.add(id);
+  }).catch(() => {});
+} catch (_) {}
+
+async function _setTakeover(tabId, on) {
+  if (on) _takeoverTabs.add(tabId);
+  else _takeoverTabs.delete(tabId);
+  try { await chrome.storage.session?.set({ [TAKEOVER_KEY]: [..._takeoverTabs] }); } catch (_) {}
+  const affected = on ? workflowEngine?.pauseRuns(tabId) : workflowEngine?.resumeRuns(tabId);
+  try {
+    chrome.tabs.sendMessage(tabId, { type: "AUTODOM_TAKEOVER_STATE", on, pausedRuns: affected || [] }).catch(() => {});
+  } catch (_) {}
+  return { ok: true, tabId, takeover: on, runs: affected || [] };
+}
+
+function _hostOf(url) {
+  try { return new URL(url).hostname || ""; } catch (_) { return ""; }
+}
+
+async function _bridgePolicyCheck(tool, params) {
+  const Gate = globalThis.AutoDOMActionGate;
+  if (tool === "approval_rules_set" || tool === "takeover_set") {
+    return { error: `${tool} can only be changed by the user from the AutoDOM chat panel.`, blocked: true };
+  }
+  const tier = Gate?.tierOf ? Gate.tierOf(tool, params) : "write";
+  let tab = null;
+  try { tab = await getActiveTab(); } catch (_) {}
+  if (tab && _takeoverTabs.has(tab.id) && tier !== "read") {
+    return {
+      error: "USER_TAKEOVER: the user has taken control of this tab. Wait and retry after they click \"Hand back\".",
+      takeover: true,
+      tabId: tab.id,
+      retryAfterMs: 5000,
+    };
+  }
+  if (!Gate?.matchApprovalRule) return null;
+  const rules = await Gate.getApprovalRules();
+  if (!rules.length) return null;
+  const target =
+    (tool === "navigate" || tool === "browser_navigate" || tool === "open_new_tab") && params?.url
+      ? params.url
+      : tab?.url;
+  const host = _hostOf(target);
+  const rule = Gate.matchApprovalRule(rules, { host, tier, tool });
+  if (!rule || rule.policy === "allow") return null;
+  if (rule.policy === "deny") {
+    return {
+      error: `Blocked by your approval rule (${rule.policy} ${rule.tier} on ${rule.match}): ${tool} on ${host || "this page"}.`,
+      blocked: true,
+      domain: host,
+      tier,
+      rule,
+    };
+  }
+  return {
+    approvalRequired: true,
+    tool,
+    tier,
+    domain: host,
+    rule,
+    message: `Your approval rule asks before ${tier} actions on ${rule.match} (${tool} on ${host || "this page"}).`,
+  };
+}
+
+async function handleToolCallWithRecording(tool, params, id, meta = {}) {
+  if (meta.bridge) {
+    const blocked = await _bridgePolicyCheck(tool, params);
+    if (blocked && !(blocked.approvalRequired && meta.confirmed)) return blocked;
+  }
   // Record the tool call (filter sensitive params)
   const safeParams = { ...params };
   if (safeParams.text && tool === "type_text") {
@@ -8552,6 +8998,7 @@ async function handleToolCallWithRecording(tool, params, id) {
     null,
     null,
   );
+  try { workflowEngine?.noteAgentTool(tool, params); } catch (_) {}
   return handleToolCall(tool, params, id);
 }
 

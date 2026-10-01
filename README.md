@@ -51,6 +51,20 @@ Floating sidebar or inline overlay — talk to your AI agent without leaving the
 <tr>
 <td>
 
+### 🎓 Teach Once, Replay Forever
+Record a task (`/teach`), replay it without an LLM (`/replay`), and let it self-heal when the page changes. Export to Playwright or a readable Markdown routine. Schedule it daily or every N minutes. [Guide →](docs/WORKFLOWS.md)
+
+</td>
+<td>
+
+### 🛡 You Stay in Control
+Per-site approval rules (`/rules`), a **Take over** button that pauses the agent, inline MCP approval prompts, and an audit log of every action. Compact `@eN` snapshots and WebMCP site tools cut tokens.
+
+</td>
+</tr>
+<tr>
+<td>
+
 ### 🔒 Local-First & Secure
 All traffic stays on `127.0.0.1`. Auth tokens are auto-generated. API keys live in session-only RAM storage — never on disk.
 
@@ -202,6 +216,8 @@ Pass these via `env` in your MCP config block.
 | `AUTODOM_SERVER_SELF_UPDATE` | `1` | `0` stops the bridge from downloading and installing its own server update |
 | `AUTODOM_ISOLATION` | `1` | `0` makes this bridge opt out of tab-group isolation (agent follows the active tab, as before) |
 | `AUTODOM_ISOLATION_IDLE_MS` | `300000` | Idle time before an unfinished session's AutoDOM tabs are closed; `0` disables |
+| `AUTODOM_HOME` | `~/.autodom` | Workflow mirrors, exports and the audit log |
+| `AUTODOM_AUDIT` | `on` | `0` disables the audit log; `all` also records read-only calls |
 | `AUTODOM_DEBUG` | `0` | `1` for verbose stderr logs |
 | `AUTODOM_WIRE_LOG` | `0` | `1` to log every wire frame |
 
@@ -280,6 +296,7 @@ node server/index.js --stop      # graceful shutdown
 |:---|:---|
 | **[INSTALL.md](INSTALL.md)** | Manual install, per-IDE setup, ports, uninstall |
 | **[CHANGELOG.md](CHANGELOG.md)** | Version history and release notes |
+| **[docs/WORKFLOWS.md](docs/WORKFLOWS.md)** | Record, replay, self-heal, export and schedule workflows; approval rules, take-over, audit log |
 | **[AUTOMATION.md](AUTOMATION.md)** | Local browser automation without AI |
 | **[UPDATES.md](UPDATES.md)** | Release channel, popup update controls, and enterprise rollout |
 | **[SECURITY.md](SECURITY.md)** | Auth tokens, secret storage, permissions |

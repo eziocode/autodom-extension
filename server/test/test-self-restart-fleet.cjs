@@ -16,7 +16,7 @@ const REAL = path.resolve(__dirname, "..");
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "autodom-fleet-"));
 const DIR = path.join(ROOT, "server");
 fs.mkdirSync(DIR);
-for (const f of ["index.js", "self-restart.js", "update-utils.js", "bridge-reaper.js", "native-host.js", "package.json"]) {
+for (const f of ["index.js", "self-restart.js", "update-utils.js", "bridge-reaper.js", "native-host.js", "automation-store.js", "package.json"]) {
   fs.copyFileSync(path.join(REAL, f), path.join(DIR, f));
 }
 fs.symlinkSync(path.join(REAL, "node_modules"), path.join(DIR, "node_modules"));

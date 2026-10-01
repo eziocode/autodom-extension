@@ -28,6 +28,7 @@ for (const f of [
   "update-utils.js",
   "bridge-reaper.js",
   "native-host.js",
+  "automation-store.js",
   "package.json",
 ]) {
   fs.copyFileSync(path.join(REAL, f), path.join(DIR, f));

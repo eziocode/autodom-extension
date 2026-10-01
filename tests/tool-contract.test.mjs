@@ -40,7 +40,7 @@ test("public MCP registration is unique and structurally complete", async () => 
   const inventory = [...direct, ...compat];
 
   assert.equal(new Set(inventory).size, inventory.length);
-  assert.equal(inventory.length, 107, "review public inventory when adding/removing tools");
+  assert.equal(inventory.length, 127, "review public inventory when adding/removing tools");
   assert.match(server, /function getToolTier\(toolName, params = \{\}\)/);
 
   for (const name of direct) {

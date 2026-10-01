@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AutoDOM workflow fixture</title>
+<style>
+  body { font: 15px system-ui, sans-serif; margin: 24px; }
+  form { display: grid; gap: 10px; max-width: 360px; }
+  #result { margin-top: 16px; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Sign in</h1>
+<form id="login-form">
+  <label for="email-1234">Email address</label>
+  <input id="email-1234" name="email" type="email" data-testid="email" placeholder="you@example.com">
+  <label>Password <input id="pw" name="password" type="password"></label>
+  <label for="country">Country</label>
+  <select id="country" name="country">
+    <option value="">Choose…</option>
+    <option value="in">India</option>
+    <option value="us">United States</option>
+  </select>
+  <label><input type="checkbox" id="remember" name="remember"> Remember me</label>
+  <button type="submit" id="login-btn">Sign in</button>
+</form>
+<p><a href="#help" id="help-link">Need help?</a></p>
+<shadow-card></shadow-card>
+<div id="result"></div>
+<script>
+  customElements.define("shadow-card", class extends HTMLElement {
+    connectedCallback() {
+      const root = this.attachShadow({ mode: "open" });
+      root.innerHTML = '<button id="shadow-go" aria-label="Open dashboard">Go</button>';
+      root.getElementById("shadow-go").addEventListener("click", () => {
+        document.getElementById("result").textContent = "Dashboard opened";
+      });
+    }
+  });
+  document.getElementById("login-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const f = e.target;
+    document.getElementById("result").textContent =
+      "Welcome " + f.email.value + " (" + f.country.value + ", remember=" + f.remember.checked + ", pw=" + (f.password.value ? "set" : "empty") + ")";
+  });
+  // ?v=2 simulates a redesign: ids, test ids and the button label change.
+  if (location.search.includes("v=2")) {
+    const btn = document.getElementById("login-btn");
+    btn.id = "submit-7f3a9c21";
+    btn.textContent = "Sign in now";
+    document.getElementById("email-1234").removeAttribute("data-testid");
+    document.getElementById("email-1234").id = "email-field";
+    document.querySelector('label[for="email-1234"]').setAttribute("for", "email-field");
+  }
+</script>
+</body>
+</html>

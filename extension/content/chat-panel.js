@@ -1304,7 +1304,7 @@
       <button class="autodom-chat-icon-btn" type="button" data-action="tab_record_toggle" title="Record this tab to WebM" aria-label="Record tab">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6"/></svg>
       </button>
-      <button class="autodom-chat-icon-btn" type="button" data-action="macro_record_toggle" title="Record / replay a macro of your interactions" aria-label="Record macro">
+      <button class="autodom-chat-icon-btn" type="button" data-action="macro_record_toggle" title="Teach a task: record and save a replayable workflow" aria-label="Record workflow">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="3"/><circle cx="18" cy="12" r="3"/><path d="M6 12h12"/></svg>
       </button>
     </div>
@@ -1708,8 +1708,36 @@
     { command: "/run", insert: "/run ", description: "Run automation script" },
     { command: "/auto", insert: "/auto ", description: "Vision-plan: one-shot screenshot→plan→execute (faster)" },
     { command: "/quick", insert: "/quick ", description: "Quick mode: compact commands, faster execution (lightning mode)" },
+    { command: "/teach", insert: "/teach", description: "Teach a task: record it now, /teach <name> again to save" },
+    { command: "/workflows", insert: "/workflows", description: "List saved workflows" },
+    { command: "/replay", insert: "/replay ", description: "Replay a saved workflow: /replay <name|id> [{vars}]" },
+    { command: "/export", insert: "/export ", description: "Export a workflow: /export <name|id> playwright|markdown|json" },
+    { command: "/shortcut", insert: "/shortcut ", description: "Save a prompt as /<name>: /shortcut add <name> <prompt>" },
+    { command: "/schedules", insert: "/schedules", description: "List scheduled runs" },
+    { command: "/runs", insert: "/runs", description: "Recent workflow run reports" },
+    { command: "/rules", insert: "/rules ", description: "Per-site approval rules: /rules add deny|ask|allow <site> [write|destructive|any]" },
   ];
   let _slashActiveIndex = 0;
+
+  // Saved shortcuts (scheduler.js stores them) become /<name> commands.
+  let _shortcutCache = {};
+  try {
+    chrome.storage?.local?.get?.(["autodom.shortcuts"], (res) => {
+      _shortcutCache = (res && res["autodom.shortcuts"]) || {};
+    });
+    chrome.storage?.onChanged?.addListener?.((changes, area) => {
+      if (area === "local" && changes["autodom.shortcuts"]) {
+        _shortcutCache = changes["autodom.shortcuts"].newValue || {};
+      }
+    });
+  } catch (_) {}
+  function _shortcutOptions() {
+    return Object.values(_shortcutCache).map((sc) => ({
+      command: "/" + sc.name,
+      insert: "/" + sc.name + " ",
+      description: sc.description || (sc.workflowId ? "Replay workflow " + sc.workflowId : String(sc.prompt || "").slice(0, 60)),
+    }));
+  }
 
   function _slashQuery() {
     if (!chatInput) return null;
@@ -1722,7 +1750,7 @@
   function _slashMatches() {
     const query = _slashQuery();
     if (query == null) return [];
-    return SLASH_COMMAND_OPTIONS.filter((opt) =>
+    return [...SLASH_COMMAND_OPTIONS, ..._shortcutOptions()].filter((opt) =>
       opt.command.slice(1).toLowerCase().startsWith(query),
     );
   }
@@ -5907,6 +5935,50 @@
           };
         case "help":
           return { type: "help" };
+        case "teach":
+          return { type: "workflow", op: "teach", name: rest.trim() };
+        case "workflows":
+        case "wf":
+          return { type: "workflow", op: "list" };
+        case "replay": {
+          // /replay <name or id> [{"var":"value"}]
+          const m = rest.trim().match(/^(.*?)\s*(\{[\s\S]*\})?$/);
+          return {
+            type: "workflow",
+            op: "replay",
+            id: (m && m[1] ? m[1] : rest).trim(),
+            variables: m && m[2] ? tryParseJSON(m[2]) : {},
+          };
+        }
+        case "export": {
+          const m = rest.trim().match(/^(.*?)(?:\s+(playwright|markdown|md|json))?$/i);
+          return {
+            type: "workflow",
+            op: "export",
+            id: (m && m[1] ? m[1] : rest).trim(),
+            format: m && m[2] ? m[2].toLowerCase() : "markdown",
+          };
+        }
+        case "shortcut":
+        case "shortcuts": {
+          const m = rest.trim().match(/^(add|save|rm|remove|delete|list)?\s*(\S+)?\s*([\s\S]*)$/i);
+          const op = ((m && m[1]) || "list").toLowerCase();
+          return {
+            type: "shortcut",
+            op: op === "save" ? "add" : op === "remove" || op === "delete" ? "rm" : op,
+            name: m && m[2] ? m[2].replace(/^\//, "").toLowerCase() : "",
+            prompt: m && m[3] ? m[3].trim() : "",
+          };
+        }
+        case "schedules":
+        case "schedule":
+          return { type: "workflow", op: "schedules" };
+        case "runs":
+          return { type: "workflow", op: "runs" };
+        case "rules": {
+          const parts2 = rest.trim().split(/\s+/).filter(Boolean);
+          return { type: "rules", op: (parts2[0] || "list").toLowerCase(), args: parts2.slice(1) };
+        }
         case "auto":
           // Vision-plan mode: one-shot screenshot+snapshot → JSON plan → replay.
           return { type: "ai_automate", prompt: rest.trim(), mode: "vision-plan" };
@@ -5924,6 +5996,9 @@
           return { type: "offscreen_keepalive", statusOnly: true };
         }
         default:
+          if (_shortcutCache[String(tool).toLowerCase()]) {
+            return { type: "shortcut", op: "invoke", name: String(tool).toLowerCase(), rest: rest.trim() };
+          }
           return { tool: tool, params: rest ? tryParseJSON(rest) : {} };
       }
     }
@@ -6981,6 +7056,14 @@
       "  /run <task> or /auto <task> \u2014 Fast AI automation plan + replay\n" +
       "  /quick <task> \u2014 Quick mode: compact command language (fastest)\n" +
       "  /offscreen on|off|status \u2014 Toggle SW keepalive mode\n" +
+      "  /teach [name] \u2014 Record a task; run again to stop and save it\n" +
+      "  /workflows \u2014 List saved workflows\n" +
+      "  /replay <name|id> [{vars}] \u2014 Replay a workflow (self-heals)\n" +
+      "  /export <name|id> playwright|markdown|json \u2014 Export a workflow\n" +
+      "  /shortcut add <name> <prompt> \u2014 Save a prompt as /<name> (list, rm <name>)\n" +
+      "  /schedules \u2014 Scheduled runs (create them from your IDE agent: schedule_create)\n" +
+      "  /runs \u2014 Recent workflow run reports\n" +
+      "  /rules \u2014 Approval rules for IDE agents (add deny|ask|allow <site> [write|destructive|any], rm <n>, clear)\n" +
       "  /extract \u2014 Extract page text\n\n" +
       "Shortcuts:\n" +
       "  Cmd/Ctrl+Shift+K \u2014 Toggle sidebar\n" +
@@ -7183,6 +7266,36 @@
     if (command && command.type === "offscreen_keepalive") {
       _handleOffscreenKeepaliveCommand(command);
       return;
+    }
+
+    if (command && command.type === "workflow") {
+      await _handleWorkflowCommand(command);
+      return;
+    }
+
+    if (command && command.type === "rules") {
+      await _handleRulesCommand(command);
+      return;
+    }
+
+    if (command && command.type === "shortcut") {
+      if (command.op !== "invoke") {
+        await _handleShortcutCommand(command);
+        return;
+      }
+      const sc = _shortcutCache[command.name];
+      if (sc && sc.workflowId) {
+        await _handleWorkflowCommand({
+          type: "workflow",
+          op: "replay",
+          id: sc.workflowId,
+          variables: command.rest ? tryParseJSON(command.rest) : {},
+        });
+        return;
+      }
+      // Prompt shortcut: expand and continue down the normal AI path.
+      text = String(sc ? sc.prompt : "") + (command.rest ? "\n\n" + command.rest : "");
+      command = null;
     }
 
     // If it's a slash command, execute directly via local tool handlers
@@ -7425,38 +7538,181 @@
     }
   }
 
-  // Macro recording — start/stop, persist the captured event array under
-  // chrome.storage.local["autodomMacros.last"] and offer immediate replay.
-  globalThis.__autodomMacroRec = globalThis.__autodomMacroRec || { active: false };
+  // Macro button = workflow recorder ("teach a task"). The recording is
+  // saved as a workflow that /replay runs with self-healing locators.
   async function _autodomToggleMacroRecording(btn) {
-    const state = globalThis.__autodomMacroRec;
     try {
-      if (!state.active) {
-        const r = await callTool("macro_record_start", {});
-        if (r && (r.ok || r.started || r.success)) {
-          state.active = true;
+      const listed = await callTool("workflow_list", {});
+      const recording = !!(listed && listed.recording);
+      if (!recording) {
+        const r = await callTool("workflow_record_start", {});
+        if (r && r.ok) {
           btn && btn.classList.add("autodom-recording");
-          btn && btn.setAttribute("title", "Stop macro recording");
-          _showChatToast("⏺ Recording macro… interact with the page, click again to stop");
+          btn && btn.setAttribute("title", "Stop recording and save the workflow");
+          _showChatToast("⏺ Recording… do the task on the page, then click again (or /teach <name>) to save");
         } else {
-          _showChatToast("Could not start macro: " + (r && (r.error || r.reason) || "unknown"));
+          _showChatToast("Could not start recording: " + ((r && r.error) || "unknown"));
         }
         return;
       }
-      const r = await callTool("macro_record_stop", {});
-      state.active = false;
       btn && btn.classList.remove("autodom-recording");
-      btn && btn.setAttribute("title", "Record / replay a macro of your interactions");
-      if (r && r.ok && Array.isArray(r.events)) {
+      btn && btn.setAttribute("title", "Teach a task: record and save a replayable workflow");
+      await _handleWorkflowCommand({ type: "workflow", op: "teach", name: "" });
+    } catch (err) {
+      _showChatToast("Recording error: " + ((err && err.message) || err));
+    }
+  }
+
+  function _workflowVarsHint(wf) {
+    const vars = (wf && wf.variables) || [];
+    if (!vars.length) return "";
+    const example = {};
+    for (const v of vars) example[v.name] = v.secret ? "<secret>" : v.default || "";
+    return "\n\nVariables: " + vars.map((v) => "`" + v.name + "`" + (v.secret ? " (secret)" : "")).join(", ") +
+      "\n\nReplay with different values:\n`/replay " + wf.name + " " + JSON.stringify(example) + "`";
+  }
+
+  function _workflowReport(run) {
+    const icon = run.status === "passed" ? "✅" : run.status === "running" ? "⏳" : "❌";
+    const lines = [`${icon} **${run.workflowName || "Workflow"}** — ${run.status}` +
+      (run.durationMs != null ? ` in ${(run.durationMs / 1000).toFixed(1)}s` : "") +
+      (run.healed ? ` · self-healed ${run.healed} step${run.healed === 1 ? "" : "s"}` : "")];
+    for (const st of run.steps || []) {
+      lines.push(`${st.ok ? "✓" : st.skipped ? "↷" : "✗"} ${st.index + 1}. ${st.action} ${st.target || ""}` +
+        (st.healed ? ` _(healed via ${st.healed})_` : "") + (st.error ? ` — ${st.error}` : ""));
+    }
+    if (run.error) lines.push("", run.error);
+    if (run.status === "running") lines.push("", "Still running — `/workflows` shows the last result when it finishes.");
+    return lines.join("\n");
+  }
+
+  async function _handleRulesCommand(command) {
+    const say = (text) => {
+      addMessage("assistant", text);
+      _pushHistory({ role: "assistant", content: text });
+    };
+    const current = await callTool("approval_rules_get", {});
+    let rules = (current && current.rules) || [];
+    if (command.op === "add") {
+      const [policy, match, tier] = command.args;
+      rules = [...rules, { policy, match, tier: tier || "write" }];
+    } else if (command.op === "rm" || command.op === "remove") {
+      const n = parseInt(command.args[0], 10);
+      if (!(n >= 1 && n <= rules.length)) return say("Usage: `/rules rm <number>` (see `/rules`)");
+      rules = rules.filter((_, i) => i !== n - 1);
+    } else if (command.op === "clear") {
+      rules = [];
+    } else {
+      if (!rules.length) {
+        return say("No approval rules. IDE agents follow the default behaviour.\n\n" +
+          "Examples:\n- `/rules add deny *.mybank.com any` — never let agents act on your bank\n" +
+          "- `/rules add ask github.com destructive` — confirm before navigating/submitting on GitHub\n" +
+          "- `/rules add allow localhost` — no extra checks on localhost\n\nFirst matching rule wins.");
+      }
+      return say("**Approval rules** (first match wins)\n\n" +
+        rules.map((r, i) => `${i + 1}. **${r.policy}** ${r.tier} actions on \`${r.match}\``).join("\n"));
+    }
+    const saved = await callTool("approval_rules_set", { rules });
+    if (!saved || !saved.ok) return say("Could not save rules: " + ((saved && saved.error) || "unknown"));
+    return say(saved.rules.length
+      ? "Saved.\n\n" + saved.rules.map((r, i) => `${i + 1}. **${r.policy}** ${r.tier} actions on \`${r.match}\``).join("\n")
+      : "All approval rules removed.");
+  }
+
+  async function _handleShortcutCommand(command) {
+    const say = (text) => {
+      addMessage("assistant", text);
+      _pushHistory({ role: "assistant", content: text });
+    };
+    if (command.op === "add") {
+      if (!command.name || !command.prompt) {
+        return say("Usage: `/shortcut add <name> <prompt>` — e.g. `/shortcut add standup Summarise my open PRs on this page`");
+      }
+      const r = await callTool("shortcut_save", { name: command.name, prompt: command.prompt });
+      return say(r && r.ok ? `Saved. Type \`/${r.shortcut.name}\` to run it.` : "Could not save shortcut: " + ((r && r.error) || "unknown"));
+    }
+    if (command.op === "rm") {
+      const r = await callTool("shortcut_delete", { name: command.name });
+      return say(r && r.ok ? `Removed /${r.deleted}.` : "Could not remove shortcut: " + ((r && r.error) || "unknown"));
+    }
+    const r = await callTool("shortcut_list", {});
+    if (!r || !r.ok) return say("Could not list shortcuts: " + ((r && r.error) || "unknown"));
+    if (!r.shortcuts.length) return say("No shortcuts yet. `/shortcut add <name> <prompt>` saves one.");
+    return say("**Shortcuts**\n\n" + r.shortcuts.map((sc) =>
+      `- \`/${sc.name}\` — ${sc.workflowId ? "replays workflow " + sc.workflowId : sc.prompt}`).join("\n"));
+  }
+
+  async function _handleWorkflowCommand(command) {
+    const say = (text) => {
+      addMessage("assistant", text);
+      _pushHistory({ role: "assistant", content: text });
+    };
+    try {
+      if (command.op === "teach") {
+        const listed = await callTool("workflow_list", {});
+        if (!(listed && listed.recording)) {
+          const r = await callTool("workflow_record_start", {});
+          if (!r || !r.ok) return say("Could not start recording: " + ((r && r.error) || "unknown"));
+          return say("⏺ **Recording.** Do the task on this page — clicks, typing, selects and navigation are captured. " +
+            "Type `/teach <name>` when you are done to save it.");
+        }
+        const stopped = await callTool("workflow_record_stop", { name: command.name || undefined, save: true });
+        if (!stopped || !stopped.ok) return say("Could not save: " + ((stopped && stopped.error) || "unknown"));
+        const wf = stopped.workflow;
+        return say(`💾 Saved **${wf.name}** (${wf.steps.length} steps, id \`${wf.id}\`).\n\n` +
+          wf.steps.map((st, i) => `${i + 1}. ${st.action} ${st.url || (st.locator && (st.locator.accessibleName || st.locator.label || st.locator.css)) || ""}`).join("\n") +
+          _workflowVarsHint(wf));
+      }
+      if (command.op === "list") {
+        const r = await callTool("workflow_list", {});
+        if (!r || !r.ok) return say("Could not list workflows: " + ((r && r.error) || "unknown"));
+        if (!r.workflows.length) return say("No saved workflows yet. Type `/teach` to record one.");
+        return say("**Saved workflows**\n\n" + r.workflows.map((w) => {
+          const last = w.lastRun ? ` · last run ${w.lastRun.status}` : "";
+          return `- **${w.name}** — ${w.steps} steps, ${w.stats.runs} runs${last} · \`${w.id}\``;
+        }).join("\n") + "\n\nRun one with `/replay <name>`, export with `/export <name> playwright`.");
+      }
+      if (command.op === "replay") {
+        if (!command.id) return say("Usage: `/replay <name|id> [{\"var\":\"value\"}]`");
+        _setBusy(true);
+        showTyping();
         try {
-          chrome.storage.local.set({ "autodomMacros.last": { events: r.events, savedAt: Date.now() } });
-        } catch (_) {}
-        _showChatToast(`Macro saved (${r.events.length} steps). Type "replay macro" to run it.`);
-      } else {
-        _showChatToast("Macro stop failed: " + (r && (r.error || r.reason) || "unknown"));
+          const run = await callTool("workflow_run", { id: command.id, variables: command.variables || {}, waitMs: 120000 });
+          if (run && run.missing) return say(`This workflow needs values for: ${run.missing.map((n) => "`" + n + "`").join(", ")}.\n\nExample: \`/replay ${command.id} ${JSON.stringify(Object.fromEntries(run.missing.map((n) => [n, "..."])))}\``);
+          if (!run || (!run.runId && run.error)) return say("Replay failed: " + ((run && run.error) || "unknown"));
+          return say(_workflowReport(run));
+        } finally {
+          hideTyping();
+          _setBusy(false);
+        }
+      }
+      if (command.op === "schedules") {
+        const r = await callTool("schedule_list", {});
+        if (!r || !r.ok) return say("Could not list schedules: " + ((r && r.error) || "unknown"));
+        if (!r.schedules.length) return say("No schedules yet. Ask your IDE agent to `schedule_create` one, e.g. run a saved workflow daily at 09:00.");
+        return say("**Schedules**\n\n" + r.schedules.map((sc) =>
+          `- **${sc.name}** — ${sc.when}${sc.enabled ? "" : " _(paused)_"}` +
+          (sc.nextRunAt ? ` · next ${new Date(sc.nextRunAt).toLocaleString()}` : "") +
+          (sc.lastStatus ? ` · last ${sc.lastStatus}` : "")).join("\n") + "\n\n" + r.note);
+      }
+      if (command.op === "runs") {
+        const r = await callTool("run_list", { limit: 10 });
+        if (!r || !r.ok) return say("Could not list runs: " + ((r && r.error) || "unknown"));
+        if (!r.runs.length) return say("No workflow runs yet.");
+        return say("**Recent runs**\n\n" + r.runs.map((x) =>
+          `- ${x.status === "passed" ? "✅" : x.status === "running" ? "⏳" : "❌"} **${x.workflowName}** (${x.trigger}) ` +
+          `${new Date(x.startedAt).toLocaleString()}` + (x.durationMs != null ? ` · ${(x.durationMs / 1000).toFixed(1)}s` : "") +
+          (x.healed ? ` · healed ${x.healed}` : "") + (x.error ? `\n  ${x.error}` : "")).join("\n"));
+      }
+      if (command.op === "export") {
+        if (!command.id) return say("Usage: `/export <name|id> playwright|markdown|json`");
+        const r = await callTool("workflow_export", { id: command.id, format: command.format });
+        if (!r || !r.ok) return say("Export failed: " + ((r && r.error) || "unknown"));
+        const lang = r.format === "playwright" ? "ts" : r.format === "json" ? "json" : "markdown";
+        return say(`**${r.filename}**\n\n\`\`\`${lang}\n${r.content}\n\`\`\``);
       }
     } catch (err) {
-      _showChatToast("Macro error: " + (err && err.message || err));
+      say("Workflow error: " + ((err && err.message) || err));
     }
   }
 
