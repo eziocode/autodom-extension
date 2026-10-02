@@ -375,7 +375,7 @@ test("tab tools never activate or focus without an explicit opt-in under isolati
     "toolWaitForPopup",
   ]) {
     const b = body(name);
-    assert.match(b, /_isolatedClientId\(\)|isoClient/, `${name} is isolation-aware`);
+    assert.match(b, /_isolatedClientId\(ctx\)|isoClient/, `${name} is isolation-aware`);
   }
   // open_new_tab creates through the group helper, in the background.
   assert.match(body("toolOpenNewTab"), /createOwnedTab\(isoClient/);
@@ -384,14 +384,47 @@ test("tab tools never activate or focus without an explicit opt-in under isolati
 });
 
 test("getActiveTab never falls back to the user's tab for isolated calls", () => {
-  const start = swSrc.indexOf("async function getActiveTab()");
+  const start = swSrc.indexOf("async function getActiveTab(ctx)");
+  assert.ok(start > 0, "getActiveTab takes the call context");
   const body = swSrc.slice(start, start + 1800);
-  assert.match(body, /_agentRunContext\?\.isolated/);
+  assert.match(body, /ctx\?\.isolated/);
   assert.match(body, /throw new Error\(NO_AUTODOM_TAB_MESSAGE\)/);
   assert.ok(
     body.indexOf("throw new Error(NO_AUTODOM_TAB_MESSAGE)") <
       body.indexOf("chrome.tabs.query"),
     "isolated branch throws before the active-tab query",
+  );
+  // A call without a context fails closed under isolation, before any
+  // active-tab query.
+  const ctxless = body.indexOf("if (!ctx)");
+  assert.ok(ctxless > 0, "ctx-less branch exists");
+  assert.ok(
+    body.indexOf("throw new Error(NO_AUTODOM_TAB_MESSAGE)", ctxless) <
+      body.indexOf("chrome.tabs.query"),
+    "ctx-less branch throws before the active-tab query",
+  );
+});
+
+test("no tool resolves its tab without the call context", () => {
+  const media = readFileSync(
+    resolve(here, "../extension/background/media-tools.js"),
+    "utf8",
+  );
+  const engine = readFileSync(
+    resolve(here, "../extension/background/workflow-engine.js"),
+    "utf8",
+  );
+  for (const [name, text] of [
+    ["service-worker.js", swSrc],
+    ["media-tools.js", media],
+    ["workflow-engine.js", engine],
+  ]) {
+    const bare = text.match(/getActiveTab\(\s*\)/g) || [];
+    assert.equal(bare.length, 0, `${name} has bare getActiveTab() calls`);
+  }
+  assert.ok(
+    !/_agentRunContext|_withAgentTabContext|_agentBatchDepth/.test(swSrc),
+    "no shared global tab context is left in the service worker",
   );
 });
 

@@ -181,10 +181,49 @@
   }
 
   // ── Storage helpers ─────────────────────────────────────────
+  // Settings, site permissions and approval rules are read on every tool
+  // call, so they are cached in memory and dropped on storage.onChanged
+  // (popup edits, other contexts). Without onChanged there is no way to
+  // invalidate, so nothing is cached. Callers get a copy, never the cache.
+  const APPROVAL_RULES_KEY = "autodom.approvalRules";
+  const CACHED_KEYS = new Set([STORAGE_KEYS.settings, STORAGE_KEYS.permissions, APPROVAL_RULES_KEY]);
+  const _cache = new Map();
+  let _cacheable = false;
+  try {
+    if (chrome.storage && chrome.storage.onChanged && typeof chrome.storage.onChanged.addListener === "function") {
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area && area !== "local") return;
+        for (const key of Object.keys(changes || {})) _cache.delete(key);
+      });
+      _cacheable = true;
+    }
+  } catch (_) {}
+
+  // Drops the in-memory copies; the next read reloads from storage.
+  function clearCaches() {
+    _cache.clear();
+  }
+
+  function _copy(v) {
+    if (v == null || typeof v !== "object") return v;
+    try {
+      return JSON.parse(JSON.stringify(v));
+    } catch (_) {
+      return v;
+    }
+  }
+
+  async function _readKey(key) {
+    if (_cacheable && CACHED_KEYS.has(key) && _cache.has(key)) return _copy(_cache.get(key));
+    const out = await chrome.storage.local.get(key);
+    const value = out ? out[key] : undefined;
+    if (_cacheable && CACHED_KEYS.has(key)) _cache.set(key, _copy(value));
+    return value;
+  }
+
   async function getStorage(key, fallback) {
     try {
-      const out = await chrome.storage.local.get(key);
-      return out[key] ?? fallback;
+      return (await _readKey(key)) ?? fallback;
     } catch (_) {
       return fallback;
     }
@@ -193,7 +232,10 @@
   async function setStorage(key, value) {
     try {
       await chrome.storage.local.set({ [key]: value });
-    } catch (_) {}
+      if (_cacheable && CACHED_KEYS.has(key)) _cache.set(key, _copy(value));
+    } catch (_) {
+      _cache.delete(key);
+    }
   }
 
   async function getSettings() {
@@ -240,19 +282,53 @@
   }
 
   // ── Audit log (bounded ring buffer) ─────────────────────────
+  // Calls now run in parallel, so concurrent read-modify-write appends
+  // would drop entries. Appends are buffered for AUDIT_FLUSH_MS and
+  // written by one serialized chain; reads flush first.
+  const AUDIT_FLUSH_MS = 500;
+  let _auditBuffer = [];
+  let _auditTimer = null;
+  let _auditChain = Promise.resolve();
+
+  function _flushAudit() {
+    if (_auditTimer) {
+      clearTimeout(_auditTimer);
+      _auditTimer = null;
+    }
+    const batch = _auditBuffer;
+    _auditBuffer = [];
+    if (!batch.length) return _auditChain;
+    _auditChain = _auditChain
+      .then(async () => {
+        const log = (await getStorage(STORAGE_KEYS.audit, [])) || [];
+        log.push(...batch);
+        if (log.length > AUDIT_LIMIT) log.splice(0, log.length - AUDIT_LIMIT);
+        await setStorage(STORAGE_KEYS.audit, log);
+      })
+      .catch(() => {});
+    return _auditChain;
+  }
+
   async function appendAudit(entry) {
-    const log = (await getStorage(STORAGE_KEYS.audit, [])) || [];
-    log.push({ ...entry, t: Date.now() });
-    if (log.length > AUDIT_LIMIT) log.splice(0, log.length - AUDIT_LIMIT);
-    await setStorage(STORAGE_KEYS.audit, log);
+    _auditBuffer.push({ ...entry, t: Date.now() });
+    if (!_auditTimer) _auditTimer = setTimeout(_flushAudit, AUDIT_FLUSH_MS);
   }
 
   async function getAuditLog() {
+    await _flushAudit();
     return (await getStorage(STORAGE_KEYS.audit, [])) || [];
   }
 
   async function clearAuditLog() {
-    await setStorage(STORAGE_KEYS.audit, []);
+    if (_auditTimer) {
+      clearTimeout(_auditTimer);
+      _auditTimer = null;
+    }
+    _auditBuffer = [];
+    _auditChain = _auditChain
+      .then(() => setStorage(STORAGE_KEYS.audit, []))
+      .catch(() => {});
+    await _auditChain;
   }
 
   // ── Interactive request flow ────────────────────────────────
@@ -374,7 +450,6 @@
   // [{ match: "*.bank.com" | "github.com" | "*", tier: "any"|"write"|"destructive",
   //    policy: "allow"|"ask"|"deny", tools?: ["navigate", ...] }]
   // First matching rule wins. No match = the default behaviour.
-  const APPROVAL_RULES_KEY = "autodom.approvalRules";
   const RULE_TIERS = new Set(["any", "write", "destructive"]);
   const RULE_POLICIES = new Set(["allow", "ask", "deny"]);
 
@@ -424,8 +499,7 @@
 
   async function getApprovalRules() {
     try {
-      const got = await chrome.storage.local.get(APPROVAL_RULES_KEY);
-      return (got && got[APPROVAL_RULES_KEY]) || [];
+      return (await _readKey(APPROVAL_RULES_KEY)) || [];
     } catch (_) {
       return [];
     }
@@ -435,6 +509,7 @@
     const { rules: clean, errors } = normalizeRules(rules);
     if (errors.length) return { ok: false, error: errors.join("; ") };
     await chrome.storage.local.set({ [APPROVAL_RULES_KEY]: clean });
+    if (_cacheable) _cache.set(APPROVAL_RULES_KEY, _copy(clean));
     return { ok: true, rules: clean };
   }
 
@@ -459,6 +534,7 @@
     clearAllPermissions,
     getAuditLog,
     clearAuditLog,
+    clearCaches,
     _STORAGE_KEYS: STORAGE_KEYS,
     _DEFAULT_SETTINGS: DEFAULT_SETTINGS,
   };

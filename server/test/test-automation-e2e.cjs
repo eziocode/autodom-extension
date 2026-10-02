@@ -8,6 +8,11 @@
 //   - workflow_save mirrors to $AUTODOM_HOME/workflows, workflow_export
 //     writes to $AUTODOM_HOME/exports
 //   - the audit log records holds and confirmed executions
+//   - confirm_action re-runs the held MCP tool in full (its server-side
+//     post-processing too); an inline approval runs the held params
+//   - only saved workflows are mirrored; WORKFLOW_MIRROR from the
+//     extension writes the mirror; schedule_update runNow reports the
+//     real run result (failed / held)
 //
 // Usage: node server/test/test-automation-e2e.cjs
 const cp = require("child_process");
@@ -85,6 +90,20 @@ function fakeExtension(msg) {
       };
     case "workflow_export":
       return { ok: true, format: "playwright", filename: "e2e.spec.ts", content: "// generated" };
+    case "workflow_record_stop":
+      if (msg.params?.save && msg.confirmed !== true) {
+        return { approvalRequired: true, tool: "workflow_record_stop", tier: "write", domain: "x.test", message: "Your approval rule asks first." };
+      }
+      return {
+        ok: true,
+        saved: !!msg.params?.save,
+        workflow: { id: msg.params?.save ? "wf_held" : "wf_draft", name: "Rec", steps: [{ action: "navigate", url: "https://x.test" }], variables: [] },
+      };
+    case "schedule_run_now":
+      if (msg.params?.id === "sched_held") {
+        return { approvalRequired: true, tool: "schedule_run_now", tier: "destructive", domain: null, message: "Your approval rule asks first." };
+      }
+      return { ok: false, status: "failed", runId: "run_sched", detail: "Step 1 failed: element not found" };
     default:
       return { ok: true };
   }
@@ -174,6 +193,43 @@ async function main() {
   assert(saved.file && fs.existsSync(saved.file), "workflow mirrored to disk: " + JSON.stringify(saved));
   assert(saved.file.startsWith(path.join(HOME, "workflows")), "mirror under AUTODOM_HOME");
   assert(saved.full === undefined, "full workflow is not echoed twice");
+
+  // Unsaved drafts are not mirrored.
+  const draft = json(await call("workflow_record_stop", {}));
+  assert(draft.ok && draft.saved === false && !draft.file, "draft not mirrored: " + JSON.stringify(draft));
+  assert(!fs.existsSync(path.join(HOME, "workflows", "wf_draft.json")), "no mirror file for a draft");
+
+  // A held MCP tool is re-run in full by confirm_action: the mirror (server
+  // post-processing of workflow_record_stop) happens on confirm.
+  const heldStop = json(await call("workflow_record_stop", { save: true, name: "Rec" }));
+  assert(heldStop.confirmRequired && heldStop.confirmId, "record_stop held: " + JSON.stringify(heldStop));
+  const confirmedStop = json(await call("confirm_action", { confirmId: heldStop.confirmId }));
+  assert(confirmedStop.confirmed && confirmedStop.result?.saved === true, "confirm ran record_stop: " + JSON.stringify(confirmedStop));
+  assert(confirmedStop.result.file === path.join(HOME, "workflows", "wf_held.json"), "confirm ran the tool's post-processing: " + JSON.stringify(confirmedStop));
+
+  // An inline approval executes the params that were held, not the retry's.
+  const ask3 = (await call("click", { ref: "@e1" }, ELICIT_META)).result;
+  await call("click", { ref: "@e9" }, ELICIT_META, {
+    inputResponses: { approve: { action: "accept", content: { approve: true } } },
+    requestState: ask3.requestState,
+  });
+  const lastClick = extCalls.filter((c) => c.tool === "click").pop();
+  assert(lastClick.confirmed === true && lastClick.params.ref === "@e1", "approved call used the held params: " + JSON.stringify(lastClick));
+
+  // Saves made in the extension (chat /teach, heal) arrive as WORKFLOW_MIRROR.
+  ext.send(JSON.stringify({ type: "WORKFLOW_MIRROR", workflow: { id: "wf_teach", name: "Teach", steps: [{ action: "navigate", url: "https://x.test" }] } }));
+  for (let i = 0; i < 40 && !fs.existsSync(path.join(HOME, "workflows", "wf_teach.json")); i++) await sleep(50);
+  assert(fs.existsSync(path.join(HOME, "workflows", "wf_teach.json")), "WORKFLOW_MIRROR wrote the mirror");
+  ext.send(JSON.stringify({ type: "WORKFLOW_MIRROR", workflow: { id: "../evil", name: "x", steps: [] } }));
+  await sleep(200);
+  assert(!fs.existsSync(path.join(HOME, "evil.json")), "unsafe ids are rejected");
+
+  // schedule_update runNow reports what the run did.
+  const runNow = json(await call("schedule_update", { id: "sched_1", runNow: true }));
+  assert(runNow.ok === true && runNow.runNow?.status === "failed", "runNow reports failure: " + JSON.stringify(runNow));
+  assert(/failed/.test(runNow.hint) && runNow.started === true, "runNow hint is honest: " + JSON.stringify(runNow));
+  const runHeld = json(await call("schedule_update", { id: "sched_held", runNow: true }));
+  assert(runHeld.started === false && runHeld.runNow?.held === true && runHeld.runNow.confirmId, "runNow reports a hold: " + JSON.stringify(runHeld));
 
   const exported = json(await call("workflow_export", { id: "wf_e2e", format: "playwright", save: true }));
   assert(exported.file === path.join(HOME, "exports", "e2e.spec.ts"), "export saved: " + JSON.stringify(exported));

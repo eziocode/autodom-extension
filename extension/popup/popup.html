@@ -40,6 +40,7 @@
 	                <button class="tab" data-tab="security">Security</button>
 	                <button class="tab" data-tab="config">Config</button>
 	                <button class="tab" data-tab="chat">Chat</button>
+	                <button class="tab" data-tab="features">Features</button>
 	                <button class="tab" data-tab="logs">Logs</button>
 	            </nav>
 
@@ -734,6 +735,243 @@
                         </div>
                     </section>
                 </div>
+                <div class="tab-content" id="tab-features">
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Workflows</span>
+                        </div>
+                        <div class="field-stack">
+                            <label class="chat-toggle-row" for="featVisionHeal">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Vision heal</span>
+                                    <span class="chat-toggle-desc">When a step's target is gone, ask the AI to find it on a screenshot. Auto = only when AI provider enabled.</span>
+                                </span>
+                                <select id="featVisionHeal" class="config-input feature-control">
+                                    <option value="auto">Auto</option>
+                                    <option value="on">On</option>
+                                    <option value="off">Off</option>
+                                </select>
+                            </label>
+                            <label class="chat-toggle-row" for="featDefaultRunMode">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Default run mode</span>
+                                    <span class="chat-toggle-desc">Heal = repair broken locators while running. Strict = fail the step instead.</span>
+                                </span>
+                                <select id="featDefaultRunMode" class="config-input feature-control">
+                                    <option value="heal">Heal</option>
+                                    <option value="strict">Strict</option>
+                                </select>
+                            </label>
+                            <label class="chat-toggle-row" for="featUndoTracking">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Undo tracking</span>
+                                    <span class="chat-toggle-desc">Remember typed values, storage and cookie changes so /undo can reverse a run.</span>
+                                </span>
+                                <input type="checkbox" id="featUndoTracking" class="chat-toggle-input" />
+                                <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
+                            </label>
+                            <label class="chat-toggle-row" for="featParallelConcurrency">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Parallel runs</span>
+                                    <span class="chat-toggle-desc">How many workflows workflow_run_many runs at once (1–5).</span>
+                                </span>
+                                <input type="number" id="featParallelConcurrency" class="config-input feature-control feature-number" min="1" max="5" step="1" inputmode="numeric" />
+                            </label>
+                            <label class="chat-toggle-row" for="featRunHistoryLimit">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Run history limit</span>
+                                    <span class="chat-toggle-desc">Run reports kept in extension storage (10–200).</span>
+                                </span>
+                                <input type="number" id="featRunHistoryLimit" class="config-input feature-control feature-number" min="10" max="200" step="1" inputmode="numeric" />
+                            </label>
+                        </div>
+                    </section>
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Overlays</span>
+                        </div>
+                        <div class="field-stack">
+                            <label class="chat-toggle-row" for="featOverlaySessionBorder">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Session border</span>
+                                    <span class="chat-toggle-desc">Thin border and MCP badge on tabs AutoDOM controls.</span>
+                                </span>
+                                <input type="checkbox" id="featOverlaySessionBorder" class="chat-toggle-input" />
+                                <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
+                            </label>
+                            <label class="chat-toggle-row" for="featOverlayTakeoverPill">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Take over pill</span>
+                                    <span class="chat-toggle-desc">Pause button on controlled tabs. Stays visible while you are in control.</span>
+                                </span>
+                                <input type="checkbox" id="featOverlayTakeoverPill" class="chat-toggle-input" />
+                                <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
+                            </label>
+                            <label class="chat-toggle-row" for="featOverlayVisionMarks">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Vision marks</span>
+                                    <span class="chat-toggle-desc">Numbered element marks drawn while vision heal looks at the page.</span>
+                                </span>
+                                <input type="checkbox" id="featOverlayVisionMarks" class="chat-toggle-input" />
+                                <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
+                            </label>
+                            <label class="chat-toggle-row" for="featOverlayAutomationRunning">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Automation running</span>
+                                    <span class="chat-toggle-desc">Page overlay, floating Stop and the &ldquo;Automation running&rdquo; pill during chat runs.</span>
+                                </span>
+                                <input type="checkbox" id="featOverlayAutomationRunning" class="chat-toggle-input" />
+                                <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
+                            </label>
+                            <label class="chat-toggle-row" for="featOverlayRecordingIndicator">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Recording indicator</span>
+                                    <span class="chat-toggle-desc">Small &ldquo;&#9679; Recording&rdquo; chip on the page while a workflow is recorded.</span>
+                                </span>
+                                <input type="checkbox" id="featOverlayRecordingIndicator" class="chat-toggle-input" />
+                                <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
+                            </label>
+                        </div>
+                    </section>
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Toolbar</span>
+                        </div>
+                        <div class="field-stack">
+                            <label class="chat-toggle-row" for="featToolbarShowTabRecord">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Tab recording button</span>
+                                    <span class="chat-toggle-desc">Show the &#9675; record-tab-to-WebM button above the chat input.</span>
+                                </span>
+                                <input type="checkbox" id="featToolbarShowTabRecord" class="chat-toggle-input" />
+                                <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
+                            </label>
+                            <label class="chat-toggle-row" for="featToolbarShowDescribeImages">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Describe images button</span>
+                                    <span class="chat-toggle-desc">Show the button that attaches page images for the AI to describe.</span>
+                                </span>
+                                <input type="checkbox" id="featToolbarShowDescribeImages" class="chat-toggle-input" />
+                                <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
+                            </label>
+                        </div>
+                    </section>
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Performance</span>
+                        </div>
+                        <div class="field-stack">
+                            <label class="chat-toggle-row" for="featPerfMode">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Performance mode</span>
+                                    <span class="chat-toggle-desc">Fast = short settle waits and reused page digests. Balanced = waits longer for slow pages.</span>
+                                </span>
+                                <select id="featPerfMode" class="config-input feature-control">
+                                    <option value="fast">Fast</option>
+                                    <option value="balanced">Balanced</option>
+                                </select>
+                            </label>
+                            <label class="chat-toggle-row" for="featToolLanes">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Parallel tool lanes</span>
+                                    <span class="chat-toggle-desc">Run tool calls for different tabs side by side. Turn off only if tools act on wrong tab.</span>
+                                </span>
+                                <input type="checkbox" id="featToolLanes" class="chat-toggle-input" />
+                                <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
+                            </label>
+                            <label class="chat-toggle-row" for="featCompactSnapshotsDefault">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Compact snapshots by default</span>
+                                    <span class="chat-toggle-desc">take_snapshot returns the compact form unless a mode is requested.</span>
+                                </span>
+                                <input type="checkbox" id="featCompactSnapshotsDefault" class="chat-toggle-input" />
+                                <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
+                            </label>
+                            <label class="chat-toggle-row" for="featWebmcp">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">WebMCP</span>
+                                    <span class="chat-toggle-desc">Let agents list and call tools that pages expose through WebMCP.</span>
+                                </span>
+                                <input type="checkbox" id="featWebmcp" class="chat-toggle-input" />
+                                <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
+                            </label>
+                        </div>
+                    </section>
+                    <section class="panel">
+                        <div class="panel-header">
+                            <span class="section-label">Storage &amp; cache</span>
+                            <div class="log-toolbar">
+                                <button type="button" class="text-btn" id="storageRefreshBtn">Refresh</button>
+                            </div>
+                        </div>
+                        <div class="field-stack">
+                            <div class="storage-usage" id="storageUsage" aria-live="polite">
+                                <div class="storage-usage-total">
+                                    <span class="storage-usage-label">Extension storage</span>
+                                    <span class="storage-usage-value" id="storageUsageTotal">&hellip;</span>
+                                </div>
+                                <ul class="storage-usage-groups" id="storageUsageGroups"></ul>
+                                <div class="storage-usage-total">
+                                    <span class="storage-usage-label">Server</span>
+                                    <span class="storage-usage-value" id="storageUsageServer">&hellip;</span>
+                                </div>
+                            </div>
+                            <div class="storage-actions">
+                                <div class="storage-action-row">
+                                    <span class="storage-action-info">
+                                        <span class="chat-toggle-title">Run history</span>
+                                        <span class="chat-toggle-desc">Workflow run reports and their undo journals.</span>
+                                    </span>
+                                    <button type="button" class="text-btn storage-clear-btn" data-scopes="runs">Clear</button>
+                                </div>
+                                <div class="storage-action-row">
+                                    <span class="storage-action-info">
+                                        <span class="chat-toggle-title">Audit log</span>
+                                        <span class="chat-toggle-desc">Recorded agent actions and approval decisions.</span>
+                                    </span>
+                                    <button type="button" class="text-btn storage-clear-btn" data-scopes="audit">Clear</button>
+                                </div>
+                                <div class="storage-action-row">
+                                    <span class="storage-action-info">
+                                        <span class="chat-toggle-title">Activity &amp; tool logs</span>
+                                        <span class="chat-toggle-desc">Popup activity log and tool error logs.</span>
+                                    </span>
+                                    <button type="button" class="text-btn storage-clear-btn" data-scopes="logs">Clear</button>
+                                </div>
+                                <div class="storage-action-row">
+                                    <span class="storage-action-info">
+                                        <span class="chat-toggle-title">Page &amp; model cache</span>
+                                        <span class="chat-toggle-desc">Cached page context, model lists and other derived data.</span>
+                                    </span>
+                                    <button type="button" class="text-btn storage-clear-btn" data-scopes="cache">Clear</button>
+                                </div>
+                                <div class="storage-action-row">
+                                    <span class="storage-action-info">
+                                        <span class="chat-toggle-title">Workflow drafts &amp; undo</span>
+                                        <span class="chat-toggle-desc">Unsaved recordings and leftover undo data.</span>
+                                    </span>
+                                    <button type="button" class="text-btn storage-clear-btn" data-scopes="drafts">Clear</button>
+                                </div>
+                                <div class="storage-action-row">
+                                    <span class="storage-action-info">
+                                        <span class="chat-toggle-title">Flush server</span>
+                                        <span class="chat-toggle-desc">Server tool-call log, error log, exports and old audit files.</span>
+                                    </span>
+                                    <button type="button" class="text-btn storage-clear-btn" data-scopes="server">Clear</button>
+                                </div>
+                                <div class="storage-action-row storage-action-all">
+                                    <span class="storage-action-info">
+                                        <span class="chat-toggle-title">Clear all caches</span>
+                                        <span class="chat-toggle-desc">Keeps saved workflows, schedules, settings and API keys.</span>
+                                    </span>
+                                    <button type="button" class="text-btn storage-clear-btn" data-scopes="runs,audit,logs,cache,drafts,server">Clear all</button>
+                                </div>
+                            </div>
+                            <p class="storage-result" id="storageResult" role="status" aria-live="polite"></p>
+                        </div>
+                    </section>
+                    <p class="field-hint features-saved-hint">Changes save instantly and apply to open tabs.</p>
+                </div>
             </main>
 
             <footer class="footer">
@@ -771,6 +1009,7 @@
             aria-live="polite"
         ></div>
 
+        <script src="../background/feature-flags.js"></script>
         <script src="popup.js"></script>
     </body>
 </html>

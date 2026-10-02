@@ -1537,6 +1537,7 @@ const _secretAreaName =
 
   initSecurityTab();
   initChatSettingsTab();
+  initFeaturesTab();
   initChatAppearanceTab();
   initStickyTabs();
 });
@@ -1778,6 +1779,234 @@ function initChatSettingsTab() {
       applyToUI(changes[STORAGE_KEY].newValue);
     });
   }
+}
+
+// ─── Features tab (autodom.features via background/feature-flags.js) ───
+// Same persistField shape as the Chat tab, but every write goes through
+// AutoDOMFeatures.set() so values are clamped / validated in one place.
+// Consumers (SW, workflow engine, content scripts) pick changes up through
+// chrome.storage.onChanged, so nothing here needs to message them.
+function initFeaturesTab() {
+  const F = globalThis.AutoDOMFeatures;
+  if (!F || !document.getElementById("tab-features")) return;
+
+  // element id → [flag, kind]
+  const FIELDS = {
+    featVisionHeal: ["visionHeal", "select"],
+    featDefaultRunMode: ["defaultRunMode", "select"],
+    featUndoTracking: ["undoTracking", "bool"],
+    featParallelConcurrency: ["parallelConcurrency", "number"],
+    featRunHistoryLimit: ["runHistoryLimit", "number"],
+    featOverlaySessionBorder: ["overlaySessionBorder", "bool"],
+    featOverlayTakeoverPill: ["overlayTakeoverPill", "bool"],
+    featOverlayVisionMarks: ["overlayVisionMarks", "bool"],
+    featOverlayAutomationRunning: ["overlayAutomationRunning", "bool"],
+    featOverlayRecordingIndicator: ["overlayRecordingIndicator", "bool"],
+    featToolbarShowTabRecord: ["toolbarShowTabRecord", "bool"],
+    featToolbarShowDescribeImages: ["toolbarShowDescribeImages", "bool"],
+    featPerfMode: ["perfMode", "select"],
+    featToolLanes: ["toolLanes", "bool"],
+    featCompactSnapshotsDefault: ["compactSnapshotsDefault", "bool"],
+    featWebmcp: ["webmcp", "bool"],
+  };
+
+  function applyToUI(flags) {
+    const s = F.normalize(flags);
+    for (const [id, [key, kind]] of Object.entries(FIELDS)) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      // Don't clobber a number the user is still typing.
+      if (kind === "number" && document.activeElement === el) continue;
+      if (kind === "bool") el.checked = !!s[key];
+      else el.value = String(s[key]);
+    }
+  }
+
+  async function persistField(key, value) {
+    try {
+      applyToUI(await F.set({ [key]: value }));
+    } catch (err) {
+      showPopupToast("Could not save setting.", "error", 3200);
+    }
+  }
+
+  for (const [id, [key, kind]] of Object.entries(FIELDS)) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.addEventListener("change", () => {
+      if (kind === "bool") persistField(key, !!el.checked);
+      else if (kind === "number") persistField(key, Number(el.value));
+      else persistField(key, el.value);
+    });
+  }
+
+  F.get().then(applyToUI).catch(() => applyToUI(F.DEFAULTS));
+
+  if (chrome.storage?.onChanged?.addListener) {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== "local" || !changes[F.KEY]) return;
+      applyToUI(changes[F.KEY].newValue);
+    });
+  }
+
+  initStorageSection();
+}
+
+function formatStorageBytes(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n < 0) return "unavailable";
+  if (n < 1024) return `${Math.round(n)} B`;
+  const units = ["KB", "MB", "GB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v >= 10 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+}
+
+// ─── Storage & cache (Features tab) ──────────────────────────
+// Usage: AUTODOM_STORAGE_USAGE → { ok, local: { totalBytes, groups: {
+//   runs, workflows, audit, logs, chat, other } }, server: { ok, bytes } | null }
+// Clear: AUTODOM_CLEAR_STORAGE { scopes } → { ok, freedBytes,
+//   results: { [scope]: { ok, error? } } }
+// Both handlers live in the service worker; a missing/failed reply renders
+// as "unavailable" rather than an error loop.
+function initStorageSection() {
+  const totalEl = document.getElementById("storageUsageTotal");
+  const groupsEl = document.getElementById("storageUsageGroups");
+  const serverEl = document.getElementById("storageUsageServer");
+  const resultEl = document.getElementById("storageResult");
+  const refreshBtn = document.getElementById("storageRefreshBtn");
+  if (!totalEl || !groupsEl || !serverEl) return;
+
+  const GROUP_LABELS = {
+    runs: "Run history",
+    workflows: "Saved workflows",
+    audit: "Audit log",
+    logs: "Logs",
+    chat: "Chat",
+    other: "Other",
+  };
+  const SCOPE_LABELS = {
+    runs: "run history",
+    audit: "audit log",
+    logs: "logs",
+    cache: "cache",
+    drafts: "drafts",
+    server: "server",
+  };
+
+  let usageSeq = 0;
+  async function refreshUsage() {
+    const seq = ++usageSeq;
+    totalEl.textContent = "…";
+    serverEl.textContent = "…";
+    const res = await sendRuntimeMessage({ type: "AUTODOM_STORAGE_USAGE" });
+    if (seq !== usageSeq) return;
+    groupsEl.textContent = "";
+    const local = res && res.ok !== false && res.local;
+    if (!local || !Number.isFinite(Number(local.totalBytes))) {
+      totalEl.textContent = "unavailable";
+    } else {
+      totalEl.textContent = formatStorageBytes(local.totalBytes);
+      const groups = local.groups && typeof local.groups === "object" ? local.groups : {};
+      for (const key of Object.keys(GROUP_LABELS)) {
+        if (!Number.isFinite(Number(groups[key]))) continue;
+        const li = document.createElement("li");
+        const name = document.createElement("span");
+        name.textContent = GROUP_LABELS[key];
+        const value = document.createElement("span");
+        value.className = "storage-usage-value";
+        value.textContent = formatStorageBytes(groups[key]);
+        li.append(name, value);
+        groupsEl.appendChild(li);
+      }
+    }
+    const server = res && res.ok !== false ? res.server : null;
+    if (server && server.ok && Number.isFinite(Number(server.bytes))) {
+      serverEl.textContent = formatStorageBytes(server.bytes);
+    } else {
+      serverEl.textContent = server === null && res && res.ok !== false
+        ? "not connected"
+        : "unavailable";
+    }
+  }
+
+  function showResult(text, tone) {
+    if (!resultEl) return;
+    resultEl.textContent = text;
+    resultEl.classList.toggle("is-ok", tone === "ok");
+    resultEl.classList.toggle("is-error", tone === "error");
+  }
+
+  async function runClear(btn, scopes) {
+    const label = btn.dataset.label;
+    btn.disabled = true;
+    btn.textContent = "Clearing…";
+    showResult("", null);
+    let res;
+    try {
+      res = await sendRuntimeMessage({ type: "AUTODOM_CLEAR_STORAGE", scopes });
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+    const results = (res && res.results && typeof res.results === "object") ? res.results : {};
+    const failed = scopes.filter((s) => results[s] && results[s].ok === false);
+    if (!res || res.success === false || (res.ok === false && !failed.length)) {
+      showResult(`Could not clear: ${(res && res.error) || "no response from background worker"}`, "error");
+    } else if (failed.length) {
+      const detail = failed
+        .map((s) => `${SCOPE_LABELS[s] || s}${results[s].error ? ` (${results[s].error})` : ""}`)
+        .join(", ");
+      const freed = Number(res.freedBytes) > 0 ? `Freed ${formatStorageBytes(res.freedBytes)}. ` : "";
+      showResult(`${freed}Failed: ${detail}`, "error");
+    } else {
+      const freed = Number(res.freedBytes);
+      showResult(
+        Number.isFinite(freed) && freed > 0 ? `Freed ${formatStorageBytes(freed)}` : "Cleared — nothing to free",
+        "ok",
+      );
+    }
+    refreshUsage();
+  }
+
+  // Two-click armed confirm, same as the extension-cache button: the first
+  // click arms for 3 s, the second runs it. Arming one disarms the rest.
+  const armed = new Map(); // btn → timer
+  function disarm(btn) {
+    const t = armed.get(btn);
+    if (t) clearTimeout(t);
+    armed.delete(btn);
+    btn.classList.remove("confirming");
+    btn.textContent = btn.dataset.label;
+    btn.removeAttribute("aria-live");
+  }
+  document.querySelectorAll("#tab-features .storage-clear-btn").forEach((btn) => {
+    btn.dataset.label = btn.textContent.trim();
+    const scopes = String(btn.dataset.scopes || "").split(",").map((s) => s.trim()).filter(Boolean);
+    btn.addEventListener("click", () => {
+      if (!scopes.length || btn.disabled) return;
+      if (!armed.has(btn)) {
+        for (const other of [...armed.keys()]) disarm(other);
+        btn.classList.add("confirming");
+        btn.setAttribute("aria-live", "polite");
+        btn.textContent = "Click again to confirm";
+        armed.set(btn, setTimeout(() => disarm(btn), 3000));
+        return;
+      }
+      disarm(btn);
+      runClear(btn, scopes);
+    });
+  });
+
+  refreshBtn?.addEventListener("click", () => refreshUsage());
+  document.addEventListener(TAB_ACTIVATED_EVENT, (event) => {
+    if (event?.detail?.tab === "features") refreshUsage();
+  });
+  if (document.getElementById("tab-features")?.classList.contains("active")) refreshUsage();
 }
 
 // ─── Sticky Tab Restriction ──────────────────────────────────

@@ -61,6 +61,9 @@ jobs:
           node test/test-server-self-update.cjs
           node test/test-legacy-upgrade.cjs
           node test/test-automation-e2e.cjs
+          node test/test-tool-cancel.cjs
+          node test/test-server-flush.cjs
+          node test/test-chat-stream.cjs
 
       - name: Build Chrome zip
         run: bash scripts/build-chrome.sh

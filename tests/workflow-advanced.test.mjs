@@ -241,12 +241,11 @@ test("dry run: reports what would self-heal and what is broken", async () => {
 });
 
 function undoEnv() {
-  // digest sequence: [before step1, after step1, before step2, after step2, before step3, after step3]
+  // digest sequence: [before step1, after step1, after step2, after step3]
+  // (each step's "after" digest is reused as the next step's "before").
   const digests = [
-    { url: "https://x.test/login", title: "", textHash: 1, elementCount: 5, storageKeys: [], sessionKeys: [], cookieNames: [] },
-    { url: "https://x.test/login", title: "", textHash: 2, elementCount: 5, storageKeys: [], sessionKeys: [], cookieNames: [] },
-    { url: "https://x.test/login", title: "", textHash: 2, elementCount: 5, storageKeys: [], sessionKeys: [], cookieNames: [] },
-    { url: "https://x.test/login", title: "", textHash: 3, elementCount: 5, storageKeys: [], sessionKeys: [], cookieNames: [] },
+    { url: "https://x.test/login", title: "", textHash: 1, elementCount: 5, storageKeys: ["theme"], sessionKeys: [], cookieNames: ["a"] },
+    { url: "https://x.test/login", title: "", textHash: 2, elementCount: 5, storageKeys: ["theme"], sessionKeys: [], cookieNames: ["a"] },
     { url: "https://x.test/login", title: "", textHash: 3, elementCount: 5, storageKeys: ["theme"], sessionKeys: [], cookieNames: ["a"] },
     { url: "https://x.test/home", title: "", textHash: 4, elementCount: 9, storageKeys: ["theme", "token"], sessionKeys: ["tmp"], cookieNames: ["a", "sid"] },
   ];

@@ -139,6 +139,20 @@
   let pendingRequests = new Map();
   let requestIdCounter = 0;
   let isProcessing = false;
+  // Feature flags this panel reads (popup Features tab → chrome.storage.local
+  // "autodom.features"; full schema in background/feature-flags.js). Content
+  // scripts read the key directly, so keep these defaults in sync with it.
+  const FEATURES_KEY = "autodom.features";
+  const _features = {
+    overlayAutomationRunning: true,
+    toolbarShowTabRecord: true,
+    toolbarShowDescribeImages: true,
+  };
+  // Toolbar toggle state. The SW is the source of truth (workflow recorder,
+  // offscreen tab recorder, workflow runs); _syncToolbarToggles() and the
+  // AUTODOM_TOOLBAR_STATE broadcast keep this mirror fresh across reloads,
+  // /teach and MCP-started recordings.
+  const _toolbarState = { wfRecording: false, tabRecording: false, activeRunId: null };
   // Image attachments queued for the next outgoing user turn. Populated by
   // the paperclip button, paste, or drag-and-drop. Cleared on send.
   let pendingAttachments = [];
@@ -1290,24 +1304,20 @@
         </svg>
       </button>
       <span class="autodom-chat-quick-divider" aria-hidden="true"></span>
-      <button class="autodom-chat-quick-btn" type="button" data-prompt="__summarize__"><span class="prompt-spark" aria-hidden="true">✨</span>Summarize</button>
-      <button class="autodom-chat-quick-btn" type="button" data-prompt="__explain__"><span class="prompt-spark" aria-hidden="true">✨</span>What can I do?</button>
-      <button class="autodom-chat-quick-btn" type="button" data-prompt="__key_controls__"><span class="prompt-spark" aria-hidden="true">✨</span>Key controls</button>
-      <button class="autodom-chat-quick-btn" type="button" data-prompt="__a11y__"><span class="prompt-spark" aria-hidden="true">✨</span>A11y audit</button>
-      <span class="autodom-chat-quick-divider" aria-hidden="true"></span>
-      <button class="autodom-chat-icon-btn" type="button" data-action="media_list" title="List videos/audio on this page" aria-label="List media">
+      <button class="autodom-chat-icon-btn" type="button" data-action="workflow_run_picker" title="Run workflow" aria-label="Run workflow" aria-pressed="false" aria-haspopup="menu" aria-expanded="false" aria-controls="__autodom_wf_picker">
         <svg viewBox="0 0 24 24" aria-hidden="true"><polygon points="8,5 19,12 8,19"/></svg>
+      </button>
+      <button class="autodom-chat-icon-btn" type="button" data-action="macro_record_toggle" title="Teach a task: record and save a replayable workflow" aria-label="Record workflow" aria-pressed="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="3"/><circle cx="18" cy="12" r="3"/><path d="M6 12h12"/></svg>
+      </button>
+      <button class="autodom-chat-icon-btn" type="button" data-action="tab_record_toggle" title="Record this tab to WebM" aria-label="Record tab" aria-pressed="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6"/></svg>
       </button>
       <button class="autodom-chat-icon-btn" type="button" data-action="describe_images" title="Send page images to AI for description" aria-label="Describe images">
         <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2"/><path d="M21 17l-5-5-7 7"/></svg>
       </button>
-      <button class="autodom-chat-icon-btn" type="button" data-action="tab_record_toggle" title="Record this tab to WebM" aria-label="Record tab">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6"/></svg>
-      </button>
-      <button class="autodom-chat-icon-btn" type="button" data-action="macro_record_toggle" title="Teach a task: record and save a replayable workflow" aria-label="Record workflow">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="3"/><circle cx="18" cy="12" r="3"/><path d="M6 12h12"/></svg>
-      </button>
     </div>
+    <div class="autodom-slash-menu autodom-wf-picker" id="__autodom_wf_picker" role="menu" aria-label="Saved workflows" hidden></div>
     <div class="autodom-chat-toast" id="__autodom_chat_toast" role="status" aria-live="polite"></div>
 
     <!-- Input Area -->
@@ -1701,6 +1711,7 @@
     { command: "/snapshot", insert: "/snapshot", description: "Capture a DOM tree snapshot" },
     { command: "/info", insert: "/info", description: "Show page metadata" },
     { command: "/extract", insert: "/extract", description: "Extract visible page text" },
+    { command: "/media", insert: "/media", description: "List videos/audio on this page" },
     { command: "/click", insert: "/click ", description: "Click by index or text" },
     { command: "/type", insert: "/type ", description: "Type into an indexed input" },
     { command: "/nav", insert: "/nav ", description: "Navigate to a URL" },
@@ -2507,7 +2518,7 @@
       const fs = document.querySelector(".autodom-chat-force-stop");
       if (fs) fs.classList.toggle("is-armed", !!isProcessing);
     } catch (_) {}
-    if (isProcessing) {
+    if (isProcessing && _features.overlayAutomationRunning) {
       _ensureAutomationOverlay();
       if (!isOpen) {
         _ensureFloatingStop();
@@ -2555,6 +2566,9 @@
         );
       }
     } catch (_) {}
+    // A /replay (or ▷ picker run) is a workflow-engine run, not an agent
+    // run — ABORT_AI_CHAT does not reach it, so cancel it explicitly.
+    if (_toolbarState.activeRunId) _cancelWorkflowRun(_toolbarState.activeRunId);
     hideTyping();
     addMessage("system", "Stopped.");
     _setBusy(false);
@@ -2626,6 +2640,7 @@
     _startStatusPolling();
     persistChatState(true);
     _updateAutomationUi();
+    try { _syncToolbarToggles(); } catch (_) {}
   }
 
   function closePanel() {
@@ -4703,6 +4718,12 @@
     return el;
   }
   function _showRunIndicator(labelText) {
+    // Features → Overlays → "Automation running" off: no on-page pill.
+    // The in-panel force-stop stays armed, so a run is still stoppable.
+    if (!_features.overlayAutomationRunning) {
+      _hideRunIndicator();
+      return;
+    }
     const el = _ensureRunIndicator();
     el.removeAttribute("data-stopping");
     const text = el.querySelector(".ari-text");
@@ -5934,6 +5955,8 @@
               code: `return document.body.innerText.substring(0, 3000);`,
             },
           };
+        case "media":
+          return { tool: "media_list", params: {}, displayName: "Media on page" };
         case "help":
           return { type: "help" };
         case "teach":
@@ -5947,12 +5970,14 @@
           let name = (m && m[1] ? m[1] : rest).trim();
           const dry = /\s+dry$/i.test(name) || /^dry\s+/i.test(name);
           name = name.replace(/\s+dry$/i, "").replace(/^dry\s+/i, "").trim();
+          const vars = m && m[2] ? _parseWorkflowVars(m[2]) : { value: {} };
           return {
             type: "workflow",
             op: "replay",
             id: name,
             dry,
-            variables: m && m[2] ? tryParseJSON(m[2]) : {},
+            variables: vars.value || {},
+            ...(vars.error ? { variablesError: vars.error } : {}),
           };
         }
         case "undo": {
@@ -6028,6 +6053,21 @@
     } catch (_) {
       return { text: str };
     }
+  }
+
+  // Workflow variables must be a JSON object; anything else is reported
+  // instead of being sent as {text: "..."} (which no workflow declares).
+  function _parseWorkflowVars(str) {
+    let value;
+    try {
+      value = JSON.parse(str);
+    } catch (err) {
+      return { error: `Variables must be a JSON object, e.g. {"email":"a@b.c"} (${(err && err.message) || "invalid JSON"}).` };
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return { error: 'Variables must be a JSON object, e.g. {"email":"a@b.c"}.' };
+    }
+    return { value };
   }
 
   // ─── Page Summarization ────────────────────────────────────
@@ -7066,6 +7106,7 @@
       "  /screenshot \u2014 Capture page\n" +
       "  /snapshot \u2014 DOM tree snapshot\n" +
       "  /info \u2014 Page metadata\n" +
+      "  /media \u2014 List videos/audio on the page\n" +
       "  /js <code> \u2014 Execute JavaScript\n" +
       "  /run <code> \u2014 Run local Playwright/Selenium-style automation\n" +
       "  /run <task> or /auto <task> \u2014 Fast AI automation plan + replay\n" +
@@ -7301,11 +7342,13 @@
       }
       const sc = _shortcutCache[command.name];
       if (sc && sc.workflowId) {
+        const vars = command.rest ? _parseWorkflowVars(command.rest) : { value: {} };
         await _handleWorkflowCommand({
           type: "workflow",
           op: "replay",
           id: sc.workflowId,
-          variables: command.rest ? tryParseJSON(command.rest) : {},
+          variables: vars.value || {},
+          ...(vars.error ? { variablesError: vars.error } : {}),
         });
         return;
       }
@@ -7512,25 +7555,29 @@
   }
 
   // Tab recording — pure UI shell over tab_recording_start/stop tools.
+  // `globalThis.__autodomTabRec` is only a fallback mirror now; the
+  // offscreen recorder (tab_recording_status) is the source of truth.
   globalThis.__autodomTabRec = globalThis.__autodomTabRec || { active: false, lastUrl: null };
   async function _autodomToggleTabRecording(btn) {
     const state = globalThis.__autodomTabRec;
     try {
-      if (!state.active) {
+      // Ask the recorder first so a stale mirror (reload, MCP-started
+      // recording) never sends start to a running recorder or vice versa.
+      const status = await callTool("tab_recording_status", {});
+      const active = status && typeof status.recording === "boolean"
+        ? status.recording
+        : _toolbarState.tabRecording;
+      if (!active) {
         const r = await callTool("tab_recording_start", {});
         if (r && r.ok) {
-          state.active = true;
-          btn && btn.classList.add("autodom-recording");
-          btn && btn.setAttribute("title", "Stop tab recording");
+          _setToolbarState({ tabRecording: true });
           _showChatToast("🔴 Recording this tab… click again to stop");
         } else {
           _showChatToast("Could not start recording: " + (r && (r.error || r.reason) || "unknown"));
         }
       } else {
         const r = await callTool("tab_recording_stop", {});
-        state.active = false;
-        btn && btn.classList.remove("autodom-recording");
-        btn && btn.setAttribute("title", "Record this tab to WebM");
+        _setToolbarState({ tabRecording: false });
         if (r && r.ok) {
           state.lastUrl = r.objectUrl;
           const kb = Math.round((r.sizeBytes || 0) / 1024);
@@ -7563,21 +7610,350 @@
       if (!recording) {
         const r = await callTool("workflow_record_start", {});
         if (r && r.ok) {
-          btn && btn.classList.add("autodom-recording");
-          btn && btn.setAttribute("title", "Stop recording and save the workflow");
+          _setToolbarState({ wfRecording: true });
           _showChatToast("⏺ Recording… do the task on the page, then click again (or /teach <name>) to save");
         } else {
+          _setToolbarState({ wfRecording: false });
           _showChatToast("Could not start recording: " + ((r && r.error) || "unknown"));
         }
         return;
       }
-      btn && btn.classList.remove("autodom-recording");
-      btn && btn.setAttribute("title", "Teach a task: record and save a replayable workflow");
       await _handleWorkflowCommand({ type: "workflow", op: "teach", name: "" });
     } catch (err) {
       _showChatToast("Recording error: " + ((err && err.message) || err));
     }
   }
+
+  // ─── Toolbar toggle state ──────────────────────────────────
+  // Toggle buttons (▷ while a run is active, ⊶ workflow recorder, ○ tab
+  // recorder) expose state via aria-pressed + .is-active; the recorders
+  // also keep the red .autodom-recording pulse. Titles describe what the
+  // next click does.
+  const _TOGGLE_TITLES = {
+    workflow_run_picker: ["Run workflow", "Stop workflow run"],
+    macro_record_toggle: ["Teach a task: record and save a replayable workflow", "Stop recording and save the workflow"],
+    tab_record_toggle: ["Record this tab to WebM", "Stop tab recording"],
+  };
+  function _toolbarBtn(action) {
+    return quickActions ? quickActions.querySelector(`[data-action="${action}"]`) : null;
+  }
+  function _applyToggle(action, on, recording) {
+    const btn = _toolbarBtn(action);
+    if (!btn) return;
+    btn.setAttribute("aria-pressed", on ? "true" : "false");
+    btn.classList.toggle("is-active", !!on);
+    if (recording) btn.classList.toggle("autodom-recording", !!on);
+    const titles = _TOGGLE_TITLES[action];
+    if (titles) btn.title = titles[on ? 1 : 0];
+    // ▷ changes behaviour (open picker → stop run), so its name follows;
+    // the recorders keep a stable name and rely on aria-pressed.
+    if (action === "workflow_run_picker") btn.setAttribute("aria-label", btn.title);
+  }
+  function _renderToolbarToggles() {
+    _applyToggle("workflow_run_picker", !!_toolbarState.activeRunId, false);
+    _applyToggle("macro_record_toggle", _toolbarState.wfRecording, true);
+    _applyToggle("tab_record_toggle", _toolbarState.tabRecording, true);
+    _applyToolbarVisibility();
+  }
+  function _setToolbarState(patch) {
+    if (!patch || typeof patch !== "object") return;
+    if (typeof patch.wfRecording === "boolean") _toolbarState.wfRecording = patch.wfRecording;
+    if (typeof patch.tabRecording === "boolean") {
+      _toolbarState.tabRecording = patch.tabRecording;
+      globalThis.__autodomTabRec.active = patch.tabRecording;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "activeRunId")) {
+      _toolbarState.activeRunId = patch.activeRunId ? String(patch.activeRunId) : null;
+    }
+    _renderToolbarToggles();
+    if (_toolbarState.activeRunId) _closeWorkflowPicker(false);
+  }
+
+  // Re-read recorder / run state from the SW. Runs on panel init and when
+  // the tab regains visibility or focus (throttled), so state lost to a
+  // page reload, a /teach from another surface or an MCP-started recording
+  // is reflected without waiting for a broadcast.
+  let _toolbarSyncPromise = null;
+  let _toolbarSyncAt = 0;
+  function _syncToolbarToggles(force = false) {
+    if (_toolbarSyncPromise) return _toolbarSyncPromise;
+    if (!force && Date.now() - _toolbarSyncAt < 3000) return Promise.resolve();
+    if (_contextInvalidated) return Promise.resolve();
+    _toolbarSyncAt = Date.now();
+    _toolbarSyncPromise = (async () => {
+      const patch = {};
+      try {
+        const [listed, rec] = await Promise.all([
+          callTool("workflow_list", {}),
+          callTool("tab_recording_status", {}),
+        ]);
+        if (listed && listed.ok !== false && !listed.error) patch.wfRecording = !!listed.recording;
+        patch.tabRecording = rec && typeof rec.recording === "boolean"
+          ? rec.recording
+          : !!globalThis.__autodomTabRec.active;
+      } catch (_) {}
+      _setToolbarState(patch);
+    })().finally(() => {
+      _toolbarSyncPromise = null;
+    });
+    return _toolbarSyncPromise;
+  }
+
+  // Features → Toolbar: hide the optional buttons. CSS keeps [hidden]
+  // icon buttons out of layout (the base rule forces inline-flex).
+  function _applyToolbarVisibility() {
+    const rec = _toolbarBtn("tab_record_toggle");
+    if (rec) rec.hidden = !_features.toolbarShowTabRecord && !_toolbarState.tabRecording;
+    const img = _toolbarBtn("describe_images");
+    if (img) img.hidden = !_features.toolbarShowDescribeImages;
+  }
+  function _applyFeatureFlags(raw) {
+    const s = raw && typeof raw === "object" ? raw : {};
+    for (const k of Object.keys(_features)) {
+      _features[k] = typeof s[k] === "boolean" ? s[k] : true;
+    }
+    try { _applyToolbarVisibility(); } catch (_) {}
+    try { _updateAutomationUi(); } catch (_) {}
+    if (!_features.overlayAutomationRunning) {
+      try { _hideRunIndicator(); } catch (_) {}
+    }
+  }
+
+  // One-shot buttons (screenshot, describe images): busy spinner while
+  // the call runs, then the same brief press flash as force-stop. Uses
+  // aria-disabled rather than `disabled` so keyboard focus stays on the
+  // button; a second click while busy is ignored. Toggles reuse it as a
+  // double-click guard.
+  async function _runOneShot(btn, fn, flash = true) {
+    if (btn && btn.classList.contains("is-busy")) return;
+    if (btn) {
+      btn.classList.add("is-busy");
+      btn.setAttribute("aria-disabled", "true");
+      btn.setAttribute("aria-busy", "true");
+    }
+    try {
+      await fn();
+    } finally {
+      if (btn) {
+        btn.classList.remove("is-busy");
+        btn.removeAttribute("aria-disabled");
+        btn.removeAttribute("aria-busy");
+        if (flash) _flashForceStop(btn);
+      }
+    }
+  }
+
+  // ─── Workflow runs (▷ picker and /replay) ──────────────────
+  // workflow_run is started without waiting so the panel learns the runId
+  // immediately (▷ turns into "Stop workflow run", Stop/abortChat can
+  // cancel it), then run_get is polled until the run leaves "running".
+  const _WF_POLL_MS = 800;
+  const _WF_MAX_WAIT_MS = 30 * 60 * 1000;
+  async function _runWorkflowTracked(params) {
+    const started = await callTool("workflow_run", { ...params, wait: false });
+    if (!started || started.missing || !started.runId) return started;
+    const runId = started.runId;
+    _setToolbarState({ activeRunId: runId });
+    let last = started;
+    let failures = 0;
+    try {
+      const deadline = Date.now() + _WF_MAX_WAIT_MS;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, _WF_POLL_MS));
+        if (_contextInvalidated) break;
+        const r = await callTool("run_get", { runId });
+        if (!r || r.error || r.ok === false || !r.status) {
+          if (++failures >= 5) break;
+          continue;
+        }
+        failures = 0;
+        last = r;
+        if (r.status !== "running") return r;
+      }
+      return last;
+    } finally {
+      if (_toolbarState.activeRunId === runId) _setToolbarState({ activeRunId: null });
+    }
+  }
+
+  function _cancelWorkflowRun(runId) {
+    if (!runId) return Promise.resolve(null);
+    return callTool("run_cancel", { runId }).then((r) => {
+      // Optimistic: the poll loop / broadcast confirms the final state. A
+      // handler reply with an empty `cancelled` list means the run already
+      // ended, so the active state is stale either way.
+      if (r && (r.ok || Array.isArray(r.cancelled)) && _toolbarState.activeRunId === runId) {
+        _setToolbarState({ activeRunId: null });
+      }
+      return r;
+    });
+  }
+
+  // Run-workflow popover. Anchored above the toolbar and styled like the
+  // slash menu; role=menu with roving focus (arrows/Home/End, Escape
+  // closes and returns focus to ▷).
+  const wfPicker = document.getElementById("__autodom_wf_picker");
+  let _wfPickerSeq = 0;
+  function _positionWorkflowPicker() {
+    if (!wfPicker || !panel || !quickActions) return;
+    const pr = panel.getBoundingClientRect();
+    const qr = quickActions.getBoundingClientRect();
+    // The panel is a containing block (transform + contain), so offsets
+    // are panel-relative rather than viewport-relative.
+    const bottom = Math.max(8, Math.round(pr.bottom - qr.top + 6));
+    _setImportantStyle(wfPicker, "position", "absolute");
+    _setImportantStyle(wfPicker, "left", "12px");
+    _setImportantStyle(wfPicker, "right", "12px");
+    _setImportantStyle(wfPicker, "top", "auto");
+    _setImportantStyle(wfPicker, "bottom", `${bottom}px`);
+    _setImportantStyle(wfPicker, "max-height", `${Math.max(140, Math.min(360, Math.round(qr.top - pr.top - 24)))}px`);
+  }
+  function _wfPickerItems() {
+    return wfPicker ? [...wfPicker.querySelectorAll('[role="menuitem"]')] : [];
+  }
+  function _focusWfPickerItem(index) {
+    const items = _wfPickerItems();
+    if (!items.length) return;
+    const i = (index + items.length) % items.length;
+    items.forEach((el, n) => {
+      el.tabIndex = n === i ? 0 : -1;
+      el.classList.toggle("is-active", n === i);
+    });
+    try { items[i].focus(); } catch (_) {}
+  }
+  function _closeWorkflowPicker(returnFocus = true) {
+    if (!wfPicker || wfPicker.hidden) return;
+    _wfPickerSeq++;
+    wfPicker.hidden = true;
+    wfPicker.textContent = "";
+    const btn = _toolbarBtn("workflow_run_picker");
+    if (btn) {
+      btn.setAttribute("aria-expanded", "false");
+      if (returnFocus) try { btn.focus(); } catch (_) {}
+    }
+  }
+  function _wfPickerNote(text) {
+    const note = document.createElement("div");
+    note.className = "autodom-wf-picker-empty";
+    note.setAttribute("role", "none");
+    note.textContent = text;
+    return note;
+  }
+  function _startPickedWorkflow(wf, dry) {
+    _closeWorkflowPicker(false);
+    if (isProcessing) {
+      _showChatToast("Wait for the current run to finish.");
+      return;
+    }
+    // Same path as typing `/replay <name>` / `/replay <name> dry`.
+    const display = `/replay ${wf.name || wf.id}${dry ? " dry" : ""}`;
+    addMessage("user", display);
+    _pushHistory({ role: "user", content: display });
+    _handleWorkflowCommand({ type: "workflow", op: "replay", id: wf.id, dry: !!dry, variables: {} });
+  }
+  async function _openWorkflowPicker() {
+    if (!wfPicker) return;
+    const btn = _toolbarBtn("workflow_run_picker");
+    const seq = ++_wfPickerSeq;
+    wfPicker.textContent = "";
+    const title = document.createElement("div");
+    title.className = "autodom-slash-menu-title";
+    title.setAttribute("role", "none");
+    title.textContent = "Run workflow";
+    wfPicker.append(title, _wfPickerNote("Loading saved workflows…"));
+    _positionWorkflowPicker();
+    wfPicker.hidden = false;
+    if (btn) btn.setAttribute("aria-expanded", "true");
+
+    const listed = await callTool("workflow_list", {});
+    if (seq !== _wfPickerSeq || wfPicker.hidden) return;
+    if (listed && listed.ok !== false && !listed.error) {
+      _setToolbarState({ wfRecording: !!listed.recording });
+    }
+    wfPicker.textContent = "";
+    wfPicker.appendChild(title);
+    const workflows = (listed && Array.isArray(listed.workflows) && listed.workflows) || [];
+    if (!listed || listed.error || listed.ok === false) {
+      wfPicker.appendChild(_wfPickerNote("Could not load workflows: " + ((listed && listed.error) || "unknown")));
+    } else if (!workflows.length) {
+      wfPicker.appendChild(_wfPickerNote("No saved workflows — press ⊶ to record one"));
+    }
+    workflows.forEach((wf) => {
+      const row = document.createElement("div");
+      row.className = "autodom-wf-picker-row";
+      row.setAttribute("role", "none");
+      const info = document.createElement("span");
+      info.className = "autodom-wf-picker-info";
+      const name = document.createElement("span");
+      name.className = "autodom-slash-menu-command autodom-wf-picker-name";
+      name.textContent = wf.name || wf.id;
+      const meta = document.createElement("span");
+      meta.className = "autodom-slash-menu-desc";
+      const last = wf.lastRun && wf.lastRun.status ? ` · last ${wf.lastRun.status}` : "";
+      meta.textContent = `${wf.steps || 0} step${wf.steps === 1 ? "" : "s"}${last}`;
+      info.append(name, meta);
+      row.appendChild(info);
+      const label = wf.name || wf.id;
+      [["Run", false], ["Dry run", true]].forEach(([text, dry]) => {
+        const action = document.createElement("button");
+        action.type = "button";
+        action.className = "autodom-wf-picker-action" + (dry ? " is-dry" : "");
+        action.setAttribute("role", "menuitem");
+        action.tabIndex = -1;
+        action.textContent = text;
+        action.setAttribute("aria-label", `${text} ${label}`);
+        action.title = dry ? "Check every step's target without clicking or typing" : `Run ${label}`;
+        action.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          _startPickedWorkflow(wf, dry);
+        });
+        row.appendChild(action);
+      });
+      wfPicker.appendChild(row);
+    });
+    _positionWorkflowPicker();
+    if (_wfPickerItems().length) _focusWfPickerItem(0);
+  }
+
+  if (wfPicker) {
+    wfPicker.addEventListener("click", (e) => e.stopPropagation());
+    wfPicker.addEventListener("keydown", (e) => {
+      const items = _wfPickerItems();
+      const current = items.indexOf(document.activeElement);
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        _closeWorkflowPicker(true);
+        return;
+      }
+      if (e.key === "Tab") {
+        _closeWorkflowPicker(false);
+        return;
+      }
+      if (!items.length) return;
+      // Each row holds [Run, Dry run]: Up/Down move between workflows in
+      // the same column, Left/Right between the two actions.
+      const COLS = 2;
+      let next = null;
+      if (e.key === "ArrowDown") next = current < 0 ? 0 : current + COLS;
+      else if (e.key === "ArrowUp") next = current < 0 ? items.length - COLS : current - COLS;
+      else if (e.key === "ArrowRight" && current >= 0) next = current + 1;
+      else if (e.key === "ArrowLeft" && current >= 0) next = current - 1;
+      else if (e.key === "Home") next = 0;
+      else if (e.key === "End") next = items.length - 1;
+      if (next == null) return;
+      e.preventDefault();
+      e.stopPropagation();
+      _focusWfPickerItem(next);
+    });
+  }
+  document.addEventListener("click", (e) => {
+    if (!wfPicker || wfPicker.hidden) return;
+    const btn = _toolbarBtn("workflow_run_picker");
+    if (wfPicker.contains(e.target) || (btn && btn.contains(e.target))) return;
+    _closeWorkflowPicker(false);
+  });
 
   function _workflowVarsHint(wf) {
     const vars = (wf && wf.variables) || [];
@@ -7672,10 +8048,12 @@
         if (!(listed && listed.recording)) {
           const r = await callTool("workflow_record_start", {});
           if (!r || !r.ok) return say("Could not start recording: " + ((r && r.error) || "unknown"));
+          _setToolbarState({ wfRecording: true });
           return say("⏺ **Recording.** Do the task on this page — clicks, typing, selects and navigation are captured. " +
             "Type `/teach <name>` when you are done to save it.");
         }
         const stopped = await callTool("workflow_record_stop", { name: command.name || undefined, save: true });
+        _syncToolbarToggles(true);
         if (!stopped || !stopped.ok) return say("Could not save: " + ((stopped && stopped.error) || "unknown"));
         const wf = stopped.workflow;
         return say(`💾 Saved **${wf.name}** (${wf.steps.length} steps, id \`${wf.id}\`).\n\n` +
@@ -7693,14 +8071,14 @@
       }
       if (command.op === "replay") {
         if (!command.id) return say("Usage: `/replay <name|id> [{\"var\":\"value\"}]`");
+        if (command.variablesError) return say("Replay not started: " + command.variablesError);
         _setBusy(true);
         showTyping();
         try {
-          const run = await callTool("workflow_run", {
+          const run = await _runWorkflowTracked({
             id: command.id,
             variables: command.variables || {},
             ...(command.dry ? { mode: "dry" } : {}),
-            waitMs: 120000,
           });
           if (run && run.missing) return say(`This workflow needs values for: ${run.missing.map((n) => "`" + n + "`").join(", ")}.\n\nExample: \`/replay ${command.id} ${JSON.stringify(Object.fromEntries(run.missing.map((n) => [n, "..."])))}\``);
           if (!run || (!run.runId && run.error)) return say("Replay failed: " + ((run && run.error) || "unknown"));
@@ -8323,10 +8701,8 @@
 
   // ─── Quick Actions ─────────────────────────────────────────
   quickActions.addEventListener("click", async (e) => {
-    const btn = e.target.closest(
-      ".autodom-chat-quick-btn, .autodom-chat-icon-btn",
-    );
-    if (!btn) return;
+    const btn = e.target.closest(".autodom-chat-icon-btn");
+    if (!btn || btn.disabled || btn.classList.contains("is-busy")) return;
 
     // Force-stop must be handled BEFORE the isProcessing guard — the
     // whole point of this button is that it works while a run is in
@@ -8345,46 +8721,31 @@
       return;
     }
 
-    if (isProcessing) return;
-
-    // Prompt chips: feed natural-language text into the AI flow via the
-    // composer so it shares the same routing/abort/typing UI.
-    const prompt = btn.dataset.prompt;
-    if (prompt) {
-      if (prompt === "__summarize__") {
-        await aiSummarizePage();
+    // ▷ also works mid-run: while a workflow run is active it is the
+    // run's stop button, otherwise it toggles the saved-workflow picker.
+    if (btn.dataset.action === "workflow_run_picker") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (_toolbarState.activeRunId) {
+        _flashForceStop(btn);
+        _showChatToast("Stopping workflow run…");
+        const r = await _cancelWorkflowRun(_toolbarState.activeRunId);
+        if (!r || !r.ok) _showChatToast("Could not stop the run: " + ((r && (r.error || r.note)) || "not running"));
         return;
       }
-      if (prompt === "__explain__") {
-        await aiPageQuery("What can I do on this page?", (title) =>
-          "Explain what a user can do on this web page using markdown. " +
-          "Summarize the main purpose, the primary workflows, and the most " +
-          "useful actions. Avoid raw DOM lists; describe meaningful tasks."
-        );
+      if (wfPicker && !wfPicker.hidden) {
+        _closeWorkflowPicker(false);
         return;
       }
-      if (prompt === "__key_controls__") {
-        await aiPageQuery("Key controls on this page", (title) =>
-          "Analyze this web page and describe the key controls and actions " +
-          "available to the user using markdown. Group them logically and " +
-          "explain what the user can accomplish. Do not return a raw list of " +
-          "DOM elements or tag names."
-        );
+      if (isProcessing) {
+        _showChatToast("Wait for the current run to finish.");
         return;
       }
-      if (prompt === "__a11y__") {
-        await aiPageQuery("Accessibility issues on this page", (title) =>
-          "Check this web page for accessibility issues and summarize the top " +
-          "problems using markdown. Prioritize user-impacting issues and " +
-          "include concise fixes. Do not dump raw DOM elements."
-        );
-        return;
-      }
-      chatInput.value = prompt;
-      autoResizeInput();
-      await sendMessage();
+      await _openWorkflowPicker();
       return;
     }
+
+    if (isProcessing) return;
 
     const action = btn.dataset.action;
     let command;
@@ -8441,13 +8802,13 @@
         // Custom flow — list images, attach a few as image attachments, then
         // queue a "Describe each of these images" user turn so vision-capable
         // models analyse them on the next send.
-        await _autodomDescribeImagesFlow();
+        await _runOneShot(btn, _autodomDescribeImagesFlow);
         return;
       case "tab_record_toggle":
-        await _autodomToggleTabRecording(btn);
+        await _runOneShot(btn, () => _autodomToggleTabRecording(btn), false);
         return;
       case "macro_record_toggle":
-        await _autodomToggleMacroRecording(btn);
+        await _runOneShot(btn, () => _autodomToggleMacroRecording(btn), false);
         return;
       default:
         return;
@@ -8458,6 +8819,10 @@
 
     // Quick actions use local tool handlers (chrome.scripting APIs) —
     // they do NOT require the MCP bridge server to be connected.
+    if (action === "screenshot") {
+      await _runOneShot(btn, () => executeToolCommand(command));
+      return;
+    }
     await executeToolCommand(command);
   });
 
@@ -8644,6 +9009,21 @@
       } catch (_) {}
       return;
     }
+    // ─── Toolbar toggle state broadcast from the SW ─────────────
+    // { wfRecording?, tabRecording?, activeRunId? } — every field is
+    // optional; only the ones present are applied.
+    if (message.type === "AUTODOM_TOOLBAR_STATE") {
+      const patch = {};
+      if (typeof message.wfRecording === "boolean") patch.wfRecording = message.wfRecording;
+      if (typeof message.tabRecording === "boolean") patch.tabRecording = message.tabRecording;
+      if (Object.prototype.hasOwnProperty.call(message, "activeRunId")) {
+        patch.activeRunId = typeof message.activeRunId === "string" && message.activeRunId
+          ? message.activeRunId
+          : null;
+      }
+      try { _setToolbarState(patch); } catch (_) {}
+      return;
+    }
     _log(
       "onMessage received:",
       message.type,
@@ -8806,6 +9186,12 @@
 
     // Escape to close whatever is open
     if (e.key === "Escape") {
+      // An open ▷ picker swallows the first Escape (focus may still be on
+      // the ▷ button rather than inside the menu).
+      if (wfPicker && !wfPicker.hidden) {
+        _closeWorkflowPicker(true);
+        return;
+      }
       if (inlineMode) {
         closeInlineOverlay();
       } else if (isOpen) {
@@ -8872,6 +9258,30 @@
   _deferAfterFirstPaint(() => {
     Promise.resolve(getPageContext()).catch(() => {});
   }, 2200);
+
+  // ─── Feature flags + toolbar state sync ────────────────────
+  try {
+    chrome.storage?.local?.get?.([FEATURES_KEY], (items) => {
+      try { void chrome.runtime.lastError; } catch (_) {}
+      _applyFeatureFlags(items && items[FEATURES_KEY]);
+    });
+    chrome.storage?.onChanged?.addListener?.((changes, area) => {
+      if (area !== "local" || !changes[FEATURES_KEY]) return;
+      _applyFeatureFlags(changes[FEATURES_KEY].newValue);
+    });
+  } catch (_) {}
+  _renderToolbarToggles();
+  _deferAfterFirstPaint(() => {
+    _syncToolbarToggles(true);
+  }, 1500);
+  // Only while the panel is showing — a closed panel has no toolbar to
+  // keep fresh, and openPanel() syncs on the way back in.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && isOpen) _syncToolbarToggles();
+  });
+  window.addEventListener("focus", () => {
+    if (isOpen) _syncToolbarToggles();
+  });
 
   // SPA navigation detection — uses History API interception instead of
   // a MutationObserver on the entire DOM tree. This eliminates thousands

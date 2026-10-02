@@ -32,7 +32,8 @@
   // Serialized into the tab. Must be self-contained. Installs
   // globalThis.__autodomWfLib once per document (idempotent).
   function _pageWfLib() {
-    const VERSION = 4;
+    // Keep in sync with WF_LIB_VERSION checks in the entry points below.
+    const VERSION = 5;
     if (globalThis.__autodomWfLib && globalThis.__autodomWfLib.v === VERSION) {
       return { ok: true, cached: true };
     }
@@ -664,9 +665,49 @@
     };
 
     // ── Recorder ──
+    // Small non-interactive "● Recording workflow" chip (Features →
+    // overlayRecordingIndicator). Closed shadow root so page CSS cannot
+    // touch it, data-autodom-ui so the recorder and candidate scans skip
+    // it, pointer-events:none so it never eats a click being recorded.
+    const CHIP_ID = "__autodom_wf_rec_chip";
+    const removeChip = () => {
+      const old = document.getElementById(CHIP_ID);
+      if (old) old.remove();
+    };
+    const showChip = () => {
+      if (document.getElementById(CHIP_ID)) return;
+      const host = document.createElement("div");
+      host.id = CHIP_ID;
+      host.setAttribute("data-autodom-ui", "");
+      host.setAttribute("aria-hidden", "true");
+      host.style.cssText = "all:initial;position:fixed;left:12px;bottom:12px;z-index:2147483646;pointer-events:none;";
+      const root = host.attachShadow({ mode: "closed" });
+      const style = document.createElement("style");
+      style.textContent =
+        ".chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;" +
+        "background:rgba(17,24,39,.88);color:#fff;font:600 12px/16px system-ui,-apple-system,sans-serif;" +
+        "box-shadow:0 2px 8px rgba(0,0,0,.25);pointer-events:none;user-select:none}" +
+        ".dot{width:8px;height:8px;border-radius:50%;background:#ef4444;animation:p 1.4s ease-in-out infinite}" +
+        "@keyframes p{50%{opacity:.35}}" +
+        "@media (prefers-reduced-motion:reduce){.dot{animation:none}}";
+      const chip = document.createElement("div");
+      chip.className = "chip";
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      const label = document.createElement("span");
+      label.textContent = "Recording workflow";
+      chip.append(dot, label);
+      root.append(style, chip);
+      document.documentElement.appendChild(host);
+    };
     let rec = null;
-    const startRecording = (nonce) => {
-      if (rec && rec.nonce === nonce) return { ok: true, alreadyRunning: true };
+    const startRecording = (nonce, opts) => {
+      const indicator = !opts || opts.indicator !== false;
+      if (rec && rec.nonce === nonce) {
+        if (indicator) showChip();
+        else removeChip();
+        return { ok: true, alreadyRunning: true };
+      }
       if (rec) stopRecording();
       const lastFilled = new WeakMap();
       const send = (step) => {
@@ -766,9 +807,13 @@
           document.removeEventListener("focusout", onFocusOut, true);
         },
       };
+      if (indicator) {
+        try { showChip(); } catch (_) {}
+      }
       return { ok: true, started: true };
     };
     const stopRecording = () => {
+      try { removeChip(); } catch (_) {}
       if (!rec) return { ok: true, wasRecording: false };
       try { rec.stop(); } catch (_) {}
       rec = null;
@@ -799,10 +844,14 @@
     return { ok: true };
   }
 
-  // Thin entry points (each assumes _pageWfLib ran first in the same world).
-  function _pageWfStartRecording(nonce) {
+  // Thin entry points. They answer { needLib: true } when the library is
+  // missing (new document) or from another build, and the engine injects
+  // _pageWfLib and retries once — so the library is injected once per
+  // document instead of before every step. The literal 5 must match
+  // VERSION in _pageWfLib (each function is serialized on its own).
+  function _pageWfStartRecording(nonce, opts) {
     const L = globalThis.__autodomWfLib;
-    return L ? L.startRecording(nonce) : { ok: false, error: "workflow lib not loaded" };
+    return L && L.v === 5 ? L.startRecording(nonce, opts) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfStopRecording() {
     const L = globalThis.__autodomWfLib;
@@ -810,23 +859,23 @@
   }
   function _pageWfRunStep(step, timeoutMs) {
     const L = globalThis.__autodomWfLib;
-    return L ? L.runStep(step, timeoutMs) : { ok: false, error: "workflow lib not loaded" };
+    return L && L.v === 5 ? L.runStep(step, timeoutMs) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfActOnRef(ref, step) {
     const L = globalThis.__autodomWfLib;
-    return L ? L.actOnRef(ref, step) : { ok: false, error: "workflow lib not loaded" };
+    return L && L.v === 5 ? L.actOnRef(ref, step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfCandidates(limit) {
     const L = globalThis.__autodomWfLib;
-    return L ? { ok: true, candidates: L.candidates(limit) } : { ok: false, error: "workflow lib not loaded" };
+    return L && L.v === 5 ? { ok: true, candidates: L.candidates(limit) } : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfResolveOnly(step) {
     const L = globalThis.__autodomWfLib;
-    return L ? L.resolveOnly(step) : { ok: false, error: "workflow lib not loaded" };
+    return L && L.v === 5 ? L.resolveOnly(step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfMark(limit, nearBbox) {
     const L = globalThis.__autodomWfLib;
-    return L ? L.markCandidates(limit, nearBbox) : { ok: false, error: "workflow lib not loaded" };
+    return L && L.v === 5 ? L.markCandidates(limit, nearBbox) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfClearMarks() {
     const L = globalThis.__autodomWfLib;
@@ -834,11 +883,39 @@
   }
   function _pageWfRemoveStorage(origin, local, session) {
     const L = globalThis.__autodomWfLib;
-    return L ? L.removeStorage(origin, local, session) : { ok: false, error: "workflow lib not loaded" };
+    return L && L.v === 5 ? L.removeStorage(origin, local, session) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfDigest() {
     const L = globalThis.__autodomWfLib;
-    return L ? L.digest() : null;
+    return L && L.v === 5 ? L.digest() : { needLib: true };
+  }
+  // Fast-mode settle: resolve once the DOM has been quiet for idleMs (no
+  // mutations), or after capMs at the latest. Self-contained, no library.
+  function _pageWfQuiet(idleMs, capMs) {
+    return new Promise((resolve) => {
+      const started = Date.now();
+      let idleTimer = null;
+      let done = false;
+      let obs = null;
+      const finish = (quiet) => {
+        if (done) return;
+        done = true;
+        clearTimeout(idleTimer);
+        clearTimeout(capTimer);
+        try { obs && obs.disconnect(); } catch (_) {}
+        resolve({ ok: true, quiet, waitedMs: Date.now() - started });
+      };
+      const arm = () => {
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => finish(true), idleMs);
+      };
+      const capTimer = setTimeout(() => finish(false), capMs);
+      try {
+        obs = new MutationObserver(arm);
+        obs.observe(document.documentElement || document, { subtree: true, childList: true, attributes: true, characterData: true });
+      } catch (_) {}
+      arm();
+    });
   }
 
   // ─── Pure helpers (SW side, unit tested) ─────────────────────────────
@@ -1302,11 +1379,36 @@
   const WF_KEY = "autodom.workflows";
   const RUNS_KEY = "autodom.workflowRuns";
   const REC_KEY = "autodom.wf.recording";
-  const MAX_RUNS = 200;
+  const DRAFT_KEY = "autodom.wf.lastDraft";
+  const MAX_RUNS = 200; // hard ceiling; features.runHistoryLimit picks the real cap
   const UNDO_KEY = "autodom.runUndo";
   const MAX_UNDO_RUNS = 20;
   const UNDO_GROUP = { field: "fields", storage: "storage", cookies: "cookies", navigation: "navigation" };
   const MAY_CHANGE_PAGE = new Set(["click", "dblclick", "press"]);
+  // Finished runs / batches stay in memory for live run_get views, then
+  // fall back to the persisted history.
+  const MAX_FINISHED_LIVE = 20;
+  const FINISHED_TTL_MS = 5 * 60 * 1000;
+  const RUNS_WRITE_DEBOUNCE_MS = 300;
+  const REC_PERSIST_DEBOUNCE_MS = 150;
+  const REC_PERSIST_MAX_WAIT_MS = 1000;
+  // Used when the SW does not pass getFeatures (unit tests, old callers).
+  // Mirrors the engine-relevant subset of feature-flags.js DEFAULTS.
+  const FEATURE_DEFAULTS = {
+    visionHeal: "auto",
+    defaultRunMode: "heal",
+    undoTracking: true,
+    parallelConcurrency: 3,
+    runHistoryLimit: 50,
+    perfMode: "fast",
+    overlayVisionMarks: true,
+    overlayRecordingIndicator: true,
+  };
+
+  function unrefTimer(t) {
+    try { if (t && typeof t.unref === "function") t.unref(); } catch (_) {}
+    return t;
+  }
 
   function makeEngine(ctx) {
     const storage = ctx.storage || (globalThis.chrome && chrome.storage);
@@ -1318,8 +1420,42 @@
     let lastDraft = null;
     const runs = new Map(); // runId → live run
     const batches = new Map(); // batchId → parallel batch
-    let persistTimer = null;
     let persistChain = Promise.resolve(); // serialises stats read-modify-write across parallel runs
+    let currentRunId = null; // newest running run, mirrored to the chat toolbar
+
+    // ── feature flags + hooks ──
+    async function features() {
+      let flags = null;
+      if (typeof ctx.getFeatures === "function") {
+        try { flags = await ctx.getFeatures(); } catch (_) {}
+      }
+      return { ...FEATURE_DEFAULTS, ...(flags && typeof flags === "object" ? flags : {}) };
+    }
+    // Vision self-heal: "off" never, "on" whenever a vision picker exists,
+    // "auto" only when the SW says an AI provider is enabled and usable.
+    // A per-call vision:false always wins.
+    async function visionAllowed(params, flags) {
+      if (params && params.vision === false) return false;
+      if (typeof ctx.visionPick !== "function") return false;
+      const mode = (flags || (await features())).visionHeal;
+      if (mode === "off") return false;
+      if (mode === "on") return true;
+      if (typeof ctx.visionAvailable === "function") {
+        try { return !!(await ctx.visionAvailable()); } catch (_) { return false; }
+      }
+      return true;
+    }
+    function broadcast(patch) {
+      if (typeof ctx.broadcastState !== "function") return;
+      try { ctx.broadcastState(patch); } catch (_) {}
+    }
+    // A workflow was written to storage outside the MCP save tools (chat
+    // /teach, self-heal): the SW forwards it to the bridge so the server's
+    // ~/.autodom/workflows mirror stays current.
+    function emitSaved(wf, reason, callCtx) {
+      if (typeof ctx.onWorkflowSaved !== "function" || !wf) return;
+      try { ctx.onWorkflowSaved(JSON.parse(JSON.stringify(wf)), { reason, origin: (callCtx && callCtx.origin) || null }); } catch (_) {}
+    }
 
     // ── storage ──
     async function loadAll() {
@@ -1347,42 +1483,194 @@
       const lower = String(ref).toLowerCase();
       return Object.values(map).find((w) => String(w.name).toLowerCase() === lower) || null;
     }
+
+    // Run history: an in-memory copy of autodom.workflowRuns serves reads;
+    // writes are debounced (300 ms) and flushed at the end of a batch.
+    let runsCache = null;
+    let runsLoading = null;
+    let runsWriteTimer = null;
+    let runsWriteChain = Promise.resolve();
+    let runsWrittenSig = null;
+    const runsSig = (list) => (list || []).map((r) => r && r.runId).join(",");
     async function loadRuns() {
-      const got = await storage.local.get(RUNS_KEY);
-      return (got && got[RUNS_KEY]) || [];
+      if (runsCache) return runsCache;
+      if (!runsLoading) {
+        runsLoading = (async () => {
+          try {
+            const got = await storage.local.get(RUNS_KEY);
+            const list = (got && got[RUNS_KEY]) || [];
+            if (!runsCache) runsCache = Array.isArray(list) ? list : [];
+          } catch (_) {
+            if (!runsCache) runsCache = [];
+          }
+          return runsCache;
+        })().finally(() => { runsLoading = null; });
+      }
+      return runsLoading;
     }
-    async function pushRun(report) {
+    function flushRuns() {
+      clearTimeout(runsWriteTimer);
+      runsWriteTimer = null;
+      if (!runsCache) return runsWriteChain;
+      const snapshot = runsCache.slice();
+      runsWrittenSig = runsSig(snapshot);
+      runsWriteChain = runsWriteChain
+        .then(() => storage.local.set({ [RUNS_KEY]: snapshot }))
+        .catch((err) => log("[AutoDOM WF] write run history failed:", err && err.message));
+      return runsWriteChain;
+    }
+    async function pushRun(report, flags) {
       const list = await loadRuns();
+      const limit = Math.max(1, Math.min(MAX_RUNS, Number((flags || {}).runHistoryLimit) || FEATURE_DEFAULTS.runHistoryLimit));
       const slim = { ...report, steps: report.steps.map(({ screenshot, ...s }) => s) };
-      const next = [slim, ...list.filter((r) => r.runId !== report.runId)].slice(0, MAX_RUNS);
-      await storage.local.set({ [RUNS_KEY]: next });
+      runsCache = [slim, ...list.filter((r) => r.runId !== report.runId)].slice(0, limit);
+      clearTimeout(runsWriteTimer);
+      runsWriteTimer = setTimeout(flushRuns, RUNS_WRITE_DEBOUNCE_MS);
     }
-    function schedulePersistRec() {
-      clearTimeout(persistTimer);
-      persistTimer = setTimeout(() => {
-        try {
-          storage.session && storage.session.set({ [REC_KEY]: rec ? { ...rec } : null });
-        } catch (_) {}
-      }, 150);
+    // Popup → Storage → "Clear run history". The SW removes the storage
+    // key; this drops the in-memory copy and any queued write so the old
+    // history is not written back. Running runs are kept (they land in the
+    // emptied history when they finish); finished ones leave memory.
+    async function clearRunHistory() {
+      clearTimeout(runsWriteTimer);
+      runsWriteTimer = null;
+      runsCache = [];
+      runsWrittenSig = "";
+      // A write that was already in flight could land after the SW's
+      // remove: wait for it, then make sure the key is gone.
+      try { await runsWriteChain; } catch (_) {}
+      try {
+        if (typeof storage.local.remove === "function") await storage.local.remove(RUNS_KEY);
+        else await storage.local.set({ [RUNS_KEY]: [] });
+      } catch (_) {}
+      let dropped = 0;
+      for (const [id, l] of [...runs.entries()]) {
+        if (l.report.status !== "running") { runs.delete(id); dropped++; }
+      }
+      for (const [id, b] of [...batches.entries()]) {
+        if (b.finishedAt) { batches.delete(id); dropped++; }
+      }
+      return { ok: true, dropped };
+    }
+    // Popup → Storage → "Clear workflow drafts" (the SW removes the session copy).
+    async function clearDrafts() {
+      const had = !!lastDraft;
+      lastDraft = null;
+      return { ok: true, cleared: had };
     }
 
-    async function hydrate() {
+    // Someone else changed the history (popup "Clear run history"): adopt it.
+    try {
+      if (storage && storage.onChanged && typeof storage.onChanged.addListener === "function") {
+        storage.onChanged.addListener((changes, area) => {
+          if (area !== "local" || !changes || !changes[RUNS_KEY]) return;
+          const next = changes[RUNS_KEY].newValue;
+          if (runsSig(next) === runsWrittenSig) return; // our own write
+          runsCache = Array.isArray(next) ? next.slice() : [];
+          runsWrittenSig = runsSig(runsCache);
+        });
+      }
+    } catch (_) {}
+
+    // In-flight recording state lives in session storage so a SW restart
+    // keeps recording. Writes are debounced for bursts but never starved:
+    // a pending change is written at least once a second, and start/stop
+    // write immediately.
+    let recPersistTimer = null;
+    let recLastWrite = 0;
+    function writeRecNow() {
+      clearTimeout(recPersistTimer);
+      recPersistTimer = null;
+      recLastWrite = Date.now();
       try {
-        if (!storage.session) return;
-        const got = await storage.session.get(REC_KEY);
-        if (got && got[REC_KEY] && got[REC_KEY].nonce) rec = got[REC_KEY];
+        if (!storage.session) return Promise.resolve();
+        const value = rec ? { ...rec, steps: rec.steps.slice() } : null;
+        return Promise.resolve(storage.session.set({ [REC_KEY]: value })).catch(() => {});
+      } catch (_) {
+        return Promise.resolve();
+      }
+    }
+    function schedulePersistRec() {
+      if (Date.now() - recLastWrite >= REC_PERSIST_MAX_WAIT_MS) {
+        writeRecNow();
+        return;
+      }
+      if (recPersistTimer) return; // a write within 150 ms is already queued
+      recPersistTimer = setTimeout(writeRecNow, REC_PERSIST_DEBOUNCE_MS);
+    }
+
+    // Recorder events (step messages, navigations) that arrive while the
+    // SW is still reading the in-flight recording back from session
+    // storage are queued and replayed once it is known.
+    let hydrated = false;
+    const earlyEvents = [];
+    async function doHydrate() {
+      try {
+        if (storage.session) {
+          const got = await storage.session.get(REC_KEY);
+          if (!rec && got && got[REC_KEY] && got[REC_KEY].nonce) rec = got[REC_KEY];
+        }
       } catch (_) {}
+      hydrated = true;
+      const queued = earlyEvents.splice(0);
+      for (const fn of queued) {
+        try { fn(); } catch (_) {}
+      }
+      if (rec) broadcast({ wfRecording: true });
+    }
+    const ready = doHydrate();
+    function hydrate() {
+      return ready;
+    }
+    function whenHydrated(fn) {
+      if (hydrated) return fn();
+      if (earlyEvents.length < 2000) earlyEvents.push(fn);
+      return undefined;
+    }
+
+    // ── page calls with lazy library injection ──
+    async function injectLib(tabId) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await exec(tabId, _pageWfLib, []);
+          return true;
+        } catch (err) {
+          if (attempt === 2) throw err;
+          await Promise.resolve(ctx.waitForTabComplete(tabId, 8000)).catch(() => {});
+          await sleep(250);
+        }
+      }
+      return false;
+    }
+    // Call a page entry point; inject the library only when the page says
+    // it is missing (first call on a new document) and retry once. A call
+    // that throws (document replaced mid-call) waits for the tab, injects
+    // and retries once too.
+    async function execLib(tabId, fn, args) {
+      let res;
+      try {
+        res = await exec(tabId, fn, args);
+      } catch (_) {
+        await injectLib(tabId);
+        return exec(tabId, fn, args);
+      }
+      if (res && res.needLib) {
+        await injectLib(tabId);
+        res = await exec(tabId, fn, args);
+      }
+      return res;
     }
 
     async function injectRecorder(tabId) {
-      await exec(tabId, _pageWfLib, []);
-      return exec(tabId, _pageWfStartRecording, [rec.nonce]);
+      const flags = await features();
+      return execLib(tabId, _pageWfStartRecording, [rec.nonce, { indicator: flags.overlayRecordingIndicator !== false }]);
     }
 
     // ── recorder ──
-    async function recordStart(params) {
+    async function recordStart(params, callCtx) {
+      await ready;
       if (rec) return { ok: false, error: "A workflow recording is already running. Call workflow_record_stop first.", tabId: rec.tabId };
-      const tab = params && params.tabId != null ? await chrome.tabs.get(params.tabId) : await ctx.getActiveTab();
+      const tab = params && params.tabId != null ? await chrome.tabs.get(params.tabId) : await ctx.getActiveTab(callCtx);
       if (params && params.url) {
         await chrome.tabs.update(tab.id, { url: params.url });
         await ctx.waitForTabComplete(tab.id);
@@ -1395,15 +1683,16 @@
         startedAt: Date.now(),
         startUrl: fresh.url || (params && params.url) || "",
       };
-      schedulePersistRec();
+      writeRecNow();
       try {
         await injectRecorder(tab.id);
       } catch (err) {
         const msg = String((err && err.message) || err);
         rec = null;
-        schedulePersistRec();
+        writeRecNow();
         return { ok: false, error: `Could not start recorder on this page: ${msg}` };
       }
+      broadcast({ wfRecording: true });
       return {
         ok: true,
         recording: true,
@@ -1413,12 +1702,7 @@
       };
     }
 
-    async function recordStop(params) {
-      if (!rec) return { ok: false, error: "No workflow recording in progress" };
-      const r = rec;
-      rec = null;
-      schedulePersistRec();
-      try { await exec(r.tabId, _pageWfStopRecording, []); } catch (_) {}
+    async function storeDraft(r, params) {
       const draft = buildDraft({
         steps: r.steps,
         startUrl: r.startUrl,
@@ -1427,11 +1711,24 @@
         source: "recording",
       });
       lastDraft = draft;
-      try { storage.session && (await storage.session.set({ "autodom.wf.lastDraft": draft })); } catch (_) {}
+      try { storage.session && (await storage.session.set({ [DRAFT_KEY]: draft })); } catch (_) {}
+      return draft;
+    }
+
+    async function recordStop(params, callCtx) {
+      await ready;
+      if (!rec) return { ok: false, error: "No workflow recording in progress" };
+      const r = rec;
+      rec = null;
+      await writeRecNow();
+      broadcast({ wfRecording: false });
+      try { await exec(r.tabId, _pageWfStopRecording, []); } catch (_) {}
+      const draft = await storeDraft(r, params);
       let saved = false;
       if (params && params.save) {
         await putWorkflow(draft);
         saved = true;
+        emitSaved(draft, "record", callCtx);
       }
       return {
         ok: true,
@@ -1442,6 +1739,23 @@
           ? `Saved as ${draft.id}. Run it with workflow_run { id: "${draft.id}" }.`
           : "Review the draft, then call workflow_save (optionally with name/description or an edited workflow) to keep it.",
       };
+    }
+
+    // The recording tab was closed: keep what was captured as an unsaved
+    // draft (workflow_save picks it up) and end the recording.
+    async function onTabRemoved(tabId) {
+      await ready;
+      for (const live of runs.values()) {
+        if (live.report.status === "running" && live.report.tabId === tabId) live.tabClosed = true;
+      }
+      if (!rec || rec.tabId !== tabId) return null;
+      const r = rec;
+      rec = null;
+      await writeRecNow();
+      broadcast({ wfRecording: false });
+      const draft = await storeDraft(r, { description: "Recording ended because its tab was closed." });
+      log("[AutoDOM WF] recording tab closed; kept draft", draft.id);
+      return draft;
     }
 
     function pushStep(step) {
@@ -1456,29 +1770,38 @@
       schedulePersistRec();
     }
 
+    function handleStepMessage(message, sender) {
+      if (!rec || message.nonce !== rec.nonce) return;
+      if (sender && sender.tab && sender.tab.id !== rec.tabId) return;
+      const step = message.step || {};
+      if (!ACTIONS.has(step.action)) return;
+      pushStep(step);
+    }
+
+    // Synchronous (the SW's onMessage listener returns right away). Steps
+    // that arrive before hydrate() finished are buffered, not dropped.
     function onRuntimeMessage(message, sender) {
       if (!message || message.type !== "AUTODOM_WF_STEP") return false;
-      if (!rec || message.nonce !== rec.nonce) return true;
-      if (sender && sender.tab && sender.tab.id !== rec.tabId) return true;
-      const step = message.step || {};
-      if (!ACTIONS.has(step.action)) return true;
-      pushStep(step);
+      whenHydrated(() => handleStepMessage(message, sender));
       return true;
     }
 
     // Typed / bookmarked / agent-driven navigations become navigate steps;
     // link clicks and form submits are implied by the step that caused them.
     function onNavigationCommitted(details) {
-      if (!rec || details.tabId !== rec.tabId || details.frameId !== 0) return;
-      const tt = details.transitionType || "";
-      const q = details.transitionQualifiers || [];
-      if (/^(chrome|about|chrome-extension|devtools):/.test(details.url || "")) return;
-      if (q.includes("forward_back")) return;
-      const explicit = ["typed", "auto_bookmark", "generated", "keyword", "keyword_generated"].includes(tt) || q.includes("from_address_bar");
-      pushStep({ action: "navigate", url: details.url, t: Date.now(), ...(explicit ? {} : { implied: true }) });
+      whenHydrated(() => {
+        if (!rec || details.tabId !== rec.tabId || details.frameId !== 0) return;
+        const tt = details.transitionType || "";
+        const q = details.transitionQualifiers || [];
+        if (/^(chrome|about|chrome-extension|devtools):/.test(details.url || "")) return;
+        if (q.includes("forward_back")) return;
+        const explicit = ["typed", "auto_bookmark", "generated", "keyword", "keyword_generated"].includes(tt) || q.includes("from_address_bar");
+        pushStep({ action: "navigate", url: details.url, t: Date.now(), ...(explicit ? {} : { implied: true }) });
+      });
     }
 
     async function onNavigationCompleted(details) {
+      await ready;
       if (!rec || details.tabId !== rec.tabId || details.frameId !== 0) return;
       try {
         await injectRecorder(details.tabId);
@@ -1488,42 +1811,98 @@
     }
 
     function noteAgentTool(tool, params) {
-      if (!rec) return;
-      if ((tool === "navigate" || tool === "browser_navigate") && params && params.url) {
-        pushStep({ action: "navigate", url: String(params.url), t: Date.now() });
-      }
+      whenHydrated(() => {
+        if (!rec) return;
+        if ((tool === "navigate" || tool === "browser_navigate") && params && params.url) {
+          pushStep({ action: "navigate", url: String(params.url), t: Date.now() });
+        }
+      });
     }
 
     // ── runner ──
-    async function injectLib(tabId) {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          await exec(tabId, _pageWfLib, []);
-          return true;
-        } catch (err) {
-          if (attempt === 2) throw err;
-          await ctx.waitForTabComplete(tabId, 8000).catch(() => {});
-          await sleep(250);
-        }
-      }
-      return false;
-    }
-
     async function safeDigest(tabId) {
       try {
-        await injectLib(tabId);
-        return await exec(tabId, _pageWfDigest, []);
+        const d = await execLib(tabId, _pageWfDigest, []);
+        return d && !d.needLib ? d : null;
       } catch (_) {
         return null;
       }
     }
 
-    async function settle(tabId, ms) {
-      await sleep(ms);
+    async function waitIfLoading(tabId) {
       try {
         const tab = await chrome.tabs.get(tabId);
         if (tab.status === "loading") await ctx.waitForTabComplete(tabId, 15000);
-      } catch (_) {}
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    // After an action. balanced: fixed wait (250 ms default) then the load.
+    // fast: 50 ms, then the load if one started, else until the DOM has
+    // been quiet for 100 ms (capped at 250 ms). An explicit step.waitMs is
+    // always a plain wait.
+    async function settle(tabId, ms, opts) {
+      if (opts && opts.fast) {
+        await sleep(50);
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          if (tab.status === "loading") {
+            await ctx.waitForTabComplete(tabId, 15000);
+            return;
+          }
+        } catch (_) {
+          return;
+        }
+        try { await exec(tabId, _pageWfQuiet, [100, 250]); } catch (_) {}
+        await waitIfLoading(tabId);
+        return;
+      }
+      await sleep(ms);
+      await waitIfLoading(tabId);
+    }
+
+    // Navigate and wait for the load. The onUpdated listener is registered
+    // before tabs.update so a fast load cannot be missed.
+    function navigateAndWait(tabId, url, timeoutMs) {
+      const onUpdated = globalThis.chrome && chrome.tabs && chrome.tabs.onUpdated;
+      if (!onUpdated || typeof onUpdated.addListener !== "function") {
+        return Promise.resolve(chrome.tabs.update(tabId, { url })).then(() => settle(tabId, 300));
+      }
+      return new Promise((resolve, reject) => {
+        let done = false;
+        let sawLoading = false;
+        const finish = (err) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          try { onUpdated.removeListener(listener); } catch (_) {}
+          if (err) reject(err);
+          else resolve();
+        };
+        const listener = (id, info) => {
+          if (id !== tabId || !info) return;
+          if (info.status === "loading") sawLoading = true;
+          if (info.status === "complete" && sawLoading) finish();
+        };
+        const timer = setTimeout(() => finish(), Math.max(1000, timeoutMs || 15000));
+        onUpdated.addListener(listener);
+        Promise.resolve(chrome.tabs.update(tabId, { url })).then(
+          async () => {
+            // Same-document navigations (hash change) may never report a load.
+            await sleep(300);
+            if (done || sawLoading) return;
+            try {
+              const tab = await chrome.tabs.get(tabId);
+              if (tab.status !== "loading") finish();
+            } catch (_) {
+              finish();
+            }
+          },
+          (err) => finish(err),
+        );
+      });
     }
 
     async function llmPickCandidate(step, list) {
@@ -1546,13 +1925,24 @@
     }
 
     // Last resort: screenshot with numbered boxes on every on-screen control;
-    // a vision model names the box that fulfils the step.
-    async function visionPickCandidate(tabId, step) {
+    // a vision model names the box that fulfils the step. The boxes are
+    // needed in the screenshot itself, so with Features → overlayVisionMarks
+    // off they are still drawn but removed right after the capture instead
+    // of staying up while the model answers.
+    async function visionPickCandidate(tabId, step, opts) {
       if (typeof ctx.visionPick !== "function" || typeof ctx.captureScreenshot !== "function") return null;
+      const keepMarks = !(opts && opts.showMarks === false);
       try {
-        const marked = await exec(tabId, _pageWfMark, [120, step.locator && step.locator.bbox]);
+        const marked = await execLib(tabId, _pageWfMark, [120, step.locator && step.locator.bbox]);
         if (!marked || !marked.ok || !marked.marks.length) return null;
-        const image = await ctx.captureScreenshot(tabId);
+        let image;
+        try {
+          image = await ctx.captureScreenshot(tabId);
+        } finally {
+          if (!keepMarks) {
+            try { await exec(tabId, _pageWfClearMarks, []); } catch (_) {}
+          }
+        }
         if (!image) return null;
         const lines = marked.marks.map((m) => {
           const name = m.accessibleName || m.label || m.placeholder || m.text || "";
@@ -1572,12 +1962,14 @@
         log("[AutoDOM WF] vision heal failed:", err && err.message);
         return null;
       } finally {
-        try { await exec(tabId, _pageWfClearMarks, []); } catch (_) {}
+        if (keepMarks) {
+          try { await exec(tabId, _pageWfClearMarks, []); } catch (_) {}
+        }
       }
     }
 
     async function healStep(tabId, step, opts) {
-      const res = await exec(tabId, _pageWfCandidates, [300]);
+      const res = await execLib(tabId, _pageWfCandidates, [300]);
       const list = (res && res.candidates) || [];
       if (!list.length) return null;
       const pool = step.action === "fill" ? list.filter((c) => ["input", "textarea"].includes(c.tag) || c.role === "textbox") : list;
@@ -1587,12 +1979,12 @@
         const viaLlm = await llmPickCandidate(step, pool.length ? pool : list);
         if (viaLlm) chosen = { candidate: viaLlm, via: "llm" };
       }
-      if (!chosen && !(opts && opts.vision === false)) {
-        const viaVision = await visionPickCandidate(tabId, step);
+      if (!chosen && opts && opts.vision === true) {
+        const viaVision = await visionPickCandidate(tabId, step, { showMarks: opts.showMarks });
         if (viaVision) chosen = { candidate: viaVision, via: "vision" };
       }
       if (!chosen) return null;
-      const acted = await exec(tabId, _pageWfActOnRef, [chosen.candidate.ref, step]);
+      const acted = await execLib(tabId, _pageWfActOnRef, [chosen.candidate.ref, step]);
       if (!acted || !acted.ok) return null;
       return { ...acted, healedVia: chosen.via, score: chosen.score };
     }
@@ -1644,10 +2036,50 @@
       return ((got && got[UNDO_KEY]) || {})[runId] || null;
     }
 
+    // ── live run bookkeeping ──
+    function trackRun(live) {
+      runs.set(live.report.runId, live);
+      currentRunId = live.report.runId;
+      broadcast({ activeRunId: currentRunId });
+    }
+    // Finished runs stay in memory for 5 minutes (at most 20 of them);
+    // run_get then reads the persisted history.
+    function retireRun(runId) {
+      unrefTimer(setTimeout(() => {
+        const l = runs.get(runId);
+        if (l && l.report.status !== "running") runs.delete(runId);
+      }, FINISHED_TTL_MS));
+      const finished = [...runs.entries()].filter(([, l]) => l.report.status !== "running");
+      if (finished.length > MAX_FINISHED_LIVE) {
+        finished.sort((a, b) => (a[1].report.finishedAt || 0) - (b[1].report.finishedAt || 0));
+        for (const [id] of finished.slice(0, finished.length - MAX_FINISHED_LIVE)) runs.delete(id);
+      }
+      if (currentRunId === runId) {
+        const still = [...runs.values()].filter((l) => l.report.status === "running");
+        currentRunId = still.length ? still[still.length - 1].report.runId : null;
+        broadcast({ activeRunId: currentRunId });
+      }
+    }
+    function retireBatch(batchId) {
+      unrefTimer(setTimeout(() => {
+        const b = batches.get(batchId);
+        if (b && b.finishedAt) batches.delete(batchId);
+      }, FINISHED_TTL_MS));
+      const finished = [...batches.entries()].filter(([, b]) => b.finishedAt);
+      if (finished.length > MAX_FINISHED_LIVE) {
+        finished.sort((a, b) => a[1].finishedAt - b[1].finishedAt);
+        for (const [id] of finished.slice(0, finished.length - MAX_FINISHED_LIVE)) batches.delete(id);
+      }
+    }
+
+    async function tabAlive(tabId) {
+      try { await chrome.tabs.get(tabId); return true; } catch (_) { return false; }
+    }
+
     // Dry run: resolve every step against the page without acting. Stops
     // checking once a step could change the page (click / key press) because
     // later targets may not exist yet; checkAll:true keeps going best-effort.
-    async function runDry(wf, params, tab, values, closeIfOwned) {
+    async function runDry(wf, params, tab, values, closeIfOwned, flags) {
       const runId = newId("run");
       const report = {
         runId,
@@ -1668,7 +2100,8 @@
         note: "Dry run: nothing was clicked, typed or changed. Page loads at the start of the workflow are performed.",
       };
       const live = { report, cancel: false, paused: false, wf };
-      runs.set(runId, live);
+      trackRun(live);
+      const visionLater = await visionAllowed(params, flags);
       const promise = (async () => {
         try {
           let canCheck = true;
@@ -1676,6 +2109,7 @@
           const timeout = Math.max(300, Math.min(15000, Number(params.stepTimeoutMs) || 1500));
           for (let i = 0; i < wf.steps.length; i++) {
             if (live.cancel) { report.status = "cancelled"; break; }
+            if (live.tabClosed) { report.status = "failed"; report.error = "The run's tab was closed."; break; }
             const raw = wf.steps[i];
             const step = { ...raw, value: substitute(raw.value, values), url: substitute(raw.url, values) };
             if (raw.assert) step.assert = { ...raw.assert, value: substitute(raw.assert.value, values) };
@@ -1683,8 +2117,7 @@
             report.steps.push(entry);
             if (step.action === "navigate") {
               if (canCheck && leading && params.load !== false) {
-                await chrome.tabs.update(tab.id, { url: step.url });
-                await settle(tab.id, 300);
+                await navigateAndWait(tab.id, step.url);
                 entry.note = "page loaded";
               } else {
                 entry.unchecked = "navigates away; later steps depend on it";
@@ -1698,8 +2131,7 @@
             let found = null;
             const deadline = Date.now() + timeout;
             do {
-              await injectLib(tab.id);
-              found = await exec(tab.id, _pageWfResolveOnly, [step]);
+              found = await execLib(tab.id, _pageWfResolveOnly, [step]);
               if (found && found.found) break;
               await sleep(250);
             } while (Date.now() < deadline);
@@ -1712,12 +2144,12 @@
               entry.ok = false;
               entry.error = step.action === "assert" ? (found && found.note) || "assertion does not hold" : "element not found";
               if (step.action !== "assert" && step.locator) {
-                const cands = await exec(tab.id, _pageWfCandidates, [300]);
+                const cands = await execLib(tab.id, _pageWfCandidates, [300]);
                 const pick = pickHeuristic(step.locator, (cands && cands.candidates) || []);
                 if (pick) {
                   entry.wouldHealTo = describeTarget(pick.candidate);
                   entry.healScore = pick.score;
-                } else if (typeof ctx.visionPick === "function" && params.vision !== false) {
+                } else if (visionLater) {
                   entry.maybeHealable = "no confident match; a vision model would be asked at run time";
                 }
               }
@@ -1748,7 +2180,8 @@
         } finally {
           report.finishedAt = Date.now();
           report.durationMs = report.finishedAt - report.startedAt;
-          try { await serialized(() => pushRun(report)); } catch (_) {}
+          try { await serialized(() => pushRun(report, flags)); } catch (_) {}
+          retireRun(runId);
           await closeIfOwned();
           if (typeof params.onDone === "function") {
             try { params.onDone(report); } catch (_) {}
@@ -1760,31 +2193,53 @@
       return { ok: true, runId, promise, report };
     }
 
-    async function resolveRunTab(params) {
+    // callCtx is the SW call context of the tool call that started the run.
+    // It is only used to pick the tab here — never kept on the run, which
+    // outlives the call.
+    async function resolveRunTab(params, callCtx) {
       if (params && params.tabId != null) return chrome.tabs.get(params.tabId);
       if (params && params.newTab && typeof ctx.openRunTab === "function") return ctx.openRunTab();
-      return ctx.getActiveTab();
+      return ctx.getActiveTab(callCtx);
     }
 
-    async function runWorkflow(wf, params) {
+    // Resolves (with null) when the calling tool call is cancelled, so a
+    // handler that waits on a run can return early; the run keeps going.
+    function whenAborted(signal) {
+      if (!signal) return new Promise(() => {});
+      if (signal.aborted) return Promise.resolve(null);
+      return new Promise((r) => signal.addEventListener("abort", () => r(null), { once: true }));
+    }
+
+    async function runWorkflow(wf, params, callCtx) {
       params = params || {};
       const errors = validateWorkflow(wf);
       if (errors.length) return { ok: false, error: "Invalid workflow", details: errors };
-      const mode = params.mode === "strict" ? "strict" : params.mode === "dry" ? "dry" : "heal";
+      const flags = await features();
+      const requested = params.mode == null || params.mode === "" ? flags.defaultRunMode : params.mode;
+      const mode = requested === "strict" ? "strict" : requested === "dry" ? "dry" : "heal";
       const { values, missing } = resolveVariables(wf, params.variables || {});
       // A dry run never types anything, so secrets are not needed for it.
       if (missing.length && mode !== "dry") {
         return { ok: false, error: `Missing values for variables: ${missing.join(", ")}`, missing };
       }
       const stepTimeoutMs = Math.max(500, Math.min(60000, Number(params.stepTimeoutMs) || 8000));
-      const tab = await resolveRunTab(params);
+      let tab;
+      try {
+        tab = await resolveRunTab(params, callCtx);
+      } catch (err) {
+        return { ok: false, error: `Could not get a tab for the run: ${String((err && err.message) || err)}` };
+      }
+      if (!tab || tab.id == null) return { ok: false, error: "Could not get a tab for the run" };
       const openedHere = !!(params.newTab && params.tabId == null);
       const closeIfOwned = async () => {
         if (openedHere && !params.keepTab && typeof ctx.closeRunTab === "function") {
           try { await ctx.closeRunTab(tab.id); } catch (_) {}
         }
       };
-      if (mode === "dry") return runDry(wf, params, tab, values, closeIfOwned);
+      if (mode === "dry") return runDry(wf, params, tab, values, closeIfOwned, flags);
+      const fast = flags.perfMode !== "balanced";
+      const vision = mode === "heal" && (await visionAllowed(params, flags));
+      const undoTracking = flags.undoTracking !== false;
       const runId = newId("run");
       const report = {
         runId,
@@ -1804,15 +2259,31 @@
         note: "Stopping a run does not undo steps that already ran.",
       };
       const live = { report, cancel: false, paused: false, wf };
-      runs.set(runId, live);
+      trackRun(live);
       const undoSteps = [];
       const promise = (async () => {
         let dirty = false;
+        let storedForMirror = null;
+        // Step i's "after" digest doubles as step i+1's "before" (nothing
+        // runs in between), except after a pause, when the user may have
+        // changed the page.
+        let carried = null;
         try {
           for (let i = 0; i < wf.steps.length; i++) {
-            while (live.paused && !live.cancel) await sleep(250);
+            if (live.paused && !live.cancel) {
+              carried = null;
+              while (live.paused && !live.cancel && !live.tabClosed) {
+                await sleep(250);
+                if (!(await tabAlive(tab.id))) live.tabClosed = true;
+              }
+            }
             if (live.cancel) {
               report.status = "cancelled";
+              break;
+            }
+            if (live.tabClosed) {
+              report.status = "failed";
+              report.error = `The run's tab was closed before step ${i + 1}.`;
               break;
             }
             const raw = wf.steps[i];
@@ -1822,12 +2293,12 @@
             const entry = { index: i, action: step.action, target: step.action === "navigate" ? step.url : describeTarget(step.locator), ok: false };
             report.steps.push(entry);
             if (typeof params.onProgress === "function") params.onProgress(report);
-            const before = params.diffs === false ? null : await safeDigest(tab.id);
+            const before = params.diffs === false ? null : carried || (await safeDigest(tab.id));
+            carried = null;
             let res;
             try {
               if (step.action === "navigate") {
-                await chrome.tabs.update(tab.id, { url: step.url });
-                await settle(tab.id, 300);
+                await navigateAndWait(tab.id, step.url);
                 res = { ok: true };
               } else if (step.action === "wait") {
                 await sleep(Math.min(60000, Number(step.ms) || 500));
@@ -1835,10 +2306,9 @@
               } else if (step.action === "upload") {
                 res = { ok: true, skipped: true, note: raw.note || "file upload steps are not replayed" };
               } else {
-                await injectLib(tab.id);
-                res = await exec(tab.id, _pageWfRunStep, [step, step.timeoutMs || stepTimeoutMs]);
+                res = await execLib(tab.id, _pageWfRunStep, [step, step.timeoutMs || stepTimeoutMs]);
                 if ((!res || !res.ok) && res && res.notFound && mode === "heal" && step.locator) {
-                  const healed = await healStep(tab.id, step, { vision: params.vision });
+                  const healed = await healStep(tab.id, step, { vision, showMarks: flags.overlayVisionMarks !== false });
                   if (healed) {
                     res = healed;
                     entry.healed = healed.healedVia;
@@ -1849,7 +2319,8 @@
                     }
                   }
                 }
-                await settle(tab.id, Number(step.waitMs) || 250);
+                if (Number(step.waitMs) > 0) await settle(tab.id, Number(step.waitMs));
+                else await settle(tab.id, 250, { fast });
               }
             } catch (err) {
               res = { ok: false, error: String((err && err.message) || err) };
@@ -1860,9 +2331,10 @@
             if (res && res.skipped) entry.skipped = true;
             entry.durationMs = Date.now() - started;
             const after = params.diffs === false ? null : await safeDigest(tab.id);
+            carried = after;
             const diff = diffDigest(before, after);
             if (diff) entry.diff = diff;
-            if (entry.ok && !entry.skipped) {
+            if (entry.ok && !entry.skipped && undoTracking) {
               const ops = undoOpsFor(step, res, before, after, diff);
               if (ops.length) {
                 undoSteps.push({ index: i, label: stepSentence(raw), ops });
@@ -1903,15 +2375,20 @@
                 if (report.status === "passed") stored.stats.passes++;
                 stored.stats.heals += report.healed;
                 stored.lastRun = { runId, status: report.status, at: report.finishedAt, durationMs: report.durationMs };
-                if (dirty) stored.steps = wf.steps;
+                if (dirty) {
+                  stored.steps = wf.steps;
+                  storedForMirror = stored;
+                }
                 await putWorkflow(stored);
               }
-              await pushRun(report);
+              await pushRun(report, flags);
             });
-            if (undoSteps.length) await saveUndo(runId, { tabId: tab.id, workflowName: wf.name, steps: undoSteps });
+            if (undoSteps.length && undoTracking) await saveUndo(runId, { tabId: tab.id, workflowName: wf.name, steps: undoSteps });
           } catch (err) {
             log("[AutoDOM WF] persist run failed:", err && err.message);
           }
+          if (storedForMirror) emitSaved(storedForMirror, "heal", null);
+          retireRun(runId);
           await closeIfOwned();
           if (typeof params.onDone === "function") {
             try { params.onDone(report); } catch (_) {}
@@ -1924,7 +2401,7 @@
     }
 
     // ── tool handlers ──
-    async function wfSave(params) {
+    async function wfSave(params, callCtx) {
       params = params || {};
       let wf;
       if (params.workflow || params.markdown) {
@@ -1932,8 +2409,8 @@
       } else {
         wf = lastDraft;
         if (!wf && storage.session) {
-          const got = await storage.session.get("autodom.wf.lastDraft");
-          wf = got && got["autodom.wf.lastDraft"];
+          const got = await storage.session.get(DRAFT_KEY);
+          wf = got && got[DRAFT_KEY];
         }
         if (!wf) return { ok: false, error: "Nothing to save: record a workflow first or pass `workflow`." };
       }
@@ -1950,10 +2427,11 @@
       if (errors.length) return { ok: false, error: "Invalid workflow", details: errors };
       await putWorkflow(wf);
       if (lastDraft && lastDraft.id === wf.id) lastDraft = null;
+      emitSaved(wf, "save", callCtx);
       return { ok: true, saved: true, workflow: summarize(wf), full: wf };
     }
 
-    async function wfRun(params) {
+    async function wfRun(params, callCtx) {
       params = params || {};
       let wf = null;
       if (params.workflow) {
@@ -1962,12 +2440,19 @@
         wf = await findWorkflow(params.id || params.name);
       }
       if (!wf) return { ok: false, error: `Workflow not found: ${params.id || params.name || "(none given)"}` };
-      const started = await runWorkflow(wf, { ...params, trigger: params.trigger || "mcp" });
+      let started;
+      try {
+        started = await runWorkflow(wf, { ...params, trigger: params.trigger || "mcp" }, callCtx);
+      } catch (err) {
+        return { ok: false, error: String((err && err.message) || err) };
+      }
       if (!started.ok) return started;
       const waitMs = params.wait === false ? 0 : Math.max(0, Math.min(Number(params.waitMs) || 25000, 120000));
       if (!waitMs) return { ok: true, runId: started.runId, status: "running", hint: "Poll run_get { runId } for progress." };
-      const timeout = new Promise((r) => setTimeout(() => r(null), waitMs));
-      const done = await Promise.race([started.promise, timeout]);
+      let timer;
+      const timeout = new Promise((r) => { timer = setTimeout(() => r(null), waitMs); });
+      const done = await Promise.race([started.promise, timeout, whenAborted(callCtx && callCtx.signal)]);
+      clearTimeout(timer);
       if (!done) {
         return {
           ok: true,
@@ -2014,25 +2499,27 @@
       };
     }
 
-    async function runMany(params) {
+    async function runMany(params, callCtx) {
       params = params || {};
       const specs = Array.isArray(params.runs) ? params.runs : [];
       if (!specs.length) return { ok: false, error: "runs must list at least one { id, variables? } entry" };
       if (specs.length > 20) return { ok: false, error: "At most 20 runs per batch" };
-      const concurrency = Math.max(1, Math.min(5, Number(params.concurrency) || 3));
+      const flags = await features();
+      const concurrency = Math.max(1, Math.min(5, Number(params.concurrency) || Number(flags.parallelConcurrency) || 3));
       const batch = { batchId: newId("batch"), startedAt: Date.now(), concurrency, cancel: false, items: [] };
       specs.forEach((sp, index) =>
         batch.items.push({ index, workflow: String((sp && (sp.id || sp.name)) || "?"), status: "queued", runId: null }),
       );
       batches.set(batch.batchId, batch);
       let next = 0;
-      const worker = async () => {
-        while (!batch.cancel && next < specs.length) {
-          const i = next++;
-          const sp = specs[i] || {};
-          const item = batch.items[i];
+      // One item failing (workflow missing, no tab, a thrown error) marks
+      // just that item failed; the batch always runs to the end.
+      const runItem = async (i) => {
+        const sp = specs[i] || {};
+        const item = batch.items[i];
+        try {
           const wf = await findWorkflow(sp.id || sp.name);
-          if (!wf) { item.status = "failed"; item.error = `Workflow not found: ${item.workflow}`; continue; }
+          if (!wf) { item.status = "failed"; item.error = `Workflow not found: ${item.workflow}`; return; }
           item.workflow = wf.name;
           const started = await runWorkflow(wf, {
             variables: { ...(params.variables || {}), ...(sp.variables || {}) },
@@ -2044,20 +2531,33 @@
             trigger: "parallel",
             batchId: batch.batchId,
           });
-          if (!started.ok) { item.status = "failed"; item.error = started.error; continue; }
+          if (!started.ok) { item.status = "failed"; item.error = started.error; return; }
           item.runId = started.runId;
           item.status = "running";
           item.report = await started.promise;
           item.status = item.report.status;
+        } catch (err) {
+          item.status = "failed";
+          item.error = String((err && err.message) || err);
         }
       };
-      batch.promise = Promise.all(Array.from({ length: Math.min(concurrency, specs.length) }, worker)).then(() => {
+      const worker = async () => {
+        while (!batch.cancel && next < specs.length) await runItem(next++);
+      };
+      batch.promise = Promise.allSettled(Array.from({ length: Math.min(concurrency, specs.length) }, worker)).then(async () => {
         batch.finishedAt = Date.now();
         // Runs that never started because the batch was cancelled.
-        for (const it of batch.items) if (it.status === "queued") it.status = "cancelled";
+        for (const it of batch.items) if (it.status === "queued" || it.status === "running") it.status = it.status === "queued" ? "cancelled" : "failed";
+        try { await flushRuns(); } catch (_) {}
+        retireBatch(batch.batchId);
       });
       const waitMs = params.wait === false ? 0 : Math.max(0, Math.min(Number(params.waitMs) || 25000, 120000));
-      if (waitMs) await Promise.race([batch.promise, sleep(waitMs)]);
+      if (waitMs) {
+        let timer;
+        const timeout = new Promise((r) => { timer = setTimeout(r, waitMs); });
+        await Promise.race([batch.promise, timeout, whenAborted(callCtx && callCtx.signal)]);
+        clearTimeout(timer);
+      }
       const view = batchView(batch);
       return {
         ok: view.status !== "failed",
@@ -2091,12 +2591,10 @@
           if (params.dryRun === true) { results.push({ ...item, status: "would_undo" }); continue; }
           try {
             if (op.type === "field") {
-              await injectLib(tabId);
-              const r = await exec(tabId, _pageWfRunStep, [op.step, 2000]);
+              const r = await execLib(tabId, _pageWfRunStep, [op.step, 2000]);
               results.push({ ...item, status: r && r.ok ? "undone" : "failed", ...(r && r.ok ? {} : { reason: (r && r.error) || "target not found" }) });
             } else if (op.type === "storage") {
-              await injectLib(tabId);
-              const r = await exec(tabId, _pageWfRemoveStorage, [op.origin, op.local, op.session]);
+              const r = await execLib(tabId, _pageWfRemoveStorage, [op.origin, op.local, op.session]);
               results.push({ ...item, status: r && r.ok ? "undone" : "failed", detail: r && r.ok ? `${r.removed} key(s) removed` : (r && r.error) });
             } else if (op.type === "cookies") {
               let removed = 0;
@@ -2129,10 +2627,21 @@
       };
     }
 
+    // A batch that already left memory is rebuilt from the run history.
+    async function storedBatchView(batchId) {
+      const list = (await loadRuns()).filter((r) => r.batchId === batchId);
+      if (!list.length) return null;
+      list.sort((a, b) => (a.startedAt || 0) - (b.startedAt || 0));
+      const items = list.map((r, index) => ({ index, workflow: r.workflowName, runId: r.runId, status: r.status, report: r }));
+      return { ...batchView({ batchId, concurrency: null, cancel: list.some((r) => r.status === "cancelled"), items }), fromHistory: true };
+    }
+
     async function runGet(params) {
       if (params && params.batchId) {
         const b = batches.get(params.batchId);
-        return b ? { ok: true, ...batchView(b) } : { ok: false, error: `Batch not found: ${params.batchId}` };
+        if (b) return { ok: true, ...batchView(b) };
+        const stored = await storedBatchView(params.batchId);
+        return stored ? { ok: true, ...stored } : { ok: false, error: `Batch not found: ${params.batchId}` };
       }
       const id = params && params.runId;
       const live = runs.get(id);
@@ -2191,6 +2700,7 @@
       workflow_record_stop: recordStop,
       workflow_save: wfSave,
       workflow_list: async () => {
+        await ready;
         const map = await loadAll();
         const list = Object.values(map).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).map(summarize);
         return { ok: true, count: list.length, workflows: list, recording: rec ? { tabId: rec.tabId, steps: rec.steps.length } : null };
@@ -2218,13 +2728,16 @@
         if (format === "markdown" || format === "md") return { ok: true, format: "markdown", filename: `${base}.md`, content: toMarkdown(wf) };
         return { ok: false, error: `Unknown format: ${format} (use playwright, markdown or json)` };
       },
-      workflow_from_recording: async (params) => {
+      workflow_from_recording: async (params, callCtx) => {
         if (typeof ctx.getSessionRecording !== "function") return { ok: false, error: "session recording unavailable" };
         const recording = await ctx.getSessionRecording();
         const draft = fromSessionRecording(recording.actions || [], params || {});
         if (!draft.steps.length) return { ok: false, error: "The session recording has no replayable agent actions (navigate/click/type/select/press)." };
         lastDraft = draft;
-        if (params && params.save) await putWorkflow(draft);
+        if (params && params.save) {
+          await putWorkflow(draft);
+          emitSaved(draft, "from_recording", callCtx);
+        }
         return { ok: true, saved: !!(params && params.save), workflow: draft, markdown: toMarkdown(draft) };
       },
       workflow_run_many: runMany,
@@ -2243,7 +2756,9 @@
     return {
       handlers,
       hydrate,
+      ready,
       onRuntimeMessage,
+      onTabRemoved,
       onNavigationCommitted,
       onNavigationCompleted,
       noteAgentTool,
@@ -2255,6 +2770,13 @@
       activeRuns: () => [...runs.values()].filter((l) => l.report.status === "running").map((l) => l.report),
       pauseRuns: (tabId) => setRunState({ tabId }, { paused: true }),
       resumeRuns: (tabId) => setRunState({ tabId }, { paused: false }),
+      activeRunId: () => currentRunId,
+      recordingState: () => (rec ? { tabId: rec.tabId, steps: rec.steps.length } : null),
+      flushRuns,
+      clearRunHistory,
+      clearDrafts,
+      // Drop the in-memory run history (after the popup cleared storage).
+      invalidateRunsCache: () => { runsCache = null; },
       // Page helpers for other SW features (compact snapshot, ref actions).
       page: { lib: _pageWfLib, candidates: _pageWfCandidates, actOnRef: _pageWfActOnRef },
     };
@@ -2285,7 +2807,7 @@
         properties: {
           id: { type: "string", description: "Workflow id or exact name" },
           variables: { type: "object" },
-          mode: { type: "string", enum: ["heal", "strict"] },
+          mode: { type: "string", enum: ["heal", "strict", "dry"], description: "heal (default) self-heals moved elements, strict fails on them, dry only checks that every target can be found" },
         },
         required: ["id"],
       },
@@ -2332,6 +2854,7 @@
       _pageWfMark,
       _pageWfClearMarks,
       _pageWfRemoveStorage,
+      _pageWfQuiet,
     },
   };
 })();

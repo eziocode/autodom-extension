@@ -65,7 +65,9 @@ import {
   writeExport,
   appendAudit,
   queryAudit,
+  autodomHome,
 } from "./automation-store.js";
+import { decideReap } from "./bridge-reaper.js";
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 
 // Local Playwright/Node automation backends were intentionally removed: AutoDOM
@@ -683,6 +685,16 @@ const ISOLATION_IDLE_MS = (() => {
 // Requests that originate from the user typing in the in-page chat panel
 // act on the page the user is looking at, so they bypass isolation.
 const userTabRequestContext = new AsyncLocalStorage();
+// Chat-panel requests are a different actor from the IDE agent that owns
+// this bridge (e.g. Codex): they get their own extension-side client id so
+// their pins and isolation opt-out never overwrite the agent's.
+const CHAT_CLIENT_ID = `${MY_CLIENT_ID}:chat`;
+let _chatClientUsed = false; // so shutdown only reports it gone when it existed
+function frameClientId() {
+  if (userTabRequestContext.getStore()?.userTab !== true) return MY_CLIENT_ID;
+  _chatClientUsed = true;
+  return CHAT_CLIENT_ID;
+}
 function isolationFrameFields() {
   const bypass = userTabRequestContext.getStore()?.userTab === true;
   return {
@@ -701,8 +713,41 @@ let confirmIdCounter = 0;
 // confirmation hold.
 const confirmedToolContext = new AsyncLocalStorage();
 
-function _holdForConfirmation({ tool, params, domain, tier, rule, reason }) {
+// The MCP request a tool is running for, so callExtensionTool can pick up
+// the client's cancellation signal (notifications/cancelled, closed stream)
+// and tell the extension to stop working on the call. It also names the
+// MCP tool (+ its params and execute) so a call held for confirmation can
+// later re-run that tool in full, with its server-side post-processing.
+const mcpRequestContext = new AsyncLocalStorage();
+
+function _cloneParams(params) {
+  try {
+    return structuredClone(params);
+  } catch {
+    return params;
+  }
+}
+
+// Ask the extension to stop a tool call it is still running (a timeout on
+// our side, or the MCP client gave up). The extension answers with a
+// cancelled TOOL_RESULT, which we ignore because the id is gone by then.
+function sendToolCancel(id, reason) {
+  try {
+    sendToExtensionImmediate({ type: "TOOL_CANCEL", id, reason });
+  } catch (_) {}
+}
+
+const CANCELLED_RESULT_ERROR = "CANCELLED";
+// Extra time the primary waits on a proxied call beyond the secondary's
+// own timeout before giving up on it itself.
+const PROXY_RELAY_GRACE_MS = 1000;
+
+function _holdForConfirmation({ tool, params, domain, tier, rule, reason, mcpCall: callerMcp }) {
   const confirmId = ++confirmIdCounter;
+  // Captured by callExtensionTool at entry: the hold itself is often
+  // created from the TOOL_RESULT socket callback, outside the MCP call's
+  // async context.
+  const mcpCall = callerMcp || mcpRequestContext.getStore();
   pendingConfirmations.set(confirmId, {
     tool,
     params,
@@ -710,6 +755,10 @@ function _holdForConfirmation({ tool, params, domain, tier, rule, reason }) {
     tier,
     rule: rule || null,
     timestamp: Date.now(),
+    // The MCP tool whose execute made the held extension call.
+    mcpTool: typeof mcpCall?.execute === "function" ? mcpCall.tool : null,
+    mcpParams: typeof mcpCall?.execute === "function" ? _cloneParams(mcpCall.params) : undefined,
+    execute: typeof mcpCall?.execute === "function" ? mcpCall.execute : null,
   });
   setTimeout(() => pendingConfirmations.delete(confirmId), 300000);
   return {
@@ -1624,6 +1673,7 @@ async function shutdown(code = 0) {
   // Release this bridge's AutoDOM tab group before the sockets are torn
   // down, and give the frame a moment to flush.
   if (extensionSocket && extensionSocket.readyState === 1) {
+    if (_chatClientUsed) notifyClientGone(CHAT_CLIENT_ID);
     notifyClientGone(MY_CLIENT_ID);
     await delay(75);
   }
@@ -2696,6 +2746,13 @@ function setupWssConnection(wss) {
       // A secondary IDE bridge went away: tell the extension so it can
       // close the tabs that session opened and restore the ones it borrowed.
       const gonePeer = proxyPeers.get(socket);
+      // Nobody is left to read the results of calls this secondary still
+      // had in flight: cancel them in the extension.
+      if (socket._proxyCalls?.size) {
+        for (const secondaryId of [...socket._proxyCalls.keys()]) {
+          _cancelProxiedCall(socket, secondaryId, "client_gone");
+        }
+      }
       if (gonePeer?.clientId) notifyClientGone(gonePeer.clientId);
       proxyPeers.delete(socket);
       if (socket === extensionSocket) {
@@ -3121,11 +3178,9 @@ async function _runAiChatRequestAsync(socket, message) {
       );
       // Stream user-visible text deltas back to the extension so the
       // chat panel can paint tokens as they arrive instead of waiting
-      // for the full provider response. Only enabled for the CLI path
-      // today (other direct-provider branches in this file still buffer
-      // their full response before returning) — runCliPrompt detects
-      // the absence of the callback and falls back to silent buffering
-      // for non-CLI providers.
+      // for the full provider response. The CLI path and the direct
+      // OpenAI / Anthropic / Ollama calls all stream (the direct ones fall
+      // back to a buffered request if streaming fails).
       const _chatStreamEmitter = makeChatDeltaEmitter(socket, id);
       const providerResult = await routeDirectProviderChat({
         provider: effectiveProvider,
@@ -3534,10 +3589,31 @@ function _handleInternalProxyCall(socket, message) {
 
     // We hijack the ID to map it back
     const internalId = ++callIdCounter;
+    const timeoutMs =
+      Number.isFinite(message.timeoutMs) && message.timeoutMs > 0
+        ? message.timeoutMs
+        : TOOL_TIMEOUT;
+    if (!socket._proxyCalls) socket._proxyCalls = new Map();
+    socket._proxyCalls.set(message.id, internalId);
+    const forget = () => socket._proxyCalls?.delete(message.id);
     pendingCalls.set(internalId, {
-      resolve: (res) => sendResult(res),
+      resolve: (res) => {
+        forget();
+        sendResult(res);
+      },
       reject: () => {},
-      timer: setTimeout(() => pendingCalls.delete(internalId), TOOL_TIMEOUT),
+      // Backstop only: the secondary times out first and sends
+      // INTERNAL_PROXY_CANCEL; this fires if that message never arrives.
+      timer: setTimeout(() => {
+        if (!pendingCalls.has(internalId)) return;
+        pendingCalls.delete(internalId);
+        forget();
+        sendToolCancel(internalId, "proxy_timeout");
+        sendResult({
+          error: `Tool "${message.tool}" timed out across proxy after ${timeoutMs}ms`,
+        });
+      }, timeoutMs + PROXY_RELAY_GRACE_MS),
+      proxySocket: socket,
     });
 
     sendToExtensionImmediate({
@@ -3546,6 +3622,7 @@ function _handleInternalProxyCall(socket, message) {
       id: internalId,
       tool: message.tool,
       params,
+      timeoutMs,
       ...(message.confirmed === true ? { confirmed: true } : {}),
       ...(message.isolation === false ? { isolation: false } : {}),
       ...(Number.isFinite(message.isolationIdleMs)
@@ -3579,6 +3656,27 @@ function _handleInternalProxyCall(socket, message) {
       error: "Chrome extension is not connected to the primary server.",
     });
   });
+}
+
+// ── INTERNAL_PROXY_CANCEL ────────────────────────────────────
+// A secondary gave up on a call it proxied through us (its own timeout or
+// its MCP client cancelled): stop the extension from working on it.
+function _cancelProxiedCall(socket, secondaryId, reason) {
+  const internalId = socket?._proxyCalls?.get(secondaryId);
+  if (internalId == null) return false;
+  socket._proxyCalls.delete(secondaryId);
+  const pending = pendingCalls.get(internalId);
+  if (pending) {
+    clearTimeout(pending.timer);
+    pendingCalls.delete(internalId);
+  }
+  sendToolCancel(internalId, reason || "proxy_cancelled");
+  return true;
+}
+
+function _handleInternalProxyCancel(socket, message) {
+  if (message.id == null) return;
+  _cancelProxiedCall(socket, message.id, String(message.reason || "proxy_cancelled"));
 }
 
 // ── TOOL_RESULT ──────────────────────────────────────────────
@@ -3646,6 +3744,267 @@ function _handleClearToolLogs(socket) {
         logFile: TOOL_ERROR_LOG_PATH,
       }),
     );
+  } catch (_) {}
+}
+
+// ── SERVER_USAGE / SERVER_FLUSH ──────────────────────────────
+// Backs the popup's Storage & cache section. Only fixed, known locations
+// are touched — nothing here takes a path from the message:
+//   ~/.autodom/{workflows,exports,audit}   (AUTODOM_HOME)
+//   /tmp/autodom-tool-errors.log, TMPDIR autodom-bridge-<port>.json locks
+//   and autodom-bridge-only-<port>.log daemon logs.
+// Flush never deletes saved workflow mirrors, never kills a process (pid
+// liveness is checked with signal 0) and never drops an in-flight chat
+// request.
+const SERVER_FLUSH_SCOPES = Object.freeze(["memory", "logs", "exports", "audit", "tmp"]);
+const AUDIT_KEEP_DAYS = 7;
+const PENDING_CHAT_TTL_MS = 120000; // matches the _routeViaIdeQueue expiry
+const _BRIDGE_LOCK_RE = /^autodom-bridge-(\d{2,5})\.json$/;
+const _BRIDGE_ONLY_LOG_RE = /^autodom-bridge-only-(\d{2,5})\.log$/;
+const _AUDIT_FILE_RE = /^(\d{4}-\d{2}-\d{2})\.jsonl$/;
+
+function _pidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  if (n === process.pid) return true;
+  try {
+    process.kill(n, 0); // signal 0: existence check only, never kills
+    return true;
+  } catch (err) {
+    return err?.code === "EPERM";
+  }
+}
+
+async function _fileSize(file) {
+  try {
+    const st = await fs.lstat(file);
+    return st.isFile() ? st.size : 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
+// Sum of regular files directly or recursively under `dir` (no symlinks
+// followed, depth-capped).
+async function _dirSize(dir, depth = 0) {
+  if (depth > 4) return 0;
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (_) {
+    return 0;
+  }
+  let total = 0;
+  for (const e of entries) {
+    const p = join(dir, e.name);
+    if (e.isFile()) total += await _fileSize(p);
+    else if (e.isDirectory()) total += await _dirSize(p, depth + 1);
+  }
+  return total;
+}
+
+async function _tmpBridgeFiles() {
+  let names = [];
+  try {
+    names = await fs.readdir(tmpdir());
+  } catch (_) {}
+  const locks = []; // { file, port }
+  const logs = []; // { file, port }
+  for (const name of names) {
+    let m = _BRIDGE_LOCK_RE.exec(name);
+    if (m) {
+      locks.push({ file: join(tmpdir(), name), port: Number(m[1]) });
+      continue;
+    }
+    m = _BRIDGE_ONLY_LOG_RE.exec(name);
+    if (m) logs.push({ file: join(tmpdir(), name), port: Number(m[1]) });
+  }
+  return { locks, logs };
+}
+
+async function _readLockInfo(file) {
+  try {
+    const parsed = JSON.parse(await fs.readFile(file, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function _collectServerUsage() {
+  const home = autodomHome();
+  const [workflows, exportsBytes, audit, toolErrorLog, tmp] = await Promise.all([
+    _dirSize(join(home, "workflows")),
+    _dirSize(join(home, "exports")),
+    _dirSize(join(home, "audit")),
+    _fileSize(TOOL_ERROR_LOG_PATH),
+    _tmpBridgeFiles(),
+  ]);
+  let tmpLogs = 0;
+  for (const l of tmp.logs) tmpLogs += await _fileSize(l.file);
+  let locks = 0;
+  for (const l of tmp.locks) locks += await _fileSize(l.file);
+  const breakdown = {
+    workflows,
+    exports: exportsBytes,
+    audit,
+    logs: toolErrorLog + tmpLogs,
+    locks,
+  };
+  const bytes = Object.values(breakdown).reduce((a, b) => a + b, 0);
+  return { bytes, breakdown, home };
+}
+
+async function _handleServerUsage(socket, message) {
+  let reply;
+  try {
+    const usage = await _collectServerUsage();
+    reply = { type: "SERVER_USAGE_RESULT", id: message.id, ok: true, bytes: usage.bytes, breakdown: usage.breakdown };
+  } catch (err) {
+    reply = { type: "SERVER_USAGE_RESULT", id: message.id, ok: false, bytes: 0, breakdown: {}, error: err?.message || String(err) };
+  }
+  try {
+    socket.send(JSON.stringify(reply));
+  } catch (_) {}
+}
+
+async function _flushServerStorage(scopes, { now = Date.now() } = {}) {
+  const wanted = new Set(
+    Array.isArray(scopes) && scopes.length
+      ? scopes.filter((s) => SERVER_FLUSH_SCOPES.includes(s))
+      : SERVER_FLUSH_SCOPES,
+  );
+  const details = {};
+  let freedBytes = 0;
+  const run = async (scope, fn) => {
+    if (!wanted.has(scope)) return;
+    try {
+      const d = await fn();
+      freedBytes += d.freedBytes || 0;
+      details[scope] = { ok: true, ...d };
+    } catch (err) {
+      details[scope] = { ok: false, error: err?.message || String(err) };
+    }
+  };
+
+  await run("memory", async () => {
+    const toolCalls = toolCallLog.length;
+    toolCallLog = [];
+    _toolLogIndex = 0;
+    const toolErrors = _toolErrorBuf.length;
+    _toolErrorBuf.length = 0;
+    let chatRequests = 0;
+    for (const [reqId, req] of pendingChatRequests) {
+      const expired = now - (req?.timestamp || 0) > PENDING_CHAT_TTL_MS;
+      const orphaned = !req?.socket || req.socket.readyState !== 1;
+      if (expired || orphaned) {
+        pendingChatRequests.delete(reqId);
+        chatRequests += 1;
+      }
+    }
+    return { freedBytes: 0, toolCalls, toolErrors, chatRequests };
+  });
+
+  await run("logs", async () => {
+    const size = await _fileSize(TOOL_ERROR_LOG_PATH);
+    if (size > 0) await fs.writeFile(TOOL_ERROR_LOG_PATH, "");
+    return { freedBytes: size, files: size > 0 ? 1 : 0 };
+  });
+
+  await run("exports", async () => {
+    const dir = join(autodomHome(), "exports");
+    let entries = [];
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch (_) {
+      return { freedBytes: 0, files: 0 };
+    }
+    let freed = 0;
+    let files = 0;
+    for (const e of entries) {
+      if (!e.isFile()) continue; // never recurse or follow links
+      const p = join(dir, e.name);
+      const size = await _fileSize(p);
+      await fs.unlink(p);
+      freed += size;
+      files += 1;
+    }
+    return { freedBytes: freed, files };
+  });
+
+  await run("audit", async () => {
+    const dir = join(autodomHome(), "audit");
+    let names = [];
+    try {
+      names = await fs.readdir(dir);
+    } catch (_) {
+      return { freedBytes: 0, files: 0 };
+    }
+    // Keep today and the previous AUDIT_KEEP_DAYS-1 days (UTC, like the
+    // file names written by appendAudit).
+    const cutoff = new Date(now - (AUDIT_KEEP_DAYS - 1) * 86400000).toISOString().slice(0, 10);
+    let freed = 0;
+    let files = 0;
+    for (const name of names) {
+      const m = _AUDIT_FILE_RE.exec(name);
+      if (!m || m[1] >= cutoff) continue;
+      const p = join(dir, name);
+      const size = await _fileSize(p);
+      await fs.unlink(p);
+      freed += size;
+      files += 1;
+    }
+    return { freedBytes: freed, files, keptSince: cutoff };
+  });
+
+  await run("tmp", async () => {
+    const { locks, logs } = await _tmpBridgeFiles();
+    const lockInfo = {};
+    const byPort = {};
+    for (const l of locks) {
+      const info = await _readLockInfo(l.file);
+      const pid = Number(info?.pid) || 0;
+      lockInfo[l.port] = { pid, alive: pid ? _pidAlive(pid) : false };
+      byPort[l.port] = l.file;
+    }
+    // Same staleness rule the reaper uses: a lock whose pid is dead.
+    const { staleLocks } = decideReap({ locks: lockInfo });
+    let freed = 0;
+    const removed = [];
+    for (const port of staleLocks) {
+      if (port === WS_PORT && lockInfo[port]?.pid === process.pid) continue;
+      const file = byPort[port];
+      const size = await _fileSize(file);
+      await fs.rm(file, { force: true });
+      freed += size;
+      removed.push(file);
+    }
+    // A bridge-only daemon log is stale once no live process owns its port.
+    for (const l of logs) {
+      if (lockInfo[l.port]?.alive) continue;
+      if (l.port === WS_PORT) continue; // this process may be the daemon
+      const size = await _fileSize(l.file);
+      await fs.rm(l.file, { force: true });
+      freed += size;
+      removed.push(l.file);
+    }
+    return { freedBytes: freed, files: removed.length, removed };
+  });
+
+  return { ok: Object.values(details).every((d) => d.ok), freedBytes, details };
+}
+
+async function _handleServerFlush(socket, message) {
+  let reply;
+  try {
+    const out = await _flushServerStorage(message.scopes);
+    reply = { type: "SERVER_FLUSH_RESULT", id: message.id, ...out };
+  } catch (err) {
+    reply = { type: "SERVER_FLUSH_RESULT", id: message.id, ok: false, freedBytes: 0, details: {}, error: err?.message || String(err) };
+  }
+  diagLog(`SERVER_FLUSH freed=${reply.freedBytes} ok=${reply.ok}`);
+  try {
+    socket.send(JSON.stringify(reply));
   } catch (_) {}
 }
 
@@ -4040,8 +4399,19 @@ function _handleRestartStale(socket, message) {
   requestFleetRestartCheck("extension-request");
 }
 
+// The extension saved a workflow outside the MCP save tools (chat /teach,
+// a locator healed during a run): mirror it like _mirrorWorkflow does.
+// Only the extension socket may write here.
+function _handleWorkflowMirror(socket, message) {
+  if (socket !== extensionSocket) return;
+  const wf = message?.workflow;
+  if (!wf || typeof wf !== "object" || !wf.id || !Array.isArray(wf.steps)) return;
+  saveWorkflowFile(wf).catch((err) => diagLog(`workflow mirror failed id=${wf.id}: ${err.message}`));
+}
+
 const _WS_MESSAGE_HANDLERS = Object.freeze({
   RESTART_STALE: _handleRestartStale,
+  WORKFLOW_MIRROR: _handleWorkflowMirror,
   PROXY_HELLO: _handleProxyHello,
   BRIDGE_STATUS: _handleBridgeStatus,
   SELF_UPDATE: _handleSelfUpdate,
@@ -4053,11 +4423,14 @@ const _WS_MESSAGE_HANDLERS = Object.freeze({
       _handleAiChatRequest(socket, message),
     ),
   INTERNAL_PROXY_CALL: _handleInternalProxyCall,
+  INTERNAL_PROXY_CANCEL: _handleInternalProxyCancel,
   TOOL_RESULT: _handleToolResult,
   KEEPALIVE: _handleKeepaliveOrPong,
   PONG: _handleKeepaliveOrPong,
   GET_TOOL_LOGS: _handleGetToolLogs,
   CLEAR_TOOL_LOGS: _handleClearToolLogs,
+  SERVER_USAGE: _handleServerUsage,
+  SERVER_FLUSH: _handleServerFlush,
 });
 
 function _processWsMessage(socket, message) {
@@ -4079,9 +4452,32 @@ process.on("exit", removeLockFileIfOwnedSync);
 
 // ─── Bridge: Send tool call to extension ─────────────────────
 
+// Run onAbort once when the MCP client cancels; returns a detach function.
+function _onClientAbort(signal, onAbort) {
+  if (!signal || typeof signal.addEventListener !== "function") return () => {};
+  if (signal.aborted) {
+    queueMicrotask(onAbort);
+    return () => {};
+  }
+  const listener = () => onAbort();
+  signal.addEventListener("abort", listener, { once: true });
+  return () => signal.removeEventListener("abort", listener);
+}
+
+function _cancelledToolResult(tool) {
+  return {
+    error: CANCELLED_RESULT_ERROR,
+    cancelled: true,
+    message: `Tool "${tool}" was cancelled by the MCP client.`,
+  };
+}
+
 function callExtensionTool(tool, params, options = {}) {
   const confirmedExecution =
     options?.confirmed === true || confirmedToolContext.getStore()?.confirmed === true;
+  // Aborted when the MCP client cancels the request it is waiting on.
+  const mcpCall = mcpRequestContext.getStore() || null;
+  const clientSignal = options?.signal || mcpCall?.signal || null;
   const auditTier = getToolTier(tool, params);
   // Reset inactivity timer on every tool call
   touchActivity();
@@ -4096,6 +4492,7 @@ function callExtensionTool(tool, params, options = {}) {
       // site: hold it exactly like confirm mode does.
       if (result?.approvalRequired && !confirmedExecution) {
         result = _holdForConfirmation({
+          mcpCall,
           tool,
           params,
           domain: result.domain || null,
@@ -4198,28 +4595,56 @@ function callExtensionTool(tool, params, options = {}) {
           return;
         }
         const id = ++callIdCounter;
+        // Tell the primary to stop the call in the extension when we stop
+        // waiting for it.
+        const cancelOnPrimary = (reason) => {
+          try {
+            if (proxyClient && proxyClient.readyState === 1) {
+              proxyClient.send(JSON.stringify({ type: "INTERNAL_PROXY_CANCEL", id, reason }));
+            }
+          } catch (_) {}
+        };
         const timer = setTimeout(() => {
+          if (!pendingCalls.has(id)) return;
           pendingCalls.delete(id);
+          detachAbort();
+          cancelOnPrimary("timeout");
           wrappedResolve({
             error: `Tool "${tool}" timed out across proxy after ${TOOL_TIMEOUT}ms`,
           });
         }, TOOL_TIMEOUT);
+        const detachAbort = _onClientAbort(clientSignal, () => {
+          if (!pendingCalls.has(id)) return;
+          clearTimeout(timer);
+          pendingCalls.delete(id);
+          cancelOnPrimary("client_cancelled");
+          wrappedResolve(_cancelledToolResult(tool));
+        });
 
-        pendingCalls.set(id, { resolve: wrappedResolve, reject, timer });
+        pendingCalls.set(id, {
+          resolve: (res) => {
+            detachAbort();
+            wrappedResolve(res);
+          },
+          reject,
+          timer,
+        });
         try {
           proxyClient.send(
             JSON.stringify({
               type: "INTERNAL_PROXY_CALL",
-              clientId: MY_CLIENT_ID,
+              clientId: frameClientId(),
               id,
               tool,
               params,
+              timeoutMs: TOOL_TIMEOUT,
               ...(confirmedExecution ? { confirmed: true } : {}),
               ...isolationFrameFields(),
             }),
           );
         } catch (err) {
           clearTimeout(timer);
+          detachAbort();
           pendingCalls.delete(id);
           wrappedResolve({
             error: `Secondary server lost proxy connection to primary AutoDOM server: ${err?.message || err}`,
@@ -4322,7 +4747,7 @@ function callExtensionTool(tool, params, options = {}) {
       // For destructive tools in confirm mode, return a confirmation request
       if (CONFIRM_MODE && tier === "destructive" && !confirmedExecution) {
         // Auto-expires after 5 minutes.
-        const held = _holdForConfirmation({ tool, params, domain: checkDomain, tier });
+        const held = _holdForConfirmation({ mcpCall, tool, params, domain: checkDomain, tier });
         diagLog(
           `toolCall CONFIRM_REQUIRED tool=${tool} confirmId=${held.confirmId}`,
         );
@@ -4333,11 +4758,29 @@ function callExtensionTool(tool, params, options = {}) {
 
     const id = ++callIdCounter;
     const timer = setTimeout(() => {
+      if (!pendingCalls.has(id)) return;
       pendingCalls.delete(id);
-      resolve({ error: `Tool "${tool}" timed out after ${TOOL_TIMEOUT}ms` });
+      detachAbort();
+      // Stop the extension from finishing a call nobody is waiting for.
+      sendToolCancel(id, "timeout");
+      wrappedResolve({ error: `Tool "${tool}" timed out after ${TOOL_TIMEOUT}ms` });
     }, TOOL_TIMEOUT);
+    const detachAbort = _onClientAbort(clientSignal, () => {
+      if (!pendingCalls.has(id)) return;
+      clearTimeout(timer);
+      pendingCalls.delete(id);
+      sendToolCancel(id, "client_cancelled");
+      wrappedResolve(_cancelledToolResult(tool));
+    });
 
-    pendingCalls.set(id, { resolve: wrappedResolve, reject, timer });
+    pendingCalls.set(id, {
+      resolve: (res) => {
+        detachAbort();
+        wrappedResolve(res);
+      },
+      reject,
+      timer,
+    });
 
     try {
       // Use immediate send for individual tool calls (low latency path).
@@ -4345,16 +4788,18 @@ function callExtensionTool(tool, params, options = {}) {
       // micro-batch window (e.g. inside batch_actions processing).
       sendToExtensionImmediate({
         type: "TOOL_CALL",
-        clientId: MY_CLIENT_ID,
+        clientId: frameClientId(),
         id,
         tool,
         params,
+        timeoutMs: TOOL_TIMEOUT,
         ...(confirmedExecution ? { confirmed: true } : {}),
         ...isolationFrameFields(),
       });
     } catch (err) {
       pendingCalls.delete(id);
       clearTimeout(timer);
+      detachAbort();
       diagLog(
         `toolCall FAIL tool=${tool} reason=send_error err=${err.message}`,
       );
@@ -5080,11 +5525,119 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = PROVIDER_FETCH_TI
   }
 }
 
+// ─── Streaming direct-provider calls ─────────────────────────
+// OpenAI / Anthropic / Ollama replies stream into the chat panel through
+// the same AI_CHAT_DELTA frames the CLI path sends (onTextDelta). Any
+// failure before the stream completes falls back to the buffered request,
+// whose final AI_CHAT_RESPONSE replaces the partial bubble. Set
+// AUTODOM_PROVIDER_STREAM=0 to always buffer.
+function _providerStreamingEnabled(onTextDelta) {
+  return typeof onTextDelta === "function" && process.env.AUTODOM_PROVIDER_STREAM !== "0";
+}
+
+// POSTs `body` and feeds each response line to onLine(line). The timeout
+// is an idle timeout (reset on every chunk) so long replies are not cut
+// off. onLine returns false to stop early. Resolves the Response headers'
+// content-type so callers can detect a non-streaming reply.
+async function _streamProviderLines(url, { headers, body }, onLine, { requestId, idleMs = PROVIDER_FETCH_TIMEOUT_MS } = {}) {
+  const controller = new AbortController();
+  let timer = null;
+  let timedOut = false;
+  const touch = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, idleMs);
+    timer.unref?.();
+  };
+  touch();
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "");
+      const err = new Error(`HTTP ${response.status}: ${errorText.slice(0, 500)}`);
+      err.status = response.status;
+      throw err;
+    }
+    const contentType = String(response.headers.get("content-type") || "");
+    if (!response.body || typeof response.body.getReader !== "function") {
+      throw new Error("provider returned no readable body");
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let stop = false;
+    const feed = (line) => {
+      if (stop) return;
+      if (_isAborted(requestId)) throw new AiAbortError(requestId);
+      if (onLine(line.replace(/\r$/, "")) === false) stop = true;
+    };
+    while (!stop) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      touch();
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while (!stop && (nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        feed(line);
+      }
+    }
+    buf += decoder.decode();
+    if (!stop && buf.trim()) feed(buf);
+    if (stop) {
+      try {
+        await reader.cancel();
+      } catch (_) {}
+    }
+    return { contentType };
+  } catch (err) {
+    if (timedOut) throw new Error(`Upstream stream idle for ${idleMs}ms: ${url}`);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// SSE "data:" payloads as parsed JSON ([DONE] → null).
+function _sseData(line) {
+  if (!line.startsWith("data:")) return undefined;
+  const raw = line.slice(5).trim();
+  if (!raw) return undefined;
+  if (raw === "[DONE]") return null;
+  try {
+    return JSON.parse(raw);
+  } catch (_) {
+    return undefined;
+  }
+}
+
+async function _withStreamFallback(label, streamFn, bufferedFn) {
+  try {
+    return await streamFn();
+  } catch (err) {
+    if (err instanceof AiAbortError) throw err;
+    process.stderr.write(
+      `[AutoDOM] ${label} streaming failed (${err?.message || err}); retrying without streaming\n`,
+    );
+    return bufferedFn();
+  }
+}
+
 async function callOpenAIProvider({
   text,
   context,
   conversationHistory,
   providerConfig,
+  onTextDelta,
+  requestId,
 }) {
   const baseUrl = (
     providerConfig.openaiBaseUrl || "https://api.openai.com/v1"
@@ -5109,28 +5662,13 @@ async function callOpenAIProvider({
 
   messages.push({ role: "user", content: text });
 
-  const response = await fetchWithTimeout(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${providerConfig.openaiApiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      max_tokens: 4096,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`OpenAI error ${response.status}: ${errorText}`);
-  }
-
-  const payload = await response.json();
-  const outputText = payload?.choices?.[0]?.message?.content || "";
-
-  return {
+  const url = `${baseUrl}/chat/completions`;
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${providerConfig.openaiApiKey}`,
+  };
+  const body = { model, messages, max_tokens: 4096 };
+  const done = (outputText) => ({
     response:
       outputText ||
       "OpenAI responded, but no text content was returned for this request.",
@@ -5141,7 +5679,59 @@ async function callOpenAIProvider({
         model,
       },
     ],
+  });
+
+  const buffered = async () => {
+    const response = await fetchWithTimeout(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`OpenAI error ${response.status}: ${errorText}`);
+    }
+
+    const payload = await response.json();
+    return done(payload?.choices?.[0]?.message?.content || "");
   };
+
+  if (!_providerStreamingEnabled(onTextDelta)) return buffered();
+  return _withStreamFallback("OpenAI", async () => {
+    let out = "";
+    let finished = false;
+    let raw = "";
+    const { contentType } = await _streamProviderLines(
+      url,
+      { headers, body: { ...body, stream: true } },
+      (line) => {
+        const data = _sseData(line);
+        if (data === undefined) {
+          raw += line + "\n"; // non-SSE reply (gateway ignored stream:true)
+          return;
+        }
+        if (data === null) {
+          finished = true;
+          return false;
+        }
+        if (data?.error) throw new Error(data.error.message || JSON.stringify(data.error));
+        const chunk = data?.choices?.[0]?.delta?.content;
+        if (typeof chunk === "string" && chunk) {
+          out += chunk;
+          onTextDelta(chunk);
+        }
+        if (data?.choices?.[0]?.finish_reason) finished = true;
+      },
+      { requestId },
+    );
+    if (!finished && !out && /json/i.test(contentType) && raw.trim()) {
+      const payload = JSON.parse(raw);
+      return done(payload?.choices?.[0]?.message?.content || "");
+    }
+    if (!finished && !out) throw new Error("stream ended without content");
+    return done(out);
+  }, buffered);
 }
 
 async function callAnthropicProvider({
@@ -5149,6 +5739,8 @@ async function callAnthropicProvider({
   context,
   conversationHistory,
   providerConfig,
+  onTextDelta,
+  requestId,
 }) {
   const messages = [];
   const historyText = conversationToProviderText(conversationHistory);
@@ -5172,36 +5764,18 @@ async function callAnthropicProvider({
     );
   }
 
-  const response = await fetchWithTimeout(ANTHROPIC_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": providerConfig.anthropicApiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: anthropicModel,
-      max_tokens: 2048,
-      system: buildProviderSystemPrompt(context, { responseStyle: providerConfig?.responseStyle }),
-      messages,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Anthropic error ${response.status}: ${errorText}`);
-  }
-
-  const payload = await response.json();
-  const outputText = Array.isArray(payload?.content)
-    ? payload.content
-        .filter((part) => part?.type === "text" && part?.text)
-        .map((part) => part.text)
-        .join("\n")
-        .trim()
-    : "";
-
-  return {
+  const headers = {
+    "Content-Type": "application/json",
+    "x-api-key": providerConfig.anthropicApiKey,
+    "anthropic-version": "2023-06-01",
+  };
+  const body = {
+    model: anthropicModel,
+    max_tokens: 2048,
+    system: buildProviderSystemPrompt(context, { responseStyle: providerConfig?.responseStyle }),
+    messages,
+  };
+  const done = (outputText) => ({
     response:
       outputText ||
       "Anthropic responded, but no text content was returned for this request.",
@@ -5212,7 +5786,72 @@ async function callAnthropicProvider({
         model: providerConfig.anthropicModel,
       },
     ],
+  });
+
+  const buffered = async () => {
+    const response = await fetchWithTimeout(ANTHROPIC_API_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Anthropic error ${response.status}: ${errorText}`);
+    }
+
+    const payload = await response.json();
+    const outputText = Array.isArray(payload?.content)
+      ? payload.content
+          .filter((part) => part?.type === "text" && part?.text)
+          .map((part) => part.text)
+          .join("\n")
+          .trim()
+      : "";
+    return done(outputText);
   };
+
+  if (!_providerStreamingEnabled(onTextDelta)) return buffered();
+  return _withStreamFallback("Anthropic", async () => {
+    // Text blocks are joined with "\n" like the buffered path.
+    const blocks = [];
+    let current = null;
+    let finished = false;
+    await _streamProviderLines(
+      ANTHROPIC_API_URL,
+      { headers, body: { ...body, stream: true } },
+      (line) => {
+        const data = _sseData(line);
+        if (!data) return;
+        if (data.type === "error") {
+          throw new Error(data.error?.message || "Anthropic stream error");
+        }
+        if (data.type === "content_block_start") {
+          current = data.content_block?.type === "text" ? { text: data.content_block.text || "" } : null;
+          if (current) {
+            if (blocks.length && current.text === "") onTextDelta("\n");
+            blocks.push(current);
+            if (current.text) onTextDelta(current.text);
+          }
+        } else if (data.type === "content_block_delta" && data.delta?.type === "text_delta") {
+          const chunk = data.delta.text || "";
+          if (current && chunk) {
+            current.text += chunk;
+            onTextDelta(chunk);
+          }
+        } else if (data.type === "content_block_stop") {
+          current = null;
+        } else if (data.type === "message_stop") {
+          finished = true;
+          return false;
+        }
+      },
+      { requestId },
+    );
+    const out = blocks.map((b) => b.text).filter(Boolean).join("\n").trim();
+    if (!finished && !out) throw new Error("stream ended without content");
+    return done(out);
+  }, buffered);
 }
 
 async function callOllamaProvider({
@@ -5220,6 +5859,8 @@ async function callOllamaProvider({
   context,
   conversationHistory,
   providerConfig,
+  onTextDelta,
+  requestId,
 }) {
   const baseUrl = (
     providerConfig.ollamaBaseUrl || "http://localhost:11434"
@@ -5244,25 +5885,9 @@ async function callOllamaProvider({
 
   messages.push({ role: "user", content: text });
 
-  const response = await fetchWithTimeout(`${baseUrl}/api/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model,
-      messages,
-      stream: false,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Ollama error ${response.status}: ${errorText}`);
-  }
-
-  const payload = await response.json();
-  const outputText = payload?.message?.content || "";
-
-  return {
+  const url = `${baseUrl}/api/chat`;
+  const headers = { "Content-Type": "application/json" };
+  const done = (outputText) => ({
     response:
       outputText || "Ollama responded, but no text content was returned.",
     toolCalls: [
@@ -5272,7 +5897,60 @@ async function callOllamaProvider({
         model,
       },
     ],
+  });
+
+  const buffered = async () => {
+    const response = await fetchWithTimeout(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model,
+        messages,
+        stream: false,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Ollama error ${response.status}: ${errorText}`);
+    }
+
+    const payload = await response.json();
+    return done(payload?.message?.content || "");
   };
+
+  if (!_providerStreamingEnabled(onTextDelta)) return buffered();
+  return _withStreamFallback("Ollama", async () => {
+    // NDJSON: one {message:{content}, done} object per line.
+    let out = "";
+    let finished = false;
+    await _streamProviderLines(
+      url,
+      { headers, body: { model, messages, stream: true } },
+      (line) => {
+        if (!line.trim()) return;
+        let data;
+        try {
+          data = JSON.parse(line);
+        } catch (_) {
+          return;
+        }
+        if (data?.error) throw new Error(String(data.error));
+        const chunk = data?.message?.content;
+        if (typeof chunk === "string" && chunk) {
+          out += chunk;
+          onTextDelta(chunk);
+        }
+        if (data?.done) {
+          finished = true;
+          return false;
+        }
+      },
+      { requestId },
+    );
+    if (!finished && !out) throw new Error("stream ended without content");
+    return done(out);
+  }, buffered);
 }
 
 function parseEnvInt(name, fallback, min, max) {
@@ -6132,6 +6810,8 @@ async function routeDirectProviderChat({
       context,
       conversationHistory,
       providerConfig,
+      onTextDelta,
+      requestId,
     });
   }
 
@@ -6141,6 +6821,8 @@ async function routeDirectProviderChat({
       context,
       conversationHistory,
       providerConfig,
+      onTextDelta,
+      requestId,
     });
   }
 
@@ -6150,6 +6832,8 @@ async function routeDirectProviderChat({
       context,
       conversationHistory,
       providerConfig,
+      onTextDelta,
+      requestId,
     });
   }
 
@@ -6595,6 +7279,63 @@ function makeChatDeltaEmitter(socket, requestId) {
   };
 }
 
+// ─── CLI MCP isolation ───────────────────────────────────────
+// AutoDOM runs the browser tools itself and uses the CLI only as an LLM,
+// so a spawned `claude -p` / `codex exec` must not boot its configured MCP
+// servers — one of which is usually AutoDOM, which would start a nested
+// bridge (and every other server) on every planning call.
+//   claude: --mcp-config '{"mcpServers":{}}' --strict-mcp-config
+//   codex:  -c mcp_servers.<name>.enabled=false for each enabled server
+//           (an override for a name that is not configured is a config
+//           error, so the names come from `codex mcp list --json`, cached)
+// AUTODOM_CLI_ISOLATE_MCP=0 turns this off.
+const CLI_MCP_LIST_TTL_MS = 10 * 60 * 1000;
+const _codexMcpNamesCache = new Map(); // binary → { at, names }
+
+function _cliIsolateMcpEnabled() {
+  return process.env.AUTODOM_CLI_ISOLATE_MCP !== "0";
+}
+
+async function _codexEnabledMcpServers(binary) {
+  const cached = _codexMcpNamesCache.get(binary);
+  if (cached && Date.now() - cached.at < CLI_MCP_LIST_TTL_MS) return cached.names;
+  let names = [];
+  try {
+    const { stdout } = await execFileAsync(binary, ["mcp", "list", "--json"], {
+      timeout: 5000,
+      maxBuffer: 1024 * 1024,
+      env: process.env,
+    });
+    const list = JSON.parse(String(stdout || "[]"));
+    if (Array.isArray(list)) {
+      names = list
+        .filter((s) => s && s.enabled !== false && typeof s.name === "string")
+        .map((s) => s.name)
+        // Only TOML bare keys can be addressed safely in a dotted -c path.
+        .filter((n) => /^[A-Za-z0-9_-]{1,64}$/.test(n));
+    }
+  } catch (err) {
+    diagLog(`codex mcp list failed (${err?.message || err}); nested MCP servers not disabled`);
+  }
+  _codexMcpNamesCache.set(binary, { at: Date.now(), names });
+  return names;
+}
+
+async function _cliMcpIsolationArgs(kind, binary, userArgsJoined) {
+  if (!_cliIsolateMcpEnabled()) return [];
+  if (kind === "claude") {
+    if (/\s--(strict-)?mcp-config(\s|=)/.test(userArgsJoined)) return [];
+    // --mcp-config is variadic: the flag after it ends its value list.
+    return ["--mcp-config", '{"mcpServers":{}}', "--strict-mcp-config"];
+  }
+  if (kind === "codex") {
+    if (/mcp_servers/.test(userArgsJoined)) return [];
+    const names = await _codexEnabledMcpServers(binary);
+    return names.flatMap((n) => ["-c", `mcp_servers.${n}.enabled=false`]);
+  }
+  return [];
+}
+
 async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta }) {
   if (_isAborted(requestId)) throw new AiAbortError(requestId);
   const binary = (providerConfig.cliBinary || "claude").trim();
@@ -6638,16 +7379,20 @@ async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta }) 
   const wantCodexJson = kind === "codex" && !userPickedJsonCodex;
   const codexJsonArgs = wantCodexJson ? ["--json"] : [];
 
+  const mcpIsolationArgs = await _cliMcpIsolationArgs(kind, binary, userArgsJoined);
+  if (_isAborted(requestId)) throw new AiAbortError(requestId);
+
   let args;
   let writePromptToStdin = true;
   if (kind === "claude") {
-    args = ["-p", ...claudeJsonArgs, ...modelArgs, ...extraArgs];
+    args = ["-p", ...mcpIsolationArgs, ...claudeJsonArgs, ...modelArgs, ...extraArgs];
   } else if (kind === "codex") {
     // Newer codex CLI accepts the prompt as a positional arg. Stdin mode
     // (`-`) silently truncated long prompts on 0.125+, so prefer arg form.
     args = [
       "exec",
       "--skip-git-repo-check",
+      ...mcpIsolationArgs,
       ...codexJsonArgs,
       ...modelArgs,
       ...extraArgs,
@@ -6985,12 +7730,13 @@ function createAutoDomMcpServer() {
     mcpServer.registerTool(
       name,
       { ...config, inputSchema: parameters },
-      async (params, context) => {
-        const resumed = await _resumeApprovedTool(name, params, context, execute);
-        if (resumed !== undefined) return normalizeMcpToolResult(resumed);
-        const value = await execute(params, context);
-        return _askForApproval(name, value, context) || normalizeMcpToolResult(value);
-      },
+      async (params, context) =>
+        mcpRequestContext.run({ signal: context?.mcpReq?.signal || null, tool: name, params, execute }, async () => {
+          const resumed = await _resumeApprovedTool(name, params, context, execute);
+          if (resumed !== undefined) return normalizeMcpToolResult(resumed);
+          const value = await execute(params, context);
+          return _askForApproval(name, value, context) || normalizeMcpToolResult(value);
+        }),
     );
   }
 
@@ -7108,10 +7854,33 @@ async function _resumeApprovedTool(tool, params, context, execute) {
   }
   const answer = acceptedContent(responses, "approve");
   if (answer?.approve !== true) {
-    _auditToolCall({ tool, params, tier: pending.tier, result: { blocked: true, domain: pending.domain } });
+    _auditToolCall({ tool, params: pending.mcpParams ?? pending.params, tier: pending.tier, result: { blocked: true, domain: pending.domain } });
     return { cancelled: true, tool, message: `The user declined ${pending.tool}.` };
   }
-  return confirmedToolContext.run({ confirmed: true }, () => execute(params, context));
+  // Run what the user approved: the held call's own params, never the
+  // retried request's (they could differ from what the prompt showed).
+  return _runApprovedCall(pending, context, tool === pending.mcpTool ? execute : null);
+}
+
+// Re-run an approved hold. The MCP tool's execute when we know it (so its
+// post-processing — workflow mirroring, result shaping — runs too), else
+// the raw extension call that was held.
+function _runApprovedCall(pending, context, execute) {
+  const run = typeof execute === "function" ? execute : pending.execute;
+  return confirmedToolContext.run({ confirmed: true }, () =>
+    typeof run === "function" && pending.mcpParams !== undefined
+      ? run(_cloneParams(pending.mcpParams), context)
+      : callExtensionTool(pending.tool, pending.params, { confirmed: true }),
+  );
+}
+
+function _parseToolValue(value) {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
 }
 
 function _playwrightTarget(params = {}) {
@@ -7871,7 +8640,7 @@ server.addTool({
       .number()
       .describe("The confirmId from the confirmation request"),
   }),
-  execute: async ({ confirmId }) => {
+  execute: async ({ confirmId }, context) => {
     const pending = pendingConfirmations.get(confirmId);
     if (!pending) {
       return JSON.stringify({
@@ -7881,14 +8650,13 @@ server.addTool({
     pendingConfirmations.delete(confirmId);
 
     try {
-      const result = await callExtensionTool(pending.tool, pending.params, {
-        confirmed: true,
-      });
+      const result = _parseToolValue(await _runApprovedCall(pending, context, null));
       _auditToolCall({ tool: "confirm_action", params: { confirmId, tool: pending.tool }, tier: pending.tier, result: { confirmed: true } });
       return JSON.stringify(
         {
           confirmed: true,
           tool: pending.tool,
+          ...(pending.mcpTool && pending.mcpTool !== pending.tool ? { via: pending.mcpTool } : {}),
           tier: pending.tier,
           result,
         },
@@ -8918,9 +9686,12 @@ server.addTool({
 // (extension/background/workflow-engine.js). The server mirrors saved
 // workflows to ~/.autodom/workflows so they can be reviewed and versioned.
 
+// Only workflows that were actually saved are mirrored (a record_stop
+// without save:true returns an unsaved draft).
 async function _mirrorWorkflow(result) {
   const wf = result?.full || result?.workflow;
-  if (!result?.ok || !wf?.id || !Array.isArray(wf.steps)) return result;
+  if (result && typeof result === "object") delete result.full;
+  if (!result?.ok || result.saved !== true || !wf?.id || !Array.isArray(wf.steps)) return result;
   try {
     result.file = await saveWorkflowFile(wf);
   } catch (err) {
@@ -9293,6 +10064,52 @@ server.addTool({
   execute: async () => stringifyToolResult(await callExtensionTool("schedule_list", {})),
 });
 
+// schedule_update {runNow:true}: report what the run actually did — held
+// for confirmation, refused, skipped, failed or passed — and only fall
+// back to "still running" when it outlasts a short wait (a run can take
+// longer than the bridge tool timeout).
+async function _scheduleRunNow(id) {
+  const waitMs = Math.max(1000, Math.min(20000, TOOL_TIMEOUT - 5000));
+  const call = callExtensionTool("schedule_run_now", { id }).then(
+    (r) => r,
+    (err) => ({ ok: false, error: err?.message || String(err) }),
+  );
+  let timer;
+  const settled = await Promise.race([
+    call,
+    new Promise((r) => {
+      timer = setTimeout(() => r(null), waitMs);
+    }),
+  ]);
+  clearTimeout(timer);
+  if (!settled) {
+    return {
+      started: true,
+      runNow: { status: "running" },
+      hint: "Run started and is still going; check run_list / schedule_list for the result.",
+    };
+  }
+  if (settled.confirmRequired) {
+    return {
+      started: false,
+      runNow: { held: true, confirmId: settled.confirmId, tier: settled.tier, message: settled.message },
+      hint: `The run is held for confirmation. Call confirm_action { confirmId: ${settled.confirmId} } to start it.`,
+    };
+  }
+  if (settled.skipped) {
+    return { started: false, runNow: settled, hint: `Not started: ${settled.reason || "skipped"}.` };
+  }
+  const failed = settled.ok === false || !!settled.error;
+  const started = !!settled.runId || (settled.status != null && !settled.blocked);
+  return {
+    started,
+    runNow: settled,
+    hint: failed
+      ? `Run ${started ? "failed" : "did not start"}: ${settled.detail || settled.error || settled.status || "unknown error"}.`
+      : `Run finished: ${settled.status || "passed"}${settled.runId ? ` (runId ${settled.runId})` : ""}.`,
+  };
+}
+
 server.addTool({
   name: "schedule_update",
   description: "Change a schedule: timing, variables, notifications, or enabled:false to pause it. runNow:true fires it immediately.",
@@ -9309,12 +10126,7 @@ server.addTool({
   }),
   execute: async ({ runNow, ...params }) => {
     const result = await callExtensionTool("schedule_update", params);
-    if (result?.ok && runNow) {
-      // Fire-and-forget: a run can outlast the bridge tool timeout.
-      callExtensionTool("schedule_run_now", { id: params.id }).catch(() => {});
-      result.started = true;
-      result.hint = "Run started; check run_list / schedule_list for the result.";
-    }
+    if (result?.ok && runNow) Object.assign(result, await _scheduleRunNow(params.id));
     return stringifyToolResult(result);
   },
 });

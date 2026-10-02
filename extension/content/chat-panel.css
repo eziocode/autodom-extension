@@ -1790,6 +1790,127 @@
       transform: scale(0.92) !important;
       transition: transform 0.12s ease !important;
     }
+    /* Features → Toolbar can hide optional buttons; the base rule forces
+       inline-flex, so [hidden] needs its own override. */
+    .autodom-chat-icon-btn[hidden] {
+      display: none !important;
+    }
+    /* Toggle state (▷ while a run is active, ⊶ / ○ while recording).
+       Accent tokens adapt per theme, so one rule covers dark + light. */
+    .autodom-chat-icon-btn {
+      position: relative !important;
+    }
+    .autodom-chat-icon-btn[aria-pressed="true"],
+    .autodom-chat-icon-btn.is-active {
+      background: var(--c-accent-soft) !important;
+      border-color: var(--c-accent-ring) !important;
+      color: var(--c-accent-2) !important;
+      box-shadow: 0 0 0 1px var(--c-accent-ring) inset !important;
+    }
+    .autodom-chat-icon-btn[aria-pressed="true"]:hover,
+    .autodom-chat-icon-btn.is-active:hover {
+      background: color-mix(in oklch, var(--c-accent) 20%, transparent) !important;
+      border-color: var(--c-accent) !important;
+      color: var(--c-accent-2) !important;
+    }
+    .autodom-chat-icon-btn[aria-pressed="true"]:focus-visible,
+    .autodom-chat-icon-btn.is-active:focus-visible {
+      outline: 2px solid var(--c-accent) !important;
+      outline-offset: 2px !important;
+    }
+    /* ▷ turns into a filled play glyph while its run is active. */
+    .autodom-chat-icon-btn[data-action="workflow_run_picker"].is-active svg polygon {
+      fill: currentColor !important;
+    }
+    .autodom-chat-icon-btn.just-pressed {
+      transform: scale(0.92) !important;
+      transition: transform 0.12s ease !important;
+    }
+    /* One-shot busy state: dim the glyph and spin a ring over it. */
+    .autodom-chat-icon-btn.is-busy {
+      cursor: progress !important;
+      pointer-events: none !important;
+    }
+    .autodom-chat-icon-btn.is-busy svg {
+      opacity: 0.35 !important;
+    }
+    .autodom-chat-icon-btn.is-busy::before {
+      content: "" !important;
+      position: absolute !important;
+      inset: 0 !important;
+      margin: auto !important;
+      width: 12px !important;
+      height: 12px !important;
+      border-radius: 50% !important;
+      border: 1.5px solid color-mix(in oklch, var(--c-text) 25%, transparent) !important;
+      border-top-color: var(--c-accent) !important;
+      animation: __autodom_spin 0.7s linear infinite !important;
+      box-sizing: border-box !important;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .autodom-chat-icon-btn.is-busy::before { animation-duration: 2s !important; }
+    }
+
+    /* ─── Run-workflow picker (▷) ─────────────────────────────
+       Reuses .autodom-slash-menu chrome; JS anchors it above the
+       toolbar (panel-relative absolute offsets). */
+    .autodom-wf-picker-row {
+      display: flex !important;
+      align-items: center !important;
+      gap: 6px !important;
+      padding: 6px 6px 6px 10px !important;
+      border-radius: 10px !important;
+    }
+    .autodom-wf-picker-row:hover,
+    .autodom-wf-picker-row:focus-within {
+      background: var(--c-surface) !important;
+    }
+    .autodom-wf-picker-info {
+      flex: 1 1 auto !important;
+      min-width: 0 !important;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 2px !important;
+    }
+    .autodom-wf-picker-info .autodom-wf-picker-name {
+      min-width: 0 !important;
+      overflow: hidden !important;
+      text-overflow: ellipsis !important;
+      white-space: nowrap !important;
+    }
+    .autodom-wf-picker-action {
+      flex: 0 0 auto !important;
+      padding: 4px 9px !important;
+      border-radius: 8px !important;
+      border: 1px solid var(--c-accent-ring) !important;
+      background: var(--c-accent-soft) !important;
+      color: var(--c-accent-2) !important;
+      font: inherit !important;
+      font-size: 11px !important;
+      font-weight: 600 !important;
+      line-height: 1.2 !important;
+      cursor: pointer !important;
+    }
+    .autodom-wf-picker-action.is-dry {
+      border-color: var(--c-border) !important;
+      background: transparent !important;
+      color: var(--c-text-2) !important;
+    }
+    .autodom-wf-picker-action:hover,
+    .autodom-wf-picker-action.is-active {
+      border-color: var(--c-accent) !important;
+      color: var(--c-text) !important;
+    }
+    .autodom-wf-picker-action:focus-visible {
+      outline: 2px solid var(--c-accent) !important;
+      outline-offset: 1px !important;
+    }
+    .autodom-wf-picker-empty {
+      padding: 8px 10px 10px !important;
+      font-size: 12px !important;
+      line-height: 1.4 !important;
+      color: var(--c-text-2) !important;
+    }
     .autodom-chat-toast {
       position: absolute !important;
       left: 50% !important;
@@ -3567,10 +3688,32 @@
 
 /* Recording indicator — pulsing red ring on toolbar buttons that are
    currently recording (tab capture or macro). */
+/* The base icon-button rule pins color/box-shadow with !important (which
+   also beats animations), so the recording state needs !important too and
+   pulses on a pseudo-element instead of the button's own box-shadow. */
 #__autodom_chat_panel .autodom-chat-icon-btn.autodom-recording {
-  color: #ff3b30;
+  color: #ff3b30 !important;
+  background: rgba(255, 59, 48, 0.12) !important;
+  border-color: rgba(255, 59, 48, 0.55) !important;
+  box-shadow: none !important;
+}
+#__autodom_chat_panel .autodom-chat-icon-btn.autodom-recording svg circle {
+  fill: currentColor;
+}
+#__autodom_chat_panel .autodom-chat-icon-btn.autodom-recording::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  pointer-events: none;
   box-shadow: 0 0 0 0 rgba(255, 59, 48, 0.6);
   animation: __autodom_rec_pulse 1.4s ease-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  #__autodom_chat_panel .autodom-chat-icon-btn.autodom-recording::after {
+    animation: none;
+    box-shadow: 0 0 0 2px rgba(255, 59, 48, 0.35);
+  }
 }
 @keyframes __autodom_rec_pulse {
   0%   { box-shadow: 0 0 0 0 rgba(255, 59, 48, 0.55); }

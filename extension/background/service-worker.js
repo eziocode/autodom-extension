@@ -11,6 +11,11 @@
 // manifest.firefox.json `background.scripts` array, so this call is a no-op
 // because the scripts have already been evaluated globally.
 try {
+  // Feature flags first: the workflow engine, tool lanes and the tool
+  // handlers below read globalThis.AutoDOMFeatures.
+  if (typeof importScripts === "function" && !globalThis.AutoDOMFeatures) {
+    importScripts("feature-flags.js");
+  }
   if (typeof importScripts === "function" && !globalThis.AutoDOMProviders) {
     importScripts("providers.js");
   }
@@ -30,6 +35,9 @@ try {
   }
   if (typeof importScripts === "function" && !globalThis.AutoDOMTabGroup) {
     importScripts("tab-isolation.js");
+  }
+  if (typeof importScripts === "function" && !globalThis.AutoDOMToolLanes) {
+    importScripts("tool-lanes.js");
   }
   if (typeof importScripts === "function" && !globalThis.AutoDOMScheduler) {
     importScripts("scheduler.js");
@@ -1187,19 +1195,156 @@ function _broadcastAgentRunState() {
   } catch (_) {}
 }
 
-// Pinned-tab execution context for the in-flight loop. Calls to active-tab
-// helpers route through this so user clicking a different tab mid-run
-// doesn't hijack the agent.
-let _agentRunContext = null; // { tabId, windowId } | null
+// Chat-toolbar toggle state ({ wfRecording?, tabRecording?, activeRunId? })
+// for every chat panel: the side panel (an extension page) gets it via
+// runtime.sendMessage, in-page panels via tabs.sendMessage to each tab
+// whose panel announced itself plus the active tab of every window.
+function _broadcastToolbarState(patch) {
+  const message = { type: "AUTODOM_TOOLBAR_STATE", ...(patch || {}) };
+  try {
+    const p = chrome.runtime.sendMessage(message);
+    if (p && typeof p.catch === "function") p.catch(() => {});
+  } catch (_) {}
+  try {
+    const targets = new Set(_chatPanelReadyTabs);
+    const send = () => {
+      for (const id of targets) {
+        try {
+          const p = chrome.tabs.sendMessage(id, message);
+          if (p && typeof p.catch === "function") p.catch(() => {});
+        } catch (_) {}
+      }
+    };
+    Promise.resolve(chrome.tabs.query({ active: true }))
+      .then((tabs) => {
+        for (const t of tabs || []) if (t && t.id != null) targets.add(t.id);
+      }, () => {})
+      .then(send);
+  } catch (_) {}
+}
+
+// ─── Call context ────────────────────────────────────────────
+// Every tool call carries its own CallContext, passed as the second
+// argument to each handler (`handler(params, ctx)`). It pins the tab the
+// call works on, so a user clicking a different tab mid-run — or another
+// client's call running at the same time — never re-targets it.
+//
+//   { callId, origin: "bridge"|"agent"|"panel"|"confirm"|"schedule",
+//     clientId, isolated, tabId, windowId, signal, deadline,
+//     batchDepth, heldLanes: Set, run }
+//
+// Handlers may update ctx.tabId / ctx.windowId (switch_tab, a closed tab);
+// the change only affects the call that owns the context.
+let _callIdCounter = 0;
+// Contexts of calls that are still running (bridge, agent runs, panel).
+// tabs.onRemoved walks this so a closed tab is dropped from every call.
+const _inflightCallContexts = new Set();
+// Calls that reached getActiveTab without a context (should stay 0).
+let _ctxlessCalls = 0;
 // Tab IDs the extension is restricted to. Empty = no restriction.
 let _stickyTabIds = new Set();
-function _withAgentTabContext(ctx, fn) {
-  const prev = _agentRunContext;
-  _agentRunContext = ctx;
+
+function _makeCallContext(init = {}) {
+  return {
+    callId: init.callId ?? `call_${Date.now().toString(36)}_${++_callIdCounter}`,
+    origin: init.origin || "bridge",
+    clientId: init.clientId ?? null,
+    isolated: init.isolated === true,
+    tabId: init.tabId ?? null,
+    windowId: init.windowId ?? null,
+    signal: init.signal ?? null,
+    deadline: init.deadline ?? null,
+    batchDepth: 0,
+    heldLanes: new Set(),
+    run: init.run ?? null,
+  };
+}
+
+// ─── Cancellation ────────────────────────────────────────────
+// A call is cancelled when its deadline passes, the bridge sends
+// TOOL_CANCEL (server timeout / MCP client gave up), or the agent run is
+// stopped. Long waits race ctx.signal so they stop right away; the
+// handler then returns this result.
+function _cancelledResult(reason) {
+  return {
+    error: "CANCELLED",
+    cancelled: true,
+    ...(reason ? { reason: String(reason) } : {}),
+  };
+}
+
+function _abortReason(signal) {
+  const r = signal?.reason;
+  if (r == null) return "cancelled";
+  return typeof r === "string" ? r : r?.message || String(r);
+}
+
+class _CallCancelledError extends Error {
+  constructor(reason) {
+    super(`CANCELLED: ${reason || "cancelled"}`);
+    this.name = "CallCancelledError";
+    this.cancelled = true;
+    this.reason = reason || "cancelled";
+  }
+}
+
+function _isCancelled(ctx) {
+  return !!ctx?.signal?.aborted;
+}
+
+// Throws _CallCancelledError when the call has been cancelled.
+function _throwIfCancelled(ctx) {
+  if (ctx?.signal?.aborted) throw new _CallCancelledError(_abortReason(ctx.signal));
+}
+
+// setTimeout that rejects with _CallCancelledError as soon as `signal`
+// aborts. Without a signal it is a plain sleep.
+function _sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new _CallCancelledError(_abortReason(signal)));
+      return;
+    }
+    let onAbort = null;
+    const timer = setTimeout(() => {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, Math.max(0, ms));
+    if (signal) {
+      onAbort = () => {
+        clearTimeout(timer);
+        reject(new _CallCancelledError(_abortReason(signal)));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+}
+
+// Run onCancel once if the call's signal aborts; returns a detach function.
+// Used by the listener-based waits (new tab, popup, download).
+function _onCallCancel(ctx, onCancel) {
+  const signal = ctx?.signal;
+  if (!signal) return () => {};
+  const listener = () => onCancel(_abortReason(signal));
+  if (signal.aborted) {
+    queueMicrotask(listener);
+    return () => {};
+  }
+  signal.addEventListener("abort", listener, { once: true });
+  return () => signal.removeEventListener("abort", listener);
+}
+
+// A batch_actions step that moves to a tab another call is busy in gives
+// up after this long (LANE_BUSY) instead of deadlocking.
+const BATCH_LANE_ACQUIRE_TIMEOUT_MS = 10000;
+
+// Register ctx as in-flight for the duration of fn.
+function _withCallContext(ctx, fn) {
+  _inflightCallContexts.add(ctx);
   return Promise.resolve()
     .then(fn)
     .finally(() => {
-      _agentRunContext = prev;
+      _inflightCallContexts.delete(ctx);
     });
 }
 
@@ -1207,7 +1352,7 @@ function _withAgentTabContext(ctx, fn) {
 // limiting and routes every call through the Ask-Before-Act ActionGate
 // middleware (action-gate.js). Denied actions short-circuit here with a
 // structured { ok:false, denied:true, reason } so the agent can replan.
-async function executeAgentTool(toolName, params) {
+async function executeAgentTool(toolName, params, ctx) {
   const handler = TOOL_HANDLERS.get(toolName);
   if (!handler) {
     return { ok: false, error: `Unknown tool: ${toolName}` };
@@ -1215,7 +1360,7 @@ async function executeAgentTool(toolName, params) {
   // Rate limit (re-uses bridge logic)
   let _gateTab;
   try {
-    const tab = await getActiveTab();
+    const tab = await getActiveTab(ctx);
     _gateTab = tab;
     const domain = getDomainFromTab(tab);
     const rateCheck = checkRateLimit(domain);
@@ -1236,7 +1381,7 @@ async function executeAgentTool(toolName, params) {
 
   // ── ActionGate: Ask Before Act ──────────────────────────────
   const Gate = globalThis.AutoDOMActionGate;
-  if (Gate && _agentBatchDepth === 0) {
+  if (Gate && !(ctx?.batchDepth > 0)) {
     try {
       const origin = Gate.normalizeOrigin(_gateTab?.url || "");
       const decision = await Gate.requestDecision({
@@ -1265,15 +1410,31 @@ async function executeAgentTool(toolName, params) {
   // Mark the active run as "mid-tool" so the UI can distinguish a run
   // that's actively executing a browser tool from one that's merely
   // unwinding / finalizing after the last tool result.
-  if (_activeAgentRun) _activeAgentRun.toolRunning = true;
+  const run = ctx?.run || null;
+  if (run) run.toolRunning = true;
   try {
     touchToolActivity();
-    const raw = await handler(params || {});
+    _throwIfCancelled(ctx);
+    // One lane per tab: agent-run and panel calls queue behind bridge calls
+    // on the same tab, never behind calls on other tabs. A batch step that
+    // moves to another tab waits at most BATCH_LANE_ACQUIRE_TIMEOUT_MS.
+    const raw = await _runInToolLanes(
+      toolName,
+      params,
+      ctx,
+      () => handler(params || {}, ctx),
+      {
+        tabHint: _gateTab?.id,
+        acquireTimeoutMs: ctx?.batchDepth > 0 ? BATCH_LANE_ACQUIRE_TIMEOUT_MS : undefined,
+      },
+    );
     return { ok: !raw?.error, ...(raw || {}) };
   } catch (err) {
+    const laneResult = _laneErrorResult(err);
+    if (laneResult) return { ok: false, ...laneResult };
     return { ok: false, error: err?.message || String(err) };
   } finally {
-    if (_activeAgentRun) _activeAgentRun.toolRunning = false;
+    if (run) run.toolRunning = false;
   }
 }
 
@@ -1300,19 +1461,20 @@ function _safeJsonParse(s) {
 
 // When the agent successfully switches/opens a tab, follow it for
 // subsequent calls. Falls back silently for unexpected result shapes.
-function _maybeRepinAgentTab(toolName, rawResult, params) {
-  if (!rawResult || rawResult.error) return;
+function _maybeRepinAgentTab(toolName, rawResult, params, ctx) {
+  if (!ctx || !rawResult || rawResult.error) return;
   let newTabId = null;
   let newWindowId = null;
-  if (_agentRunContext?.isolated) {
+  if (ctx.isolated) {
     // Bridge call under tab isolation (e.g. inside batch_actions): keep the
     // isolation context and move this client's pin along with it.
     const next = _repinTargetFromResult(toolName, params || {}, rawResult);
     if (next != null) {
       const win = rawResult.windowId ?? rawResult.tab?.windowId ?? rawResult.newTab?.windowId ?? null;
-      _agentRunContext = { ..._agentRunContext, tabId: next, windowId: win };
-      if (_agentRunContext.clientId) {
-        _setClientPin(_agentRunContext.clientId, { id: next, windowId: win });
+      ctx.tabId = next;
+      ctx.windowId = win;
+      if (ctx.clientId) {
+        _setClientPin(ctx.clientId, { id: next, windowId: win });
       }
     }
     return;
@@ -1326,11 +1488,12 @@ function _maybeRepinAgentTab(toolName, rawResult, params) {
     newWindowId =
       rawResult.windowId ??
       rawResult.tab?.windowId ??
-      _agentRunContext?.windowId ??
+      ctx.windowId ??
       null;
   }
   if (newTabId != null) {
-    _agentRunContext = { tabId: newTabId, windowId: newWindowId };
+    ctx.tabId = newTabId;
+    ctx.windowId = newWindowId;
   }
 }
 
@@ -1348,15 +1511,14 @@ function _maybeRepinAgentTab(toolName, rawResult, params) {
 //   - On chrome.tabs.onRemoved, the entry is *kept* but tabId is set to
 //     null so subsequent calls return a structured PINNED_TAB_GONE error
 //     instead of silently grabbing the user's current tab.
-//   - Phase 1 limitation: tool-call dispatch is serialized globally below
-//     because all handlers still read the single `_agentRunContext` global.
-//     Phase 2 will introduce clientId-aware getActiveTab so concurrent
-//     bridges no longer block each other.
+//   - Each call resolves its pin into its own CallContext (see
+//     _makeCallContext), so calls from different clients never share
+//     tab state.
 const _clientPins = new Map();
 // clientId -> { tabId: number|null, windowId, lastUrl, lastTitle, pinnedAt }
 
 // ─── Tab-group isolation glue (see tab-isolation.js) ────────
-// While isolation is on, a bridge call runs with an _agentRunContext of
+// While isolation is on, a bridge call runs with a CallContext of
 // { tabId, windowId, clientId, isolated:true } so every tool helper resolves
 // to the client's own tab and never to the user's active tab.
 const NO_AUTODOM_TAB_MESSAGE =
@@ -1453,10 +1615,10 @@ const _AUTOPIN_TOOLS = new Set([
   "switch_tab",
 ]);
 
-// Global serialization chain for bridge TOOL_CALLs. Each incoming call is
-// chained so the shared `_agentRunContext` swap is race-free across
-// clientIds. The chain is always re-armed (.catch(()=>{})) so a single
-// thrown handler can never poison the queue.
+// Kill-switch fallback only (features.toolLanes === false): the old global
+// one-at-a-time chain for bridge TOOL_CALLs. Normally calls run in per-tab
+// lanes (see _runInToolLanes). The chain is always re-armed
+// (.catch(()=>{})) so a single thrown handler can never poison the queue.
 let _bridgeToolChain = Promise.resolve();
 function _runSerializedToolCall(fn) {
   const next = _bridgeToolChain.then(fn, fn);
@@ -1612,16 +1774,9 @@ function _handleGetPinnedTabTool(clientId) {
   };
 }
 
-// Acquire the pinned tab for this agent run. Falls back to active tab if
-// nothing pinned yet.
+// Acquire the tab for this agent run: the tab the chat started on, else a
+// sticky tab, else the active tab.
 async function _resolveAgentTab(initialTabId) {
-  if (_agentRunContext?.tabId != null) {
-    try {
-      return await chrome.tabs.get(_agentRunContext.tabId);
-    } catch (_) {
-      _agentRunContext = null;
-    }
-  }
   if (initialTabId != null) {
     try {
       return await chrome.tabs.get(initialTabId);
@@ -1910,9 +2065,9 @@ function _wrapUntrustedPageDataForPrompt(value, maxChars) {
   );
 }
 
-async function _buildTabContextReminder() {
+async function _buildTabContextReminder(ctx) {
   try {
-    const tab = await getActiveTab();
+    const tab = await getActiveTab(ctx);
     // List all open tabs briefly (id, title, url) so the model can switch
     // if needed.
     const allTabs = await chrome.tabs.query({}).catch(() => []);
@@ -2028,6 +2183,7 @@ async function runAgentLoop({
   attachments,
   mode,
   responseStyle,
+  origin,
 }) {
   const ProvidersApi = globalThis.AutoDOMProviders;
   const AgentApi = globalThis.AutoDOMAgent;
@@ -2053,12 +2209,17 @@ async function runAgentLoop({
 
   // Pin the tab where the chat originated so user focus changes don't hijack the run
   const startTab = await _resolveAgentTab(initialTabId);
-  const runCtx = startTab
-    ? { tabId: startTab.id, windowId: startTab.windowId }
-    : null;
   const panelTabId = startTab?.id ?? null;
+  // The run's own call context: every tool it executes targets this tab
+  // (re-pinned by switch_tab / open_new_tab), whatever the bridge or the
+  // user does meanwhile.
+  const agentCtx = _makeCallContext({
+    origin: origin === "schedule" ? "schedule" : "agent",
+    tabId: startTab?.id ?? null,
+    windowId: startTab?.windowId ?? null,
+  });
 
-  return _withAgentTabContext(runCtx, async () => {
+  return _withCallContext(agentCtx, async () => {
     const startedAt = Date.now();
     const callHistory = []; // for repeat-loop detection
     const accumulatedToolCalls = []; // surfaced as chips in final response
@@ -2070,6 +2231,9 @@ async function runAgentLoop({
     // and have both the in-flight provider fetch and the tool loop bail out.
     const runHandle = _startAgentRunHandle(panelTabId);
     const signal = runHandle.aborter.signal;
+    agentCtx.clientId = `chat:${panelTabId}:${runHandle.runId}`;
+    agentCtx.signal = signal;
+    agentCtx.run = runHandle;
     const isAborted = () => runHandle.aborted;
     const abortedReply = () => ({
       response: "⏹ Stopped by user.",
@@ -2183,13 +2347,15 @@ async function runAgentLoop({
 
       let snap, shot;
       try {
-        snap = await executeAgentTool("take_snapshot", { maxDepth: 4 });
+        // Explicit tree mode: the plan prompt relies on the full snapshot
+        // even when Features → compact snapshots is on.
+        snap = await executeAgentTool("take_snapshot", { maxDepth: 4, mode: "tree" }, agentCtx);
       } catch (e) {
         fastPlanFallbackMessages.push(`Vision plan snapshot failed (${e.message}); continue with the normal tool loop.`);
         return { done: false };
       }
       try {
-        shot = await executeAgentTool("take_screenshot", {});
+        shot = await executeAgentTool("take_screenshot", {}, agentCtx);
       } catch (_) {
         shot = null;
       }
@@ -2264,7 +2430,7 @@ async function runAgentLoop({
         _streamAgentToolEvent(panelTabId, {
           phase: "start", runId: runHandle.runId, tool: step.tool, args,
         });
-        const r = await executeAgentTool(step.tool, args);
+        const r = await executeAgentTool(step.tool, args, agentCtx);
         const ok = !!r?.ok && !r?.error;
         accumulatedToolCalls.push({ tool: step.tool, args, ok });
         _streamAgentToolEvent(panelTabId, {
@@ -2350,42 +2516,42 @@ async function runAgentLoop({
       async function _execQuickCommand(qcmd) {
         switch (qcmd.cmd) {
           case "click":
-            return executeAgentTool("click", { x: qcmd.x, y: qcmd.y });
+            return executeAgentTool("click", { x: qcmd.x, y: qcmd.y }, agentCtx);
           case "right_click":
-            return executeAgentTool("right_click", { x: qcmd.x, y: qcmd.y });
+            return executeAgentTool("right_click", { x: qcmd.x, y: qcmd.y }, agentCtx);
           case "dbl_click":
             // Double-click via evaluate_script as there's no native double_click tool
-            return executeAgentTool("evaluate_script", { script: `(function(){const e=document.elementFromPoint(${qcmd.x},${qcmd.y});if(e){e.dispatchEvent(new MouseEvent('dblclick',{bubbles:true,cancelable:true,clientX:${qcmd.x},clientY:${qcmd.y}}));}})()` });
+            return executeAgentTool("evaluate_script", { script: `(function(){const e=document.elementFromPoint(${qcmd.x},${qcmd.y});if(e){e.dispatchEvent(new MouseEvent('dblclick',{bubbles:true,cancelable:true,clientX:${qcmd.x},clientY:${qcmd.y}}));}})()` }, agentCtx);
           case "triple_click":
-            return executeAgentTool("evaluate_script", { script: `(function(){const e=document.elementFromPoint(${qcmd.x},${qcmd.y});if(e){e.click();e.click();e.click();}})()` });
+            return executeAgentTool("evaluate_script", { script: `(function(){const e=document.elementFromPoint(${qcmd.x},${qcmd.y});if(e){e.click();e.click();e.click();}})()` }, agentCtx);
           case "hover":
-            return executeAgentTool("hover", { x: qcmd.x, y: qcmd.y });
+            return executeAgentTool("hover", { x: qcmd.x, y: qcmd.y }, agentCtx);
           case "type":
-            return executeAgentTool("type_text", { text: qcmd.text });
+            return executeAgentTool("type_text", { text: qcmd.text }, agentCtx);
           case "press_key":
-            return executeAgentTool("press_key", { key: qcmd.keys.join("+") });
+            return executeAgentTool("press_key", { key: qcmd.keys.join("+") }, agentCtx);
           case "scroll":
-            return executeAgentTool("scroll", { direction: qcmd.direction, amount: qcmd.amount, x: qcmd.x, y: qcmd.y });
+            return executeAgentTool("scroll", { direction: qcmd.direction, amount: qcmd.amount, x: qcmd.x, y: qcmd.y }, agentCtx);
           case "drag":
-            return executeAgentTool("drag_and_drop", { sourceX: qcmd.x1, sourceY: qcmd.y1, targetX: qcmd.x2, targetY: qcmd.y2 });
+            return executeAgentTool("drag_and_drop", { sourceX: qcmd.x1, sourceY: qcmd.y1, targetX: qcmd.x2, targetY: qcmd.y2 }, agentCtx);
           case "screenshot_region":
-            return executeAgentTool("take_screenshot", {});
+            return executeAgentTool("take_screenshot", {}, agentCtx);
           case "navigate": {
             const url = qcmd.url;
-            if (url === "back") return executeAgentTool("navigate", { action: "back" });
-            if (url === "forward") return executeAgentTool("navigate", { action: "forward" });
-            return executeAgentTool("navigate", { url });
+            if (url === "back") return executeAgentTool("navigate", { action: "back" }, agentCtx);
+            if (url === "forward") return executeAgentTool("navigate", { action: "forward" }, agentCtx);
+            return executeAgentTool("navigate", { url }, agentCtx);
           }
           case "js":
-            return executeAgentTool("evaluate_script", { script: qcmd.code });
+            return executeAgentTool("evaluate_script", { script: qcmd.code }, agentCtx);
           case "wait":
-            return executeAgentTool("wait_for_network_idle", {});
+            return executeAgentTool("wait_for_network_idle", {}, agentCtx);
           case "switch_tab":
-            return executeAgentTool("switch_tab", { tabId: qcmd.tabId });
+            return executeAgentTool("switch_tab", { tabId: qcmd.tabId }, agentCtx);
           case "open_new_tab":
-            return executeAgentTool("open_new_tab", { url: qcmd.url });
+            return executeAgentTool("open_new_tab", { url: qcmd.url }, agentCtx);
           case "list_tabs":
-            return executeAgentTool("list_tabs", {});
+            return executeAgentTool("list_tabs", {}, agentCtx);
           case "present_plan": {
             const decision = await _requestPlanApproval(panelTabId, {
               domains: qcmd.plan.domains || [],
@@ -2402,7 +2568,7 @@ async function runAgentLoop({
       // Take the initial screenshot to ground the model
       let shotResult;
       try {
-        shotResult = await executeAgentTool("take_screenshot", {});
+        shotResult = await executeAgentTool("take_screenshot", {}, agentCtx);
       } catch (_) { shotResult = null; }
       const initialScreenshot = shotResult?.screenshot || shotResult?.dataUrl || null;
 
@@ -2511,7 +2677,7 @@ async function runAgentLoop({
 
         // Take a new screenshot and feed back to model
         let nextShot;
-        try { nextShot = await executeAgentTool("take_screenshot", {}); } catch (_) { nextShot = null; }
+        try { nextShot = await executeAgentTool("take_screenshot", {}, agentCtx); } catch (_) { nextShot = null; }
         const nextScreenshotUrl = nextShot?.screenshot || nextShot?.dataUrl || null;
 
         if (providerType === "anthropic") {
@@ -2680,10 +2846,10 @@ async function runAgentLoop({
             tool: tc.name,
             args,
           });
-          const rawResult = await executeAgentTool(tc.name, args);
+          const rawResult = await executeAgentTool(tc.name, args, agentCtx);
           const result = AgentApi.truncateToolResult(tc.name, rawResult);
           // Re-pin the agent run to a new tab when the AI explicitly asked to.
-          _maybeRepinAgentTab(tc.name, rawResult);
+          _maybeRepinAgentTab(tc.name, rawResult, undefined, agentCtx);
           // Track if any navigation tool ran — we'll inject tab context after.
           if (NAVIGATION_TOOLS.has(tc.name)) _needsTabContextInjection = true;
           accumulatedToolCalls.push({
@@ -2707,7 +2873,7 @@ async function runAgentLoop({
         }
         // Inject fresh tab context as a system-reminder after navigation
         if (_needsTabContextInjection) {
-          const reminder = await _buildTabContextReminder();
+          const reminder = await _buildTabContextReminder(agentCtx);
           if (reminder) {
             messages.push({ role: "user", content: reminder });
           }
@@ -2853,9 +3019,9 @@ async function runAgentLoop({
             tool: tc.name,
             args,
           });
-          const rawResult = await executeAgentTool(tc.name, args);
+          const rawResult = await executeAgentTool(tc.name, args, agentCtx);
           const result = AgentApi.truncateToolResult(tc.name, rawResult);
-          _maybeRepinAgentTab(tc.name, rawResult);
+          _maybeRepinAgentTab(tc.name, rawResult, undefined, agentCtx);
           // Track navigation for tab context injection
           if (NAVIGATION_TOOLS.has(tc.name)) _anthropicNeedsTabContext = true;
           accumulatedToolCalls.push({
@@ -2886,7 +3052,7 @@ async function runAgentLoop({
         }
         // Inject fresh tab context as a system-reminder after navigation
         if (_anthropicNeedsTabContext) {
-          const reminder = await _buildTabContextReminder();
+          const reminder = await _buildTabContextReminder(agentCtx);
           if (reminder) {
             // Append the reminder as an extra text block in the tool-results message
             toolResultBlocks.push({
@@ -2992,12 +3158,6 @@ function stopInactivityTimer() {
   // No-op — server-driven now (see header comment above).
 }
 
-// ─── Indexed Element Cache ───────────────────────────────────
-// Stores the last get_dom_state result so click_by_index / type_by_index
-// can resolve indices to real DOM elements without re-scanning.
-let _indexedElements = []; // Array of serialised element descriptors
-let _indexedTabId = null; // Tab the index map belongs to
-let _agentBatchDepth = 0; // Nested batch_actions skip duplicate confirmation prompts
 
 function getCurrentPort() {
   return typeof wsPort === "number" && Number.isFinite(wsPort) ? wsPort : 9876;
@@ -3426,22 +3586,28 @@ chrome.tabs.onCreated.addListener((tab) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   recordAction("tab_closed", `Tab closed`, {}, tabId);
   _chatPanelReadyTabs.delete(tabId);
+  // Recording tab closed → keep the steps as an unsaved draft; runs on the
+  // tab stop with "tab closed" (also when paused by a take-over).
+  try { workflowEngine?.onTabRemoved?.(tabId)?.catch?.(() => {}); } catch (_) {}
+  try {
+    if (_takeoverTabs.delete(tabId)) {
+      chrome.storage.session?.set({ [TAKEOVER_KEY]: [..._takeoverTabs] })?.catch?.(() => {});
+    }
+  } catch (_) {}
   _chatPanelInjectingTabs.delete(tabId);
   _pageCtxCache.delete(tabId);
   // Don't kill the agent run when its panel tab is closed — the user
   // may want automation to keep running on whichever tab they switch
-  // to next. Just unpin so getActiveTab() can fall back to whatever
+  // to next. Just unpin so getActiveTab(ctx) can fall back to whatever
   // tab is currently active.
   try {
     if (_activeAgentRun && _activeAgentRun.panelTabId === tabId) {
       _activeAgentRun.panelTabId = null;
     }
-    if (_agentRunContext && _agentRunContext.tabId === tabId) {
-      _agentRunContext = _agentRunContext.isolated
-        ? { ..._agentRunContext, tabId: null }
-        : _agentRunContext.windowId != null
-          ? { windowId: _agentRunContext.windowId }
-          : null;
+    // In-flight calls working on this tab: isolated calls then fail with
+    // NO_AUTODOM_TAB; legacy calls fall back to their window's active tab.
+    for (const ctx of _inflightCallContexts) {
+      if (ctx.tabId === tabId) ctx.tabId = null;
     }
     // Per-clientId pins: keep the entry (so we can surface
     // PINNED_TAB_GONE with lastUrl) but clear the live tabId.
@@ -3742,304 +3908,290 @@ async function _onWsConn_CLIENT_GONE(message) {
     await globalThis.AutoDOMTabGroup?.release(clientId, "client_gone");
 }
 
-async function _onWsConn_TOOL_CALL(message) {
-    _debugLog(
-      "[AutoDOM SW] TOOL_CALL from bridge:",
-      message.tool,
-      "id:",
-      message.id,
+// ─── Bridge tool calls: cancellation registry ───────────────
+// Every TOOL_CALL from the bridge gets an AbortController and a deadline
+// (the server's timeoutMs, else 30 s). The server sends TOOL_CANCEL when
+// it stops waiting (its own timeout, or the MCP client cancelled); either
+// way the call's ctx.signal aborts, waits stop, queued calls are skipped.
+// The result is still sent back — the server just ignores the stale id.
+// A dropped WebSocket does NOT cancel anything: the bridge may reconnect.
+const BRIDGE_CALL_DEFAULT_TIMEOUT_MS = 30000;
+const _inflightBridgeCalls = new Map(); // id -> entry
+const _recentCancelledCalls = []; // last few cancellations, for diagnostics
+const RECENT_CANCELLED_MAX = 20;
+
+function _registerBridgeCall(message) {
+  const timeoutMs =
+    Number.isFinite(message.timeoutMs) && message.timeoutMs > 0
+      ? message.timeoutMs
+      : BRIDGE_CALL_DEFAULT_TIMEOUT_MS;
+  const startedAt = Date.now();
+  const entry = {
+    id: message.id,
+    tool: message.tool,
+    clientId: message.clientId || null,
+    aborter: new AbortController(),
+    ctx: null,
+    state: "queued", // queued → waiting (for a lane) → running → done | cancelled
+    startedAt,
+    deadline: startedAt + timeoutMs,
+    timer: null,
+  };
+  entry.timer = setTimeout(() => _cancelBridgeCall(entry, "timeout"), timeoutMs);
+  if (message.id != null) _inflightBridgeCalls.set(message.id, entry);
+  return entry;
+}
+
+function _cancelBridgeCall(entry, reason) {
+  if (!entry || entry.aborter.signal.aborted) return false;
+  _recentCancelledCalls.push({
+    id: entry.id,
+    tool: entry.tool,
+    clientId: entry.clientId,
+    reason,
+    during: entry.state,
+    afterMs: Date.now() - entry.startedAt,
+    at: Date.now(),
+  });
+  if (_recentCancelledCalls.length > RECENT_CANCELLED_MAX) _recentCancelledCalls.shift();
+  entry.state = "cancelled";
+  try {
+    entry.aborter.abort(reason);
+  } catch (_) {}
+  return true;
+}
+
+function _finishBridgeCall(entry) {
+  clearTimeout(entry.timer);
+  if (_inflightBridgeCalls.get(entry.id) === entry) _inflightBridgeCalls.delete(entry.id);
+}
+
+async function _onWsConn_TOOL_CANCEL(message) {
+  const entry = _inflightBridgeCalls.get(message.id);
+  if (!entry) return;
+  _debugLog("[AutoDOM SW] TOOL_CANCEL:", entry.tool, "id:", message.id, "reason:", message.reason);
+  _cancelBridgeCall(entry, String(message.reason || "cancelled"));
+}
+
+// ─── Tool lanes ─────────────────────────────────────────────
+// Bridge, agent-run and chat-panel calls run concurrently, one FIFO lane
+// per tab (see tool-lanes.js): two clients on different tabs never wait
+// for each other, two calls on the same tab run in order. The kill switch
+// chrome.storage.local["autodom.features"].toolLanes === false brings back
+// the old one-at-a-time queue for bridge calls.
+const _ToolLanes = globalThis.AutoDOMToolLanes?.makeLanes({ log: (m) => _debugWarn(m) }) || null;
+// Per-client admission: pin resolution and tab creation for one client run
+// one at a time. Calls that move the client's pin hold it until they finish.
+const _admissionLanes = globalThis.AutoDOMToolLanes?.makeLanes({ log: (m) => _debugWarn(m) }) || null;
+const FEATURES_STORAGE_KEY = "autodom.features";
+let _toolLanesFlag = true;
+// Last known normalized flags (sync readers); _getFeatures() is the async
+// source of truth (AutoDOMFeatures.get(), cached until storage changes).
+let _featureFlags = globalThis.AutoDOMFeatures?.normalize?.({}) || {};
+
+function _applyFeatureFlags(raw) {
+  const F = globalThis.AutoDOMFeatures;
+  const flags = F?.normalize ? F.normalize(raw) : raw || {};
+  _featureFlags = flags || {};
+  _toolLanesFlag = flags?.toolLanes !== false;
+}
+
+async function _getFeatures() {
+  try {
+    const F = globalThis.AutoDOMFeatures;
+    if (F?.get) return await F.get();
+  } catch (_) {}
+  return { ..._featureFlags };
+}
+
+try {
+  chrome.storage.local.get([FEATURES_STORAGE_KEY], (got) => {
+    try { void chrome.runtime.lastError; } catch (_) {}
+    _applyFeatureFlags(got?.[FEATURES_STORAGE_KEY]);
+  });
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes?.[FEATURES_STORAGE_KEY]) {
+      _applyFeatureFlags(changes[FEATURES_STORAGE_KEY].newValue);
+    }
+  });
+} catch (_) {}
+
+function _toolLanesEnabled() {
+  return _toolLanesFlag && !!_ToolLanes && !!_admissionLanes;
+}
+
+// Tools that never touch a tab's page (or only read extension state).
+const _LANE_FREE_TOOLS = new Set([
+  "list_tabs",
+  "get_pinned_tab",
+  "__get_pinned_tab",
+  "__diagnostics",
+  "workflow_list",
+  "workflow_get",
+  "workflow_save",
+  "workflow_delete",
+  "workflow_export",
+  "workflow_from_recording",
+  "workflow_run_many",
+  "run_get",
+  "run_list",
+  "run_cancel",
+  "run_pause",
+  "run_resume",
+  "approval_rules_get",
+  "get_session_summary",
+  "get_recording",
+  "start_recording",
+  "stop_recording",
+  "list_downloads",
+  "wait_for_download",
+  "performance_analyze_insight",
+  "tab_recording_status",
+  // User controls from the chat panel must answer at once, even while an
+  // agent is busy in the tab.
+  "takeover_set",
+  "approval_rules_set",
+]);
+const _COOKIE_TOOLS = new Set(["get_cookies", "set_cookie", "delete_cookie", "clear_cookies"]);
+
+function _laneKeysFor(toolName, params, ctx, tabHint) {
+  const p = params || {};
+  if (_LANE_FREE_TOOLS.has(toolName)) return [];
+  if (/^(schedule|shortcut)_/.test(toolName)) return [];
+  if (toolName === "browser_tabs" && String(p.action || "list").toLowerCase() === "list") return [];
+  if (_COOKIE_TOOLS.has(toolName) && typeof p.url === "string" && p.url) return [];
+  // A workflow run in a fresh tab works on that tab only.
+  if (toolName === "workflow_run" && p.newTab === true && p.tabId == null) return [];
+  const keys = [];
+  const tabId = ctx?.tabId ?? tabHint ?? null;
+  if (tabId != null) keys.push(`tab:${tabId}`);
+  else if (!ctx?.isolated) keys.push("tab:active");
+  if ((toolName === "set_viewport" || toolName === "browser_resize") && ctx?.windowId != null) {
+    keys.push(`win:${ctx.windowId}`);
+  }
+  if (toolName === "tab_recording_start" || toolName === "tab_recording_stop") keys.push("recorder");
+  if (toolName === "performance_start_trace" || toolName === "performance_stop_trace") keys.push("trace");
+  return keys;
+}
+
+// Legacy (non-isolated) bridge calls that move the user's active tab run
+// alone, because other legacy bridge calls work on "the active tab".
+// Agent-run and chat-panel calls carry their own pinned tab, so they never
+// need (or wait for) the exclusive gate.
+function _needsExclusiveLane(toolName, params, ctx) {
+  if (ctx?.isolated || ctx?.origin !== "bridge") return false;
+  const p = params || {};
+  switch (toolName) {
+    case "switch_tab":
+    case "switch_to_popup":
+      return true;
+    case "wait_for_popup":
+    case "wait_for_new_tab":
+      return p.switchTo !== false;
+    case "open_new_tab":
+      return p.active !== false;
+    case "close_tab":
+      return p.tabId == null || p.tabId === ctx?.tabId;
+    case "browser_close":
+      return true;
+    case "browser_tabs": {
+      const a = String(p.action || "list").toLowerCase();
+      if (a === "select" || a === "new") return true;
+      if (a === "close") return p.tabId == null || p.tabId === ctx?.tabId;
+      return false;
+    }
+    default:
+      return false;
+  }
+}
+
+// Calls that move the calling client's pin keep the client's admission
+// until they finish, so the client's next call sees the new pin.
+const _PIN_MOVING_TOOLS = new Set([
+  "switch_tab",
+  "open_new_tab",
+  "close_tab",
+  "close_popup",
+  "wait_for_new_tab",
+  "switch_to_popup",
+  "wait_for_popup",
+  "browser_close",
+]);
+
+function _holdsClientAdmission(toolName, params) {
+  if (_PIN_MOVING_TOOLS.has(toolName)) return true;
+  if (toolName === "browser_tabs") {
+    const a = String(params?.action || "list").toLowerCase();
+    return a === "new" || a === "select" || a === "close";
+  }
+  if (toolName === "batch_actions") {
+    const steps = Array.isArray(params?.actions) ? params.actions : [];
+    return steps.some((s) =>
+      _holdsClientAdmission(String(s?.tool || s?.name || ""), s?.args || s?.params || {}),
     );
-    // Bridge is actively driving tools => the agent is alive.
-    // Reset the idle timeout for any in-flight AI request so we
-    // don't surface a spurious "timed out" while automation runs.
-    refreshAiRequestActivity();
-    _streamBridgeToolEvent({
-      phase: "start",
-      tool: message.tool,
-      args: message.params || {},
-    });
-    // Serialize TOOL_CALL handling so per-clientId tab pins
-    // (see _clientPins) don't race on the shared _agentRunContext.
-    // Phase 1 trade-off: this means one slow tool can briefly
-    // delay another bridge's call. Phase 2 will replace this with
-    // clientId-aware getActiveTab so concurrency is restored.
-    _runSerializedToolCall(async () => {
-      const clientId = message.clientId || null;
-      const toolName = message.tool;
-      const params = message.params || {};
-      if (clientId) {
-        if (message.isolation === false) _isolationOptOut.add(clientId);
-        else _isolationOptOut.delete(clientId);
-      }
-      if (Number.isFinite(message.isolationIdleMs)) {
-        _AutoDOMTabGroup()?.configure({ idleMs: message.isolationIdleMs });
-      }
+  }
+  return false;
+}
 
-      // Synthetic pin_tab / unpin_tab / get_pinned_tab — handled
-      // here because they need direct access to the calling
-      // clientId, which TOOL_HANDLERS entries don't see.
-      let result;
-      if (toolName === "__pin_tab" || toolName === "pin_tab") {
-        result = await _handlePinTabTool(clientId, params);
-      } else if (toolName === "__unpin_tab" || toolName === "unpin_tab") {
-        result = await _handleUnpinTabTool(clientId);
-      } else if (
-        toolName === "__finish_session" ||
-        toolName === "finish_session"
-      ) {
-        result = await _handleFinishSessionTool(clientId);
-      } else if (
-        toolName === "__get_pinned_tab" ||
-        toolName === "get_pinned_tab"
-      ) {
-        result = _handleGetPinnedTabTool(clientId);
-      } else if (toolName === "__diagnostics") {
-        // Service-worker / extension half of autodom_diagnostics.
-        // Reports every per-client pin (so the agent can see whether
-        // a sibling IDE has the page pinned), basic tab metrics,
-        // and active-agent-run state.
-        const pins = [];
-        for (const [cid, pin] of _clientPins) {
-          pins.push({
-            clientId: cid,
-            tabId: pin.tabId,
-            windowId: pin.windowId,
-            url: pin.lastUrl,
-            title: pin.lastTitle,
-            pinnedAt: pin.pinnedAt,
-            gone: pin.tabId == null,
-          });
-        }
-        let tabCount = 0;
-        let activeTab = null;
-        try {
-          const all = await chrome.tabs.query({});
-          tabCount = all.length;
-          const [t] = await chrome.tabs.query({
-            active: true,
-            currentWindow: true,
-          });
-          if (t) {
-            activeTab = {
-              id: t.id,
-              windowId: t.windowId,
-              url: t.url,
-              title: t.title,
-            };
-          }
-        } catch (_) {}
-        const Tab = _AutoDOMTabGroup();
-        result = {
-          pins,
-          tabIsolation: {
-            supported: !!Tab?.supported(),
-            enabled: Tab ? await Tab.isEnabled() : false,
-            clients: Tab ? Tab.snapshot() : [],
-          },
-          tabCount,
-          activeTab,
-          callingClientId: clientId,
-          activeAgentRun: _activeAgentRun
-            ? {
-                runId: _activeAgentRun.runId,
-                panelTabId: _activeAgentRun.panelTabId,
-                toolRunning: !!_activeAgentRun.toolRunning,
-              }
-            : null,
-          agentRunContext: _agentRunContext,
-          bridgeToolChainPending:
-            // Heuristic: if the chain is currently a non-resolved
-            // promise (the queue has work), best-effort reflect that.
-            // We can't introspect Promise state directly; this is
-            // intentionally approximate.
-            undefined,
-        };
-      } else {
-        const Tab = _AutoDOMTabGroup();
-        const isolated = await _isolationOn(clientId);
-        let autoCreatedTabId = null;
+// Run fn inside the lanes this call needs. No-op when lanes are off or the
+// tool needs none. Keys the caller already holds (nested batch steps) are
+// skipped by the lanes module.
+async function _runInToolLanes(toolName, params, ctx, fn, opts = {}) {
+  if (!ctx || !_toolLanesEnabled()) return fn();
+  const keys = _laneKeysFor(toolName, params, ctx, opts.tabHint);
+  const exclusive = _needsExclusiveLane(toolName, params, ctx);
+  if (!keys.length && !exclusive) return fn();
+  return _ToolLanes.run(
+    {
+      keys,
+      exclusive,
+      signal: ctx.signal,
+      deadline: ctx.deadline,
+      label: `${ctx.origin}:${ctx.clientId || "-"}:${toolName}#${ctx.callId}`,
+      heldLanes: ctx.heldLanes,
+      acquireTimeoutMs: opts.acquireTimeoutMs,
+      ctx,
+    },
+    fn,
+  );
+}
 
-        // Resolve pinned tab for this client (if any).
-        let pinCtx = null;
-        if (clientId) {
-          let resolved = await _resolveClientPin(clientId);
-          if (isolated && resolved?.tab && !Tab.ownsTab(clientId, resolved.tab.id)) {
-            // A pin left over from before isolation was on (or set by an
-            // in-panel chat request) points at a tab AutoDOM has not been
-            // asked to touch. Drop it rather than act on the user's page.
-            _clientPins.delete(clientId);
-            resolved = null;
-          }
-          if (
-            resolved?.gone &&
-            isolated &&
-            _isTabCreatingCall(toolName, params)
-          ) {
-            // The tool is about to create a fresh tab anyway — drop the
-            // dead pin instead of failing with PINNED_TAB_GONE.
-            _clientPins.delete(clientId);
-            resolved = null;
-          }
-          if (resolved?.gone) {
-            result = {
-              error: "PINNED_TAB_GONE",
-              clientId,
-              lastUrl: resolved.pin?.lastUrl || null,
-              lastTitle: resolved.pin?.lastTitle || null,
-              hint: "The tab this client was pinned to has been closed. Call pin_tab (or open_new_tab) before retrying.",
-            };
-          } else if (resolved?.tab) {
-            pinCtx = {
-              tabId: resolved.tab.id,
-              windowId: resolved.tab.windowId ?? null,
-            };
-          }
-        }
+function _laneErrorResult(err) {
+  if (err?.cancelled || err?.code === "CANCELLED") return _cancelledResult(err.reason || err.message);
+  if (err?.code === "LANE_BUSY") {
+    return {
+      error: err.message,
+      laneBusy: true,
+      hint: "Another call is still working in that tab. Retry once it finishes.",
+    };
+  }
+  return null;
+}
 
-        // Isolation: navigate with no tab yet opens a background tab in the
-        // AutoDOM group and works there — never on the user's tab.
-        if (
-          result === undefined &&
-          isolated &&
-          !pinCtx &&
-          _needsPrecreatedTab(toolName, params)
-        ) {
-          try {
-            const created = await Tab.createOwnedTab(clientId, {
-              url: "about:blank",
-            });
-            _setClientPin(clientId, created);
-            pinCtx = { tabId: created.id, windowId: created.windowId ?? null };
-            autoCreatedTabId = created.id;
-          } catch (createErr) {
-            result = {
-              error: `Could not create an AutoDOM tab: ${createErr?.message || createErr}`,
-            };
-          }
-        }
-
-        if (result === undefined && isolated) {
-          const isoCtx = {
-            tabId: pinCtx?.tabId ?? null,
-            windowId: pinCtx?.windowId ?? null,
-            clientId,
-            isolated: true,
-          };
-          Tab.beginCall(clientId);
-          try {
-            result = await _withAgentTabContext(isoCtx, () =>
-              handleToolCallWithRecording(toolName, params, message.id, {
-                bridge: true,
-                confirmed: message.confirmed === true,
-              }),
-            );
-          } finally {
-            Tab.endCall(clientId);
-          }
-          _ensureIsolationSweepAlarm();
-          if (autoCreatedTabId != null && result && typeof result === "object") {
-            result.autoCreatedTab = true;
-            result.tabId = result.tabId ?? autoCreatedTabId;
-          }
-          // Tools that used to activate/focus a tab now only re-target
-          // this client's working tab.
-          const nextTabId = _repinTargetFromResult(toolName, params, result);
-          if (nextTabId != null) {
-            const nextTab = await chrome.tabs.get(nextTabId).catch(() => null);
-            if (nextTab) _setClientPin(clientId, nextTab);
-          }
-        } else if (result === undefined) {
-          if (pinCtx) {
-            result = await _withAgentTabContext(pinCtx, () =>
-              handleToolCallWithRecording(toolName, params, message.id, {
-                bridge: true,
-                confirmed: message.confirmed === true,
-              }),
-            );
-          } else {
-            result = await handleToolCallWithRecording(
-              toolName,
-              params,
-              message.id,
-              { bridge: true, confirmed: message.confirmed === true },
-            );
-          }
-
-          // Auto-pin after a successful MCP-originated navigate /
-          // open_new_tab / switch_tab when this client has no pin
-          // yet. We never override an existing pin silently.
-          if (
-            clientId &&
-            !pinCtx &&
-            !result?.error &&
-            _AUTOPIN_TOOLS.has(toolName) &&
-            !_clientPins.has(clientId)
-          ) {
-            try {
-              let candidateTabId =
-                result?.tabId ??
-                result?.tab?.id ??
-                result?.id ??
-                null;
-              let candidate = null;
-              if (candidateTabId != null) {
-                candidate = await chrome.tabs
-                  .get(candidateTabId)
-                  .catch(() => null);
-              }
-              if (!candidate) {
-                const [active] = await chrome.tabs.query({
-                  active: true,
-                  currentWindow: true,
-                });
-                candidate = active || null;
-              }
-              if (candidate) {
-                const entry = _setClientPin(clientId, candidate);
-                if (entry && result && typeof result === "object") {
-                  result.autoPinned = true;
-                  result.pinnedTabId = entry.tabId;
-                }
-              }
-            } catch (pinErr) {
-              _debugWarn(
-                "[AutoDOM] auto-pin failed:",
-                pinErr?.message || pinErr,
-              );
-            }
-          }
-        }
-      }
-
-      _streamBridgeToolEvent({
-        phase: "end",
-        tool: toolName,
-        ok: !result?.error,
-        error: result?.error,
-        result: _compactBridgeToolResult(result),
-      });
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        return;
-      }
-      ws.send(
-        JSON.stringify({
-          type: "TOOL_RESULT",
-          id: message.id,
-          result,
-        }),
-      );
-      // Notify popup
-      chrome.runtime
-        .sendMessage({
-          type: "TOOL_CALLED",
-          tool: toolName,
-        })
-        .catch(() => {});
-    }).catch((err) => {
-      // Final safety net: a throw inside the serialized block
-      // already gets caught by _runSerializedToolCall's .catch,
-      // but we still try to reply to the bridge so the call
-      // doesn't hang forever from FastMCP's perspective.
+async function _onWsConn_TOOL_CALL(message) {
+  _debugLog(
+    "[AutoDOM SW] TOOL_CALL from bridge:",
+    message.tool,
+    "id:",
+    message.id,
+  );
+  // Bridge is actively driving tools => the agent is alive.
+  // Reset the idle timeout for any in-flight AI request so we
+  // don't surface a spurious "timed out" while automation runs.
+  refreshAiRequestActivity();
+  _streamBridgeToolEvent({
+    phase: "start",
+    tool: message.tool,
+    args: message.params || {},
+  });
+  const entry = _registerBridgeCall(message);
+  const work = () => _runBridgeToolCall(message, entry);
+  // Kill switch: the old global one-at-a-time queue.
+  const pending = _toolLanesEnabled() ? work() : _runSerializedToolCall(work);
+  pending
+    .catch((err) => {
+      // Final safety net: still reply so the call doesn't hang forever
+      // from the MCP client's perspective.
       try {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(
@@ -4051,7 +4203,368 @@ async function _onWsConn_TOOL_CALL(message) {
           );
         }
       } catch (_) {}
+    })
+    .finally(() => _finishBridgeCall(entry));
+}
+
+async function _runBridgeToolCall(message, entry) {
+  const clientId = message.clientId || null;
+  const toolName = message.tool;
+  const params = message.params || {};
+  if (clientId) {
+    if (message.isolation === false) _isolationOptOut.add(clientId);
+    else _isolationOptOut.delete(clientId);
+  }
+  if (Number.isFinite(message.isolationIdleMs)) {
+    _AutoDOMTabGroup()?.configure({ idleMs: message.isolationIdleMs });
+  }
+
+  // Synthetic pin_tab / unpin_tab / get_pinned_tab — handled
+  // here because they need direct access to the calling
+  // clientId, which TOOL_HANDLERS entries don't see.
+  let result;
+  const signal = entry.aborter.signal;
+  try {
+    if (signal.aborted || Date.now() >= entry.deadline) {
+      // Cancelled or past its deadline before it got its turn.
+      result = _cancelledResult(signal.aborted ? _abortReason(signal) : "timeout");
+    } else if (toolName === "__pin_tab" || toolName === "pin_tab") {
+      result = await _withClientAdmission(clientId, entry, () =>
+        _handlePinTabTool(clientId, params),
+      );
+    } else if (toolName === "__unpin_tab" || toolName === "unpin_tab") {
+      result = await _withClientAdmission(clientId, entry, () =>
+        _handleUnpinTabTool(clientId),
+      );
+    } else if (
+      toolName === "__finish_session" ||
+      toolName === "finish_session"
+    ) {
+      result = await _withClientAdmission(clientId, entry, () =>
+        _handleFinishSessionTool(clientId),
+      );
+    } else if (
+      toolName === "__get_pinned_tab" ||
+      toolName === "get_pinned_tab"
+    ) {
+      result = _handleGetPinnedTabTool(clientId);
+    } else if (toolName === "__diagnostics") {
+      result = await _bridgeDiagnostics(clientId);
+    } else {
+      result = await _runBridgeTool(message, entry, clientId, toolName, params);
+    }
+  } catch (err) {
+    const laneResult = _laneErrorResult(err);
+    if (!laneResult) throw err;
+    result = laneResult;
+  }
+  if (entry.state !== "cancelled") entry.state = "done";
+
+  _streamBridgeToolEvent({
+    phase: "end",
+    tool: toolName,
+    ok: !result?.error,
+    error: result?.error,
+    result: _compactBridgeToolResult(result),
+  });
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  ws.send(
+    JSON.stringify({
+      type: "TOOL_RESULT",
+      id: message.id,
+      result,
+    }),
+  );
+  // Notify popup
+  chrome.runtime
+    .sendMessage({
+      type: "TOOL_CALLED",
+      tool: toolName,
+    })
+    .catch(() => {});
+}
+
+// Hold this client's admission while fn runs (lanes on), else just run fn.
+async function _withClientAdmission(clientId, entry, fn) {
+  if (!_toolLanesEnabled()) return fn();
+  return _admissionLanes.run(
+    {
+      keys: [`client:${clientId || "anonymous"}`],
+      signal: entry.aborter.signal,
+      deadline: entry.deadline,
+      label: `admission:${entry.tool}#${entry.id}`,
+    },
+    fn,
+  );
+}
+
+async function _runBridgeTool(message, entry, clientId, toolName, params) {
+  const lanesOn = _toolLanesEnabled();
+  const signal = entry.aborter.signal;
+  // Short per-client FIFO: pin resolution, tab creation and building the
+  // call context for one client happen one call at a time.
+  let releaseAdmission = () => {};
+  if (lanesOn) {
+    releaseAdmission = await _admissionLanes.acquire({
+      keys: [`client:${clientId || "anonymous"}`],
+      signal,
+      deadline: entry.deadline,
+      label: `admission:${toolName}#${entry.id}`,
     });
+  }
+  let result;
+  try {
+    const Tab = _AutoDOMTabGroup();
+    const isolated = await _isolationOn(clientId);
+    let autoCreatedTabId = null;
+
+    // Resolve pinned tab for this client (if any).
+    let pinCtx = null;
+    if (clientId) {
+      let resolved = await _resolveClientPin(clientId);
+      if (isolated && resolved?.tab && !Tab.ownsTab(clientId, resolved.tab.id)) {
+        // A pin left over from before isolation was on (or set by an
+        // in-panel chat request) points at a tab AutoDOM has not been
+        // asked to touch. Drop it rather than act on the user's page.
+        _clientPins.delete(clientId);
+        resolved = null;
+      }
+      if (
+        resolved?.gone &&
+        isolated &&
+        _isTabCreatingCall(toolName, params)
+      ) {
+        // The tool is about to create a fresh tab anyway — drop the
+        // dead pin instead of failing with PINNED_TAB_GONE.
+        _clientPins.delete(clientId);
+        resolved = null;
+      }
+      if (resolved?.gone) {
+        result = {
+          error: "PINNED_TAB_GONE",
+          clientId,
+          lastUrl: resolved.pin?.lastUrl || null,
+          lastTitle: resolved.pin?.lastTitle || null,
+          hint: "The tab this client was pinned to has been closed. Call pin_tab (or open_new_tab) before retrying.",
+        };
+      } else if (resolved?.tab) {
+        pinCtx = {
+          tabId: resolved.tab.id,
+          windowId: resolved.tab.windowId ?? null,
+        };
+      }
+    }
+
+    // Isolation: navigate with no tab yet opens a background tab in the
+    // AutoDOM group and works there — never on the user's tab.
+    if (
+      result === undefined &&
+      isolated &&
+      !pinCtx &&
+      _needsPrecreatedTab(toolName, params)
+    ) {
+      try {
+        const created = await Tab.createOwnedTab(clientId, {
+          url: "about:blank",
+        });
+        _setClientPin(clientId, created);
+        pinCtx = { tabId: created.id, windowId: created.windowId ?? null };
+        autoCreatedTabId = created.id;
+      } catch (createErr) {
+        result = {
+          error: `Could not create an AutoDOM tab: ${createErr?.message || createErr}`,
+        };
+      }
+    }
+    if (result !== undefined) return result;
+
+    const ctx = _makeCallContext({
+      callId: message.id,
+      origin: "bridge",
+      clientId,
+      isolated,
+      tabId: pinCtx?.tabId ?? null,
+      windowId: pinCtx?.windowId ?? null,
+      signal,
+      deadline: entry.deadline,
+    });
+    entry.ctx = ctx;
+    if (!isolated && lanesOn && ctx.tabId == null) {
+      // Legacy, unpinned: "the active tab" is decided now, at admission,
+      // so the call queues on that tab's lane and keeps it even if the
+      // user switches tabs while it waits.
+      const t = await getActiveTab(_makeCallContext({ origin: "bridge" })).catch(() => null);
+      if (t) {
+        ctx.tabId = t.id;
+        ctx.windowId = t.windowId ?? null;
+      }
+    }
+    // Most calls leave the pin alone: let the client's next call in.
+    if (autoCreatedTabId == null && !_holdsClientAdmission(toolName, params)) {
+      releaseAdmission();
+    }
+
+    const callMeta = { bridge: true, confirmed: message.confirmed === true };
+    if (isolated) Tab.beginCall(clientId);
+    try {
+      entry.state = "waiting";
+      result = await _withCallContext(ctx, () =>
+        _runInToolLanes(toolName, params, ctx, () => {
+          if (entry.state !== "cancelled") entry.state = "running";
+          return handleToolCallWithRecording(toolName, params, message.id, callMeta, ctx);
+        }),
+      );
+    } finally {
+      if (isolated) Tab.endCall(clientId);
+    }
+
+    if (isolated) {
+      _ensureIsolationSweepAlarm();
+      if (autoCreatedTabId != null && result && typeof result === "object") {
+        result.autoCreatedTab = true;
+        result.tabId = result.tabId ?? autoCreatedTabId;
+      }
+      // Tools that used to activate/focus a tab now only re-target
+      // this client's working tab.
+      const nextTabId = _repinTargetFromResult(toolName, params, result);
+      if (nextTabId != null) {
+        const nextTab = await chrome.tabs.get(nextTabId).catch(() => null);
+        if (nextTab) _setClientPin(clientId, nextTab);
+      }
+    } else {
+      // Auto-pin after a successful MCP-originated navigate /
+      // open_new_tab / switch_tab when this client has no pin
+      // yet. We never override an existing pin silently.
+      if (
+        clientId &&
+        !pinCtx &&
+        !result?.error &&
+        _AUTOPIN_TOOLS.has(toolName) &&
+        !_clientPins.has(clientId)
+      ) {
+        try {
+          let candidateTabId =
+            result?.tabId ??
+            result?.tab?.id ??
+            result?.id ??
+            null;
+          let candidate = null;
+          if (candidateTabId != null) {
+            candidate = await chrome.tabs
+              .get(candidateTabId)
+              .catch(() => null);
+          }
+          if (!candidate) {
+            const [active] = await chrome.tabs.query({
+              active: true,
+              currentWindow: true,
+            });
+            candidate = active || null;
+          }
+          if (candidate) {
+            const pinEntry = _setClientPin(clientId, candidate);
+            if (pinEntry && result && typeof result === "object") {
+              result.autoPinned = true;
+              result.pinnedTabId = pinEntry.tabId;
+            }
+          }
+        } catch (pinErr) {
+          _debugWarn(
+            "[AutoDOM] auto-pin failed:",
+            pinErr?.message || pinErr,
+          );
+        }
+      }
+    }
+    return result;
+  } finally {
+    releaseAdmission();
+  }
+}
+
+// Service-worker / extension half of autodom_diagnostics. Reports every
+// per-client pin (so the agent can see whether a sibling IDE has the page
+// pinned), basic tab metrics, active-agent-run state and the tool lanes.
+async function _bridgeDiagnostics(clientId) {
+  const pins = [];
+  for (const [cid, pin] of _clientPins) {
+    pins.push({
+      clientId: cid,
+      tabId: pin.tabId,
+      windowId: pin.windowId,
+      url: pin.lastUrl,
+      title: pin.lastTitle,
+      pinnedAt: pin.pinnedAt,
+      gone: pin.tabId == null,
+    });
+  }
+  let tabCount = 0;
+  let activeTab = null;
+  try {
+    const all = await chrome.tabs.query({});
+    tabCount = all.length;
+    const [t] = await chrome.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
+    if (t) {
+      activeTab = {
+        id: t.id,
+        windowId: t.windowId,
+        url: t.url,
+        title: t.title,
+      };
+    }
+  } catch (_) {}
+  const Tab = _AutoDOMTabGroup();
+  const now = Date.now();
+  return {
+    pins,
+    tabIsolation: {
+      supported: !!Tab?.supported(),
+      enabled: Tab ? await Tab.isEnabled() : false,
+      clients: Tab ? Tab.snapshot() : [],
+    },
+    tabCount,
+    activeTab,
+    callingClientId: clientId,
+    activeAgentRun: _activeAgentRun
+      ? {
+          runId: _activeAgentRun.runId,
+          panelTabId: _activeAgentRun.panelTabId,
+          toolRunning: !!_activeAgentRun.toolRunning,
+        }
+      : null,
+    toolLanes: {
+      enabled: _toolLanesEnabled(),
+      lanes: _ToolLanes ? _ToolLanes.snapshot() : null,
+      admission: _admissionLanes ? _admissionLanes.snapshot() : null,
+    },
+    bridgeCalls: {
+      inflight: _inflightBridgeCalls.size,
+      calls: [..._inflightBridgeCalls.values()].map((e) => ({
+        id: e.id,
+        tool: e.tool,
+        clientId: e.clientId,
+        state: e.state,
+        tabId: e.ctx?.tabId ?? null,
+        elapsedMs: now - e.startedAt,
+        deadlineInMs: e.deadline - now,
+        orphaned: !!e.ctx?.orphaned,
+      })),
+      recentCancelled: _recentCancelledCalls.slice(),
+    },
+    inflightCalls: [..._inflightCallContexts].map((c) => ({
+      callId: c.callId,
+      origin: c.origin,
+      clientId: c.clientId,
+      tabId: c.tabId,
+      isolated: c.isolated,
+    })),
+    ctxlessCalls: _ctxlessCalls,
+  };
 }
 
 async function _onWsConn_SERVER_INFO(message) {
@@ -4126,10 +4639,13 @@ const _WS_CONN_MESSAGE_HANDLERS = Object.freeze({
   INACTIVITY_WARNING: _onWsConn_INACTIVITY_WARNING,
   SESSION_TIMEOUT: _onWsConn_SESSION_TIMEOUT,
   TOOL_CALL: _onWsConn_TOOL_CALL,
+  TOOL_CANCEL: _onWsConn_TOOL_CANCEL,
   CLIENT_GONE: _onWsConn_CLIENT_GONE,
   SERVER_INFO: _onWsConn_SERVER_INFO,
   BRIDGE_STATUS_RESPONSE: _onWsConn_BRIDGE_STATUS_RESPONSE,
   RESTART_STALE_RESULT: _onWsConn_RESTART_STALE_RESULT,
+  SERVER_USAGE_RESULT: _onWsConn_SERVER_USAGE_RESULT,
+  SERVER_FLUSH_RESULT: _onWsConn_SERVER_FLUSH_RESULT,
   PING: _onWsConn_PING,
 });
 
@@ -5032,7 +5548,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ error: `Unknown tool: ${pending.tool}` });
           return;
         }
-        const result = await handler(pending.params);
+        // Run on the tab the held call was aimed at, not the one the
+        // user is looking at while confirming.
+        const confirmCtx = _makeCallContext({
+          ...(pending.ctx || {}),
+          origin: "confirm",
+        });
+        const result = await _withCallContext(confirmCtx, () =>
+          _runInToolLanes(pending.tool, pending.params, confirmCtx, () =>
+            handler(pending.params, confirmCtx),
+          ),
+        );
         sendResponse({ confirmed: true, tool: pending.tool, result });
       } catch (err) {
         sendResponse({ error: err.message });
@@ -5114,34 +5640,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "CLEAR_TOOL_LOGS") {
-    _swToolErrorLog.length = 0;
-    (async () => {
-      let logFile = null;
-      if (isConnected && ws && ws.readyState === WebSocket.OPEN) {
-        try {
-          const ack = await new Promise((resolve) => {
-            _pendingToolLogClearResolve = resolve;
-            try {
-              ws.send(JSON.stringify({ type: "CLEAR_TOOL_LOGS" }));
-            } catch (sendErr) {
-              if (_pendingToolLogClearResolve === resolve) {
-                _pendingToolLogClearResolve = null;
-              }
-              resolve({ logFile: null });
-              return;
-            }
-            setTimeout(() => {
-              if (_pendingToolLogClearResolve === resolve) {
-                _pendingToolLogClearResolve = null;
-                resolve({ logFile: null });
-              }
-            }, 3000);
-          });
-          logFile = ack?.logFile || null;
-        } catch (_) {}
-      }
-      sendResponse({ ok: true, logFile });
-    })();
+    _clearToolLogs().then((logFile) => sendResponse({ ok: true, logFile }));
     return true;
   }
 
@@ -5166,7 +5665,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       try {
         _debugLog("[AutoDOM SW] Executing tool:", tool);
-        const result = await handler(params || {});
+        const panelCtx = await _panelCallContext(sender);
+        const result = await _withCallContext(panelCtx, () =>
+          _runInToolLanes(tool, params || {}, panelCtx, () =>
+            handler(params || {}, panelCtx),
+          ),
+        ).catch((err) => {
+          const laneResult = _laneErrorResult(err);
+          if (laneResult) return laneResult;
+          throw err;
+        });
         _debugLog(
           "[AutoDOM SW] Tool result for",
           tool,
@@ -5644,6 +6152,7 @@ function _streamBridgeRunEnd(pending, aborted) {
 }
 
 function _streamBridgeToolEvent(evt) {
+  if (!pendingAiRequests.size) return; // no chat request is listening
   for (const pending of pendingAiRequests.values()) {
     if (!pending._runStarted) {
       pending._runStarted = true;
@@ -5659,8 +6168,34 @@ function _streamBridgeToolEvent(evt) {
   }
 }
 
+// Fields that carry bulky payloads (base64 images, page dumps). Their size
+// is known without serialising the whole result.
+const _BULKY_RESULT_FIELDS = ["screenshot", "data", "dataUrl", "image", "html", "content", "text", "pdf"];
+
 function _compactBridgeToolResult(result) {
   if (result == null) return result;
+  // Only the chat panel's tool stream consumes this; skip the work (and
+  // the JSON.stringify of a multi-MB screenshot) when nobody listens.
+  if (!pendingAiRequests.size) return null;
+  if (typeof result === "object" && !Array.isArray(result)) {
+    let bulky = 0;
+    for (const k of _BULKY_RESULT_FIELDS) {
+      if (typeof result[k] === "string") bulky += result[k].length;
+    }
+    if (bulky > 6000) {
+      const slim = { ...result };
+      for (const k of _BULKY_RESULT_FIELDS) {
+        if (typeof slim[k] === "string" && slim[k].length > 200) {
+          slim[k] = `[${slim[k].length} chars omitted]`;
+        }
+      }
+      try {
+        return { truncated: true, summary: JSON.stringify(slim).substring(0, 6000) };
+      } catch (_) {
+        return { truncated: true, summary: "[unserialisable result]" };
+      }
+    }
+  }
   try {
     const json = JSON.stringify(result);
     if (json.length > 6000) {
@@ -5803,27 +6338,27 @@ function _playwrightCompatTarget(params = {}) {
   ).trim();
 }
 
-async function toolBrowserSnapshot(params = {}) {
+async function toolBrowserSnapshot(params = {}, ctx) {
   return toolSnapshot({
     maxDepth: params.depth || params.maxDepth || 6,
     selector: params.target || params.selector || "",
-  });
+  }, ctx);
 }
 
-async function toolBrowserClick(params = {}) {
+async function toolBrowserClick(params = {}, ctx) {
   const selector = _playwrightCompatTarget(params);
   if (!selector && !params.text) return { error: "browser_click requires target or text" };
   if (String(params.button || "").toLowerCase() === "right") {
-    return toolRightClick({ selector });
+    return toolRightClick({ selector }, ctx);
   }
   return toolClick({
     selector,
     text: params.text || "",
     dblClick: params.doubleClick === true,
-  });
+  }, ctx);
 }
 
-async function toolBrowserType(params = {}) {
+async function toolBrowserType(params = {}, ctx) {
   const selector = _playwrightCompatTarget(params);
   if (!selector) return { error: "browser_type requires target" };
   if (typeof params.text !== "string") return { error: "browser_type requires text" };
@@ -5831,24 +6366,24 @@ async function toolBrowserType(params = {}) {
     selector,
     text: params.text,
     clearFirst: params.clearFirst === true,
-  });
+  }, ctx);
   if (!typed?.error && params.submit === true) {
-    const submitted = await toolPressKey({ key: "Enter", selector });
+    const submitted = await toolPressKey({ key: "Enter", selector }, ctx);
     return { typed, submitted };
   }
   return typed;
 }
 
-async function toolBrowserWaitFor(params = {}) {
+async function toolBrowserWaitFor(params = {}, ctx) {
   const timeout =
     typeof params.time === "number"
       ? Math.max(0, params.time * 1000)
       : params.timeout || 10000;
   if (typeof params.text === "string" && params.text) {
-    return toolWaitForText({ text: params.text, timeout });
+    return toolWaitForText({ text: params.text, timeout }, ctx);
   }
   if (typeof params.textGone === "string" && params.textGone) {
-    const tab = await getActiveTab();
+    const tab = await getActiveTab(ctx);
     const start = Date.now();
     while (Date.now() - start < timeout) {
       const present = await executeInTab(
@@ -5857,22 +6392,22 @@ async function toolBrowserWaitFor(params = {}) {
         [params.textGone],
       );
       if (!present) return { success: true, elapsed: Date.now() - start };
-      await new Promise((r) => setTimeout(r, 150));
+      await _sleep(150, ctx?.signal);
     }
     return {
       success: false,
       error: `Text "${params.textGone}" still present after ${timeout}ms`,
     };
   }
-  await new Promise((r) => setTimeout(r, timeout));
+  await _sleep(timeout, ctx?.signal);
   return { success: true, elapsed: timeout };
 }
 
-async function toolBrowserTabs(params = {}) {
+async function toolBrowserTabs(params = {}, ctx) {
   const action = String(params.action || "list").toLowerCase();
-  if (action === "list") return toolListTabs({ currentWindow: params.currentWindow === true, all: params.all });
+  if (action === "list") return toolListTabs({ currentWindow: params.currentWindow === true, all: params.all }, ctx);
   if (action === "new") {
-    return toolOpenNewTab({ url: params.url || "about:blank", active: true });
+    return toolOpenNewTab({ url: params.url || "about:blank", active: true }, ctx);
   }
   const resolveTabForIndex = async () => {
     if (typeof params.listIndex === "number") {
@@ -5890,35 +6425,35 @@ async function toolBrowserTabs(params = {}) {
     return null;
   };
   if (action === "select") {
-    if (params.tabId) return toolSwitchTab({ tabId: params.tabId });
+    if (params.tabId) return toolSwitchTab({ tabId: params.tabId }, ctx);
     const tab = await resolveTabForIndex();
-    if (tab) return toolSwitchTab({ tabId: tab.id });
+    if (tab) return toolSwitchTab({ tabId: tab.id }, ctx);
     return { error: "browser_tabs select requires tabId, listIndex, or windowId + index" };
   }
   if (action === "close") {
-    if (params.tabId) return toolCloseTab({ tabId: params.tabId });
+    if (params.tabId) return toolCloseTab({ tabId: params.tabId }, ctx);
     const tab = await resolveTabForIndex();
-    if (tab) return toolCloseTab({ tabId: tab.id });
+    if (tab) return toolCloseTab({ tabId: tab.id }, ctx);
     if (typeof params.listIndex === "number" || typeof params.index === "number") return { error: "Tab not found" };
-    const activeTab = await getActiveTab();
-    return toolCloseTab({ tabId: activeTab.id });
+    const activeTab = await getActiveTab(ctx);
+    return toolCloseTab({ tabId: activeTab.id }, ctx);
   }
   return { error: `Unsupported browser_tabs action: ${action}` };
 }
 
-async function toolBrowserEvaluate(params = {}) {
+async function toolBrowserEvaluate(params = {}, ctx) {
   const fn = String(params.function || params.code || "").trim();
   if (!fn) return { error: "browser_evaluate requires function" };
   const selector = _playwrightCompatTarget(params);
   const code = selector
     ? `const __autodomTarget = document.querySelector(${JSON.stringify(selector)}); return await (${fn})(__autodomTarget);`
     : `return await (${fn})();`;
-  return toolExecuteCode({ code, timeout: params.timeout });
+  return toolExecuteCode({ code, timeout: params.timeout }, ctx);
 }
 
-async function toolBrowserClose() {
-  const tab = await getActiveTab();
-  return toolCloseTab({ tabId: tab.id });
+async function toolBrowserClose(_params, ctx) {
+  const tab = await getActiveTab(ctx);
+  return toolCloseTab({ tabId: tab.id }, ctx);
 }
 
 const TOOL_HANDLERS = new Map([
@@ -6014,8 +6549,8 @@ const TOOL_HANDLERS = new Map([
   ["approval_rules_set", async (params) => globalThis.AutoDOMActionGate.setApprovalRules(params?.rules || [])],
   [
     "takeover_set",
-    async (params) => {
-      const tabId = params?.tabId ?? (await getActiveTab()).id;
+    async (params, ctx) => {
+      const tabId = params?.tabId ?? (await getActiveTab(ctx)).id;
       return _setTakeover(tabId, params?.on !== false);
     },
   ],
@@ -6032,35 +6567,35 @@ const TOOL_HANDLERS = new Map([
   ["browser_network_requests", toolGetNetworkRequests],
   ["browser_take_screenshot", toolScreenshot],
   ["browser_navigate", toolNavigate],
-  ["browser_navigate_back", () => toolNavigate({ action: "back" })],
+  ["browser_navigate_back", (_params, ctx) => toolNavigate({ action: "back" }, ctx)],
   ["browser_press_key", toolPressKey],
   [
     "browser_select_option",
-    (params) =>
+    (params, ctx) =>
       toolSelectOption({
         selector: _playwrightCompatTarget(params),
         value: Array.isArray(params?.values) ? params.values[0] : params?.value,
         text: params?.text,
         index: params?.index,
-      }),
+      }, ctx),
   ],
-  ["browser_hover", (params) => toolHover({ selector: _playwrightCompatTarget(params) })],
+  ["browser_hover", (params, ctx) => toolHover({ selector: _playwrightCompatTarget(params) }, ctx)],
   [
     "browser_drag",
-    (params) =>
+    (params, ctx) =>
       toolDragAndDrop({
         sourceSelector: params?.startTarget || params?.sourceSelector,
         targetSelector: params?.endTarget || params?.targetSelector,
-      }),
+      }, ctx),
   ],
   ["browser_resize", toolSetViewport],
   [
     "browser_handle_dialog",
-    (params) =>
+    (params, ctx) =>
       toolHandleDialog({
         action: params?.accept === false ? "dismiss" : "accept",
         promptText: params?.promptText,
-      }),
+      }, ctx),
   ],
   ["browser_evaluate", toolBrowserEvaluate],
   ["browser_close", toolBrowserClose],
@@ -6078,6 +6613,18 @@ try {
     });
     for (const [name, fn] of Object.entries(mediaHandlers)) {
       TOOL_HANDLERS.set(name, fn);
+    }
+    // Keep every chat panel's ○ tab-record toggle in sync.
+    for (const name of ["tab_recording_start", "tab_recording_stop"]) {
+      const fn = mediaHandlers[name];
+      if (typeof fn !== "function") continue;
+      TOOL_HANDLERS.set(name, async (params, ctx) => {
+        const result = await fn(params, ctx);
+        const started = name === "tab_recording_start";
+        const ok = !!result && result.ok !== false && !result.error;
+        if (!started || ok) _broadcastToolbarState({ tabRecording: started && ok });
+        return result;
+      });
     }
   }
 } catch (mtErr) {
@@ -6107,6 +6654,11 @@ try {
       closeRunTab: (tabId) => _closeRunTab(tabId),
       llmPick: _workflowLlmPick,
       visionPick: _workflowVisionPick,
+      // Features → visionHeal "auto": only with an enabled, usable provider.
+      visionAvailable: () => _directProviderUsable(),
+      getFeatures: _getFeatures,
+      broadcastState: _broadcastToolbarState,
+      onWorkflowSaved: _mirrorWorkflowToServer,
     });
     for (const [name, fn] of Object.entries(workflowEngine.handlers)) {
       TOOL_HANDLERS.set(name, fn);
@@ -6115,6 +6667,18 @@ try {
   }
 } catch (wfErr) {
   _debugWarn("[AutoDOM SW] Failed to wire workflow engine:", wfErr && wfErr.message);
+}
+
+// Saved workflows are mirrored by the bridge to ~/.autodom/workflows. MCP
+// save tools mirror on the server side already; saves from the chat panel
+// (/teach) and locators healed during a run are pushed from here.
+function _mirrorWorkflowToServer(workflow, info) {
+  if (!workflow?.id || info?.origin === "bridge") return;
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "WORKFLOW_MIRROR", workflow, reason: info?.reason || "save" }));
+    }
+  } catch (_) {}
 }
 
 // Background tab for unattended runs: in the AutoDOM group when isolation
@@ -6127,13 +6691,13 @@ async function _openWorkflowRunTab() {
   return chrome.tabs.create({ url: "about:blank", active: false });
 }
 
+// A direct provider the SW can call itself: the user enabled AI in the
+// popup and the provider is set up (Ollama needs no key).
 function _directProviderUsable() {
+  if (aiProviderSettings?.enabled !== true) return false;
   const provider = String(aiProviderSettings?.source || "").toLowerCase();
   const hasKey = !!String(aiProviderSettings?.apiKey || "").trim();
-  return (
-    (provider === "ollama" && aiProviderSettings?.enabled === true) ||
-    ((provider === "openai" || provider === "anthropic") && hasKey)
-  );
+  return provider === "ollama" || ((provider === "openai" || provider === "anthropic") && hasKey);
 }
 
 // Vision self-heal: the configured direct provider looks at a screenshot
@@ -6198,6 +6762,7 @@ async function _scheduledPromptRun(prompt) {
   const runTab = await _openWorkflowRunTab();
   try {
     return await runAgentLoop({
+      origin: "schedule",
       providerType: provider,
       text: prompt,
       context: {},
@@ -6332,20 +6897,19 @@ async function _sendToOffscreenRecorder(message) {
   return await _sendRawOffscreenRecorderMessage(message);
 }
 
-async function handleToolCall(tool, params, id) {
+async function handleToolCall(tool, params, id, ctx) {
   // Reset inactivity timer on every real tool call
   touchToolActivity();
 
   // ─── Per-Domain Rate Limiting ────────────────────────────
   try {
     let tab;
-    if (_agentRunContext?.isolated) {
-      // Rate-limit the tab the agent is actually driving, not the one
+    if (ctx?.tabId != null) {
+      // Rate-limit the tab the call is actually driving, not the one
       // the user happens to be looking at.
-      tab =
-        _agentRunContext.tabId != null
-          ? await chrome.tabs.get(_agentRunContext.tabId).catch(() => null)
-          : null;
+      tab = await chrome.tabs.get(ctx.tabId).catch(() => null);
+    } else if (ctx?.isolated) {
+      tab = null;
     } else {
       tab = (await chrome.tabs.query({ active: true, currentWindow: true }))[0];
     }
@@ -6375,6 +6939,15 @@ async function handleToolCall(tool, params, id) {
       tool,
       params,
       id,
+      // The confirmed call later runs on the same tab/client as this one.
+      ctx: ctx
+        ? {
+            clientId: ctx.clientId,
+            isolated: ctx.isolated,
+            tabId: ctx.tabId,
+            windowId: ctx.windowId,
+          }
+        : null,
       reason: sensitiveCheck.reason,
       timestamp: Date.now(),
     });
@@ -6397,38 +6970,49 @@ async function handleToolCall(tool, params, id) {
   try {
     const handler = TOOL_HANDLERS.get(tool);
     if (!handler) return { error: `Unknown tool: ${tool}` };
-    return await handler(params);
+    _throwIfCancelled(ctx);
+    return await handler(params, ctx);
   } catch (err) {
+    if (err?.cancelled) return _cancelledResult(err.reason);
     return { error: err.message };
   }
 }
 
 // ─── Helper: Get active tab ──────────────────────────────────
 
-async function getActiveTab() {
+// Resolve the tab a call works on, from its CallContext. Writes back to
+// ctx when the pinned tab has gone so later steps of the same call agree.
+async function getActiveTab(ctx) {
   // Tab-group isolation: a bridge call resolves ONLY to the tab this
   // client owns/adopted. Never fall back to whatever the user is looking at.
-  if (_agentRunContext?.isolated) {
-    if (_agentRunContext.tabId != null) {
+  if (ctx?.isolated) {
+    if (ctx.tabId != null) {
       try {
-        return await chrome.tabs.get(_agentRunContext.tabId);
+        return await chrome.tabs.get(ctx.tabId);
       } catch (_) {
-        _agentRunContext = { ..._agentRunContext, tabId: null };
+        ctx.tabId = null;
       }
     }
     throw new Error(NO_AUTODOM_TAB_MESSAGE);
   }
-  const pinnedWindowId = _agentRunContext?.windowId;
-  if (_agentRunContext?.tabId != null) {
-    try {
-      return await chrome.tabs.get(_agentRunContext.tabId);
-    } catch (_) {
-      _agentRunContext =
-        pinnedWindowId != null ? { windowId: pinnedWindowId } : null;
+  if (!ctx) {
+    // Every entry point passes a context; a call without one cannot know
+    // whose tab it is meant for, so it fails closed under isolation.
+    _ctxlessCalls++;
+    if (await _AutoDOMTabGroup()?.isEnabled?.()) {
+      throw new Error(NO_AUTODOM_TAB_MESSAGE);
     }
   }
-  // Sticky tab restriction: no agent context → use first live sticky tab
-  if (_stickyTabIds.size > 0 && _agentRunContext == null) {
+  const pinnedWindowId = ctx?.windowId ?? null;
+  if (ctx?.tabId != null) {
+    try {
+      return await chrome.tabs.get(ctx.tabId);
+    } catch (_) {
+      ctx.tabId = null;
+    }
+  }
+  // Sticky tab restriction: nothing pinned → use first live sticky tab
+  if (_stickyTabIds.size > 0 && pinnedWindowId == null) {
     for (const tabId of _stickyTabIds) {
       try { return await chrome.tabs.get(tabId); } catch (_) {}
     }
@@ -6469,20 +7053,97 @@ async function executeInTab(tabId, func, args = [], world = "MAIN") {
   }
 }
 
-async function waitForTabComplete(tabId, timeout = 15000) {
+// ─── In-page waits ───────────────────────────────────────────
+// Wait tools used to poll with one executeScript round trip every
+// 100-250 ms. Instead each round runs one in-page wait (MutationObserver /
+// PerformanceObserver) for a slice of at most WAIT_SLICE_MS, so a wait
+// costs a handful of injections and reacts as soon as the page changes.
+// `pageFn(...args, sliceMs)` must resolve truthy when the condition holds
+// and falsy when its slice ends. The SW side races each slice with the
+// call's signal (cancellation is immediate; the page-side wait just ends
+// its slice) and with a backstop for throttled background-tab timers.
+const WAIT_SLICE_MS = 1500;
+const WAIT_SLICE_BACKSTOP_MS = 400;
+
+function _raceSlice(promise, signal, ms) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new _CallCancelledError(_abortReason(signal)));
+      return;
+    }
+    let onAbort = null;
+    const done = (fn, v) => {
+      clearTimeout(timer);
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+      fn(v);
+    };
+    const timer = setTimeout(() => done(resolve, false), ms);
+    if (signal) {
+      onAbort = () => done(reject, new _CallCancelledError(_abortReason(signal)));
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    promise.then(
+      (v) => done(resolve, v),
+      (err) => done(reject, err),
+    );
+  });
+}
+
+// Resolves { met: true, elapsed } or { met: false } after maxWait ms.
+async function _waitInPage(tabId, pageFn, args, maxWait, signal) {
+  const start = Date.now();
+  for (;;) {
+    if (signal?.aborted) throw new _CallCancelledError(_abortReason(signal));
+    const remaining = maxWait - (Date.now() - start);
+    if (remaining <= 0) return { met: false };
+    const slice = Math.max(1, Math.min(WAIT_SLICE_MS, remaining));
+    let met = false;
+    try {
+      met = await _raceSlice(
+        executeInTab(tabId, pageFn, [...args, slice]),
+        signal,
+        slice + WAIT_SLICE_BACKSTOP_MS,
+      );
+    } catch (err) {
+      if (err instanceof _CallCancelledError) throw err;
+      const msg = String(err?.message || err);
+      // Restricted page, tab gone or a bad argument (invalid selector):
+      // fail the same way the polling version did.
+      if (/Cannot inject|No tab with id|Cannot access|not a valid selector|SyntaxError/i.test(msg)) throw err;
+      // Document replaced mid-slice (navigation): retry on the new one.
+      await _sleep(100, signal);
+      continue;
+    }
+    if (met) return { met: true, elapsed: Date.now() - start };
+  }
+}
+
+// signal (optional): the call's AbortSignal — rejects with
+// _CallCancelledError as soon as the call is cancelled.
+async function waitForTabComplete(tabId, timeout = 15000, signal = null) {
   const initialTab = await chrome.tabs.get(tabId);
   if (initialTab.status === "complete") {
     return initialTab;
   }
+  if (signal?.aborted) throw new _CallCancelledError(_abortReason(signal));
 
-  return await new Promise((resolve) => {
+  return await new Promise((resolve, reject) => {
     let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new _CallCancelledError(_abortReason(signal)));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
 
     const finish = (tab) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       chrome.tabs.onUpdated.removeListener(listener);
+      signal?.removeEventListener("abort", onAbort);
       resolve(tab || initialTab);
     };
 
@@ -6515,8 +7176,8 @@ async function waitForTabComplete(tabId, timeout = 15000) {
 // ─── Tool Implementations ────────────────────────────────────
 
 // 1. Navigate
-async function toolNavigate(params) {
-  const tab = await getActiveTab();
+async function toolNavigate(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { url, action } = params;
 
   if (action === "back") {
@@ -6544,10 +7205,10 @@ async function toolNavigate(params) {
 }
 
 // 2. Click
-async function toolClick(params) {
+async function toolClick(params, ctx) {
   const ref = _refParam(params);
-  if (ref) return _actByRef(ref, { action: params?.dblClick ? "dblclick" : "click" });
-  const tab = await getActiveTab();
+  if (ref) return _actByRef(ref, { action: params?.dblClick ? "dblclick" : "click" }, ctx);
+  const tab = await getActiveTab(ctx);
   const { selector, text, dblClick } = params;
   return await executeInTab(
     tab.id,
@@ -6589,13 +7250,13 @@ async function toolClick(params) {
 }
 
 // 3. Type text
-async function toolTypeText(params) {
+async function toolTypeText(params, ctx) {
   const clearFirst = params?.clearFirst ?? params?.clear ?? false;
   const ref = _refParam(params);
   if (ref) {
-    return _actByRef(ref, { action: "fill", value: params?.text ?? "", append: !clearFirst });
+    return _actByRef(ref, { action: "fill", value: params?.text ?? "", append: !clearFirst }, ctx);
   }
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(ctx);
   const { selector, text } = params;
   return await executeInTab(
     tab.id,
@@ -6646,10 +7307,10 @@ function _refParam(params) {
   return m ? m[1] : null;
 }
 
-async function _actByRef(ref, step) {
+async function _actByRef(ref, step, ctx) {
   const P = globalThis.AutoDOMWorkflow?._page;
   if (!P) return { error: "workflow engine not loaded" };
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(ctx);
   await executeInTab(tab.id, P._pageWfLib, [], "ISOLATED");
   const res = await executeInTab(tab.id, P._pageWfActOnRef, [ref, step], "ISOLATED");
   if (!res?.ok) {
@@ -6666,23 +7327,25 @@ async function _actByRef(ref, step) {
   };
 }
 
-async function _interactiveSnapshot(params) {
+async function _interactiveSnapshot(params, ctx) {
   const W = globalThis.AutoDOMWorkflow;
   if (!W) return { error: "workflow engine not loaded" };
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(ctx);
   await executeInTab(tab.id, W._page._pageWfLib, [], "ISOLATED");
   const limit = Math.max(10, Math.min(1000, Number(params?.limit) || 300));
   const res = await executeInTab(tab.id, W._page._pageWfCandidates, [limit], "ISOLATED");
   const all = res?.candidates || [];
   const shown = params?.includeHidden ? all : all.filter((c) => c.visible !== false);
   let webmcp = 0;
-  try {
-    const listed = await Promise.race([
-      executeInTab(tab.id, _pageWebMcpList, [], "MAIN"),
-      new Promise((r) => setTimeout(() => r(null), 800)),
-    ]);
-    webmcp = listed?.tools?.length || 0;
-  } catch (_) {}
+  if ((await _getFeatures()).webmcp !== false) {
+    try {
+      const listed = await Promise.race([
+        executeInTab(tab.id, _pageWebMcpList, [], "MAIN"),
+        new Promise((r) => setTimeout(() => r(null), 800)),
+      ]);
+      webmcp = listed?.tools?.length || 0;
+    } catch (_) {}
+  }
   const header = [`Page: ${tab.title || ""} — ${tab.url || ""}`];
   if (webmcp) header.push(`WebMCP: this page exposes ${webmcp} tool${webmcp === 1 ? "" : "s"} (webmcp_list_tools / webmcp_call_tool)`);
   const lines = shown.map(W.compactLine);
@@ -6755,15 +7418,31 @@ async function _pageWebMcpCall(name, args) {
   }
 }
 
-async function toolWebMcpListTools() {
-  const tab = await getActiveTab();
-  const res = await executeInTab(tab.id, _pageWebMcpList, [], "MAIN");
+const WEBMCP_DISABLED_RESULT = Object.freeze({ ok: false, error: "WebMCP disabled in AutoDOM settings" });
+const WEBMCP_LIST_TIMEOUT_MS = 5000;
+
+async function toolWebMcpListTools(_params, ctx) {
+  if ((await _getFeatures()).webmcp === false) return { ...WEBMCP_DISABLED_RESULT };
+  const tab = await getActiveTab(ctx);
+  // A page whose getTools() never settles must not hold the call (and its
+  // tab lane) until the bridge timeout.
+  let timer;
+  const res = await Promise.race([
+    executeInTab(tab.id, _pageWebMcpList, [], "MAIN"),
+    new Promise((r) => {
+      timer = setTimeout(
+        () => r({ ok: false, timedOut: true, error: `The page did not list its WebMCP tools within ${WEBMCP_LIST_TIMEOUT_MS / 1000}s.` }),
+        WEBMCP_LIST_TIMEOUT_MS,
+      );
+    }),
+  ]).finally(() => clearTimeout(timer));
   return { ...res, url: tab.url, count: res?.tools?.length || 0 };
 }
 
-async function toolWebMcpCallTool(params) {
+async function toolWebMcpCallTool(params, ctx) {
+  if ((await _getFeatures()).webmcp === false) return { ...WEBMCP_DISABLED_RESULT };
   if (!params?.name) return { error: "name is required" };
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(ctx);
   return executeInTab(tab.id, _pageWebMcpCall, [String(params.name), params.arguments || params.args || {}], "MAIN");
 }
 
@@ -6773,6 +7452,29 @@ async function toolWebMcpCallTool(params) {
 // short deadline; the fallback activates the tab for one capture and puts
 // the user's tab back right away (no window focus change).
 const BACKGROUND_CAPTURE_CDP_TIMEOUT_MS = 4000;
+
+// captureVisibleTab is limited to 2 calls per second per extension, and
+// the brief-activation fallback flips a window's active tab. With calls
+// running in parallel lanes, only these sections are serialized: one
+// capture at a time, at least CAPTURE_MIN_SPACING_MS apart. (A single
+// chain rather than one per window, because the quota is extension-wide.)
+const CAPTURE_MIN_SPACING_MS = 500;
+let _captureChain = Promise.resolve();
+let _lastCaptureAt = 0;
+function _withWindowCapture(windowId, fn) {
+  const next = _captureChain.then(async () => {
+    const wait = CAPTURE_MIN_SPACING_MS - (Date.now() - _lastCaptureAt);
+    if (wait > 0) await _sleep(wait);
+    try {
+      return await fn(windowId);
+    } finally {
+      _lastCaptureAt = Date.now();
+    }
+  });
+  _captureChain = next.catch(() => {});
+  return next;
+}
+
 async function _captureBackgroundTab(tab, params) {
   const jpeg = /^jpe?g$/i.test(String(params?.format || ""));
   try {
@@ -6799,26 +7501,28 @@ async function _captureBackgroundTab(tab, params) {
   } catch (_) {
     // fall through to the brief-activation capture
   }
-  const [previous] = await chrome.tabs.query({
-    active: true,
-    windowId: tab.windowId,
-  });
-  try {
-    await chrome.tabs.update(tab.id, { active: true });
-    await new Promise((r) => setTimeout(r, 150));
-    return await chrome.tabs.captureVisibleTab(tab.windowId, {
-      format: jpeg ? "jpeg" : "png",
-      quality: params?.quality || 80,
+  return _withWindowCapture(tab.windowId, async () => {
+    const [previous] = await chrome.tabs.query({
+      active: true,
+      windowId: tab.windowId,
     });
-  } finally {
-    if (previous && previous.id !== tab.id) {
-      await chrome.tabs.update(previous.id, { active: true }).catch(() => {});
+    try {
+      await chrome.tabs.update(tab.id, { active: true });
+      await new Promise((r) => setTimeout(r, 150));
+      return await chrome.tabs.captureVisibleTab(tab.windowId, {
+        format: jpeg ? "jpeg" : "png",
+        quality: params?.quality || 80,
+      });
+    } finally {
+      if (previous && previous.id !== tab.id) {
+        await chrome.tabs.update(previous.id, { active: true }).catch(() => {});
+      }
     }
-  }
+  });
 }
 
-async function toolScreenshot(params) {
-  const tab = await getActiveTab();
+async function toolScreenshot(params, ctx) {
+  const tab = await getActiveTab(ctx);
 
   // Temporarily hide AutoDOM's own injected UI (chat panel, overlays,
   // stop button, run indicator) so the screenshot reflects what the
@@ -6839,16 +7543,22 @@ async function toolScreenshot(params) {
   const PUSH_CLASS = "__autodom_panel_open";
   const PUSH_MARK = "data-autodom-screenshot-unpushed";
 
+  // Returns how many things it hid/restored (0 when none of our UI is on
+  // the page, or scripting is not allowed there). When hiding changed
+  // something it also waits, in the page, for two animation frames (60 ms
+  // fallback for throttled background tabs) so the change is painted.
   async function setHiddenState(hidden) {
     try {
-      await chrome.scripting.executeScript({
+      const res = await chrome.scripting.executeScript({
         target: { tabId: tab.id, allFrames: false },
         world: "MAIN",
         args: [HIDE_IDS, HIDE_MARK, PUSH_CLASS, PUSH_MARK, hidden],
-        func: (ids, mark, pushClass, pushMark, on) => {
+        func: async (ids, mark, pushClass, pushMark, on) => {
+          let changed = 0;
           for (const id of ids) {
             const el = document.getElementById(id);
             if (!el) continue;
+            if (on || el.hasAttribute(mark)) changed += 1;
             if (on) {
               if (!el.hasAttribute(mark)) {
                 // Snapshot BOTH display + visibility so we can restore
@@ -6892,6 +7602,7 @@ async function toolScreenshot(params) {
               if (html.classList.contains(pushClass)) {
                 html.setAttribute(pushMark, "1");
                 html.classList.remove(pushClass);
+                changed += 1;
               }
               // Also clear the panel-width CSS variable so any host-page
               // CSS that depends on it reflows for the capture.
@@ -6902,11 +7613,13 @@ async function toolScreenshot(params) {
                   root.style.getPropertyValue("--autodom-panel-w"),
                 );
                 root.style.removeProperty("--autodom-panel-w");
+                changed += 1;
               }
             } else {
               if (html.hasAttribute(pushMark)) {
                 html.classList.add(pushClass);
                 html.removeAttribute(pushMark);
+                changed += 1;
               }
               const root = document.documentElement;
               if (root && root.hasAttribute("data-autodom-prev-pw")) {
@@ -6915,36 +7628,54 @@ async function toolScreenshot(params) {
                   root.getAttribute("data-autodom-prev-pw"),
                 );
                 root.removeAttribute("data-autodom-prev-pw");
+                changed += 1;
               }
             }
           }
+          if (on && changed > 0) {
+            // captureVisibleTab snapshots the current paint: let the
+            // reflow + display:none land first.
+            await new Promise((resolve) => {
+              let done = false;
+              const finish = () => {
+                if (done) return;
+                done = true;
+                resolve();
+              };
+              try {
+                requestAnimationFrame(() => requestAnimationFrame(finish));
+              } catch (_) {}
+              setTimeout(finish, 60);
+            });
+          }
+          return changed;
         },
       });
+      return Number(res?.[0]?.result) || 0;
     } catch (_e) {
       // Tab may not allow scripting (e.g. chrome:// pages); fall through.
+      return 0;
     }
   }
 
   let hidden = false;
   try {
-    await setHiddenState(true);
-    hidden = true;
-    // Two animation frames + a margin so the reflow + display-none
-    // change paint before capture. captureVisibleTab snapshots the
-    // current paint, so we MUST wait long enough for the compositor.
-    await new Promise((r) => setTimeout(r, 120));
+    // Nothing of ours on the page → no paint to wait for, nothing to restore.
+    hidden = (await setHiddenState(true)) > 0;
 
     let dataUrl = null;
-    if (_isolatedClientId() && !tab.active) {
+    if (_isolatedClientId(ctx) && !tab.active) {
       // The agent's tab sits in the background (we never activate it), so
       // captureVisibleTab would photograph whatever the user is viewing.
       dataUrl = await _captureBackgroundTab(tab, params);
     }
     if (!dataUrl) {
-      dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-        format: params?.format || "png",
-        quality: params?.quality || 80,
-      });
+      dataUrl = await _withWindowCapture(tab.windowId, () =>
+        chrome.tabs.captureVisibleTab(tab.windowId, {
+          format: params?.format || "png",
+          quality: params?.quality || 80,
+        }),
+      );
     }
     return { success: true, screenshot: dataUrl };
   } catch (err) {
@@ -6955,9 +7686,14 @@ async function toolScreenshot(params) {
 }
 
 // 5. Take snapshot (DOM/a11y tree)
-async function toolSnapshot(params) {
-  if (params?.mode === "interactive") return _interactiveSnapshot(params);
-  const tab = await getActiveTab();
+async function toolSnapshot(params, ctx) {
+  // Features → compactSnapshotsDefault: no mode given → the compact
+  // interactive list instead of the full tree.
+  if (params?.mode == null && (await _getFeatures()).compactSnapshotsDefault === true) {
+    return _interactiveSnapshot({ ...(params || {}), mode: "interactive" }, ctx);
+  }
+  if (params?.mode === "interactive") return _interactiveSnapshot(params, ctx);
+  const tab = await getActiveTab(ctx);
   const autoScroll = params?.autoScroll || false;
   const maxScrolls = Number.isFinite(params?.maxScrolls) ? params.maxScrolls : 12;
   const scrollDelayMs = Number.isFinite(params?.scrollDelayMs)
@@ -7071,8 +7807,8 @@ async function toolSnapshot(params) {
 }
 
 // 6. Evaluate Script
-async function toolEvaluateScript(params) {
-  const tab = await getActiveTab();
+async function toolEvaluateScript(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { script } = params;
   return await executeInTab(
     tab.id,
@@ -7090,8 +7826,8 @@ async function toolEvaluateScript(params) {
 }
 
 // 7. Fill form
-async function toolFillForm(params) {
-  const tab = await getActiveTab();
+async function toolFillForm(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { fields } = params; // [{selector, value}]
   return await executeInTab(
     tab.id,
@@ -7121,10 +7857,10 @@ async function toolFillForm(params) {
 }
 
 // 8. Hover
-async function toolHover(params) {
+async function toolHover(params, ctx) {
   const ref = _refParam(params);
-  if (ref) return _actByRef(ref, { action: "hover" });
-  const tab = await getActiveTab();
+  if (ref) return _actByRef(ref, { action: "hover" }, ctx);
+  const tab = await getActiveTab(ctx);
   const { selector } = params;
   return await executeInTab(
     tab.id,
@@ -7145,10 +7881,10 @@ async function toolHover(params) {
 }
 
 // 9. Press key
-async function toolPressKey(params) {
+async function toolPressKey(params, ctx) {
   const ref = _refParam(params);
-  if (ref) return _actByRef(ref, { action: "press", key: params?.key || "Enter" });
-  const tab = await getActiveTab();
+  if (ref) return _actByRef(ref, { action: "press", key: params?.key || "Enter" }, ctx);
+  const tab = await getActiveTab(ctx);
   const { key, selector } = params;
   return await executeInTab(
     tab.id,
@@ -7187,8 +7923,8 @@ async function toolPressKey(params) {
 }
 
 // 10. Get page info
-async function toolGetPageInfo(params) {
-  const tab = await getActiveTab();
+async function toolGetPageInfo(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const moreInfo = await executeInTab(
     tab.id,
     () => {
@@ -7214,24 +7950,57 @@ async function toolGetPageInfo(params) {
 }
 
 // 11. Wait for text
-async function toolWaitForText(params) {
-  const tab = await getActiveTab();
+async function toolWaitForText(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { text, timeout } = params;
   const maxWait = timeout || 10000;
-  const startTime = Date.now();
 
-  while (Date.now() - startTime < maxWait) {
-    const found = await executeInTab(
-      tab.id,
-      (text) => {
-        return document.body.innerText.includes(text);
-      },
-      [text],
-    );
-    if (found)
-      return { success: true, found: true, elapsed: Date.now() - startTime };
-    await new Promise((r) => setTimeout(r, 150));
-  }
+  const res = await _waitInPage(
+    tab.id,
+    (text, sliceMs) => {
+      const has = () => !!document.body && document.body.innerText.includes(text);
+      if (has()) return true;
+      return new Promise((resolve) => {
+        let done = false;
+        let queued = null;
+        let lastCheck = 0;
+        const finish = (v) => {
+          if (done) return;
+          done = true;
+          obs.disconnect();
+          clearTimeout(queued);
+          clearTimeout(endTimer);
+          clearInterval(poll);
+          resolve(v);
+        };
+        // innerText forces layout: coalesce bursts of mutations.
+        const check = () => {
+          queued = null;
+          lastCheck = Date.now();
+          if (has()) finish(true);
+        };
+        const obs = new MutationObserver(() => {
+          if (queued) return;
+          const wait = Math.max(0, 50 - (Date.now() - lastCheck));
+          queued = setTimeout(check, wait);
+        });
+        obs.observe(document.documentElement, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+          attributes: true,
+        });
+        // Fallback for changes no mutation reports (CSS animations, media
+        // queries).
+        const poll = setInterval(check, 250);
+        const endTimer = setTimeout(() => finish(has()), sliceMs);
+      });
+    },
+    [text],
+    maxWait,
+    ctx?.signal,
+  );
+  if (res.met) return { success: true, found: true, elapsed: res.elapsed };
 
   return {
     success: false,
@@ -7241,8 +8010,8 @@ async function toolWaitForText(params) {
 }
 
 // 12. Query elements
-async function toolQueryElements(params) {
-  const tab = await getActiveTab();
+async function toolQueryElements(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { selector, limit } = params;
   return await executeInTab(
     tab.id,
@@ -7270,8 +8039,8 @@ async function toolQueryElements(params) {
 }
 
 // 13. Extract text
-async function toolExtractText(params) {
-  const tab = await getActiveTab();
+async function toolExtractText(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { selector } = params;
   return await executeInTab(
     tab.id,
@@ -7288,9 +8057,9 @@ async function toolExtractText(params) {
 }
 
 // 14. Get network requests (basic — from captured data)
-async function toolGetNetworkRequests(params) {
+async function toolGetNetworkRequests(params, ctx) {
   // Note: We capture via performance API, not debugger for simplicity
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(ctx);
   return await executeInTab(
     tab.id,
     (limit, urlPattern, artifactOnly) => {
@@ -7320,8 +8089,8 @@ async function toolGetNetworkRequests(params) {
 }
 
 // 15. Get console logs (injected capture)
-async function toolGetConsoleLogs(params) {
-  const tab = await getActiveTab();
+async function toolGetConsoleLogs(params, ctx) {
+  const tab = await getActiveTab(ctx);
   // Inject a console capture if not already done
   return await executeInTab(
     tab.id,
@@ -7366,7 +8135,7 @@ async function toolGetConsoleLogs(params) {
 // ─── Tab Management Tools ────────────────────────────────────
 
 // 16. List all tabs
-async function toolListTabs(params) {
+async function toolListTabs(params, ctx) {
   const allTabs = await chrome.tabs.query({});
   const listIndexById = new Map(allTabs.map((t, listIndex) => [t.id, listIndex]));
   let tabs = params?.currentWindow === false
@@ -7375,7 +8144,7 @@ async function toolListTabs(params) {
   // Tab isolation: by default only the AutoDOM group is listed. `all:true`
   // also lists the user's own tabs (read-only) so one can be picked for
   // pin_tab; listing never touches them.
-  const isoClient = _isolatedClientId();
+  const isoClient = _isolatedClientId(ctx);
   let owned = null;
   let adopted = null;
   if (isoClient) {
@@ -7412,14 +8181,14 @@ async function toolListTabs(params) {
 }
 
 // clientId of the bridge call in flight when tab isolation is on, else null.
-function _isolatedClientId() {
-  return _agentRunContext?.isolated ? _agentRunContext.clientId || null : null;
+function _isolatedClientId(ctx) {
+  return ctx?.isolated ? ctx.clientId || null : null;
 }
 
 // 17. Switch to a tab by ID or index
-async function toolSwitchTab(params) {
+async function toolSwitchTab(params, ctx) {
   const { tabId, index } = params;
-  const isoClient = _isolatedClientId();
+  const isoClient = _isolatedClientId(ctx);
   let targetTab;
   if (tabId) {
     targetTab = await chrome.tabs.get(tabId);
@@ -7477,9 +8246,9 @@ async function toolSwitchTab(params) {
 }
 
 // 18. Wait for a new tab to open (e.g. after clicking a link with target=_blank)
-async function toolWaitForNewTab(params) {
+async function toolWaitForNewTab(params, ctx) {
   const timeout = params?.timeout || 10000;
-  const isoClient = _isolatedClientId();
+  const isoClient = _isolatedClientId(ctx);
   const existingTabs = await chrome.tabs.query({});
   const existingIds = new Set(existingTabs.map((t) => t.id));
 
@@ -7488,6 +8257,7 @@ async function toolWaitForNewTab(params) {
     const timer = setTimeout(() => {
       if (!resolved) {
         resolved = true;
+        detachCancel();
         chrome.tabs.onCreated.removeListener(listener);
         resolve({
           success: false,
@@ -7495,6 +8265,13 @@ async function toolWaitForNewTab(params) {
         });
       }
     }, timeout);
+    const detachCancel = _onCallCancel(ctx, (reason) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      chrome.tabs.onCreated.removeListener(listener);
+      resolve(_cancelledResult(reason));
+    });
 
     const listener = async (tab) => {
       if (!existingIds.has(tab.id) && !resolved) {
@@ -7509,6 +8286,7 @@ async function toolWaitForNewTab(params) {
         }
         resolved = true;
         clearTimeout(timer);
+        detachCancel();
         chrome.tabs.onCreated.removeListener(listener);
         if (isoClient) {
           // Belongs to the session now; the caller re-targets to it. No
@@ -7536,10 +8314,10 @@ async function toolWaitForNewTab(params) {
 }
 
 // 19. Close a tab
-async function toolCloseTab(params) {
+async function toolCloseTab(params, ctx) {
   const { tabId } = params;
   if (!tabId) return { error: "tabId is required" };
-  const isoClient = _isolatedClientId();
+  const isoClient = _isolatedClientId(ctx);
   if (isoClient) {
     const Tab = _AutoDOMTabGroup();
     if (!Tab.ownsTab(isoClient, tabId)) {
@@ -7594,8 +8372,8 @@ async function toolCloseTab(params) {
 // ─── Additional Tools (20–35) ───────────────────────────────
 
 // 20. Scroll
-async function toolScroll(params) {
-  const tab = await getActiveTab();
+async function toolScroll(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { direction, amount, selector, behavior } = params;
   return await executeInTab(
     tab.id,
@@ -7643,12 +8421,12 @@ async function toolScroll(params) {
 }
 
 // 21. Select option from <select>
-async function toolSelectOption(params) {
+async function toolSelectOption(params, ctx) {
   const ref = _refParam(params);
   if (ref) {
-    return _actByRef(ref, { action: "select", value: params?.value ?? "", optionText: params?.text || "" });
+    return _actByRef(ref, { action: "select", value: params?.value ?? "", optionText: params?.text || "" }, ctx);
   }
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(ctx);
   const { selector, value, text, index } = params;
   return await executeInTab(
     tab.id,
@@ -7684,17 +8462,16 @@ async function toolSelectOption(params) {
 }
 
 // 22. Wait for element (CSS selector)
-async function toolWaitForElement(params) {
-  const tab = await getActiveTab();
+async function toolWaitForElement(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { selector, state, timeout } = params;
   const maxWait = timeout || 10000;
-  const startTime = Date.now();
   const desiredState = state || "visible"; // visible | hidden | attached | detached
 
-  while (Date.now() - startTime < maxWait) {
-    const check = await executeInTab(
-      tab.id,
-      (selector, desiredState) => {
+  const res = await _waitInPage(
+    tab.id,
+    (selector, desiredState, sliceMs) => {
+      const reached = () => {
         const el = document.querySelector(selector);
         if (desiredState === "attached") return !!el;
         if (desiredState === "detached") return !el;
@@ -7715,17 +8492,43 @@ async function toolWaitForElement(params) {
           return s.display === "none" || s.visibility === "hidden";
         }
         return !!el;
-      },
-      [selector, desiredState],
-    );
-    if (check)
-      return {
-        success: true,
-        elapsed: Date.now() - startTime,
-        state: desiredState,
       };
-    await new Promise((r) => setTimeout(r, 100));
-  }
+      if (reached()) return true;
+      return new Promise((resolve) => {
+        let done = false;
+        const finish = (v) => {
+          if (done) return;
+          done = true;
+          obs.disconnect();
+          clearTimeout(endTimer);
+          clearInterval(poll);
+          resolve(v);
+        };
+        const check = () => {
+          if (reached()) finish(true);
+        };
+        const obs = new MutationObserver(check);
+        obs.observe(document.documentElement, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+        });
+        // Visibility can change without a mutation (stylesheet media
+        // queries, animations); a cheap in-page poll covers that.
+        const poll = setInterval(check, 200);
+        const endTimer = setTimeout(() => finish(reached()), sliceMs);
+      });
+    },
+    [selector, desiredState],
+    maxWait,
+    ctx?.signal,
+  );
+  if (res.met)
+    return {
+      success: true,
+      elapsed: res.elapsed,
+      state: desiredState,
+    };
   return {
     success: false,
     error: `Element "${selector}" did not reach state "${desiredState}" within ${maxWait}ms`,
@@ -7733,11 +8536,11 @@ async function toolWaitForElement(params) {
 }
 
 // 23. Wait for navigation / page load
-async function toolWaitForNavigation(params) {
-  const tab = await getActiveTab();
+async function toolWaitForNavigation(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const timeout = params?.timeout || 15000;
   const startTime = Date.now();
-  const updatedTab = await waitForTabComplete(tab.id, timeout);
+  const updatedTab = await waitForTabComplete(tab.id, timeout, ctx?.signal);
   if (updatedTab.status === "complete") {
     return {
       success: true,
@@ -7754,8 +8557,8 @@ async function toolWaitForNavigation(params) {
 
 // 24. Handle browser dialog (alert/confirm/prompt)
 // Note: Dialogs in Chrome extensions are tricky. We use chrome.debugger for this.
-async function toolHandleDialog(params) {
-  const tab = await getActiveTab();
+async function toolHandleDialog(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { action, promptText } = params; // action: accept | dismiss
   try {
     await ensureDebugger(tab.id);
@@ -7780,8 +8583,8 @@ async function toolHandleDialog(params) {
 }
 
 // 25. Get cookies
-async function toolGetCookies(params) {
-  const tab = await getActiveTab();
+async function toolGetCookies(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const url = params?.url || tab.url;
   const cookies = await chrome.cookies.getAll({ url });
   return {
@@ -7799,8 +8602,8 @@ async function toolGetCookies(params) {
 }
 
 // 26. Set cookie
-async function toolSetCookie(params) {
-  const tab = await getActiveTab();
+async function toolSetCookie(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { name, value, domain, path, secure, httpOnly, expirationDate } =
     params;
   const url = params.url || tab.url;
@@ -7822,8 +8625,8 @@ async function toolSetCookie(params) {
 }
 
 // 27. Get localStorage/sessionStorage
-async function toolGetStorage(params) {
-  const tab = await getActiveTab();
+async function toolGetStorage(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { type, key } = params; // type: local | session
   return await executeInTab(
     tab.id,
@@ -7844,8 +8647,8 @@ async function toolGetStorage(params) {
 }
 
 // 28. Set localStorage/sessionStorage
-async function toolSetStorage(params) {
-  const tab = await getActiveTab();
+async function toolSetStorage(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { type, key, value, clear } = params;
   return await executeInTab(
     tab.id,
@@ -7870,8 +8673,8 @@ async function toolSetStorage(params) {
 }
 
 // 29. Get HTML (innerHTML/outerHTML)
-async function toolGetHtml(params) {
-  const tab = await getActiveTab();
+async function toolGetHtml(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { selector, outer } = params;
   return await executeInTab(
     tab.id,
@@ -8183,7 +8986,7 @@ function _extractLinksFromHtml(html, url) {
 // Fetch the raw response of any URL directly via HTTP without navigating a tab.
 // Useful as a fallback when artifact/report pages, including .gz payloads,
 // do not render cleanly through tab-based DOM tools.
-async function toolFetchPageSource(params) {
+async function toolFetchPageSource(params, ctx) {
   const {
     url,
     method = "GET",
@@ -8363,7 +9166,7 @@ async function toolFetchPageSource(params) {
   }
 }
 
-async function toolVerifyArtifactCounts(params = {}) {
+async function toolVerifyArtifactCounts(params = {}, ctx) {
   const response = await toolFetchPageSource({
     ...params,
     method: params.method || "GET",
@@ -8377,7 +9180,7 @@ async function toolVerifyArtifactCounts(params = {}) {
     maxBytes: params.maxBytes || DEFAULT_RAW_FETCH_MAX_BYTES,
     readMaxBytes: params.readMaxBytes || DEFAULT_ARTIFACT_READ_MAX_BYTES,
     decodedMaxBytes: params.decodedMaxBytes || params.readMaxBytes || DEFAULT_ARTIFACT_READ_MAX_BYTES,
-  });
+  }, ctx);
   if (params.includePayload !== true) {
     if (params.includeText !== true) {
       delete response.text;
@@ -8392,8 +9195,8 @@ async function toolVerifyArtifactCounts(params = {}) {
 }
 
 // 30. Set attribute on element
-async function toolSetAttribute(params) {
-  const tab = await getActiveTab();
+async function toolSetAttribute(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { selector, attribute, value } = params;
   return await executeInTab(
     tab.id,
@@ -8412,8 +9215,8 @@ async function toolSetAttribute(params) {
 }
 
 // 31. Check element state (visible, enabled, checked, etc.)
-async function toolCheckElementState(params) {
-  const tab = await getActiveTab();
+async function toolCheckElementState(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { selector } = params;
   return await executeInTab(
     tab.id,
@@ -8443,8 +9246,8 @@ async function toolCheckElementState(params) {
 }
 
 // 32. Drag and drop
-async function toolDragAndDrop(params) {
-  const tab = await getActiveTab();
+async function toolDragAndDrop(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { sourceSelector, targetSelector } = params;
   return await executeInTab(
     tab.id,
@@ -8510,8 +9313,8 @@ async function toolDragAndDrop(params) {
 }
 
 // 33. Right-click (context menu)
-async function toolRightClick(params) {
-  const tab = await getActiveTab();
+async function toolRightClick(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { selector } = params;
   return await executeInTab(
     tab.id,
@@ -8534,8 +9337,8 @@ async function toolRightClick(params) {
 }
 
 // 34. Execute async script (with await support)
-async function toolExecuteAsyncScript(params) {
-  const tab = await getActiveTab();
+async function toolExecuteAsyncScript(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { script } = params;
   return await executeInTab(
     tab.id,
@@ -8556,10 +9359,10 @@ async function toolExecuteAsyncScript(params) {
 }
 
 // 35. Set viewport / window size
-async function toolSetViewport(params) {
-  const tab = await getActiveTab();
+async function toolSetViewport(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { width, height } = params;
-  if (_isolatedClientId()) {
+  if (_isolatedClientId(ctx)) {
     // Resizing the browser window would resize the user's window. Emulate
     // the viewport on the agent's tab instead.
     try {
@@ -8592,10 +9395,10 @@ async function toolSetViewport(params) {
 }
 
 // 36. Open a new tab
-async function toolOpenNewTab(params) {
+async function toolOpenNewTab(params, ctx) {
   const { url, active } = params;
   try {
-    const isoClient = _isolatedClientId();
+    const isoClient = _isolatedClientId(ctx);
     if (isoClient) {
       // Background tab inside the AutoDOM group; `active` is ignored so
       // the user's focus never moves.
@@ -8626,31 +9429,65 @@ async function toolOpenNewTab(params) {
 }
 
 // 37. Wait for network idle
-async function toolWaitForNetworkIdle(params) {
-  const tab = await getActiveTab();
+async function toolWaitForNetworkIdle(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const timeout = params?.timeout || 10000;
   const idleTime = params?.idleTime || 500;
-  const startTime = Date.now();
 
-  while (Date.now() - startTime < timeout) {
-    // Check via Performance API — if no new resources loaded in idleTime ms
-    const pending = await executeInTab(
-      tab.id,
-      (idleTime) => {
-        const entries = performance.getEntriesByType("resource");
-        if (entries.length === 0) return false;
-        const lastEntry = entries[entries.length - 1];
-        const timeSinceLast =
-          performance.now() - (lastEntry.startTime + lastEntry.duration);
-        return timeSinceLast < idleTime;
-      },
-      [idleTime],
-    );
-
-    if (!pending) {
-      return { success: true, elapsed: Date.now() - startTime };
-    }
-    await new Promise((r) => setTimeout(r, 250));
+  // Idle = no resource finished loading within the last idleTime ms
+  // (Resource Timing, as before). A PerformanceObserver also sees entries
+  // after the page's resource buffer is full, which the old buffer-only
+  // check missed.
+  const res = await _waitInPage(
+    tab.id,
+    (idleTime, sliceMs) => {
+      const endOf = (e) => e.responseEnd || e.startTime + e.duration;
+      let last = null;
+      const entries = performance.getEntriesByType("resource");
+      for (let i = Math.max(0, entries.length - 50); i < entries.length; i++) {
+        const end = endOf(entries[i]);
+        if (last == null || end > last) last = end;
+      }
+      const quietFor = () => (last == null ? Infinity : performance.now() - last);
+      if (quietFor() >= idleTime) return true;
+      return new Promise((resolve) => {
+        const deadline = performance.now() + sliceMs;
+        let done = false;
+        let timer = null;
+        let obs = null;
+        const finish = (v) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          try { obs && obs.disconnect(); } catch (_) {}
+          resolve(v);
+        };
+        const tick = () => {
+          const quiet = quietFor();
+          if (quiet >= idleTime) return finish(true);
+          const left = deadline - performance.now();
+          if (left <= 0) return finish(false);
+          clearTimeout(timer);
+          timer = setTimeout(tick, Math.max(10, Math.min(idleTime - quiet, left)));
+        };
+        try {
+          obs = new PerformanceObserver((list) => {
+            for (const e of list.getEntries()) {
+              const end = endOf(e);
+              if (last == null || end > last) last = end;
+            }
+          });
+          obs.observe({ type: "resource" });
+        } catch (_) {}
+        tick();
+      });
+    },
+    [idleTime],
+    timeout,
+    ctx?.signal,
+  );
+  if (res.met) {
+    return { success: true, elapsed: res.elapsed };
   }
   return {
     success: false,
@@ -8661,7 +9498,7 @@ async function toolWaitForNetworkIdle(params) {
 // ─── Session Recording Tools ─────────────────────────────────
 
 // 38. Start recording
-async function toolStartRecording(params) {
+async function toolStartRecording(params, ctx) {
   sessionRecording = {
     active: true,
     startTime: Date.now(),
@@ -8669,7 +9506,7 @@ async function toolStartRecording(params) {
     maxActions: params?.maxActions || 1000,
   };
   // Inject user-interaction tracker into active tab
-  const tab = await getActiveTab();
+  const tab = await getActiveTab(ctx);
   try {
     await injectInteractionTracker(tab.id);
   } catch {}
@@ -8678,7 +9515,7 @@ async function toolStartRecording(params) {
 }
 
 // 39. Stop recording
-async function toolStopRecording(params) {
+async function toolStopRecording(params, ctx) {
   if (!sessionRecording.active)
     return { success: false, error: "No active recording" };
   recordAction("recording_stopped", "Session recording stopped");
@@ -8692,7 +9529,7 @@ async function toolStopRecording(params) {
 }
 
 // 40. Get recording (full action log)
-async function toolGetRecording(params) {
+async function toolGetRecording(params, ctx) {
   const { last } = params || {};
   const actions = last
     ? sessionRecording.actions.slice(-last)
@@ -8706,7 +9543,7 @@ async function toolGetRecording(params) {
 }
 
 // 41. Get session summary (human-readable case summary)
-async function toolGetSessionSummary(params) {
+async function toolGetSessionSummary(params, ctx) {
   if (sessionRecording.actions.length === 0) {
     return { summary: "No actions recorded yet.", steps: [] };
   }
@@ -8919,6 +9756,27 @@ async function injectInteractionTracker(tabId) {
 // (USER_ACTION listener merged into the main onMessage handler above)
 
 // ─── Record tool calls into session ──────────────────────────
+// Call context for a tool call typed into the in-page chat panel (or sent
+// by the popup): it targets the tab the panel lives in, else the active tab.
+async function _panelCallContext(sender) {
+  const senderTab = sender?.tab || null;
+  let tabId = senderTab?.id ?? null;
+  let windowId = senderTab?.windowId ?? null;
+  if (tabId == null) {
+    // Popup / extension page: the sticky tab if one is set, else the
+    // user's active tab.
+    const tab = await getActiveTab(_makeCallContext({ origin: "panel" })).catch(() => null);
+    tabId = tab?.id ?? null;
+    windowId = tab?.windowId ?? null;
+  }
+  return _makeCallContext({
+    origin: "panel",
+    clientId: `panel:${senderTab?.id ?? "popup"}`,
+    tabId,
+    windowId,
+  });
+}
+
 // Wrap handleToolCall to also record agent actions
 const _originalHandleToolCall = handleToolCall;
 // We patch it inline via the existing handleToolCall since it's referenced by name
@@ -8952,14 +9810,14 @@ function _hostOf(url) {
   try { return new URL(url).hostname || ""; } catch (_) { return ""; }
 }
 
-async function _bridgePolicyCheck(tool, params) {
+async function _bridgePolicyCheck(tool, params, ctx) {
   const Gate = globalThis.AutoDOMActionGate;
   if (tool === "approval_rules_set" || tool === "takeover_set") {
     return { error: `${tool} can only be changed by the user from the AutoDOM chat panel.`, blocked: true };
   }
   const tier = Gate?.tierOf ? Gate.tierOf(tool, params) : "write";
   let tab = null;
-  try { tab = await getActiveTab(); } catch (_) {}
+  try { tab = await getActiveTab(ctx); } catch (_) {}
   if (tab && _takeoverTabs.has(tab.id) && tier !== "read") {
     return {
       error: "USER_TAKEOVER: the user has taken control of this tab. Wait and retry after they click \"Hand back\".",
@@ -8997,33 +9855,36 @@ async function _bridgePolicyCheck(tool, params) {
   };
 }
 
-async function handleToolCallWithRecording(tool, params, id, meta = {}) {
+async function handleToolCallWithRecording(tool, params, id, meta = {}, ctx) {
   if (meta.bridge) {
-    const blocked = await _bridgePolicyCheck(tool, params);
+    const blocked = await _bridgePolicyCheck(tool, params, ctx);
     if (blocked && !(blocked.approvalRequired && meta.confirmed)) return blocked;
   }
-  // Record the tool call (filter sensitive params)
-  const safeParams = { ...params };
-  if (safeParams.text && tool === "type_text") {
-    // Check if typing into a sensitive field
-    if (
-      safeParams.selector &&
-      /password|passwd|pwd|secret|token|pin|cvv|cvc|ssn|credit/i.test(
-        safeParams.selector,
-      )
-    ) {
-      safeParams.text = "[REDACTED]";
+  // Record the tool call (filter sensitive params). recordAction is a
+  // no-op when no session recording runs, so skip the copy + stringify.
+  if (sessionRecording.active) {
+    const safeParams = { ...params };
+    if (safeParams.text && tool === "type_text") {
+      // Check if typing into a sensitive field
+      if (
+        safeParams.selector &&
+        /password|passwd|pwd|secret|token|pin|cvv|cvc|ssn|credit/i.test(
+          safeParams.selector,
+        )
+      ) {
+        safeParams.text = "[REDACTED]";
+      }
     }
+    recordAction(
+      "tool_call",
+      `${tool}(${JSON.stringify(safeParams).substring(0, 150)})`,
+      safeParams,
+      null,
+      null,
+    );
   }
-  recordAction(
-    "tool_call",
-    `${tool}(${JSON.stringify(safeParams).substring(0, 150)})`,
-    safeParams,
-    null,
-    null,
-  );
   try { workflowEngine?.noteAgentTool(tool, params); } catch (_) {}
-  return handleToolCall(tool, params, id);
+  return handleToolCall(tool, params, id, ctx);
 }
 
 // ─── Session Border Helpers ──────────────────────────────────
@@ -10843,6 +11704,290 @@ async function _runBridgeFix() {
   return { ok: true, steps, check: await _runBridgeCheck() };
 }
 
+// ─── Storage & cache (popup Features tab) ────────────────────
+// AUTODOM_STORAGE_USAGE → { ok, local: { totalBytes, groups: { runs,
+//   workflows, audit, logs, chat, other }, areas: { local, session } },
+//   server: { ok, bytes, breakdown } | null }
+// AUTODOM_CLEAR_STORAGE { scopes: [runs|audit|logs|cache|drafts|server] }
+//   → { ok, freedBytes, results: { [scope]: { ok, error? } } }
+// Saved workflows, schedules, shortcuts, settings, API keys, approval rules
+// and site permissions are never removed by any scope; the active workflow
+// recording (autodom.wf.recording) is left alone too.
+const STORAGE_GROUPS = ["runs", "workflows", "audit", "logs", "chat", "other"];
+const _STORAGE_GROUP_KEYS = Object.freeze({
+  runs: ["autodom.workflowRuns", "autodom.runUndo"],
+  workflows: ["autodom.workflows", "autodom.schedules", "autodom.shortcuts"],
+  audit: ["autodomAuditLog"],
+  logs: [ACTIVITY_LOG_KEY],
+});
+const STORAGE_CLEAR_SCOPES = ["runs", "audit", "logs", "cache", "drafts", "server"];
+const SERVER_USAGE_TIMEOUT_MS = 1500;
+const SERVER_FLUSH_TIMEOUT_MS = 8000;
+const _serverStorageWaiters = new Map(); // id → resolve
+let _serverStorageReqCounter = 0;
+
+function _storageGroupFor(key) {
+  for (const [group, keys] of Object.entries(_STORAGE_GROUP_KEYS)) {
+    if (keys.includes(key)) return group;
+  }
+  if (key.startsWith("__autodom_chat_")) return "chat";
+  if (key.startsWith("autodom.wf.")) return "workflows";
+  return "other";
+}
+
+function _estimateStoredBytes(key, value) {
+  try {
+    return key.length + (JSON.stringify(value) || "").length;
+  } catch (_) {
+    return key.length;
+  }
+}
+
+async function _areaGroupBytes(area) {
+  const groups = Object.fromEntries(STORAGE_GROUPS.map((g) => [g, 0]));
+  if (!area || typeof area.get !== "function") return { groups, total: 0 };
+  let all = {};
+  try {
+    all = (await area.get(null)) || {};
+  } catch (_) {
+    return { groups, total: 0 };
+  }
+  const keysByGroup = {};
+  for (const key of Object.keys(all)) {
+    (keysByGroup[_storageGroupFor(key)] ||= []).push(key);
+  }
+  const canMeasure = typeof area.getBytesInUse === "function";
+  for (const [group, keys] of Object.entries(keysByGroup)) {
+    let bytes = NaN;
+    if (canMeasure) {
+      try {
+        bytes = Number(await area.getBytesInUse(keys));
+      } catch (_) {}
+    }
+    if (!Number.isFinite(bytes)) {
+      bytes = keys.reduce((sum, k) => sum + _estimateStoredBytes(k, all[k]), 0);
+    }
+    groups[group] += bytes;
+  }
+  return { groups, total: Object.values(groups).reduce((a, b) => a + b, 0) };
+}
+
+function _sessionStorageArea() {
+  try {
+    const s = chrome.storage.session;
+    return s && s !== chrome.storage.local ? s : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function _serverStorageRequest(frame, timeoutMs) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve(null);
+  const id = `st-${Date.now()}-${++_serverStorageReqCounter}`;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      _serverStorageWaiters.delete(id);
+      resolve(null);
+    }, timeoutMs);
+    _serverStorageWaiters.set(id, (msg) => {
+      clearTimeout(timer);
+      resolve(msg);
+    });
+    try {
+      ws.send(JSON.stringify({ ...frame, id }));
+    } catch (_) {
+      _serverStorageWaiters.delete(id);
+      clearTimeout(timer);
+      resolve(null);
+    }
+  });
+}
+
+function _resolveServerStorageWaiter(message) {
+  const waiter = _serverStorageWaiters.get(message?.id);
+  if (!waiter) return;
+  _serverStorageWaiters.delete(message.id);
+  waiter(message);
+}
+
+async function _onWsConn_SERVER_USAGE_RESULT(message) {
+  _resolveServerStorageWaiter(message);
+}
+
+async function _onWsConn_SERVER_FLUSH_RESULT(message) {
+  _resolveServerStorageWaiter(message);
+}
+
+// null = no bridge connected; { ok:false } = connected but no usable reply
+// (e.g. an older server without SERVER_USAGE).
+async function _requestServerUsage() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return null;
+  const msg = await _serverStorageRequest({ type: "SERVER_USAGE" }, SERVER_USAGE_TIMEOUT_MS);
+  if (!msg) return { ok: false, error: "no reply from server" };
+  return {
+    ok: msg.ok !== false && Number.isFinite(Number(msg.bytes)),
+    bytes: Number(msg.bytes) || 0,
+    breakdown: msg.breakdown && typeof msg.breakdown === "object" ? msg.breakdown : {},
+    ...(msg.error ? { error: String(msg.error) } : {}),
+  };
+}
+
+async function _storageUsage({ includeServer = true } = {}) {
+  const serverP = includeServer ? _requestServerUsage() : Promise.resolve(null);
+  const local = await _areaGroupBytes(chrome.storage.local);
+  const sessionArea = _sessionStorageArea();
+  const session = sessionArea ? await _areaGroupBytes(sessionArea) : { groups: {}, total: 0 };
+  const groups = {};
+  for (const g of STORAGE_GROUPS) groups[g] = (local.groups[g] || 0) + (session.groups[g] || 0);
+  // In-memory tool error log (shown in the Logs tab, cleared with logs).
+  if (_swToolErrorLog.length) groups.logs += _estimateStoredBytes("", _swToolErrorLog);
+  const totalBytes = Object.values(groups).reduce((a, b) => a + b, 0);
+  return {
+    ok: true,
+    local: { totalBytes, groups, areas: { local: local.total, session: session.total } },
+    server: await serverP,
+  };
+}
+
+// Clears the bridge's tool error log too when connected. Resolves to the
+// server's log file path (or null).
+async function _clearToolLogs() {
+  _swToolErrorLog.length = 0;
+  if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) return null;
+  try {
+    const ack = await new Promise((resolve) => {
+      _pendingToolLogClearResolve = resolve;
+      try {
+        ws.send(JSON.stringify({ type: "CLEAR_TOOL_LOGS" }));
+      } catch (sendErr) {
+        if (_pendingToolLogClearResolve === resolve) {
+          _pendingToolLogClearResolve = null;
+        }
+        resolve({ logFile: null });
+        return;
+      }
+      setTimeout(() => {
+        if (_pendingToolLogClearResolve === resolve) {
+          _pendingToolLogClearResolve = null;
+          resolve({ logFile: null });
+        }
+      }, 3000);
+    });
+    return ack?.logFile || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// In-memory caches that are rebuilt on demand, plus the cached update
+// check result. Approval rules, settings and permissions stay in storage;
+// only ActionGate's in-memory copies are dropped (next read reloads).
+async function _clearExtensionCaches() {
+  _providerModelCache.clear();
+  _pageCtxCache.clear();
+  try {
+    globalThis.AutoDOMActionGate?.clearCaches?.();
+  } catch (_) {}
+  await _writeUpdateStorage(
+    {
+      [UPDATE_STORAGE_KEYS.available]: null,
+      [UPDATE_STORAGE_KEYS.lastCheckStatus]: "cache_cleared",
+    },
+    "clear extension cache",
+  );
+  try {
+    await chrome.storage.local.remove(["mcpDetectedPort"]);
+  } catch (_) {}
+}
+
+async function _removeKeys(area, keys) {
+  if (!area || typeof area.remove !== "function") return;
+  await area.remove(keys);
+}
+
+const _STORAGE_CLEAR_HANDLERS = Object.freeze({
+  async runs() {
+    await _removeKeys(chrome.storage.local, ["autodom.workflowRuns"]);
+    await _removeKeys(_sessionStorageArea(), ["autodom.runUndo"]);
+    // The engine may keep finished runs in memory; let it drop them so
+    // they are not written back. Live runs are untouched.
+    const clearEngine = workflowEngine && workflowEngine.clearRunHistory;
+    if (typeof clearEngine === "function") await clearEngine.call(workflowEngine);
+    return { engineCache: typeof clearEngine === "function" };
+  },
+  async audit() {
+    const Gate = globalThis.AutoDOMActionGate;
+    if (!Gate?.clearAuditLog) throw new Error("ActionGate unavailable");
+    await Gate.clearAuditLog();
+    return {};
+  },
+  async logs() {
+    _activityLog = [];
+    _activityLogDirty = false;
+    if (_activityFlushTimer) {
+      clearTimeout(_activityFlushTimer);
+      _activityFlushTimer = null;
+    }
+    await _removeKeys(activityStorage, [ACTIVITY_LOG_KEY]);
+    const serverLogFile = await _clearToolLogs();
+    return { serverLogFile };
+  },
+  async cache() {
+    await _clearExtensionCaches();
+    return {};
+  },
+  async drafts() {
+    // Last unsaved recording draft and per-run undo journals. The active
+    // recording (autodom.wf.recording) is never touched.
+    await _removeKeys(_sessionStorageArea() || chrome.storage.local, [
+      "autodom.wf.lastDraft",
+      "autodom.runUndo",
+    ]);
+    const clearEngine = workflowEngine && workflowEngine.clearDrafts;
+    if (typeof clearEngine === "function") await clearEngine.call(workflowEngine);
+    return { engineCache: typeof clearEngine === "function" };
+  },
+  async server() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error("server not connected");
+    const msg = await _serverStorageRequest({ type: "SERVER_FLUSH" }, SERVER_FLUSH_TIMEOUT_MS);
+    if (!msg) throw new Error("no reply from server");
+    return {
+      ok: msg.ok !== false,
+      freedBytes: Math.max(0, Number(msg.freedBytes) || 0),
+      details: msg.details || {},
+      ...(msg.ok === false ? { error: String(msg.error || "server flush failed") } : {}),
+    };
+  },
+});
+
+async function _clearStorage(scopes) {
+  const wanted = [...new Set((Array.isArray(scopes) ? scopes : []).map(String))].filter((s) =>
+    STORAGE_CLEAR_SCOPES.includes(s),
+  );
+  if (!wanted.length) {
+    return { ok: false, freedBytes: 0, results: {}, error: "no valid scopes" };
+  }
+  const before = await _storageUsage({ includeServer: false });
+  const results = {};
+  let serverFreed = 0;
+  for (const scope of wanted) {
+    try {
+      const out = (await _STORAGE_CLEAR_HANDLERS[scope]()) || {};
+      results[scope] = { ok: true, ...out };
+      if (scope === "server") serverFreed = out.freedBytes || 0;
+    } catch (err) {
+      results[scope] = { ok: false, error: err?.message || String(err) };
+    }
+  }
+  const after = await _storageUsage({ includeServer: false });
+  const localFreed = Math.max(0, before.local.totalBytes - after.local.totalBytes);
+  return {
+    ok: Object.values(results).every((r) => r.ok),
+    freedBytes: localFreed + serverFreed,
+    results,
+  };
+}
+
 // Popup → service worker: forward a manual `update_available` result so the
 // badge appears even when the user triggered the check rather than the
 // browser's own scheduler.
@@ -10906,21 +12051,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
   if (msg && msg.type === "AUTODOM_CLEAR_EXTENSION_CACHE") {
-    (async () => {
-      _providerModelCache.clear();
-      _pageCtxCache.clear();
-      await _writeUpdateStorage(
-        {
-          [UPDATE_STORAGE_KEYS.available]: null,
-          [UPDATE_STORAGE_KEYS.lastCheckStatus]: "cache_cleared",
-        },
-        "clear extension cache",
-      );
-      try {
-        chrome.storage.local.remove(["mcpDetectedPort"]);
-      } catch (_) {}
-      sendResponse({ ok: true });
-    })();
+    _clearExtensionCaches().then(
+      () => sendResponse({ ok: true }),
+      (err) => sendResponse({ ok: false, error: err?.message || String(err) }),
+    );
+    return true;
+  }
+  if (msg && msg.type === "AUTODOM_STORAGE_USAGE") {
+    _storageUsage().then(sendResponse, (err) =>
+      sendResponse({ ok: false, error: err?.message || String(err) }),
+    );
+    return true;
+  }
+  if (msg && msg.type === "AUTODOM_CLEAR_STORAGE") {
+    _clearStorage(msg.scopes).then(sendResponse, (err) =>
+      sendResponse({ ok: false, freedBytes: 0, results: {}, error: err?.message || String(err) }),
+    );
     return true;
   }
   if (msg && msg.type === "AUTODOM_BRIDGE_CHECK") {
@@ -11102,8 +12248,8 @@ async function ensureDebugger(tabId) {
 }
 
 // 42. Emulate device / features
-async function toolEmulate({ userAgent, viewport, colorScheme }) {
-  const tab = await getActiveTab();
+async function toolEmulate({ userAgent, viewport, colorScheme }, ctx) {
+  const tab = await getActiveTab(ctx);
   const tabId = tab.id;
   await ensureDebugger(tabId);
   if (userAgent) {
@@ -11135,8 +12281,8 @@ async function toolEmulate({ userAgent, viewport, colorScheme }) {
 }
 
 // 43. Upload File
-async function toolUploadFile({ uid, filePath }) {
-  const tab = await getActiveTab();
+async function toolUploadFile({ uid, filePath }, ctx) {
+  const tab = await getActiveTab(ctx);
   const tabId = tab.id;
   await ensureDebugger(tabId);
   try {
@@ -11170,8 +12316,8 @@ async function toolUploadFile({ uid, filePath }) {
 }
 
 // 44. Start Trace
-async function toolPerformanceStartTrace({ reload }) {
-  const tab = await getActiveTab();
+async function toolPerformanceStartTrace({ reload }, ctx) {
+  const tab = await getActiveTab(ctx);
   const tabId = tab.id;
   await ensureDebugger(tabId);
   await chrome.debugger.sendCommand({ tabId }, "Tracing.start", {
@@ -11186,8 +12332,8 @@ async function toolPerformanceStartTrace({ reload }) {
 }
 
 // 45. Stop Trace
-async function toolPerformanceStopTrace({ filePath }) {
-  const tab = await getActiveTab();
+async function toolPerformanceStopTrace({ filePath }, ctx) {
+  const tab = await getActiveTab(ctx);
   const tabId = tab.id;
   await ensureDebugger(tabId);
   return new Promise((resolve, reject) => {
@@ -11211,7 +12357,7 @@ async function toolPerformanceStopTrace({ filePath }) {
 }
 
 // 46. Analyze Performance Insight
-async function toolPerformanceAnalyzeInsight({ insightName, insightSetId }) {
+async function toolPerformanceAnalyzeInsight({ insightName, insightSetId }, ctx) {
   return {
     insightName,
     insightSetId,
@@ -11227,8 +12373,8 @@ async function toolPerformanceAnalyzeInsight({ insightName, insightSetId }) {
 // only what the LLM actually needs instead of full page dumps.
 
 // execute_code: Run arbitrary JS in page context, return only extracted data
-async function toolExecuteCode(params) {
-  const tab = await getActiveTab();
+async function toolExecuteCode(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { code, timeout } = params;
   const timeoutMs = timeout || 15000;
 
@@ -11358,8 +12504,8 @@ async function executeCodeViaCdp(tabId, code, timeoutMs) {
 
 // get_dom_state: Compact map of interactive elements with numeric indices.
 // Returns ~2-5K chars instead of 500K+ for full snapshots.
-async function toolGetDomState(params) {
-  const tab = await getActiveTab();
+async function toolGetDomState(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const includeHidden = params?.includeHidden || false;
   const maxElements = Math.min(200, Math.max(1, Number(params?.maxElements) || 60));
   const autoScroll = params?.autoScroll || false;
@@ -11941,18 +13087,12 @@ async function toolGetDomState(params) {
     ],
   );
 
-  // Cache the index map for click_by_index / type_by_index
-  if (result && result.elements) {
-    _indexedElements = result.elements;
-    _indexedTabId = tab.id;
-  }
-
   return result;
 }
 
 // click_by_index: Click element by numeric index from get_dom_state
-async function toolClickByIndex(params) {
-  const tab = await getActiveTab();
+async function toolClickByIndex(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { index, dblClick } = params;
 
   return await executeInTab(
@@ -12070,8 +13210,8 @@ async function toolClickByIndex(params) {
 }
 
 // type_by_index: Type text into element by numeric index from get_dom_state
-async function toolTypeByIndex(params) {
-  const tab = await getActiveTab();
+async function toolTypeByIndex(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { index, text } = params;
   const clearFirst = params?.clearFirst ?? params?.clear ?? false;
 
@@ -12198,7 +13338,7 @@ async function toolTypeByIndex(params) {
 }
 
 // batch_actions: Execute several known actions without another model round-trip.
-async function toolBatchActions(params) {
+async function toolBatchActions(params, ctx) {
   const actions = Array.isArray(params?.actions) ? params.actions : [];
   const stopOnError = params?.stopOnError !== false;
   const maxActions = Math.min(Math.max(Number(params?.maxActions) || 8, 1), 12);
@@ -12234,11 +13374,18 @@ async function toolBatchActions(params) {
   }
 
   const results = [];
-  _agentBatchDepth++;
+  // Nested steps share the caller's context (same tab, same deadline) and
+  // skip the per-step confirmation prompt.
+  if (ctx) ctx.batchDepth++;
   try {
     for (let i = 0; i < Math.min(actions.length, maxActions); i++) {
       const action = actions[i] || {};
       const tool = String(action.tool || action.name || "").trim();
+      if (_isCancelled(ctx)) {
+        // The call was cancelled (timeout / client gave up): stop here.
+        results.push({ step: i, tool, result: { ok: false, ..._cancelledResult(_abortReason(ctx.signal)) } });
+        break;
+      }
       const args =
         action.args && typeof action.args === "object"
           ? action.args
@@ -12253,15 +13400,15 @@ async function toolBatchActions(params) {
         continue;
       }
 
-      const result = await executeAgentTool(tool, args);
-      _maybeRepinAgentTab(tool, result, args);
+      const result = await executeAgentTool(tool, args, ctx);
+      _maybeRepinAgentTab(tool, result, args, ctx);
       results.push({ step: i, tool, args, result });
       if (stopOnError && (!result?.ok || result?.error || result?.blocked || result?.denied)) {
         break;
       }
     }
   } finally {
-    _agentBatchDepth--;
+    if (ctx) ctx.batchDepth--;
   }
 
   return {
@@ -12273,8 +13420,8 @@ async function toolBatchActions(params) {
 }
 
 // extract_data: Extract structured data using CSS selector + field mapping
-async function toolExtractData(params) {
-  const tab = await getActiveTab();
+async function toolExtractData(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { selector, fields, limit } = params;
   const maxItems = limit || 50;
 
@@ -12326,7 +13473,7 @@ async function toolExtractData(params) {
 // ─── Popup / Window Tools ────────────────────────────────────
 
 // List all browser windows including popups opened via window.open
-async function toolListPopups(params) {
+async function toolListPopups(params, ctx) {
   const allWindows = await chrome.windows.getAll({ populate: true });
   const windows = [];
   for (const win of allWindows) {
@@ -12358,13 +13505,13 @@ async function toolListPopups(params) {
 }
 
 // Switch focus to a popup/window by windowId, optionally activate a specific tab
-async function toolSwitchToPopup(params) {
+async function toolSwitchToPopup(params, ctx) {
   const { windowId, tabId } = params;
   if (!windowId) return { error: "windowId is required" };
   try {
     // Isolation: re-target only. The popup is not raised over the user's
     // window and no tab is activated.
-    if (!_isolatedClientId()) {
+    if (!_isolatedClientId(ctx)) {
       await chrome.windows.update(windowId, { focused: true });
       if (tabId) {
         await chrome.tabs.update(tabId, { active: true });
@@ -12392,7 +13539,7 @@ async function toolSwitchToPopup(params) {
 }
 
 // Close a popup window by windowId
-async function toolClosePopup(params) {
+async function toolClosePopup(params, ctx) {
   const { windowId } = params;
   if (!windowId) return { error: "windowId is required" };
   try {
@@ -12411,9 +13558,9 @@ async function toolClosePopup(params) {
 }
 
 // Wait for a new popup/window to appear
-async function toolWaitForPopup(params) {
+async function toolWaitForPopup(params, ctx) {
   const timeout = params?.timeout || 10000;
-  const isoClient = _isolatedClientId();
+  const isoClient = _isolatedClientId(ctx);
   const existingWindows = await chrome.windows.getAll();
   const existingIds = new Set(existingWindows.map((w) => w.id));
 
@@ -12422,6 +13569,7 @@ async function toolWaitForPopup(params) {
     const timer = setTimeout(() => {
       if (!resolved) {
         resolved = true;
+        detachCancel();
         chrome.windows.onCreated.removeListener(listener);
         resolve({
           success: false,
@@ -12429,11 +13577,19 @@ async function toolWaitForPopup(params) {
         });
       }
     }, timeout);
+    const detachCancel = _onCallCancel(ctx, (reason) => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(timer);
+      chrome.windows.onCreated.removeListener(listener);
+      resolve(_cancelledResult(reason));
+    });
 
     const listener = async (win) => {
       if (!existingIds.has(win.id) && !resolved) {
         resolved = true;
         clearTimeout(timer);
+        detachCancel();
         chrome.windows.onCreated.removeListener(listener);
         // Let Chrome attach the initial tab, then return promptly.
         await new Promise((r) => setTimeout(r, 300));
@@ -12467,8 +13623,8 @@ async function toolWaitForPopup(params) {
 // ─── iframe Tools ────────────────────────────────────────────
 
 // List all iframes on the current page with their frame IDs
-async function toolListIframes(params) {
-  const tab = await getActiveTab();
+async function toolListIframes(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id });
   if (!frames) return { error: "Could not retrieve frames for this tab" };
 
@@ -12760,8 +13916,8 @@ function _runIframeInteractInPage(action, selector, text, value, fields, clearFi
   return { error: `Unknown iframe action: ${action}` };
 }
 
-async function toolIframeInteract(params) {
-  const tab = await getActiveTab();
+async function toolIframeInteract(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { frameId, action, selector, text, value, fields, clearFirst } = params;
 
   if (frameId === undefined && !params.iframeSelector) {
@@ -12816,8 +13972,8 @@ async function toolIframeInteract(params) {
 // ─── Shadow DOM Tools ────────────────────────────────────────
 
 // List all elements that host an open shadow root
-async function toolListShadowRoots(params) {
-  const tab = await getActiveTab();
+async function toolListShadowRoots(params, ctx) {
+  const tab = await getActiveTab(ctx);
   return await executeInTab(
     tab.id,
     (maxDepth) => {
@@ -12870,8 +14026,8 @@ async function toolListShadowRoots(params) {
 
 // Interact with elements inside shadow DOMs using piercing selector
 // Piercing syntax: "host-selector >>> inner-selector" or nested "host1 >>> host2 >>> target"
-async function toolShadowInteract(params) {
-  const tab = await getActiveTab();
+async function toolShadowInteract(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { piercingSelector, action, value, clearFirst, fields } = params;
 
   if (!piercingSelector) {
@@ -13099,8 +14255,8 @@ async function toolShadowInteract(params) {
 }
 
 // Deep query: search across main DOM, all iframes, and all shadow DOMs
-async function toolDeepQuery(params) {
-  const tab = await getActiveTab();
+async function toolDeepQuery(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { selector, text, limit } = params;
   const maxItems = limit || 30;
 
@@ -13249,8 +14405,8 @@ async function toolDeepQuery(params) {
 
 // ─── Canvas Tools ────────────────────────────────────────────
 
-async function toolCanvasInteract(params) {
-  const tab = await getActiveTab();
+async function toolCanvasInteract(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { action, selector, x, y, maxSize, pathCommands, strokeStyle, fillStyle, lineWidth } = params;
   const canvasSel = selector || "canvas";
 
@@ -13328,7 +14484,7 @@ async function toolCanvasInteract(params) {
 
 // ─── Download Tools ──────────────────────────────────────────
 
-async function toolListDownloads({ limit, state } = {}) {
+async function toolListDownloads({ limit, state } = {}, ctx) {
   const query = {};
   if (state) query.state = state;
   const items = await chrome.downloads.search({ ...query, limit: limit || 10, orderBy: ["-startTime"] });
@@ -13349,7 +14505,7 @@ async function toolListDownloads({ limit, state } = {}) {
   };
 }
 
-async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter, lookbackMs } = {}) {
+async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter, lookbackMs } = {}, ctx) {
   const maxWait = timeout || 15000;
   const start = Date.now();
   const explicitLookbackMs = Number(lookbackMs);
@@ -13377,14 +14533,21 @@ async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter, l
       }
       const remaining = Math.max(0, maxWait - (Date.now() - start));
       const completeTimer = setTimeout(() => {
+        detachCancel();
         chrome.downloads.onChanged.removeListener(onChanged);
         resolve({ ...formatDownload(item), state: "timeout_waiting_for_complete" });
       }, remaining);
+      const detachCancel = _onCallCancel(ctx, (reason) => {
+        clearTimeout(completeTimer);
+        chrome.downloads.onChanged.removeListener(onChanged);
+        resolve({ ...formatDownload(item), ..._cancelledResult(reason) });
+      });
 
       function onChanged(delta) {
         if (delta.id !== item.id) return;
         if (delta.state && (delta.state.current === "complete" || delta.state.current === "interrupted")) {
           clearTimeout(completeTimer);
+          detachCancel();
           chrome.downloads.onChanged.removeListener(onChanged);
           resolve(formatDownload(item, delta.state.current));
         }
@@ -13404,12 +14567,19 @@ async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter, l
 
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
+      detachCreateCancel();
       chrome.downloads.onCreated.removeListener(onCreated);
       resolve({ error: `No new download started within ${maxWait}ms` });
     }, maxWait);
+    const detachCreateCancel = _onCallCancel(ctx, (reason) => {
+      clearTimeout(timer);
+      chrome.downloads.onCreated.removeListener(onCreated);
+      resolve(_cancelledResult(reason));
+    });
     async function onCreated(item) {
       if (!matchesDownload(item)) return;
       clearTimeout(timer);
+      detachCreateCancel();
       chrome.downloads.onCreated.removeListener(onCreated);
 
       if (!waitForComplete) {
@@ -13418,14 +14588,21 @@ async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter, l
 
       // Wait for completion
       const completeTimer = setTimeout(() => {
+        detachDoneCancel();
         chrome.downloads.onChanged.removeListener(onChanged);
         resolve({ ...formatDownload(item), state: "timeout_waiting_for_complete" });
       }, Math.max(0, maxWait - (Date.now() - start)));
+      const detachDoneCancel = _onCallCancel(ctx, (reason) => {
+        clearTimeout(completeTimer);
+        chrome.downloads.onChanged.removeListener(onChanged);
+        resolve({ ...formatDownload(item), ..._cancelledResult(reason) });
+      });
 
       function onChanged(delta) {
         if (delta.id !== item.id) return;
         if (delta.state && (delta.state.current === "complete" || delta.state.current === "interrupted")) {
           clearTimeout(completeTimer);
+          detachDoneCancel();
           chrome.downloads.onChanged.removeListener(onChanged);
           resolve(formatDownload(item, delta.state.current));
         }
@@ -13440,13 +14617,13 @@ async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter, l
 // ─── New Interaction Tools ──────────────────────────────────
 
 // 49. Double-click
-async function toolDoubleClick(params) {
-  return toolClick({ ...params, dblClick: true });
+async function toolDoubleClick(params, ctx) {
+  return toolClick({ ...params, dblClick: true }, ctx);
 }
 
 // 50. Middle-click (opens links in new tab, etc.)
-async function toolMiddleClick(params) {
-  const tab = await getActiveTab();
+async function toolMiddleClick(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { selector } = params;
   return await executeInTab(
     tab.id,
@@ -13469,8 +14646,8 @@ async function toolMiddleClick(params) {
 }
 
 // 51. Force-click — dispatches events without visibility/scroll checks
-async function toolForceClick(params) {
-  const tab = await getActiveTab();
+async function toolForceClick(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { selector } = params;
   return await executeInTab(
     tab.id,
@@ -13488,8 +14665,8 @@ async function toolForceClick(params) {
 }
 
 // 52. Click at absolute viewport coordinates
-async function toolClickAtCoordinates(params) {
-  const tab = await getActiveTab();
+async function toolClickAtCoordinates(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { x, y, button = "left", double = false } = params;
   return await executeInTab(
     tab.id,
@@ -13522,8 +14699,8 @@ async function toolClickAtCoordinates(params) {
 }
 
 // 53. Key down — hold a key (useful for Shift/Ctrl modifier combos)
-async function toolKeyDown(params) {
-  const tab = await getActiveTab();
+async function toolKeyDown(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { key, selector } = params;
   return await executeInTab(
     tab.id,
@@ -13547,8 +14724,8 @@ async function toolKeyDown(params) {
 }
 
 // 54. Key up — release a held key
-async function toolKeyUp(params) {
-  const tab = await getActiveTab();
+async function toolKeyUp(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { key, selector } = params;
   return await executeInTab(
     tab.id,
@@ -13572,8 +14749,8 @@ async function toolKeyUp(params) {
 }
 
 // 55. Get bounding box — element position and size in viewport
-async function toolGetBoundingBox(params) {
-  const tab = await getActiveTab();
+async function toolGetBoundingBox(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { selector } = params;
   return await executeInTab(
     tab.id,
@@ -13597,8 +14774,8 @@ async function toolGetBoundingBox(params) {
 }
 
 // 56. Get computed style — resolved CSS properties for an element
-async function toolGetComputedStyle(params) {
-  const tab = await getActiveTab();
+async function toolGetComputedStyle(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { selector, properties } = params;
   return await executeInTab(
     tab.id,
@@ -13637,8 +14814,8 @@ async function toolGetComputedStyle(params) {
 }
 
 // 57. Set geolocation override (CDP)
-async function toolSetGeolocation(params) {
-  const tab = await getActiveTab();
+async function toolSetGeolocation(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const tabId = tab.id;
   await ensureDebugger(tabId);
   const { latitude, longitude, accuracy = 1, clear = false } = params;
@@ -13661,8 +14838,8 @@ async function toolSetGeolocation(params) {
 }
 
 // 58. Delete a single cookie
-async function toolDeleteCookie(params) {
-  const tab = await getActiveTab();
+async function toolDeleteCookie(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const { name, url } = params;
   const targetUrl = url || tab.url;
   try {
@@ -13674,8 +14851,8 @@ async function toolDeleteCookie(params) {
 }
 
 // 59. Clear all cookies for the current (or given) URL
-async function toolClearCookies(params) {
-  const tab = await getActiveTab();
+async function toolClearCookies(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const url = params?.url || tab.url;
   const cookies = await chrome.cookies.getAll({ url });
   const results = await Promise.allSettled(
@@ -13686,8 +14863,8 @@ async function toolClearCookies(params) {
 }
 
 // 60. Print page to PDF (CDP)
-async function toolPrintToPdf(params) {
-  const tab = await getActiveTab();
+async function toolPrintToPdf(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const tabId = tab.id;
   await ensureDebugger(tabId);
   try {
@@ -13717,8 +14894,8 @@ async function toolPrintToPdf(params) {
 }
 
 // 61. Emulate media type and/or CSS media features (CDP)
-async function toolEmulateMedia(params) {
-  const tab = await getActiveTab();
+async function toolEmulateMedia(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const tabId = tab.id;
   await ensureDebugger(tabId);
   const { media, colorScheme, reducedMotion, contrast, forcedColors } = params;

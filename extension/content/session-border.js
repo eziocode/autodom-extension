@@ -9,7 +9,39 @@
 (function () {
   const OVERLAY_ID = "__bmcp_session_border";
 
+  // Features → Overlays (chrome.storage.local "autodom.features"; schema
+  // and defaults in background/feature-flags.js). Read directly here so
+  // this content script needs no extra file, and live-updated on change.
+  const FEATURES_KEY = "autodom.features";
+  const flags = { overlaySessionBorder: true, overlayTakeoverPill: true };
+  let sessionActive = false;
+
+  function applyFlags(raw) {
+    const s = raw && typeof raw === "object" ? raw : {};
+    for (const k of Object.keys(flags)) flags[k] = typeof s[k] === "boolean" ? s[k] : true;
+    if (!sessionActive) return;
+    if (flags.overlaySessionBorder) mountBorder();
+    else unmountBorder();
+    if (flags.overlayTakeoverPill) showTakeoverButton();
+    else hideTakeoverButton();
+  }
+  try {
+    chrome.storage.local.get([FEATURES_KEY], (res) => {
+      void chrome.runtime.lastError;
+      applyFlags(res && res[FEATURES_KEY]);
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === "local" && changes[FEATURES_KEY]) applyFlags(changes[FEATURES_KEY].newValue);
+    });
+  } catch (_) {}
+
   function showBorder() {
+    sessionActive = true;
+    if (flags.overlaySessionBorder) mountBorder();
+    if (flags.overlayTakeoverPill) showTakeoverButton();
+  }
+
+  function mountBorder() {
     if (document.getElementById(OVERLAY_ID)) return;
 
     const overlay = document.createElement("div");
@@ -62,7 +94,15 @@
     document.documentElement.appendChild(style);
     document.documentElement.appendChild(overlay);
     document.documentElement.appendChild(badge);
-    showTakeoverButton();
+  }
+
+  function unmountBorder() {
+    const overlay = document.getElementById(OVERLAY_ID);
+    const badge = document.getElementById(OVERLAY_ID + "_badge");
+    const style = document.getElementById(OVERLAY_ID + "_style");
+    if (overlay) overlay.remove();
+    if (badge) badge.remove();
+    if (style) style.remove();
   }
 
   // ── Take over / hand back ──
@@ -216,6 +256,7 @@
           if (res && res.ok) {
             takeoverOn = next;
             render();
+            if (!takeoverOn && !flags.overlayTakeoverPill) hideTakeoverButton();
           }
         });
       } catch (_) {}
@@ -231,18 +272,19 @@
     } catch (_) {}
   }
 
-  function hideBorder() {
-    const overlay = document.getElementById(OVERLAY_ID);
-    const badge = document.getElementById(OVERLAY_ID + "_badge");
-    const style = document.getElementById(OVERLAY_ID + "_style");
-    if (overlay) overlay.remove();
-    if (badge) badge.remove();
-    if (style) style.remove();
-    // Keep the hand-back control visible while the user is in control.
+  // Removes the pill unless the user is in control — the hand-back
+  // control must stay reachable even when the pill overlay is turned off.
+  function hideTakeoverButton() {
     if (takeoverUi && !takeoverOn) {
       takeoverUi.host.remove();
       takeoverUi = null;
     }
+  }
+
+  function hideBorder() {
+    sessionActive = false;
+    unmountBorder();
+    hideTakeoverButton();
   }
 
   // Listen for messages from the service worker
@@ -256,6 +298,9 @@
     if (message.type === "AUTODOM_TAKEOVER_STATE") {
       takeoverOn = !!message.on;
       if (takeoverUi) takeoverUi.render();
+      // Hand-back finished while the pill overlay is off: drop the pill
+      // that was only kept around for hand-back.
+      if (!takeoverOn && !flags.overlayTakeoverPill) hideTakeoverButton();
     }
   });
 

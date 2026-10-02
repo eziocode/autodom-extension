@@ -471,37 +471,39 @@
   // ── SW-side tool handlers (bound at registration) ────────────────────
   // These all expect `this` to be a context object exposing
   // { getActiveTab, executeInTab, sendToOffscreen } — assigned by SW.
+  // Each handler gets the SW's per-call context as its second argument
+  // and resolves its tab through getActiveTab(callCtx).
 
   function makeHandlers(ctx) {
     const { getActiveTab, executeInTab, sendToOffscreen } = ctx;
 
     return {
-      media_list: async () => {
-        const tab = await getActiveTab();
+      media_list: async (_params, callCtx) => {
+        const tab = await getActiveTab(callCtx);
         return executeInTab(tab.id, _pageMediaList, []);
       },
-      media_control: async (params) => {
-        const tab = await getActiveTab();
+      media_control: async (params, callCtx) => {
+        const tab = await getActiveTab(callCtx);
         return executeInTab(
           tab.id,
           _pageMediaControl,
           [params?.index, params?.selector, params?.action || "toggle", params?.value],
         );
       },
-      media_get_captions: async (params) => {
-        const tab = await getActiveTab();
+      media_get_captions: async (params, callCtx) => {
+        const tab = await getActiveTab(callCtx);
         return executeInTab(tab.id, _pageMediaCaptions, [params?.index || 0]);
       },
-      media_capture_frame: async (params) => {
-        const tab = await getActiveTab();
+      media_capture_frame: async (params, callCtx) => {
+        const tab = await getActiveTab(callCtx);
         return executeInTab(
           tab.id,
           _pageMediaCaptureFrame,
           [params?.index || 0, params?.mimeType, params?.quality],
         );
       },
-      media_sample_frames: async (params) => {
-        const tab = await getActiveTab();
+      media_sample_frames: async (params, callCtx) => {
+        const tab = await getActiveTab(callCtx);
         return executeInTab(
           tab.id,
           _pageMediaSampleFrames,
@@ -515,36 +517,36 @@
           ],
         );
       },
-      image_list: async (params) => {
-        const tab = await getActiveTab();
+      image_list: async (params, callCtx) => {
+        const tab = await getActiveTab(callCtx);
         return executeInTab(tab.id, _pageImageList, [params?.limit || 60]);
       },
-      image_get_data: async (params) => {
-        const tab = await getActiveTab();
+      image_get_data: async (params, callCtx) => {
+        const tab = await getActiveTab(callCtx);
         return executeInTab(
           tab.id,
           _pageImageGetData,
           [params?.index, params?.selector],
         );
       },
-      macro_record_start: async () => {
-        const tab = await getActiveTab();
+      macro_record_start: async (_params, callCtx) => {
+        const tab = await getActiveTab(callCtx);
         return executeInTab(tab.id, _pageMacroInstall, []);
       },
-      macro_record_stop: async () => {
-        const tab = await getActiveTab();
+      macro_record_stop: async (_params, callCtx) => {
+        const tab = await getActiveTab(callCtx);
         return executeInTab(tab.id, _pageMacroStop, []);
       },
-      macro_replay: async (params) => {
-        const tab = await getActiveTab();
+      macro_replay: async (params, callCtx) => {
+        const tab = await getActiveTab(callCtx);
         return executeInTab(
           tab.id,
           _pageMacroReplay,
           [params?.events || [], params?.speed || 1],
         );
       },
-      tab_recording_start: async (params) => {
-        const tab = await getActiveTab();
+      tab_recording_start: async (params, callCtx) => {
+        const tab = await getActiveTab(callCtx);
         // `tabCapture` is an optional permission (declared in
         // optional_permissions) so that adding it never forces a
         // disable-on-update re-authorization prompt for existing installs.
