@@ -54,6 +54,18 @@ results.push(await tryConnect({ path: `/?token=wrongtoken` }, "wrong-token"));
 console.log("lockfile mode:", mode, "token len:", lock.token?.length);
 for (const r of results) console.log(JSON.stringify(r));
 
+// Reject at the transport layer, before allocating/parsing the entire JSON
+// message. An invalid frame must close only that connection, not the bridge.
+const oversizedCode = await new Promise((resolve) => {
+  const ws = new WebSocket(`ws://127.0.0.1:${PORT}/?token=${lock.token}`);
+  const timer = setTimeout(() => { ws.terminate(); resolve(0); }, 5000);
+  ws.on("open", () => ws.send(Buffer.alloc(32 * 1024 * 1024 + 1, 32)));
+  ws.on("error", () => {});
+  ws.on("close", (code) => { clearTimeout(timer); resolve(code); });
+});
+results.push(await tryConnect({ path: `/?token=${lock.token}` }, "valid-after-oversized"));
+console.log("oversized frame close code:", oversizedCode);
+
 const expected = {
   "no-origin-no-token": false,
   "evil-origin": false,
@@ -63,8 +75,9 @@ const expected = {
   "unknown-moz-origin": false,
   "valid-token": true,
   "wrong-token": false,
+  "valid-after-oversized": true,
 };
-let pass = mode === "600" && lock.token?.length === 64;
+let pass = mode === "600" && lock.token?.length === 64 && oversizedCode === 1009;
 for (const r of results) if (!!r.ok !== expected[r.label]) pass = false;
 console.log(pass ? "PASS" : "FAIL");
 proc.kill();

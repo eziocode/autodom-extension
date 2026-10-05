@@ -4,6 +4,26 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 6.2.2
+
+### Performance
+- Audit queries stream daily logs and retain only the requested newest matches
+  instead of loading and keeping the entire log in memory.
+- Server updates reuse installed dependencies when only the release version
+  changes. Dependency versions, integrity hashes and configuration still
+  participate in the comparison.
+
+### Security
+- WebSocket frame size limits are enforced during receipt on primary and
+  proxy connections. Oversized frames close only the offending connection.
+- ZIP updates cap inflation before allocating output, validate directory and
+  payload bounds, and reject unsafe or duplicate paths before writing files.
+- Release inputs and signing secrets are passed as environment data rather
+  than embedded in shell source. Signing keys use private temporary files
+  with cleanup even when packaging fails.
+- Version bump helpers reject malformed versions before changing files;
+  Prepare Release now audits dependencies before creating its commit/tag.
+
 ## 6.2.1
 
 ### Fixed

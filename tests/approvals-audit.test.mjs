@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, rm, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +10,7 @@ import vm from "node:vm";
 
 import {
   appendAudit,
+  auditFileFor,
   queryAudit,
   redactParams,
   saveWorkflowFile,
@@ -152,4 +153,24 @@ test("MCP approval state is HMAC-bound to the confirmId and tool", () => {
   );
   assert.equal(ctx._parseHeld('{"confirmRequired":true,"confirmId":3}').confirmId, 3);
   assert.equal(ctx._parseHeld('{"ok":true}'), null);
+});
+
+
+test("audit queries stream large logs, keep exact totals and newest filtered matches", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "autodom-audit-stream-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const file = auditFileFor(Date.now(), home);
+  await mkdir(dirname(file), { recursive: true });
+  const records = Array.from({ length: 2500 }, (_, i) => JSON.stringify({
+    i, tool: i % 2 ? "click" : "navigate", domain: "test.example", pad: "x".repeat(1000),
+  }));
+  records.splice(200, 0, "null", "[]", "broken JSON");
+  await writeFile(file, records.join("\n")); // final line has no newline
+  const result = await queryAudit({ tool: "click", limit: 3 }, home);
+  assert.equal(result.total, 1250);
+  assert.deepEqual(result.entries.map((e) => e.i), [2499, 2497, 2495]);
+  const all = await queryAudit({ limit: 1000 }, home);
+  assert.equal(all.total, 2500);
+  assert.equal(all.entries.length, 1000);
+  assert.equal(all.entries[999].i, 1500);
 });

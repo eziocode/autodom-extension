@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, cp, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve as resolvePath } from "node:path";
 import { inflateRawSync } from "node:zlib";
 
@@ -82,9 +82,22 @@ export async function locateStagedBundle(
   return { root, serverDir: join(root, "server"), extensionDir: join(root, "extension") };
 }
 
-async function sha256OfFile(file) {
+/** Ignore only the release's own version; keep every dependency/integrity field. */
+export async function lockfileHash(serverDir) {
   try {
-    return createHash("sha256").update(await readFile(file)).digest("hex");
+    const raw = await readFile(join(serverDir, "package-lock.json"));
+    let data = raw;
+    try {
+      const lock = JSON.parse(raw.toString("utf8"));
+      if (lock && typeof lock === "object" && !Array.isArray(lock)) {
+        delete lock.version;
+        if (lock.packages?.[""]) delete lock.packages[""].version;
+        data = JSON.stringify(lock);
+      }
+    } catch (_) {
+      // Legacy/non-JSON locks can only reuse an exact byte-for-byte match.
+    }
+    return createHash("sha256").update(data).digest("hex");
   } catch (_) {
     return null;
   }
@@ -93,8 +106,8 @@ async function sha256OfFile(file) {
 /** Do both server dirs pin exactly the same dependency tree? */
 export async function dependenciesUnchanged(oldServerDir, newServerDir) {
   const [oldLock, newLock] = await Promise.all([
-    sha256OfFile(join(oldServerDir, "package-lock.json")),
-    sha256OfFile(join(newServerDir, "package-lock.json")),
+    lockfileHash(oldServerDir),
+    lockfileHash(newServerDir),
   ]);
   return !!oldLock && oldLock === newLock;
 }
@@ -130,14 +143,9 @@ export async function installServerDependencies(serverDir, run = defaultRunComma
   }
 }
 
-/** Hash of server/package-lock.json, to tell whether dependencies changed. */
-export function lockfileHash(serverDir) {
-  return sha256OfFile(join(serverDir, "package-lock.json"));
-}
-
 /**
  * Give a staged server/ its node_modules before it goes live. Reuse the
- * current install's when the lockfile is identical (no network, instant);
+ * current install's when the dependency tree is unchanged (no network);
  * otherwise install from the new lockfile. A failure here aborts the update
  * while the old server is still untouched.
  */
@@ -412,7 +420,10 @@ function findEndOfCentralDirectory(buffer) {
   // The EOCD is at the tail, after a comment of at most 0xffff bytes.
   const minOffset = Math.max(0, buffer.length - 0xffff - 22);
   for (let offset = buffer.length - 22; offset >= minOffset; offset -= 1) {
-    if (buffer.readUInt32LE(offset) === ZIP_EOCD_SIGNATURE) return offset;
+    if (
+      buffer.readUInt32LE(offset) === ZIP_EOCD_SIGNATURE &&
+      offset + 22 + buffer.readUInt16LE(offset + 20) === buffer.length
+    ) return offset;
   }
   throw new Error("Not a ZIP archive (no end-of-central-directory record)");
 }
@@ -425,10 +436,19 @@ export function parseZipEntries(buffer) {
     throw new Error("ZIP64 archives are not supported");
   }
 
+  const directorySize = buffer.readUInt32LE(eocd + 12);
+  const directoryEnd = directoryOffset + directorySize;
+  if (
+    buffer.readUInt16LE(eocd + 4) !== 0 ||
+    buffer.readUInt16LE(eocd + 6) !== 0 ||
+    buffer.readUInt16LE(eocd + 8) !== entryCount ||
+    directoryEnd !== eocd
+  ) throw new Error("Corrupt or multi-disk ZIP central directory");
+
   const entries = [];
   let cursor = directoryOffset;
   for (let index = 0; index < entryCount; index += 1) {
-    if (buffer.readUInt32LE(cursor) !== ZIP_CENTRAL_SIGNATURE) {
+    if (cursor + 46 > directoryEnd || buffer.readUInt32LE(cursor) !== ZIP_CENTRAL_SIGNATURE) {
       throw new Error(`Corrupt ZIP central directory at entry ${index}`);
     }
     const method = buffer.readUInt16LE(cursor + 10);
@@ -439,6 +459,15 @@ export function parseZipEntries(buffer) {
     const commentLength = buffer.readUInt16LE(cursor + 32);
     const externalAttributes = buffer.readUInt32LE(cursor + 38);
     const localOffset = buffer.readUInt32LE(cursor + 42);
+    if (cursor + 46 + nameLength + extraLength + commentLength > directoryEnd) {
+      throw new Error(`Corrupt ZIP central directory at entry ${index}`);
+    }
+    if (buffer.readUInt16LE(cursor + 8) & 1) {
+      throw new Error("Encrypted ZIP entries are not supported");
+    }
+    if (localOffset + 30 > directoryOffset) {
+      throw new Error("Corrupt ZIP local header offset");
+    }
     const name = buffer.toString("utf8", cursor + 46, cursor + 46 + nameLength);
     const unixMode = (externalAttributes >>> 16) & 0xffff;
     entries.push({
@@ -447,12 +476,14 @@ export function parseZipEntries(buffer) {
       compressedSize,
       uncompressedSize,
       localOffset,
+      directoryOffset,
       isDirectory: name.endsWith("/"),
       // S_IFLNK. Symlinks in an update archive are never legitimate.
       isSymlink: (unixMode & 0xf000) === 0xa000,
     });
     cursor += 46 + nameLength + extraLength + commentLength;
   }
+  if (cursor !== directoryEnd) throw new Error("Corrupt ZIP central directory size");
   return entries;
 }
 
@@ -463,13 +494,18 @@ function readZipEntryData(buffer, entry) {
   const nameLength = buffer.readUInt16LE(entry.localOffset + 26);
   const extraLength = buffer.readUInt16LE(entry.localOffset + 28);
   const start = entry.localOffset + 30 + nameLength + extraLength;
+  if (start + entry.compressedSize > entry.directoryOffset) {
+    throw new Error(`Truncated ZIP entry data for ${entry.name}`);
+  }
   const raw = buffer.subarray(start, start + entry.compressedSize);
 
   let data;
   if (entry.method === ZIP_METHOD_STORED) {
     data = raw;
   } else if (entry.method === ZIP_METHOD_DEFLATE) {
-    data = inflateRawSync(raw);
+    // The advertised size is untrusted. Bound inflation before allocating
+    // the full output, including when the entry lies about its size.
+    data = inflateRawSync(raw, { maxOutputLength: Math.max(1, entry.uncompressedSize) });
   } else {
     throw new Error(
       `Unsupported ZIP compression method ${entry.method} for ${entry.name}`,
@@ -486,6 +522,9 @@ function readZipEntryData(buffer, entry) {
 // Rejects anything that would land outside `destDir` — absolute paths, `..`
 // traversal, and symlinks — before a single byte is written.
 function resolveZipEntryPath(destDir, name) {
+  if (/^(?:[/\\]|[A-Za-z]:)/.test(name) || name.includes("\\")) {
+    throw new Error(`Refusing ZIP entry outside the target directory: ${name}`);
+  }
   if (name.includes("\0")) {
     throw new Error(`Refusing ZIP entry with a NUL byte in its name`);
   }
@@ -499,11 +538,19 @@ function resolveZipEntryPath(destDir, name) {
 
 export async function extractZipArchive(archivePath, destDir, options = {}) {
   const maxBytes = options.maxBytes || MAX_UPDATE_BYTES;
+  if ((await stat(archivePath)).size > MAX_UPDATE_BYTES) {
+    throw new Error("Update ZIP exceeds 50 MiB safety limit");
+  }
   const buffer = await readFile(archivePath);
+  if (buffer.length > MAX_UPDATE_BYTES) throw new Error("Update ZIP exceeds 50 MiB safety limit");
   const entries = parseZipEntries(buffer);
 
   let total = 0;
+  const targets = new Set();
   for (const entry of entries) {
+    const target = resolveZipEntryPath(destDir, entry.isDirectory ? entry.name.slice(0, -1) : entry.name);
+    if (targets.has(target)) throw new Error(`Duplicate ZIP entry: ${entry.name}`);
+    targets.add(target);
     if (entry.isSymlink) {
       throw new Error(`Refusing symlink in update archive: ${entry.name}`);
     }

@@ -34,8 +34,9 @@ ID, add exact IDs/origins with `AUTODOM_ALLOWED_EXTENSION_IDS` or
 Connections that satisfy neither layer receive **HTTP 401 Unauthorized**
 and the rejection is logged to stderr.
 
-WebSocket messages are also capped and minimally schema-checked before
-dispatch. Unknown message types, malformed IDs, and oversized payloads are
+WebSocket messages are capped at 32 MiB by the transport on primary and
+proxy connections, before the complete payload is buffered or parsed.
+Messages are also minimally schema-checked before dispatch. Unknown message types, malformed IDs, and oversized payloads are
 ignored or rejected before they reach tool routing.
 
 ## API key storage

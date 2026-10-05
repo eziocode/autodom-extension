@@ -7,7 +7,8 @@
 //   audit/YYYY-MM-DD.jsonl  append-only log of tool calls and approval
 //                           decisions (one JSON object per line)
 
-import { promises as fs } from "fs";
+import { promises as fs, createReadStream } from "fs";
+import { createInterface } from "node:readline";
 import { homedir } from "os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "path";
 
@@ -109,26 +110,35 @@ export async function appendAudit(entry, home = autodomHome()) {
 
 export async function queryAudit({ date, tool, decision, domain, limit = 100 } = {}, home = autodomHome()) {
   const file = auditFileFor(date || Date.now(), home);
-  let text = "";
-  try {
-    text = await fs.readFile(file, "utf8");
-  } catch {
-    return { file, entries: [] };
-  }
+  const max = Math.max(1, Math.min(1000, Math.trunc(Number(limit) || 100)));
+  // Stream the log and retain only the newest matching entries, even when
+  // a long-running bridge has written a large daily audit file.
   const entries = [];
-  for (const line of text.split("\n")) {
-    if (!line.trim()) continue;
-    let e;
-    try {
-      e = JSON.parse(line);
-    } catch {
-      continue;
+  let total = 0;
+  const stream = createReadStream(file, { encoding: "utf8" });
+  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) continue;
+      let e;
+      try { e = JSON.parse(line); } catch { continue; }
+      if (!e || typeof e !== "object" || Array.isArray(e)) continue;
+      if (tool && e.tool !== tool) continue;
+      if (decision && e.decision !== decision) continue;
+      if (domain && !String(e.domain || "").includes(domain)) continue;
+      entries[total % max] = e;
+      total += 1;
     }
-    if (tool && e.tool !== tool) continue;
-    if (decision && e.decision !== decision) continue;
-    if (domain && !String(e.domain || "").includes(domain)) continue;
-    entries.push(e);
+  } catch (error) {
+    if (error.code === "ENOENT") return { file, entries: [] };
+    throw error;
+  } finally {
+    lines.close();
+    stream.destroy();
   }
-  const max = Math.max(1, Math.min(1000, Number(limit) || 100));
-  return { file, total: entries.length, entries: entries.slice(-max).reverse() };
+  const newest = [];
+  for (let i = 0; i < Math.min(total, max); i += 1) {
+    newest.push(entries[(total - 1 - i) % max]);
+  }
+  return { file, total, entries: newest };
 }

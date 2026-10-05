@@ -2283,6 +2283,7 @@ function bindWebSocketServer() {
     const wss = new WebSocketServer({
       port: WS_PORT,
       host: "127.0.0.1",
+      maxPayload: WS_MAX_MESSAGE_BYTES,
       verifyClient: (info, cb) => {
         const origin = info.origin || info.req.headers.origin || "";
         if (isAllowedOrigin(origin)) return cb(true);
@@ -2577,6 +2578,7 @@ async function ensureProxyClientConnected() {
       let timer = null;
       const ws = new WebSocket(
         `ws://127.0.0.1:${WS_PORT}/?token=${encodeURIComponent(token)}`,
+        { maxPayload: WS_MAX_MESSAGE_BYTES },
       );
       proxyClient = ws;
 
@@ -2735,6 +2737,10 @@ function setupWssConnection(wss) {
         socket.ping();
       } catch (_) {}
     }, 15000); // 15s ping interval (half the 30s inactivity check)
+
+    socket.on("error", (error) => {
+      diagLog(`WebSocket error: ${error.message}`);
+    });
 
     socket.on("pong", () => {
       _wsAlive = true;

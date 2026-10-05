@@ -75,6 +75,11 @@ jobs:
               ;;
           esac
 
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "✘ '$VERSION' is not a plain semver version" >&2
+            exit 2
+          fi
+
           if git show-ref --verify --quiet "refs/tags/v${VERSION}" ||
              git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
             echo "✘ tag v${VERSION} already exists" >&2
@@ -85,6 +90,14 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
           echo "Preparing v$VERSION from $CURRENT"
+
+      - name: Install server dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Audit server dependencies (fail on high+)
+        working-directory: server
+        run: npm audit --audit-level=high
 
       - name: Bump version, commit, and tag
         env:

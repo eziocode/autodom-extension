@@ -22,6 +22,8 @@ import {
   dependenciesUnchanged,
   installServerDependencies,
   locateStagedBundle,
+  lockfileHash,
+  parseZipEntries,
   prepareStagedServerDependencies,
   extractZipArchive,
   classifyInstallRoot,
@@ -752,4 +754,76 @@ test("atomicReplaceDirectories rolls back the pairs already swapped when a later
   );
   assert.equal(await readFile(join(root, "server/v"), "utf8"), "old-server", "server put back");
   assert.equal(await readFile(join(root, "extension/v"), "utf8"), "old-ext", "extension put back");
+});
+
+
+test("dependency hashes ignore release versions but retain dependency integrity", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "autodom-lock-hash-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const oldDir = join(root, "old"), newDir = join(root, "new");
+  for (const dir of [oldDir, newDir]) await mkdir(dir);
+  const lock = (version, integrity = "sha512-old") => ({
+    name: "autodom-server", version, lockfileVersion: 3,
+    packages: {
+      "": { name: "autodom-server", version, dependencies: { ws: "^8.0.0" } },
+      "node_modules/ws": { version: "8.21.1", integrity },
+    },
+  });
+  await writeFile(join(oldDir, "package-lock.json"), JSON.stringify(lock("6.2.1")));
+  await writeFile(join(newDir, "package-lock.json"), JSON.stringify(lock("6.2.2"), null, 2));
+  assert.equal(await dependenciesUnchanged(oldDir, newDir), true);
+  await mkdir(join(oldDir, "node_modules"));
+  const result = await prepareStagedServerDependencies(
+    { oldServerDir: oldDir, newServerDir: newDir },
+    { run: async () => { throw new Error("must not install for version-only bump"); } },
+  );
+  assert.equal(result.method, "reused");
+  await writeFile(join(newDir, "package-lock.json"), JSON.stringify(lock("6.2.2", "sha512-new")));
+  assert.equal(await dependenciesUnchanged(oldDir, newDir), false);
+  assert.equal(await lockfileHash(join(root, "missing")), null);
+});
+
+test("ZIP inflation is bounded even when advertised output size is forged", async (t) => {
+  const { dir, archive, dest } = await writeZip([
+    { name: "bomb.txt", data: "x".repeat(1_000_000), declaredSize: 10 },
+  ]);
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await assert.rejects(() => extractZipArchive(archive, dest), { code: "ERR_BUFFER_TOO_LARGE" });
+  await assert.rejects(() => access(join(dest, "bomb.txt")));
+});
+
+test("ZIP path validation finishes before any entries are written", async (t) => {
+  for (const name of ["../escape", "C:/escape", "nested\\..\\escape", "/escape"]) {
+    const { dir, archive, dest } = await writeZip([
+      { name: "safe.txt", data: "safe" }, { name, data: "bad" },
+    ]);
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    await assert.rejects(() => extractZipArchive(archive, dest), /outside the target directory/);
+    await assert.rejects(() => access(join(dest, "safe.txt")));
+  }
+});
+
+test("ZIP parser rejects truncated headers, data and duplicate destinations", async (t) => {
+  const zip = buildZip([{ name: "hello.txt", data: "hello" }]);
+  const eocd = zip.length - 22;
+  const central = zip.readUInt32LE(eocd + 16);
+  for (const mutate of [
+    (b) => b.writeUInt32LE(central + 1, eocd + 16),
+    (b) => b.writeUInt16LE(0xffff, central + 28),
+    (b) => b.writeUInt32LE(central, central + 42),
+    (b) => b.writeUInt16LE(1, eocd + 4),
+  ]) {
+    const damaged = Buffer.from(zip);
+    mutate(damaged);
+    assert.throws(() => parseZipEntries(damaged), /Corrupt/);
+  }
+  const dir = await mkdtemp(join(tmpdir(), "autodom-zip-truncated-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const archive = join(dir, "archive.zip"), dest = join(dir, "out");
+  const damaged = Buffer.from(zip);
+  damaged.writeUInt32LE(zip.length, central + 20);
+  await writeFile(archive, damaged);
+  await assert.rejects(() => extractZipArchive(archive, dest), /Truncated ZIP entry/);
+  await writeFile(archive, buildZip([{ name: "same", data: "a" }, { name: "./same", data: "b" }]));
+  await assert.rejects(() => extractZipArchive(archive, dest), /Duplicate ZIP entry/);
 });

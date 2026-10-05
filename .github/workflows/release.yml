@@ -38,9 +38,11 @@ jobs:
 
       - name: Resolve release version
         id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [[ -n "${{ inputs.version }}" ]]; then
-            VERSION="${{ inputs.version }}"
+          if [[ -n "$INPUT_VERSION" ]]; then
+            VERSION="$INPUT_VERSION"
           else
             VERSION="${GITHUB_REF_NAME#v}"
           fi
@@ -89,11 +91,14 @@ jobs:
           NODE
 
       - name: Validate required secrets / vars
+        env:
+          CRX_PRIVATE_KEY: ${{ secrets.CHROME_CRX_PRIVATE_KEY }}
+          EXTENSION_KEY: ${{ secrets.CHROME_EXTENSION_KEY }}
         run: |
           missing=()
-          [[ -z "${{ secrets.CHROME_CRX_PRIVATE_KEY }}" ]] && missing+=("secret CHROME_CRX_PRIVATE_KEY")
-          [[ -z "${{ secrets.CHROME_EXTENSION_KEY }}"  ]] && missing+=("secret CHROME_EXTENSION_KEY")
-          [[ -z "${{ env.CHROME_EXTENSION_ID }}"       ]] && missing+=("var CHROME_EXTENSION_ID")
+          [[ -z "$CRX_PRIVATE_KEY" ]] && missing+=("secret CHROME_CRX_PRIVATE_KEY")
+          [[ -z "$EXTENSION_KEY"  ]] && missing+=("secret CHROME_EXTENSION_KEY")
+          [[ -z "$CHROME_EXTENSION_ID"       ]] && missing+=("var CHROME_EXTENSION_ID")
           if (( ${#missing[@]} )); then
             printf '✘ missing required release inputs:\n' >&2
             printf '  - %s\n' "${missing[@]}" >&2
@@ -162,13 +167,14 @@ jobs:
           PEM: ${{ secrets.CHROME_CRX_PRIVATE_KEY }}
           V: ${{ steps.ver.outputs.version }}
         run: |
-          echo "$PEM" > /tmp/autodom.pem
-          chmod 600 /tmp/autodom.pem
+          umask 077
+          KEY_FILE="$(mktemp)"
+          trap 'shred -u "$KEY_FILE"' EXIT
+          printf '%s\n' "$PEM" > "$KEY_FILE"
           npx --yes crx3@2.0.0 \
-            --keyPath=/tmp/autodom.pem \
+            --keyPath="$KEY_FILE" \
             --crxPath="dist/autodom-${V}.crx" \
             "dist/chrome"
-          shred -u /tmp/autodom.pem
           ls -lh "dist/autodom-${V}.crx"
 
       # The share bundle (server/ + extension/) is what lets an installed

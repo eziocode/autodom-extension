@@ -77,6 +77,12 @@ case "$ARG" in
         ;;
 esac
 
+# Validate before embedding the value in JavaScript or touching files.
+if [[ ! "$NEXT" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    echo "error: '$NEXT' is not a plain semver version" >&2
+    exit 2
+fi
+
 if [[ "$CURRENT" == "$NEXT" ]]; then
     echo "[=] Already at v${CURRENT}, nothing to do."
     exit 0
