@@ -11387,8 +11387,13 @@ async function _runBridgeCheck() {
         (b) => b.verdict && b.verdict.action !== "keep",
       );
       const portInfo = helperStatus.ports?.[port];
-      if (primaries.length === 1 || (portInfo?.listening && portInfo?.lockAlive)) {
-        const p = primaries[0];
+      // A missing lock prevents the helper's authenticated status request,
+      // but its process scan can still identify the AutoDOM listener.
+      const listener = portInfo?.listening
+        ? onPort.find((b) => b.pid === portInfo.listenerPid)
+        : null;
+      if (primaries.length === 1 || listener || (portInfo?.listening && portInfo?.lockAlive)) {
+        const p = primaries[0] || listener;
         row(
           "primary",
           "Primary server",

@@ -461,7 +461,8 @@ async function restart(port = DEFAULT_PORT, options = {}) {
   const flushed = await flush(port, options);
   const portInfo = flushed.after.ports[port];
   const hasPrimary = flushed.after.bridges.some(
-    (b) => b.port === port && b.primary,
+    (b) => b.port === port && (b.primary ||
+      (portInfo?.listening && b.pid === portInfo.listenerPid)),
   );
   if (hasPrimary || (portInfo?.listening && portInfo?.lockAlive)) {
     return { ...flushed, started: null, note: "a live primary already owns the port" };

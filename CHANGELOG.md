@@ -4,6 +4,13 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 6.2.1
+
+### Fixed
+- Bridge Check and Fix recognize an AutoDOM process listening on the configured
+  port even when its lock file is missing. A working bridge is no longer
+  incorrectly reported as a non-AutoDOM process.
+
 ## 6.1.0
 
 ### Added
