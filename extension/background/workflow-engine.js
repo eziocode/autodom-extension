@@ -2772,6 +2772,8 @@
       resumeRuns: (tabId) => setRunState({ tabId }, { paused: false }),
       activeRunId: () => currentRunId,
       recordingState: () => (rec ? { tabId: rec.tabId, steps: rec.steps.length } : null),
+      // Copy of the steps recorded so far (each carries t and url).
+      recordingSteps: () => (rec ? rec.steps.map((s) => ({ ...s })) : []),
       flushRuns,
       clearRunHistory,
       clearDrafts,

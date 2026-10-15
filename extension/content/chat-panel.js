@@ -3999,17 +3999,23 @@
 
     const title = document.createElement("div");
     title.className = "autodom-gate-title";
-    const riskLabel =
-      req.category === "destructive"
+    const transition = req.transition || null;
+    const riskLabel = transition
+      ? "Leaving this site"
+      : req.category === "destructive"
         ? "Destructive action"
-        : req.category === "safe-read"
-          ? "Read action"
-          : "Page mutation";
+        : req.category === "debug-read"
+          ? "Read debugging data (console / network)"
+          : req.category === "safe-read"
+            ? "Read action"
+            : "Page mutation";
     title.textContent = `${riskLabel} — confirm to proceed`;
 
     const tool = document.createElement("div");
     tool.className = "autodom-gate-tool";
-    tool.textContent = `${req.toolName} · ${req.origin || "unknown origin"}`;
+    tool.textContent = transition
+      ? `${req.toolName} · ${transition.from} → ${transition.to}`
+      : `${req.toolName} · ${req.origin || "unknown origin"}`;
 
     const preview = document.createElement("pre");
     preview.className = "autodom-gate-preview";
@@ -4024,9 +4030,12 @@
 
     const allowSiteBtn = document.createElement("button");
     allowSiteBtn.className = "autodom-gate-btn allow-site";
-    allowSiteBtn.textContent = `Allow on ${shortOrigin(req.origin)}`;
-    // Destructive actions cannot be persisted without Full Trust (v2).
-    if (req.category === "destructive") {
+    allowSiteBtn.textContent = transition
+      ? `Always allow ${transition.from} → ${transition.to}`
+      : `Allow on ${shortOrigin(req.origin)}`;
+    // Destructive actions cannot be persisted without Full Trust (v2); a
+    // site-to-site navigation grant can.
+    if (req.category === "destructive" && !transition) {
       allowSiteBtn.disabled = true;
       allowSiteBtn.title = "Destructive actions always require per-call approval";
     }
@@ -4044,7 +4053,9 @@
       status.textContent = decision.allowed
         ? decision.persist === "origin"
           ? "Allowed on this site"
-          : "Allowed once"
+          : decision.persist === "transition"
+            ? "Always allowed between these sites"
+            : "Allowed once"
         : "Denied";
       card.appendChild(status);
       try {
@@ -4061,7 +4072,7 @@
 
     allowBtn.addEventListener("click", () => finish({ allowed: true }));
     allowSiteBtn.addEventListener("click", () =>
-      finish({ allowed: true, persist: "origin" }),
+      finish({ allowed: true, persist: transition ? "transition" : "origin" }),
     );
     denyBtn.addEventListener("click", () =>
       finish({ allowed: false, reason: "User denied" }),

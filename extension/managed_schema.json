@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "properties": {
+    "blockedUrlPatterns": {
+      "title": "Blocked URL patterns",
+      "description": "Sites where AutoDOM may not act. Each pattern is matched against the page's host and path (for example 'example.com/admin/*'). '*' matches any run of characters; matching is case-insensitive; a leading scheme or 'www.' is ignored. A bare domain is treated as '<domain>/*'; use '*.example.com' to include subdomains. Applies to the page a tool runs on and to the destination of navigate/open_new_tab, for every caller, and overrides the user's own settings.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

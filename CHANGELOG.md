@@ -4,6 +4,19 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 6.3.0
+
+### Added
+- Console and network capture over CDP with per-tab ring buffers, kept attached
+  between `get_console_logs` / `get_network_requests` calls.
+- HAR recorder (`har_start`, `har_status`, `har_stop`): HAR 1.2 log per tab with
+  user actions attached and secrets redacted by default.
+- Permission gating for tool actions, with a managed storage schema
+  (`managed_schema.json`) for enterprise policy.
+
+### Security
+- Updated `@modelcontextprotocol/client` to 2.3.1 (GHSA-6qxp-vccf-f47h).
+
 ## 6.2.2
 
 ### Performance

@@ -42,6 +42,12 @@ try {
   if (typeof importScripts === "function" && !globalThis.AutoDOMScheduler) {
     importScripts("scheduler.js");
   }
+  if (typeof importScripts === "function" && !globalThis.AutoDOMDebugCapture) {
+    importScripts("debug-capture.js");
+  }
+  if (typeof importScripts === "function" && !globalThis.AutoDOMHar) {
+    importScripts("har-recorder.js");
+  }
 } catch (_) {
   // Already loaded (Firefox path) — ignore.
 }
@@ -1380,22 +1386,35 @@ async function executeAgentTool(toolName, params, ctx) {
   }
 
   // ── ActionGate: Ask Before Act ──────────────────────────────
+  // Every call is checked, batch steps included: a step runs under the
+  // batch's approval only while it stays on the origin the batch was
+  // approved for. Steps of non-agent batches (bridge, panel, schedule)
+  // follow that caller's own policy instead of prompting.
   const Gate = globalThis.AutoDOMActionGate;
-  if (Gate && !(ctx?.batchDepth > 0)) {
+  const inBatch = ctx?.batchDepth > 0;
+  if (Gate) {
     try {
-      const origin = Gate.normalizeOrigin(_gateTab?.url || "");
-      const decision = await Gate.requestDecision({
-        tabId: _gateTab?.id,
-        origin,
-        toolName,
-        params,
-      });
-      if (!decision?.allowed) {
-        return {
-          ok: false,
-          denied: true,
-          error: decision?.reason || `Action '${toolName}' denied by user`,
-        };
+      const gateOrigin = Gate.normalizeOrigin(_gateTab?.url || "");
+      if (inBatch && ctx?.origin !== "agent") {
+        const blocked = await _batchStepPolicyCheck(toolName, params, ctx, _gateTab);
+        if (blocked) return { ok: false, denied: true, ...blocked };
+      } else {
+        const decision = await Gate.requestDecision({
+          tabId: _gateTab?.id,
+          origin: gateOrigin,
+          pageUrl: _gateTab?.url || "",
+          toolName,
+          params,
+          batchOrigin: inBatch ? ctx.batchOrigin : undefined,
+        });
+        if (!decision?.allowed) {
+          return {
+            ok: false,
+            denied: true,
+            ...(decision?.policyBlocked && { blocked: true }),
+            error: decision?.reason || `Action '${toolName}' denied by user`,
+          };
+        }
       }
     } catch (err) {
       // Fail closed: if the gate itself crashes, refuse the action.
@@ -1973,6 +1992,13 @@ function _isRepeatLoop(history, toolName, args) {
 // into provider-native message shapes. Returns the additional fields
 // to spread onto a `{ role: "user", ... }` entry. Falls back to the
 // plain text payload when no attachments are present (cheapest path).
+// { type:"base64", media_type, data } for an image data URL; the media type
+// comes from the URL (screenshots can be JPEG or PNG).
+function _anthropicImageSource(dataUrl) {
+  const m = String(dataUrl).match(/^data:([^;,]+);base64,(.*)$/s);
+  return { type: "base64", media_type: m ? m[1] : "image/png", data: m ? m[2] : String(dataUrl) };
+}
+
 function _buildUserMessageForProvider(text, attachments, providerType) {
   const list = Array.isArray(attachments) ? attachments.filter((a) => a && a.dataUrl) : [];
   if (list.length === 0) return { content: String(text || "") };
@@ -2580,7 +2606,7 @@ async function runAgentLoop({
         if (initialScreenshot) {
           userContent.push({
             type: "image",
-            source: { type: "base64", media_type: "image/png", data: initialScreenshot.replace(/^data:image\/[a-z]+;base64,/, "") },
+            source: _anthropicImageSource(initialScreenshot),
           });
         }
         qMessages.push({ role: "user", content: userContent });
@@ -2684,7 +2710,7 @@ async function runAgentLoop({
           const feedback = nextScreenshotUrl
             ? [
                 { type: "text", text: "Here is the updated page after the commands:" },
-                { type: "image", source: { type: "base64", media_type: "image/png", data: nextScreenshotUrl.replace(/^data:image\/[a-z]+;base64,/, "") } },
+                { type: "image", source: _anthropicImageSource(nextScreenshotUrl) },
               ]
             : [{ type: "text", text: "Commands executed. No screenshot available." }];
           qMessages.push({ role: "user", content: feedback });
@@ -6472,6 +6498,9 @@ const TOOL_HANDLERS = new Map([
   ["extract_text", toolExtractText],
   ["get_network_requests", toolGetNetworkRequests],
   ["get_console_logs", toolGetConsoleLogs],
+  ["har_start", toolHarStart],
+  ["har_status", toolHarStatus],
+  ["har_stop", toolHarStop],
   ["list_tabs", toolListTabs],
   ["switch_tab", toolSwitchTab],
   ["wait_for_new_tab", toolWaitForNewTab],
@@ -7188,20 +7217,84 @@ async function toolNavigate(params, ctx) {
     await chrome.tabs.goForward(tab.id);
     return { success: true, action: "forward" };
   }
+  // Wait for the new document to load (like wait_for_navigation, without
+  // the extra call), unless waitUntil:"none".
+  const waitMs = params?.waitUntil === "none" ? 0 : Number(params?.timeout) || 15000;
   if (action === "reload") {
+    const loaded = waitMs ? _waitForNextLoad(tab.id, waitMs, ctx?.signal) : null;
     await chrome.tabs.reload(tab.id);
-    return { success: true, action: "reload" };
+    if (!loaded) return { success: true, action: "reload" };
+    return { success: true, action: "reload", ...(await loaded) };
   }
   if (url) {
+    // Same-document (#hash) navigations fire no load.
+    const sameDocument = _sameDocumentUrl(tab.url, url);
+    const loaded = waitMs && !sameDocument ? _waitForNextLoad(tab.id, waitMs, ctx?.signal) : null;
     const updatedTab = await chrome.tabs.update(tab.id, { url });
-    return {
-      success: true,
-      url: updatedTab.pendingUrl || updatedTab.url || url,
-      title: updatedTab.title,
-      status: updatedTab.status,
-    };
+    if (!loaded) {
+      return {
+        success: true,
+        url: updatedTab.pendingUrl || updatedTab.url || url,
+        title: updatedTab.title,
+        status: updatedTab.status,
+      };
+    }
+    return { success: true, ...(await loaded) };
   }
   return { error: "Provide url or action (back/forward/reload)" };
+}
+
+function _sameDocumentUrl(current, next) {
+  try {
+    const a = new URL(current);
+    const b = new URL(next, current);
+    return b.hash !== "" && a.href.split("#")[0] === b.href.split("#")[0];
+  } catch (_) {
+    return false;
+  }
+}
+
+// Resolves once tabId goes through "loading" → "complete" after this call
+// (the listener is attached before the caller starts the navigation, so a
+// fast load cannot be missed), or at the timeout with the tab's state then.
+function _waitForNextLoad(tabId, timeoutMs, signal) {
+  const startedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    let sawLoading = false;
+    let settled = false;
+    const done = (tab, timedOut) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      signal?.removeEventListener?.("abort", onAbort);
+      resolve({
+        url: tab?.url,
+        title: tab?.title,
+        status: tab?.status,
+        loaded: !timedOut && tab?.status === "complete",
+        elapsedMs: Date.now() - startedAt,
+        ...(timedOut && { note: `Page still loading after ${timeoutMs}ms; call wait_for_navigation to keep waiting.` }),
+      });
+    };
+    const listener = (id, info, tab) => {
+      if (id !== tabId) return;
+      if (info.status === "loading") sawLoading = true;
+      else if (info.status === "complete" && sawLoading) done(tab, false);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new _CallCancelledError(_abortReason(signal)));
+    };
+    const timer = setTimeout(() => {
+      chrome.tabs.get(tabId).then((t) => done(t, true), () => done(null, true));
+    }, timeoutMs);
+    chrome.tabs.onUpdated.addListener(listener);
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+  });
 }
 
 // 2. Click
@@ -7475,8 +7568,101 @@ function _withWindowCapture(windowId, fn) {
   return next;
 }
 
-async function _captureBackgroundTab(tab, params) {
-  const jpeg = /^jpe?g$/i.test(String(params?.format || ""));
+// Screenshots default to the page's CSS viewport size — image pixels are
+// then the coordinates click_at_coordinates takes — capped so the long edge
+// stays within SCREENSHOT_MAX_EDGE and the area within SCREENSHOT_MAX_PIXELS
+// (vision models downscale anything larger, so the extra pixels only cost
+// transfer and encode time). maxWidth narrows it; fullResolution skips it.
+const SCREENSHOT_MAX_EDGE = 1568;
+const SCREENSHOT_MAX_PIXELS = 1_200_000;
+
+function _screenshotTargetSize(vp, params) {
+  if (!vp || !(vp.width > 0) || !(vp.height > 0)) return null;
+  let s = Math.min(1, SCREENSHOT_MAX_EDGE / Math.max(vp.width, vp.height));
+  s = Math.min(s, Math.sqrt(SCREENSHOT_MAX_PIXELS / (vp.width * vp.height)));
+  const maxWidth = Number(params?.maxWidth);
+  if (maxWidth > 0) s = Math.min(s, maxWidth / vp.width);
+  return {
+    width: Math.max(1, Math.floor(vp.width * s)),
+    height: Math.max(1, Math.floor(vp.height * s)),
+  };
+}
+
+// Width/height from a PNG IHDR or JPEG SOF header, without decoding.
+function _imageSize(dataUrl) {
+  const comma = typeof dataUrl === "string" ? dataUrl.indexOf(",") : -1;
+  if (comma < 0) return null;
+  let bin;
+  try {
+    // 64 KiB of base64 covers the JPEG segments before SOF in practice.
+    const head = dataUrl.slice(comma + 1, comma + 1 + 65536);
+    bin = atob(head.slice(0, head.length - (head.length % 4)));
+  } catch (_) {
+    return null;
+  }
+  const at = (i) => bin.charCodeAt(i);
+  if (at(0) === 0x89 && bin.slice(1, 4) === "PNG") {
+    const u32 = (i) => ((at(i) << 24) | (at(i + 1) << 16) | (at(i + 2) << 8) | at(i + 3)) >>> 0;
+    return { width: u32(16), height: u32(20) };
+  }
+  if (at(0) === 0xff && at(1) === 0xd8) {
+    let i = 2;
+    while (i + 9 < bin.length) {
+      if (at(i) !== 0xff) return null;
+      const marker = at(i + 1);
+      const len = (at(i + 2) << 8) | at(i + 3);
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        return { height: (at(i + 5) << 8) | at(i + 6), width: (at(i + 7) << 8) | at(i + 8) };
+      }
+      i += 2 + len;
+    }
+  }
+  return null;
+}
+
+function _shotFormat(params) {
+  const f = String(params?.format || "jpeg").toLowerCase();
+  return f === "png" || f === "webp" ? f : "jpeg";
+}
+
+function _shotQuality(params) {
+  const q = Number(params?.quality);
+  return q >= 1 && q <= 100 ? Math.round(q) : 80;
+}
+
+// Downscale and/or re-encode a captured data URL (captureVisibleTab returns
+// device pixels, and no WebP). Returns null where OffscreenCanvas is
+// unavailable; the caller keeps the original.
+async function _resizeDataUrl(dataUrl, target, params) {
+  if (!target || typeof OffscreenCanvas !== "function" || typeof createImageBitmap !== "function") return null;
+  try {
+    const blob = await (await fetch(dataUrl)).blob();
+    const bitmap = await createImageBitmap(blob, {
+      resizeWidth: target.width,
+      resizeHeight: target.height,
+      resizeQuality: "high",
+    });
+    const canvas = new OffscreenCanvas(target.width, target.height);
+    canvas.getContext("2d").drawImage(bitmap, 0, 0);
+    bitmap.close?.();
+    const format = _shotFormat(params);
+    const out = await canvas.convertToBlob(
+      format === "png" ? { type: "image/png" } : { type: `image/${format}`, quality: _shotQuality(params) / 100 },
+    );
+    const bytes = new Uint8Array(await out.arrayBuffer());
+    let s = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return `data:${out.type};base64,${btoa(s)}`;
+  } catch (_) {
+    return null;
+  }
+}
+
+// clip (optional): { x, y, width, height, scale } in CSS px for
+// Page.captureScreenshot, so CDP renders the image at the target size.
+async function _captureBackgroundTab(tab, params, clip) {
+  const format = _shotFormat(params);
+  const jpeg = format === "jpeg";
   try {
     await ensureDebugger(tab.id);
     let timer;
@@ -7484,9 +7670,13 @@ async function _captureBackgroundTab(tab, params) {
       chrome.debugger.sendCommand(
         { tabId: tab.id },
         "Page.captureScreenshot",
-        jpeg
-          ? { format: "jpeg", quality: params?.quality || 80, fromSurface: true }
-          : { format: "png", fromSurface: true },
+        {
+          format,
+          ...(format !== "png" && { quality: _shotQuality(params) }),
+          fromSurface: true,
+          captureBeyondViewport: false,
+          ...(clip && { clip }),
+        },
       ),
       new Promise((_, reject) => {
         timer = setTimeout(
@@ -7496,7 +7686,7 @@ async function _captureBackgroundTab(tab, params) {
       }),
     ]).finally(() => clearTimeout(timer));
     if (res?.data) {
-      return `data:image/${jpeg ? "jpeg" : "png"};base64,${res.data}`;
+      return `data:image/${format};base64,${res.data}`;
     }
   } catch (_) {
     // fall through to the brief-activation capture
@@ -7511,7 +7701,7 @@ async function _captureBackgroundTab(tab, params) {
       await new Promise((r) => setTimeout(r, 150));
       return await chrome.tabs.captureVisibleTab(tab.windowId, {
         format: jpeg ? "jpeg" : "png",
-        quality: params?.quality || 80,
+        quality: _shotQuality(params),
       });
     } finally {
       if (previous && previous.id !== tab.id) {
@@ -7543,8 +7733,9 @@ async function toolScreenshot(params, ctx) {
   const PUSH_CLASS = "__autodom_panel_open";
   const PUSH_MARK = "data-autodom-screenshot-unpushed";
 
-  // Returns how many things it hid/restored (0 when none of our UI is on
-  // the page, or scripting is not allowed there). When hiding changed
+  // Returns { changed, viewport }: how many things it hid/restored (0 when
+  // none of our UI is on the page, or scripting is not allowed there — then
+  // viewport is null too) and the page's viewport. When hiding changed
   // something it also waits, in the page, for two animation frames (60 ms
   // fallback for throttled background tabs) so the change is painted.
   async function setHiddenState(hidden) {
@@ -7648,36 +7839,78 @@ async function toolScreenshot(params, ctx) {
               setTimeout(finish, 60);
             });
           }
-          return changed;
+          // The viewport after our UI was hidden: the capture is sized to it.
+          return {
+            changed,
+            viewport: {
+              width: window.innerWidth,
+              height: window.innerHeight,
+              dpr: window.devicePixelRatio || 1,
+              scrollX: window.scrollX,
+              scrollY: window.scrollY,
+            },
+          };
         },
       });
-      return Number(res?.[0]?.result) || 0;
+      return res?.[0]?.result || { changed: 0, viewport: null };
     } catch (_e) {
       // Tab may not allow scripting (e.g. chrome:// pages); fall through.
-      return 0;
+      return { changed: 0, viewport: null };
     }
   }
 
   let hidden = false;
   try {
     // Nothing of ours on the page → no paint to wait for, nothing to restore.
-    hidden = (await setHiddenState(true)) > 0;
+    const state = await setHiddenState(true);
+    hidden = state.changed > 0;
+    const vp = state.viewport;
+    const target = params?.fullResolution === true ? null : _screenshotTargetSize(vp, params);
 
     let dataUrl = null;
     if (_isolatedClientId(ctx) && !tab.active) {
       // The agent's tab sits in the background (we never activate it), so
       // captureVisibleTab would photograph whatever the user is viewing.
-      dataUrl = await _captureBackgroundTab(tab, params);
+      const clip = target && {
+        x: vp.scrollX,
+        y: vp.scrollY,
+        width: vp.width,
+        height: vp.height,
+        scale: target.width / (vp.width * vp.dpr),
+      };
+      dataUrl = await _captureBackgroundTab(tab, params, clip);
     }
     if (!dataUrl) {
+      const format = _shotFormat(params);
       dataUrl = await _withWindowCapture(tab.windowId, () =>
         chrome.tabs.captureVisibleTab(tab.windowId, {
-          format: params?.format || "png",
-          quality: params?.quality || 80,
+          // captureVisibleTab has no WebP; _resizeDataUrl re-encodes to it.
+          format: format === "jpeg" ? "jpeg" : "png",
+          quality: _shotQuality(params),
         }),
       );
     }
-    return { success: true, screenshot: dataUrl };
+    let size = _imageSize(dataUrl);
+    const wantType = `image/${_shotFormat(params)}`;
+    const needsResize = target && size && size.width > target.width + 1;
+    if (needsResize || !dataUrl.startsWith(`data:${wantType};`)) {
+      const resized = await _resizeDataUrl(dataUrl, needsResize ? target : size, params);
+      if (resized) {
+        dataUrl = resized;
+        size = _imageSize(dataUrl) || size;
+      }
+    }
+    return {
+      success: true,
+      screenshot: dataUrl,
+      ...(size && { width: size.width, height: size.height }),
+      ...(vp && {
+        viewport: { width: vp.width, height: vp.height, devicePixelRatio: vp.dpr },
+        // Image pixels per CSS pixel: divide image coordinates by this to get
+        // the x/y that click_at_coordinates takes.
+        ...(size && { scale: Math.round((size.width / vp.width) * 1000) / 1000 }),
+      }),
+    };
   } catch (err) {
     return { error: `Screenshot failed: ${err.message}` };
   } finally {
@@ -8056,10 +8289,205 @@ async function toolExtractText(params, ctx) {
   );
 }
 
-// 14. Get network requests (basic — from captured data)
+// ─── Console / network capture (CDP, see debug-capture.js) ──
+// Both tools start capture on first use and keep it running for the tab.
+// Where CDP is unavailable (Firefox, attach refused — e.g. DevTools already
+// attached) they fall back to the in-page capture below.
+
+let _debugCaptureReady = false;
+function _debugCapture() {
+  const cap = globalThis.AutoDOMDebugCapture;
+  if (!cap || IS_FIREFOX) return null;
+  if (!_debugCaptureReady) {
+    cap.init({
+      ensureDebugger,
+      sendCommand: (tabId, method, commandParams) =>
+        chrome.debugger.sendCommand({ tabId }, method, commandParams || {}),
+      detach: (tabId) => detachDebuggerSafe(tabId, { force: true }),
+    });
+    _debugCaptureReady = true;
+  }
+  return cap;
+}
+
+// Starts capture on the tab. Returns { cap, started } or { fallback: reason }.
+async function _startDebugCapture(tab) {
+  const cap = _debugCapture();
+  if (!cap) return { fallback: "CDP capture is not available in this browser" };
+  try {
+    const { started } = await cap.start(tab.id, tab.url);
+    return { cap, started };
+  } catch (err) {
+    return { fallback: err?.message || String(err) };
+  }
+}
+
+const _CAPTURE_STARTED_NOTE =
+  "Capture started with this call; anything the page logged or requested earlier is not included. Reload the page or repeat the action, then call again.";
+
 async function toolGetNetworkRequests(params, ctx) {
-  // Note: We capture via performance API, not debugger for simplicity
   const tab = await getActiveTab(ctx);
+  const capture = await _startDebugCapture(tab);
+  if (capture.fallback) {
+    const result = await _getNetworkRequestsInPage(tab, params);
+    return { ...result, source: "performance-api", note: `CDP capture unavailable (${capture.fallback}); showing Performance API entries (no method, status or failures).` };
+  }
+  const limit = params?.limit || 50;
+  const { requests, total, truncated } = capture.cap.getNetwork(tab.id, {
+    urlPattern: params?.urlPattern,
+    failedOnly: params?.failedOnly === true,
+    limit,
+    clear: params?.clear === true,
+  });
+  const artifactRe = /(\.(?:gz|zip|json|ndjson|html?|csv|txt|log)(?:[?#]|$)|artifact|report|sync[\s_-]*history|api\/)/i;
+  const marked = requests.map((r) => ({ ...r, artifactCandidate: artifactRe.test(r.url) }));
+  const out = params?.artifactOnly === true ? marked.filter((r) => r.artifactCandidate) : marked;
+  if (params?.stop === true) await capture.cap.stop(tab.id);
+  return {
+    source: "cdp",
+    requests: out,
+    total,
+    truncated,
+    artifactCandidates: out.filter((r) => r.artifactCandidate).map((r) => r.url),
+    ...(capture.started && { note: _CAPTURE_STARTED_NOTE }),
+    ...(params?.stop === true && { captureStopped: true }),
+  };
+}
+
+async function toolGetConsoleLogs(params, ctx) {
+  const tab = await getActiveTab(ctx);
+  const capture = await _startDebugCapture(tab);
+  if (capture.fallback) {
+    const result = await _getConsoleLogsInPage(tab);
+    return { ...result, source: "in-page", note: result.note || `CDP capture unavailable (${capture.fallback}); showing console.* calls captured in the page (no exceptions or browser messages).` };
+  }
+  const { messages, total, truncated } = capture.cap.getConsole(tab.id, {
+    pattern: params?.pattern,
+    level: params?.level,
+    onlyErrors: params?.onlyErrors === true,
+    limit: params?.limit || 100,
+    clear: params?.clear === true,
+  });
+  if (params?.stop === true) await capture.cap.stop(tab.id);
+  return {
+    source: "cdp",
+    logs: messages,
+    total,
+    truncated,
+    ...(capture.started && { note: _CAPTURE_STARTED_NOTE }),
+    ...(params?.stop === true && { captureStopped: true }),
+  };
+}
+
+// ─── HAR recording (see har-recorder.js) ─────────────────────
+// har_start captures the tab's traffic over CDP and, through the workflow
+// recorder, the user's own clicks/typing/navigations in that tab, so the
+// agent can ask the user to "do it by hand" and get back a HAR whose entries
+// say which action triggered them. har_stop returns the HAR; the MCP server
+// writes it to disk.
+
+const _harTabs = new Map(); // tabId → { ownsRecorder, captureStarted }
+
+function _harRecorder() {
+  const har = globalThis.AutoDOMHar;
+  const cap = _debugCapture();
+  if (!har || !cap) return null;
+  har.init({
+    capture: cap,
+    sendCommand: (tabId, method, commandParams) =>
+      chrome.debugger.sendCommand({ tabId }, method, commandParams || {}),
+  });
+  return har;
+}
+
+async function toolHarStart(params, ctx) {
+  const har = _harRecorder();
+  if (!har) return { error: "HAR recording needs the Chrome DevTools protocol (Chrome/Edge/Chromium)." };
+  const tab = await getActiveTab(ctx);
+  if (har.isActive(tab.id)) return { ok: true, alreadyRecording: true, tabId: tab.id, ...har.status(tab.id) };
+  const capture = await _startDebugCapture(tab);
+  if (capture.fallback) return { error: `Could not attach to the tab: ${capture.fallback}` };
+  await har.start(tab.id, params || {});
+
+  let actions = params?.actions !== false;
+  let note;
+  if (actions && workflowEngine?.isRecording()) {
+    actions = false;
+    note = "A workflow recording is already running, so user actions are not captured for this HAR; stop it to include them next time.";
+  } else if (actions) {
+    const rec = await workflowEngine?.handlers?.workflow_record_start?.({ tabId: tab.id }, ctx);
+    if (!rec?.ok) {
+      actions = false;
+      note = `User actions are not captured: ${rec?.error || "workflow recorder unavailable"}`;
+    }
+  }
+  _harTabs.set(tab.id, { ownsRecorder: actions, captureStarted: capture.started });
+
+  if (params?.url) await toolNavigate({ url: params.url }, ctx);
+  return {
+    ok: true,
+    recording: true,
+    tabId: tab.id,
+    url: params?.url || tab.url,
+    capturingUserActions: actions,
+    ...(note && { note }),
+    hint:
+      "Recording network traffic" + (actions ? " and the user's clicks, typing and navigations" : "") +
+      " in this tab. Ask the user to perform the flow in that tab (it is in the AutoDOM tab group), then call har_stop. Use har_status to watch progress.",
+  };
+}
+
+async function toolHarStatus(params, ctx) {
+  const har = _harRecorder();
+  const tab = await getActiveTab(ctx);
+  const st = har?.status(tab.id);
+  if (!st) return { ok: true, recording: false, tabId: tab.id };
+  const steps = _harTabs.get(tab.id)?.ownsRecorder ? workflowEngine?.recordingSteps?.() || [] : [];
+  return {
+    ok: true,
+    recording: true,
+    tabId: tab.id,
+    ...st,
+    userActions: steps.length,
+    recentActions: steps.slice(-5).map((s) => ({ action: s.action, text: s.locator?.accessibleName || s.locator?.text || s.locator?.label, url: s.url })),
+  };
+}
+
+async function toolHarStop(params, ctx) {
+  const har = _harRecorder();
+  const tab = await getActiveTab(ctx);
+  if (!har?.isActive(tab.id)) return { error: "No HAR recording on this tab. Call har_start first." };
+  const meta = _harTabs.get(tab.id) || {};
+  _harTabs.delete(tab.id);
+  let actions = [];
+  if (meta.ownsRecorder) {
+    actions = workflowEngine?.recordingSteps?.() || [];
+    await workflowEngine?.handlers?.workflow_record_stop?.({}, ctx);
+  }
+  const manifest = chrome.runtime.getManifest?.() || {};
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent || "" : "";
+  const browserMatch = /(Edg|OPR|Chrome)\/([\d.]+)/.exec(ua);
+  const result = await har.stop(tab.id, {
+    actions,
+    creator: { name: "AutoDOM", version: manifest.version || "" },
+    ...(browserMatch && { browser: { name: browserMatch[1] === "Edg" ? "Edge" : browserMatch[1], version: browserMatch[2] } }),
+  });
+  if (meta.captureStarted) await globalThis.AutoDOMDebugCapture?.stop(tab.id);
+  let host = "page";
+  try { host = new URL(tab.url).hostname || host; } catch (_) {}
+  return {
+    ok: true,
+    tabId: tab.id,
+    host,
+    ...result,
+    ...(meta.ownsRecorder && {
+      workflowDraft: "The user actions are also kept as a workflow draft: workflow_save keeps it as a replayable workflow.",
+    }),
+  };
+}
+
+// Fallback: Performance API resource entries (no debugger).
+async function _getNetworkRequestsInPage(tab, params) {
   return await executeInTab(
     tab.id,
     (limit, urlPattern, artifactOnly) => {
@@ -8088,9 +8516,8 @@ async function toolGetNetworkRequests(params, ctx) {
   );
 }
 
-// 15. Get console logs (injected capture)
-async function toolGetConsoleLogs(params, ctx) {
-  const tab = await getActiveTab(ctx);
+// Fallback: console.* patched in the page's main world (no debugger).
+async function _getConsoleLogsInPage(tab) {
   // Inject a console capture if not already done
   return await executeInTab(
     tab.id,
@@ -9818,6 +10245,8 @@ async function _bridgePolicyCheck(tool, params, ctx) {
   const tier = Gate?.tierOf ? Gate.tierOf(tool, params) : "write";
   let tab = null;
   try { tab = await getActiveTab(ctx); } catch (_) {}
+  const policyBlock = await _adminPolicyBlock(tool, params, tab);
+  if (policyBlock) return policyBlock;
   if (tab && _takeoverTabs.has(tab.id) && tier !== "read") {
     return {
       error: "USER_TAKEOVER: the user has taken control of this tab. Wait and retry after they click \"Hand back\".",
@@ -9829,10 +10258,7 @@ async function _bridgePolicyCheck(tool, params, ctx) {
   if (!Gate?.matchApprovalRule) return null;
   const rules = await Gate.getApprovalRules();
   if (!rules.length) return null;
-  const target =
-    (tool === "navigate" || tool === "browser_navigate" || tool === "open_new_tab") && params?.url
-      ? params.url
-      : tab?.url;
+  const target = Gate.navigationTarget?.(tool, params) || tab?.url;
   const host = _hostOf(target);
   const rule = Gate.matchApprovalRule(rules, { host, tier, tool });
   if (!rule || rule.policy === "allow") return null;
@@ -9855,10 +10281,51 @@ async function _bridgePolicyCheck(tool, params, ctx) {
   };
 }
 
+// Administrator blockedUrlPatterns (chrome.storage.managed) for the page
+// and, for navigating tools, the destination. Applies to every caller.
+async function _adminPolicyBlock(tool, params, tab) {
+  const Gate = globalThis.AutoDOMActionGate;
+  if (!Gate?.policyBlockFor) return null;
+  const pattern = await Gate.policyBlockFor(tab?.url, Gate.navigationTarget(tool, params));
+  if (!pattern) return null;
+  return {
+    error: `Blocked by administrator policy (${pattern}): ${tool} is not allowed on this site.`,
+    blocked: true,
+    policy: pattern,
+  };
+}
+
+// Batch steps from non-agent callers. Bridge, confirm and schedule steps
+// get the approval-rule check each standalone call gets; a rule that asks
+// cannot be confirmed mid-batch, so that step fails and names the fix.
+// Panel steps are the user's own commands: only admin policy applies.
+async function _batchStepPolicyCheck(tool, params, ctx, tab) {
+  if (ctx?.origin === "panel") return _adminPolicyBlock(tool, params, tab);
+  const blocked = await _bridgePolicyCheck(tool, params, ctx);
+  if (!blocked) return null;
+  if (blocked.approvalRequired) {
+    // The user confirmed this batch; that covers steps on the batch's own
+    // site, but not a step that has moved (or navigates) somewhere else.
+    const Gate = globalThis.AutoDOMActionGate;
+    const stepOrigin = Gate?.normalizeOrigin(tab?.url || "");
+    const crossing = Gate?.transitionOf(tab?.url || "", Gate.navigationTarget(tool, params));
+    const confirmed = ctx?.batchConfirmed || ctx?.origin === "confirm";
+    if (confirmed && !crossing && stepOrigin && stepOrigin === ctx.batchOrigin) return null;
+    return {
+      error: `${blocked.message} Call ${tool} on its own (not inside batch_actions) so it can be confirmed.`,
+      approvalRequired: true,
+      tool,
+      domain: blocked.domain,
+    };
+  }
+  return blocked;
+}
+
 async function handleToolCallWithRecording(tool, params, id, meta = {}, ctx) {
   if (meta.bridge) {
     const blocked = await _bridgePolicyCheck(tool, params, ctx);
     if (blocked && !(blocked.approvalRequired && meta.confirmed)) return blocked;
+    if (ctx && meta.confirmed) ctx.batchConfirmed = true;
   }
   // Record the tool call (filter sensitive params). recordAction is a
   // no-op when no session recording runs, so skip the copy + stringify.
@@ -12200,9 +12667,12 @@ const _debuggerAttached = new Set();
 // (execute_code CSP fallback, file upload) so Chrome's permanent
 // "AutoDOM started debugging this browser" banner doesn't linger on
 // top of our session-border MCP overlay.
-async function detachDebuggerSafe(tabId) {
+async function detachDebuggerSafe(tabId, { force = false } = {}) {
   if (IS_FIREFOX) return;
   if (!_debuggerAttached.has(tabId)) return;
+  // Console/network capture holds the session open between tool calls;
+  // one-shot CDP users must not tear it down underneath it.
+  if (!force && globalThis.AutoDOMDebugCapture?.isActive(tabId)) return;
   try {
     await chrome.debugger.detach({ tabId });
   } catch (_) {
@@ -13379,8 +13849,16 @@ async function toolBatchActions(params, ctx) {
   }
 
   const results = [];
-  // Nested steps share the caller's context (same tab, same deadline) and
-  // skip the per-step confirmation prompt.
+  // Nested steps share the caller's context (same tab, same deadline).
+  // The batch was approved for the origin it starts on; each step is still
+  // gated, and runs under that approval only while it stays on that origin
+  // (see executeAgentTool).
+  const prevBatchOrigin = ctx?.batchOrigin;
+  if (ctx && ctx.batchDepth === 0) {
+    let startTab = null;
+    try { startTab = await getActiveTab(ctx); } catch (_) {}
+    ctx.batchOrigin = globalThis.AutoDOMActionGate?.normalizeOrigin(startTab?.url || "") || undefined;
+  }
   if (ctx) ctx.batchDepth++;
   try {
     for (let i = 0; i < Math.min(actions.length, maxActions); i++) {
@@ -13413,7 +13891,10 @@ async function toolBatchActions(params, ctx) {
       }
     }
   } finally {
-    if (ctx) ctx.batchDepth--;
+    if (ctx) {
+      ctx.batchDepth--;
+      if (ctx.batchDepth === 0) ctx.batchOrigin = prevBatchOrigin;
+    }
   }
 
   return {

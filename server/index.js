@@ -53,7 +53,7 @@ import { z } from "zod";
 import { fileURLToPath } from "url";
 import { execFile, spawn, spawnSync } from "child_process";
 import { promises as fs, readFileSync, rmSync, createWriteStream } from "fs";
-import { tmpdir } from "os";
+import { homedir, tmpdir } from "os";
 import { join, isAbsolute, resolve as resolvePath } from "path";
 import { promisify } from "util";
 import { AsyncLocalStorage } from "async_hooks";
@@ -954,6 +954,10 @@ const TOOL_TIERS = new Map([
   ["verify_artifact_counts", "read"],
   ["get_network_requests", "read"],
   ["get_console_logs", "read"],
+  // har_start can open a URL; status/stop only read what was captured.
+  ["har_start", "write"],
+  ["har_status", "read"],
+  ["har_stop", "read"],
   ["list_tabs", "read"],
   ["list_downloads", "read"],
   ["wait_for_download", "read"],
@@ -8005,6 +8009,7 @@ function _registerPlaywrightCompatTool({ name, description, parameters }) {
       if (name === "browser_snapshot" && typeof result?.snapshot === "string") {
         return result.snapshot;
       }
+      if (name === "browser_take_screenshot") return screenshotToolResult(result, params);
       return stringifyToolResult(result);
     },
   });
@@ -8239,19 +8244,24 @@ const PLAYWRIGHT_COMPAT_TOOLS = [
   },
   {
     name: "browser_console_messages",
-    description: "Read recent browser console messages.",
+    description: "Read recent browser console messages and uncaught exceptions. Capture starts on the first call for a tab.",
     parameters: z.object({
       level: z.string().optional().describe("Optional level filter such as error, warn, info"),
+      pattern: z.string().optional().describe("Regex or substring filter on message text"),
+      onlyErrors: z.boolean().optional().describe("Only errors and uncaught exceptions"),
       limit: z.number().optional().describe("Maximum number of messages"),
+      clear: z.boolean().optional().describe("Clear the buffer after reading"),
     }),
   },
   {
     name: "browser_network_requests",
-    description: "Read recent network requests observed for the page, with optional artifact/report URL candidate filtering.",
+    description: "Read recent network requests (method, status, failures) observed for the page, with optional artifact/report URL candidate filtering. Capture starts on the first call for a tab.",
     parameters: z.object({
       urlPattern: z.string().optional().describe("Optional URL substring or pattern filter"),
       limit: z.number().optional().describe("Maximum number of requests"),
       artifactOnly: z.boolean().optional().describe("Return only likely artifact/report/API payload URLs"),
+      failedOnly: z.boolean().optional().describe("Only failed requests and HTTP status >= 400"),
+      clear: z.boolean().optional().describe("Clear the buffer after reading"),
     }),
   },
   {
@@ -8348,6 +8358,27 @@ function stringifyToolResult(result) {
   } catch (_) {
     return String(result);
   }
+}
+
+// An image content block (never base64 inside JSON text, which a client
+// would read as text tokens) plus a one-line size/scale note.
+function screenshotToolResult(result, params = {}) {
+  if (!result?.screenshot) return stringifyToolResult(result);
+  const m = /^data:([^;,]+);base64,/.exec(result.screenshot);
+  const content = [
+    {
+      type: "image",
+      data: result.screenshot.slice(m ? m[0].length : 0),
+      mimeType: m ? m[1] : `image/${params.format || "jpeg"}`,
+    },
+  ];
+  if (result.width && result.viewport) {
+    content.push({
+      type: "text",
+      text: `${result.width}x${result.height} image; viewport ${result.viewport.width}x${result.viewport.height} CSS px; scale ${result.scale} image px per CSS px`,
+    });
+  }
+  return { content };
 }
 
 // ─── Script Runner Scope ─────────────────────────────────────
@@ -8740,16 +8771,22 @@ server.addTool({
 server.addTool({
   name: "navigate",
   description:
-    "Navigate the browser to a URL, or go back/forward/reload. Fast — uses chrome.tabs API directly.",
+    "Navigate the browser to a URL, or go back/forward/reload. URL and reload navigations wait for the page to load " +
+    "(returns final url, title, loaded, elapsedMs), so no separate wait_for_navigation call is needed.",
   parameters: z.object({
     url: z.string().optional().describe("URL to navigate to"),
     action: z
       .enum(["back", "forward", "reload"])
       .optional()
       .describe("Navigation action instead of URL"),
+    waitUntil: z
+      .enum(["load", "none"])
+      .optional()
+      .describe('"none" returns as soon as the navigation starts (default "load")'),
+    timeout: z.number().optional().describe("Max ms to wait for the load (default 15000)"),
   }),
-  execute: async ({ url, action }) => {
-    const result = await callExtensionTool("navigate", { url, action });
+  execute: async ({ url, action, waitUntil, timeout }) => {
+    const result = await callExtensionTool("navigate", { url, action, waitUntil, timeout });
     return stringifyToolResult(result);
   },
 });
@@ -8805,12 +8842,14 @@ server.addTool({
 server.addTool({
   name: "take_screenshot",
   description:
-    "Capture a screenshot of the visible viewport. Returns a base64 PNG image.",
+    "Capture a screenshot of the visible viewport. By default the image is sized to the page's CSS viewport " +
+    "(image pixels = the x/y click_at_coordinates takes) and capped at 1568px on the long side / ~1.2 MP; " +
+    "the reply states the image size and its scale (image px per CSS px — divide by it to get click coordinates when the cap applied).",
   parameters: z.object({
     format: z
       .enum(["png", "jpeg", "webp"])
       .optional()
-      .default("png")
+      .default("jpeg")
       .describe("Image format"),
     quality: z
       .number()
@@ -8819,17 +8858,15 @@ server.addTool({
       .optional()
       .default(80)
       .describe("JPEG/WebP quality"),
+    maxWidth: z.number().optional().describe("Cap the image width in pixels (smaller = fewer image tokens)"),
+    fullResolution: z
+      .boolean()
+      .optional()
+      .describe("Return device pixels with no downscaling (large; only for pixel-exact checks)"),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("take_screenshot", params);
-    if (result.screenshot) {
-      const base64 = result.screenshot.replace(/^data:image\/\w+;base64,/, "");
-      const mimeType = `image/${params.format || "png"}`;
-      return {
-        content: [{ type: "image", data: base64, mimeType }],
-      };
-    }
-    return stringifyToolResult(result);
+    return screenshotToolResult(result, params);
   },
 });
 
@@ -9033,15 +9070,18 @@ server.addTool({
 server.addTool({
   name: "get_network_requests",
   description:
-    "List recent network requests made by the page (via Performance API), including likely artifact/report payload candidates.",
+    "List network requests made by the page (method, URL, type, status, failures, duration, size), captured over the DevTools protocol, including likely artifact/report payload candidates. Capture starts on the first call for a tab and keeps running; requests made before that are not included, so reload or repeat the action and call again. Sensitive query values are shown as REDACTED. Buffers reset when the tab moves to another site. Falls back to Performance API entries (no method/status) where the debugger is unavailable. Asks the user once per site.",
   parameters: z.object({
     limit: z
       .number()
       .optional()
       .default(50)
-      .describe("Max number of requests to return"),
-    urlPattern: z.string().optional().describe("Optional URL substring filter"),
+      .describe("Max number of requests to return (most recent)"),
+    urlPattern: z.string().optional().describe("Optional URL substring filter (matched against the redacted URL)"),
     artifactOnly: z.boolean().optional().describe("Return only likely artifact/report/API payload URLs"),
+    failedOnly: z.boolean().optional().describe("Return only failed requests and HTTP status >= 400"),
+    clear: z.boolean().optional().describe("Clear the buffer after reading, so the next call only returns new requests"),
+    stop: z.boolean().optional().describe("Stop capturing on this tab after reading and detach the debugger"),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("get_network_requests", params);
@@ -9053,10 +9093,71 @@ server.addTool({
 server.addTool({
   name: "get_console_logs",
   description:
-    "Get captured console messages (log, warn, error, info, debug). Call once to install capture, then again to retrieve.",
-  execute: async () => {
-    const result = await callExtensionTool("get_console_logs", {});
+    "Get console messages, uncaught exceptions (with stack) and browser-side messages (CSP, failed loads) captured over the DevTools protocol. Capture starts on the first call for a tab and keeps running; output from before that is not included, so reload or repeat the action and call again. Buffers reset when the tab moves to another site. Falls back to in-page console.* capture where the debugger is unavailable. Asks the user once per site.",
+  parameters: z.object({
+    pattern: z.string().optional().describe("Regex (case-insensitive) or substring to filter message text, e.g. 'error|warn' or 'MyApp'"),
+    level: z.string().optional().describe("Only this level: log, info, warn, error, debug, exception"),
+    onlyErrors: z.boolean().optional().describe("Only errors and uncaught exceptions"),
+    limit: z.number().optional().default(100).describe("Max number of messages to return (most recent)"),
+    clear: z.boolean().optional().describe("Clear the buffer after reading, so the next call only returns new messages"),
+    stop: z.boolean().optional().describe("Stop capturing on this tab after reading and detach the debugger"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("get_console_logs", params);
     return stringifyToolResult(result);
+  },
+});
+
+// HAR recording: network traffic + the user's own clicks in the tab.
+server.addTool({
+  name: "har_start",
+  description:
+    "Start recording a HAR (HTTP Archive) of the active tab over the DevTools protocol, together with the user's own clicks, typing and navigations in that tab. " +
+    "Use it when the user should perform a flow by hand while you capture it: call har_start, ask the user to do the steps in the AutoDOM tab, then call har_stop. " +
+    "Entries record method, URL, headers, request/response bodies (text types), status, timings and which user action triggered them. Credentials, cookies and sensitive parameters are redacted unless includeSensitive is true. Asks the user once per site.",
+  parameters: z.object({
+    url: z.string().optional().describe("Open this URL first (its load is recorded)"),
+    actions: z.boolean().optional().describe("Also record the user's clicks/typing/navigations (default true)"),
+    includeBodies: z.boolean().optional().describe("Save text response bodies (default true)"),
+    maxBodyBytes: z.number().optional().describe("Largest response body to save, in bytes (default 262144)"),
+    includeSensitive: z.boolean().optional().describe("Keep Authorization/Cookie headers, tokens and password fields unredacted (default false)"),
+  }),
+  execute: async (params) => stringifyToolResult(await callExtensionTool("har_start", params)),
+});
+
+server.addTool({
+  name: "har_status",
+  description: "Progress of the HAR recording on the active tab: entries so far, in-flight requests, pages, user actions recorded and the most recent requests/actions.",
+  parameters: z.object({}),
+  execute: async () => stringifyToolResult(await callExtensionTool("har_status", {})),
+});
+
+server.addTool({
+  name: "har_stop",
+  description:
+    "Stop the HAR recording on the active tab and write the .har file (default ~/Downloads/autodom-har/<host>-<time>.har). " +
+    "Returns the file path and a summary: entry counts by status, pages, and each user action with how many requests it triggered. Pass inline:true to also get the HAR JSON (can be large).",
+  parameters: z.object({
+    path: z.string().optional().describe("Absolute .har path to write instead of the default"),
+    inline: z.boolean().optional().describe("Also return the HAR JSON in the result"),
+  }),
+  execute: async (params) => {
+    const result = await callExtensionTool("har_stop", {});
+    if (!result?.har) return stringifyToolResult(result);
+    const { har, ...rest } = result;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const file =
+      params.path && isAbsolute(params.path)
+        ? params.path
+        : join(homedir(), "Downloads", "autodom-har", `${String(rest.host || "page").replace(/[^a-z0-9.-]/gi, "_")}-${stamp}.har`);
+    const text = JSON.stringify(har, null, 2);
+    try {
+      await fs.mkdir(resolvePath(file, ".."), { recursive: true });
+      await fs.writeFile(file, text, "utf8");
+    } catch (err) {
+      return stringifyToolResult({ ...rest, error: `Recorded, but could not write ${file}: ${err.message}`, ...(params.inline && { har }) });
+    }
+    return stringifyToolResult({ ...rest, path: file, bytes: Buffer.byteLength(text), ...(params.inline && { har }) });
   },
 });
 

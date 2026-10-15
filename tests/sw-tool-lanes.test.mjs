@@ -98,7 +98,14 @@ function makeEnv() {
     async update(id, props) {
       const t = tabs.get(id);
       if (!t) throw new Error(`No tab with id: ${id}`);
-      if (props.url) t.url = props.url;
+      if (props.url) {
+        t.url = props.url;
+        // Like the browser: the navigation reports loading, then complete.
+        setTimeout(() => {
+          for (const fn of chrome.tabs.onUpdated.listeners) fn(id, { status: "loading" }, { ...t, status: "loading" });
+          for (const fn of chrome.tabs.onUpdated.listeners) fn(id, { status: "complete" }, { ...t, status: "complete" });
+        }, 0);
+      }
       return { ...t };
     },
     sendMessage: () => Promise.resolve(),

@@ -342,7 +342,7 @@ test("screenshot skips the paint wait and the restore when none of our UI is on 
 
 test("screenshot restores our UI when it hid something", async () => {
   const sw = await loadSw();
-  sw.exec = (opts) => (isHideCall(opts) ? [{ result: 2 }] : [{ result: null }]);
+  sw.exec = (opts) => (isHideCall(opts) ? [{ result: { changed: 2, viewport: null } }] : [{ result: null }]);
   const t0 = Date.now();
   const r = await sw.run("toolScreenshot({}, _makeCallContext({ origin: 'agent', tabId: 1, windowId: 1 }))");
   assert.equal(r.success, true);

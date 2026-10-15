@@ -9,20 +9,30 @@
  * Exposed as globalThis.AutoDOMActionGate via importScripts() in the SW.
  *
  * Decision flow:
- *   classify(tool, params?) → one of "safe-read" | "mutating" | "destructive"
+ *   classify(tool, params?) → one of "safe-read" | "debug-read" |
+ *                             "mutating" | "destructive"
  *   resolveDecision(origin, category, settings) → "allow" | "ask" | "deny"
- *   requestDecision({ tabId, origin, toolName, params }):
- *     - if pre-allowed, return { allowed: true, reason: "pre-approved" }
- *     - otherwise send ACTION_GATE_REQUEST to the tab's chat panel,
- *       await an ACTION_GATE_DECISION reply, persist if the user opted
- *       to "Allow on <origin>", and append to the audit log.
+ *   requestDecision({ tabId, origin, pageUrl, targetUrl, toolName, params, batchOrigin }):
+ *     1. administrator policy (managed blockedUrlPatterns) on the page or
+ *        navigation target → deny, even with the gate switched off
+ *     2. gate disabled → allow
+ *     3. navigation to another host → domain-transition grant
+ *        (from → to), else ask
+ *     4. batch step on the origin the batch was approved for → allow
+ *     5. per-origin category policy; ask → send ACTION_GATE_REQUEST to
+ *        the tab's chat panel, await an ACTION_GATE_DECISION reply,
+ *        persist if the user opted to, and append to the audit log.
  */
 (function () {
   const STORAGE_KEYS = {
     permissions: "autodomSitePermissions",
+    transitions: "autodomDomainTransitions",
     audit: "autodomAuditLog",
     settings: "autodomActionGateSettings",
   };
+
+  // chrome.storage.managed key set by enterprise policy (managed_schema.json).
+  const POLICY_BLOCKLIST_KEY = "blockedUrlPatterns";
 
   const DEFAULT_SETTINGS = {
     enabled: true,
@@ -40,8 +50,6 @@
     "extract_text",
     "extract_data",
     "get_html",
-    "get_console_logs",
-    "get_network_requests",
     "list_tabs",
     "list_downloads",
     "wait_for_download",
@@ -62,8 +70,6 @@
     "get_pending_chat_requests",
     "performance_analyze_insight",
     "browser_snapshot",
-    "browser_console_messages",
-    "browser_network_requests",
     "browser_take_screenshot",
     "browser_wait_for",
     // Media / image reads (additive tier set merged below).
@@ -85,6 +91,22 @@
     "schedule_list",
     "webmcp_list_tools",
   ]);
+
+  // Debugging reads (console output, network traffic) can expose tokens,
+  // PII and API payloads, so they are reads that silentReads does not
+  // cover: they ask once per origin unless "Allow on <origin>" is chosen.
+  const DEBUG_READ = new Set([
+    "get_console_logs",
+    "get_network_requests",
+    "browser_console_messages",
+    "browser_network_requests",
+    "har_start",
+    "har_status",
+    "har_stop",
+  ]);
+
+  // Tools whose `url` param moves the page (or a new tab) to another site.
+  const NAVIGATING_TOOLS = new Set(["navigate", "browser_navigate", "open_new_tab", "har_start"]);
 
   // Anything in this list bypasses a site's "allow mutating" rule and is
   // always prompted unless the origin is Full Trust (v2 — not yet exposed).
@@ -148,6 +170,7 @@
       if (action === "new" || action === "close") return "destructive";
     }
     if (SAFE_READ.has(toolName)) return "safe-read";
+    if (DEBUG_READ.has(toolName)) return "debug-read";
     if (DESTRUCTIVE.has(toolName)) return "destructive";
     return "mutating";
   }
@@ -160,6 +183,102 @@
     } catch (_) {
       return "unknown";
     }
+  }
+
+  // ── Domain transitions ──────────────────────────────────────
+  // A navigation that leaves the current host is its own decision
+  // (from → to), separate from what is allowed on either site.
+
+  function _webHost(url, base) {
+    try {
+      const u = base ? new URL(url, base) : new URL(url);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return "";
+      return u.host.toLowerCase().replace(/^www\./, "");
+    } catch (_) {
+      return "";
+    }
+  }
+
+  // The URL a navigating tool is about to load, or null.
+  function navigationTarget(toolName, params) {
+    if (!NAVIGATING_TOOLS.has(toolName)) return null;
+    const url = params?.url;
+    return typeof url === "string" && url ? url : null;
+  }
+
+  // { from, to } hosts when targetUrl leaves pageUrl's host. Pages without
+  // a web host (new tab, chrome://, about:blank) have nothing to leave.
+  function transitionOf(pageUrl, targetUrl) {
+    if (!targetUrl) return null;
+    const from = _webHost(pageUrl);
+    const to = _webHost(targetUrl, pageUrl || undefined);
+    if (!from || !to || from === to) return null;
+    return { from, to };
+  }
+
+  // ── Administrator policy: blockedUrlPatterns ────────────────
+  // Patterns match "host/path" (case-insensitive; scheme and "www." are
+  // ignored; "*" matches any run of characters). A bare domain means
+  // "<domain>/*"; use "*.example.com" for subdomains.
+
+  function compileBlockPattern(pattern) {
+    let p = String(pattern || "").trim().toLowerCase();
+    if (!p) return null;
+    p = p.replace(/^[a-z][a-z0-9+.-]*:\/\//, "").replace(/^www\./, "");
+    if (!p.includes("/")) p += "/*";
+    const body = p
+      .split("*")
+      .map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"))
+      .join(".*");
+    try {
+      return new RegExp(`^${body}$`);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function matchBlockedPattern(patterns, url) {
+    let subject;
+    try {
+      const u = new URL(url);
+      if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+      subject = u.host.toLowerCase().replace(/^www\./, "") + (u.pathname || "/");
+    } catch (_) {
+      return null;
+    }
+    for (const pattern of patterns || []) {
+      const re = compileBlockPattern(pattern);
+      if (re && re.test(subject)) return pattern;
+    }
+    return null;
+  }
+
+  let _policyBlocklist = null;
+
+  async function getPolicyBlocklist() {
+    if (_policyBlocklist) return _policyBlocklist;
+    let list = [];
+    try {
+      const out = await chrome.storage.managed.get(POLICY_BLOCKLIST_KEY);
+      const raw = out ? out[POLICY_BLOCKLIST_KEY] : undefined;
+      if (Array.isArray(raw)) list = raw.map(String).filter(Boolean);
+    } catch (_) {
+      // No managed storage (Firefox without policy, tests): no blocklist.
+    }
+    _policyBlocklist = list;
+    return list;
+  }
+
+  // The administrator pattern that blocks any of the given URLs, or null.
+  async function policyBlockFor(...urls) {
+    const patterns = await getPolicyBlocklist();
+    if (!patterns.length) return null;
+    for (const url of urls) {
+      if (!url) continue;
+      const hit = matchBlockedPattern(patterns, url);
+      if (hit) return hit;
+    }
+    return null;
   }
 
   // Pure decision function — unit-testable. Given the stored permission
@@ -186,12 +305,21 @@
   // (popup edits, other contexts). Without onChanged there is no way to
   // invalidate, so nothing is cached. Callers get a copy, never the cache.
   const APPROVAL_RULES_KEY = "autodom.approvalRules";
-  const CACHED_KEYS = new Set([STORAGE_KEYS.settings, STORAGE_KEYS.permissions, APPROVAL_RULES_KEY]);
+  const CACHED_KEYS = new Set([
+    STORAGE_KEYS.settings,
+    STORAGE_KEYS.permissions,
+    STORAGE_KEYS.transitions,
+    APPROVAL_RULES_KEY,
+  ]);
   const _cache = new Map();
   let _cacheable = false;
   try {
     if (chrome.storage && chrome.storage.onChanged && typeof chrome.storage.onChanged.addListener === "function") {
       chrome.storage.onChanged.addListener((changes, area) => {
+        if (area === "managed") {
+          _policyBlocklist = null;
+          return;
+        }
         if (area && area !== "local") return;
         for (const key of Object.keys(changes || {})) _cache.delete(key);
       });
@@ -202,6 +330,7 @@
   // Drops the in-memory copies; the next read reloads from storage.
   function clearCaches() {
     _cache.clear();
+    _policyBlocklist = null;
   }
 
   function _copy(v) {
@@ -279,6 +408,38 @@
 
   async function clearAllPermissions() {
     await setStorage(STORAGE_KEYS.permissions, {});
+    await setStorage(STORAGE_KEYS.transitions, {});
+  }
+
+  // Domain-transition grants: { "<from>-><to>": { from, to, action, updatedAt } }
+  function _transitionKey(from, to) {
+    return `${from}->${to}`;
+  }
+
+  async function getTransitions() {
+    return (await getStorage(STORAGE_KEYS.transitions, {})) || {};
+  }
+
+  async function getTransitionFor(from, to) {
+    const all = await getTransitions();
+    return all[_transitionKey(from, to)] || null;
+  }
+
+  async function setTransition(from, to, action) {
+    if (action !== "allow" && action !== "deny") {
+      throw new Error('transition action must be "allow" or "deny"');
+    }
+    const all = await getTransitions();
+    const next = { from, to, action, updatedAt: Date.now() };
+    all[_transitionKey(from, to)] = next;
+    await setStorage(STORAGE_KEYS.transitions, all);
+    return next;
+  }
+
+  async function revokeTransition(from, to) {
+    const all = await getTransitions();
+    delete all[_transitionKey(from, to)];
+    await setStorage(STORAGE_KEYS.transitions, all);
   }
 
   // ── Audit log (bounded ring buffer) ─────────────────────────
@@ -351,8 +512,31 @@
     return true;
   }
 
-  async function requestDecision({ tabId, origin, toolName, params, category }) {
+  async function requestDecision({
+    tabId,
+    origin,
+    pageUrl,
+    targetUrl,
+    toolName,
+    params,
+    category,
+    batchOrigin,
+  }) {
     const cat = category || classify(toolName, params);
+    const target = targetUrl === undefined ? navigationTarget(toolName, params) : targetUrl;
+
+    // 1. Administrator policy beats every user setting, including the
+    //    master toggle.
+    const blockedBy = await policyBlockFor(pageUrl || origin, target);
+    if (blockedBy) {
+      await appendAudit({ origin, toolName, category: cat, decision: "deny-policy", reason: blockedBy });
+      return {
+        allowed: false,
+        policyBlocked: true,
+        reason: `Blocked by administrator policy (${blockedBy})`,
+      };
+    }
+
     // Parallelize independent storage reads: previously these awaited
     // sequentially, doubling the per-tool storage round-trip cost on every
     // turn of the agent loop.
@@ -360,6 +544,37 @@
       getSettings(),
       getPermissionFor(origin),
     ]);
+    if (!settings.enabled) {
+      await appendAudit({ origin, toolName, category: cat, decision: "allow-preapproved" });
+      return { allowed: true, reason: "pre-approved" };
+    }
+
+    // 2. Leaving the current site is decided per from → to pair.
+    const transition = transitionOf(pageUrl || origin, target);
+    if (transition) {
+      const grant = await getTransitionFor(transition.from, transition.to);
+      if (grant?.action === "deny") {
+        await appendAudit({ origin, toolName, category: cat, decision: "deny-transition", transition });
+        return {
+          allowed: false,
+          reason: `Navigation from ${transition.from} to ${transition.to} is blocked by your site rule`,
+        };
+      }
+      if (grant?.action === "allow") {
+        await appendAudit({ origin, toolName, category: cat, decision: "allow-transition", transition });
+        return { allowed: true, reason: "pre-approved transition" };
+      }
+      return _promptAndRecord({ tabId, origin, toolName, params, category: cat, transition });
+    }
+
+    // 3. Steps of an approved batch run on that batch's origin. A step on
+    //    any other origin (the batch navigated away) is decided below.
+    if (batchOrigin && batchOrigin === origin) {
+      await appendAudit({ origin, toolName, category: cat, decision: "allow-batch" });
+      return { allowed: true, reason: "approved batch" };
+    }
+
+    // 4. Per-origin category policy.
     const policy = resolveDecision(perm, cat, settings);
 
     if (policy === "allow") {
@@ -371,10 +586,15 @@
       return { allowed: false, reason: `Blocked by site rule on ${origin}` };
     }
 
-    // policy === "ask" → prompt in chat panel
+    return _promptAndRecord({ tabId, origin, toolName, params, category: cat });
+  }
+
+  // policy === "ask" → prompt in the tab's chat panel, persist what the
+  // user chose, audit, and return the decision.
+  async function _promptAndRecord({ tabId, origin, toolName, params, category: cat, transition }) {
     if (tabId == null) {
       // No UI available — fail closed.
-      await appendAudit({ origin, toolName, category: cat, decision: "deny-no-ui" });
+      await appendAudit({ origin, toolName, category: cat, decision: "deny-no-ui", transition });
       return { allowed: false, reason: "No chat panel available to confirm action" };
     }
 
@@ -386,6 +606,7 @@
       toolName,
       category: cat,
       params: _safeParamsPreview(params),
+      ...(transition && { transition }),
       ts: Date.now(),
     };
 
@@ -412,26 +633,38 @@
       }
     });
 
-    // Persist "Allow on origin" decisions.
-    if (decision.allowed && decision.persist === "origin" && cat !== "destructive") {
-      await setPermission(origin, { categories: { [cat]: "always" } });
-    }
-    if (!decision.allowed && decision.persist === "origin-deny") {
-      await setPermission(origin, { categories: { [cat]: "never" } });
+    // Persist "Allow on origin" / "Always allow from → to" decisions.
+    if (transition) {
+      if (decision.allowed && decision.persist === "transition") {
+        await setTransition(transition.from, transition.to, "allow");
+      }
+      if (!decision.allowed && decision.persist === "transition-deny") {
+        await setTransition(transition.from, transition.to, "deny");
+      }
+    } else {
+      if (decision.allowed && decision.persist === "origin" && cat !== "destructive") {
+        await setPermission(origin, { categories: { [cat]: "always" } });
+      }
+      if (!decision.allowed && decision.persist === "origin-deny") {
+        await setPermission(origin, { categories: { [cat]: "never" } });
+      }
     }
 
+    const persisted = ["origin", "transition"].includes(decision.persist);
+    const persistedDeny = ["origin-deny", "transition-deny"].includes(decision.persist);
     await appendAudit({
       origin,
       toolName,
       category: cat,
       decision: decision.allowed
-        ? decision.persist === "origin"
+        ? persisted
           ? "allow-persisted"
           : "allow-once"
-        : decision.persist === "origin-deny"
+        : persistedDeny
           ? "deny-persisted"
           : "deny-once",
       reason: decision.reason || null,
+      transition,
     });
 
     return decision;
@@ -455,7 +688,8 @@
 
   function tierOf(toolName, params) {
     const c = classify(toolName, params);
-    return c === "safe-read" ? "read" : c === "mutating" ? "write" : "destructive";
+    if (c === "safe-read" || c === "debug-read") return "read";
+    return c === "mutating" ? "write" : "destructive";
   }
 
   function hostMatches(pattern, host) {
@@ -522,6 +756,10 @@
     getApprovalRules,
     setApprovalRules,
     normalizeOrigin,
+    navigationTarget,
+    transitionOf,
+    matchBlockedPattern,
+    policyBlockFor,
     resolveDecision,
     requestDecision,
     deliverDecision,
@@ -532,6 +770,10 @@
     setPermission,
     revokePermission,
     clearAllPermissions,
+    getTransitions,
+    getTransitionFor,
+    setTransition,
+    revokeTransition,
     getAuditLog,
     clearAuditLog,
     clearCaches,
