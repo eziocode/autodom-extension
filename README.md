@@ -1,175 +1,116 @@
-<div align="center">
+# AutoDOM
 
-<br>
+AutoDOM lets an MCP client (an IDE agent or CLI) drive a real Chromium browser.
+It is two programs that talk over a local WebSocket:
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://img.shields.io/badge/Auto-DOM-white?style=for-the-badge&labelColor=0d1117&color=58a6ff&logo=googlechrome&logoColor=white">
-  <img alt="AutoDOM" src="https://img.shields.io/badge/Auto-DOM-black?style=for-the-badge&labelColor=f6f8fa&color=0969da&logo=googlechrome&logoColor=black">
-</picture>
+- `server/`: a Node.js MCP server. Speaks MCP over stdio (optionally HTTP) to
+  the client, and runs a WebSocket bridge on `127.0.0.1`.
+- `extension/`: a Manifest V3 extension. Executes the tool calls in the
+  browser through `chrome.scripting`, `chrome.tabs` and the DevTools protocol.
 
-### Give your AI coding assistant a real browser.
+Current release: **7.0.0** ([changelog](CHANGELOG.md)). License: MIT.
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server + Chromium extension that lets<br>
-**GitHub Copilot · JetBrains AI · Claude · Cursor · Gemini CLI**<br>
-*click, type, navigate, screenshot, and inspect* a live browser — straight from your IDE.
+Targeted clients: GitHub Copilot, JetBrains AI Assistant, Claude (Desktop and
+Code), Cursor and Gemini CLI. Anything that speaks MCP over stdio should work.
 
-<br>
+## Contents
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](server/package.json)
-[![Node](https://img.shields.io/badge/node-20.19%2B%20%7C%2022.12%2B%20%7C%2023%2B-brightgreen?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org)
-[![MCP](https://img.shields.io/badge/protocol-MCP-blueviolet?style=flat-square)](https://modelcontextprotocol.io)
-[![Chrome MV3](https://img.shields.io/badge/extension-Manifest%20V3-yellow?style=flat-square&logo=googlechrome&logoColor=white)](extension/manifest.json)
-[![Release](https://img.shields.io/github/v/release/eziocode/autodom-extension?style=flat-square&color=orange)](https://github.com/eziocode/autodom-extension/releases/latest)
+- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Verify](#verify)
+- [Client configuration](#client-configuration)
+- [Tools](#tools)
+- [Output compaction (ATK)](#output-compaction-atk)
+- [Tab isolation](#tab-isolation)
+- [Configuration reference](#configuration-reference)
+- [Security model](#security-model)
+- [Troubleshooting](#troubleshooting)
+- [Repository layout](#repository-layout)
+- [Development](#development)
+- [Documentation](#documentation)
 
-[Quick Start](#-quick-start) · [How It Works](#-how-it-works) · [Configuration](#-configuration) · [Troubleshooting](#-troubleshooting) · [Architecture](#-advanced-architecture)
-
-<br>
-
-</div>
-
----
-
-## ✨ Highlights
-
-<table>
-<tr>
-<td width="50%">
-
-### 🧰 Full Browser Tool Suite
-DOM queries, navigation, network logs, cookies, tabs, JS eval, screenshots, Playwright-compatible aliases — all exposed over MCP.
-
-Runs in its own background tab group, so you can keep using the same browser while an agent works.
-
-</td>
-<td width="50%">
-
-### 💬 In-Page AI Chat
-Floating sidebar or inline overlay — talk to your AI agent without leaving the tab. Supports OpenAI, Anthropic, and Ollama.
-
-</td>
-</tr>
-<tr>
-<td>
-
-### 🎓 Teach Once, Replay Forever
-Record a task (`/teach`), replay it without an LLM (`/replay`), and let it self-heal when the page changes, even by looking at a screenshot. Dry-run, undo, run several at once, export to Playwright or a readable Markdown routine, and schedule it. [Guide →](docs/WORKFLOWS.md)
-
-</td>
-<td>
-
-### 🛡 You Stay in Control
-Per-site approval rules (`/rules`), a **Take over** button that pauses the agent, inline MCP approval prompts, and an audit log of every action. Compact `@eN` snapshots and WebMCP site tools cut tokens.
-
-</td>
-</tr>
-<tr>
-<td>
-
-### 🔒 Local-First & Secure
-All traffic stays on `127.0.0.1`. Auth tokens are auto-generated. API keys live in session-only RAM storage — never on disk.
-
-</td>
-<td>
-
-### ⚡ Guided One-Command Setup
-One command installs the server, registers MCP for detected IDEs, and writes
-verified managed-policy files for supported browser targets.
-
-</td>
-</tr>
-<tr>
-<td>
-
-### 🤖 Bring Your Own Provider
-OpenAI, Anthropic, local Ollama, or just use your IDE's built-in agent — Copilot, Claude Code, Codex. Your choice.
-
-</td>
-<td>
-
-### 🏢 Enterprise Ready
-GPO / plist / JSON policy templates for force-install across macOS, Windows, and Linux fleets. See [`enterprise/`](enterprise/).
-
-</td>
-</tr>
-</table>
-
----
-
-## 🧠 How It Works
+## Architecture
 
 ```
-  ┌─────────────────┐        stdio (MCP)        ┌─────────────────┐      ws://127.0.0.1:9876      ┌─────────────────┐
-  │                 │                            │                 │                                │                 │
-  │   IDE / Agent   │◀──────────────────────────▶│  AutoDOM Server │◀──────────────────────────────▶│    Extension    │
-  │                 │                            │                 │                                │                 │
-  │  Copilot, Claude│   JSON-RPC over stdin/out  │  Node.js bridge │ pinned origin / bearer token   │  Chromium MV3   │
-  │  Cursor, Gemini │                            │ MCP SDK v2 + ws │                                │  service worker │
-  └─────────────────┘                            └─────────────────┘                                └─────────────────┘
+MCP client            AutoDOM server                    Extension (service worker)
+(IDE / CLI)           server/index.js                   extension/background/
+    |                        |                                  |
+    |--- stdio, JSON-RPC --->|                                  |
+    |                        |--- ws://127.0.0.1:9876 --------->|
+    |                        |    origin pin + bearer token     |
+    |                        |                                  |-- chrome.scripting  (DOM)
+    |                        |                                  |-- chrome.tabs       (tabs)
+    |<-- result (compacted) -|<-------------------------------- |-- chrome.debugger   (CDP)
 ```
 
-> **The IDE never talks to the browser directly.** The bridge mediates every call, pins browser-extension origins or verifies auth tokens, validates message shape/size, and streams results back.
+Everything stays on loopback. The client never talks to the browser directly;
+the server validates each frame, authenticates the extension, applies the
+safety tier of the tool, and compacts the result before returning it.
 
----
+Several clients can run at once. The first server instance owns the port and
+writes a lock file (PID, port, token; mode `0600`) in the OS temp directory.
+Later instances start in proxy mode and relay through the primary instead of
+competing for the port. A bridge that finds a newer `server/` on disk restarts
+itself in place (`AUTODOM_AUTO_RESTART=0` disables this).
 
-## 📋 Requirements
+## Requirements
 
-| Requirement | Details |
-|:---|:---|
-| **Node.js** | v20.19+, v22.12+, or v23+ — `node -v` to check |
-| **Chromium browser** | Chrome/Edge for managed installs; Brave best-effort; other MV3 browsers use the unpacked/manual path |
-| **MCP-capable IDE** | IntelliJ family, VS Code, Cursor, Claude Desktop, Gemini CLI |
-| **Free port** | `9876` on `127.0.0.1` *(configurable)* |
-| **Admin / sudo** | One-time, for managed-policy enrollment where the browser supports it |
+| Item | Requirement |
+|---|---|
+| Node.js | 20.19+, 22.12+ or 23+ (`node -v`) |
+| Browser | Chrome or Edge for managed install; Brave best effort; other MV3 browsers use the unpacked extension |
+| Client | Any MCP client; the installer configures IntelliJ-family IDEs, VS Code, Cursor, Claude Desktop and Gemini CLI |
+| Port | `9876` on `127.0.0.1`, changeable with `--port` |
+| Privileges | One-time admin prompt for managed browser policy (skippable) |
 
----
-
-## 🚀 Quick Start
+## Install
 
 ```bash
 git clone https://github.com/eziocode/autodom-extension.git
 cd autodom-extension
 
-# macOS / Linux / WSL / Git Bash
-./setup.sh
-
-# Windows PowerShell
-powershell -ExecutionPolicy Bypass -File .\setup.ps1
+./setup.sh                                               # macOS / Linux / WSL / Git Bash
+powershell -ExecutionPolicy Bypass -File .\setup.ps1     # Windows
 ```
 
-<details>
-<summary><b>What the installer does</b></summary>
-<br>
+The installer:
 
-1. ✅ Verifies a supported Node.js version (v20.19+, v22.12+, or v23+)
-2. ✅ Runs `npm install` inside `server/`
-3. ✅ Auto-detects installed IDEs and writes MCP config for each
-4. ✅ Enables AutoDOM for **GitHub Copilot** and **JetBrains AI Assistant**
-5. ✅ Writes and verifies managed-policy files for Chrome/Edge and best-effort Brave *(one `sudo` / UAC prompt)*
+1. checks the Node.js version and runs `npm install` in `server/`;
+2. detects installed IDEs and writes the MCP entry for each;
+3. enables AutoDOM for GitHub Copilot and JetBrains AI Assistant;
+4. writes and verifies managed-policy files for Chrome and Edge (and Brave on
+   a best-effort basis), which needs one `sudo` or UAC prompt.
 
-> Opt out of auto-install: `--no-auto-update` (macOS/Linux) or `-NoAutoUpdate` (PowerShell)
+Afterwards restart the browser and check that `ExtensionSettings` is active on
+its policy page (`chrome://policy`, `edge://policy`). Managed install and
+updates only work once the browser has accepted the policy. Then restart the
+IDE so it reloads its MCP config. The extension popup should show Connected.
 
-</details>
+Options: `--no-auto-update` (`-NoAutoUpdate` on PowerShell) skips the update
+channel; `--name autodom-edge --port 9877` registers a second instance for a
+second browser profile. Manual steps for each IDE are in
+[INSTALL.md](INSTALL.md).
 
-### After setup
+## Verify
 
-1. **Restart Chrome / Edge / Brave**, then confirm `ExtensionSettings` is active
-   on the browser policy page. Managed installation and updates only work after
-   the browser accepts that policy.
-2. **Restart your IDE** — so it picks up the new MCP config.
-3. Open the AutoDOM popup → confirm **Connected** ✅
-4. Ask your AI agent to do something in the browser 🎉
+`scripts/mcp-selftest.mjs` starts a server, performs the MCP handshake and
+checks the tool list. Pass the server path as an absolute path.
 
-> **Multiple profiles?** `./setup.sh --name autodom-edge --port 9877`
->
-> **Manual setup?** See **[INSTALL.md](INSTALL.md)** for per-IDE walkthroughs.
+```bash
+node scripts/mcp-selftest.mjs "$PWD/server/index.js" --port 9945
+```
 
----
+Expected: every line prefixed with a check mark, ending with
+`autodom_diagnostics reports a bridge role`. Stop a running bridge with
+`node server/index.js --stop [--port N]`.
 
-## 🛠 Configuration
+## Client configuration
 
-### MCP config (all IDEs)
+Any stdio MCP client needs the same entry. The path must be absolute, because
+IDE working directories are unpredictable.
 
-```jsonc
+```json
 {
   "mcpServers": {
     "autodom": {
@@ -180,310 +121,288 @@ powershell -ExecutionPolicy Bypass -File .\setup.ps1
 }
 ```
 
-> ⚠️ The path **must be absolute** — IDE working directories are unpredictable.
-
-<details>
-<summary><b>Where each IDE reads its config</b></summary>
-<br>
-
-| IDE | Config location |
-|:---|:---|
-| IntelliJ / WebStorm / PyCharm / GoLand / Rider | *Settings → Tools → MCP Servers* |
-| VS Code / Cursor | `.vscode/mcp.json` in the workspace |
-| Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) |
+| Client | Config location |
+|---|---|
+| IntelliJ family | Settings, Tools, MCP Servers |
+| VS Code, Cursor | `.vscode/mcp.json` in the workspace |
+| Claude Desktop (macOS) | `~/Library/Application Support/Claude/claude_desktop_config.json` |
 | Gemini CLI | `~/.gemini/settings.json` |
 
-</details>
+Environment variables go in an `env` block of the same entry. See the
+[configuration reference](#configuration-reference).
 
-### Environment variables
+Optional transports, both off by default:
 
-Pass these via `env` in your MCP config block.
+- `--mcp-http-port N` (or `AUTODOM_MCP_HTTP_PORT`): stateless Streamable HTTP
+  at `/mcp`.
+- `--http-port N` (or `AUTODOM_HTTP_PORT`): a plain REST API,
+  `POST /tools/<name>` with a JSON body. Set `AUTODOM_HTTP_TOKEN` to require a
+  bearer token. Useful for scripts and CI without an MCP client.
 
-<details>
-<summary><b>Bridge / runtime</b></summary>
-<br>
+## Tools
+
+136 tools are registered. 117 are listed to clients by default; the 19
+Playwright-compatible aliases (`browser_click`, `browser_snapshot`, ...) stay
+callable by name but are only listed with `AUTODOM_PLAYWRIGHT_COMPAT=1`.
+
+| Area | Tools |
+|---|---|
+| Observe | `take_snapshot`, `get_dom_state`, `query_elements`, `deep_query`, `extract_text`, `extract_data`, `get_html`, `get_page_info`, `take_screenshot`, `get_bounding_box`, `get_computed_style`, `check_element_state` |
+| Act | `click`, `type_text`, `fill_form`, `select_option`, `hover`, `press_key`, `scroll`, `drag_and_drop`, `double_click`, `right_click`, `middle_click`, `force_click`, `click_at_coordinates`, `key_down`, `key_up`, `click_by_index`, `type_by_index`, `upload_file` |
+| Navigate and wait | `navigate`, `wait_for_text`, `wait_for_element`, `wait_for_navigation`, `wait_for_network_idle`, `handle_dialog` |
+| Tabs and frames | `list_tabs`, `open_new_tab`, `switch_tab`, `close_tab`, `pin_tab`, `unpin_tab`, `get_pinned_tab`, `finish_session`, popups (`list_popups`, `switch_to_popup`, `close_popup`, `wait_for_popup`), `list_iframes`, `iframe_interact`, `list_shadow_roots`, `shadow_interact` |
+| Scripting | `execute_code`, `evaluate_script`, `execute_async_script` (deprecated), `batch_actions` |
+| Debugging | `get_console_logs`, `get_network_requests`, `har_start`, `har_status`, `har_stop`, `performance_start_trace`, `performance_stop_trace`, `emulate`, `emulate_media`, `set_viewport`, `set_geolocation`, `print_to_pdf` |
+| Storage | `get_cookies`, `set_cookie`, `delete_cookie`, `clear_cookies`, `get_storage`, `set_storage`, `set_attribute` |
+| Workflows | `workflow_record_start`, `workflow_record_stop`, `workflow_save`, `workflow_list`, `workflow_get`, `workflow_run`, `workflow_run_many`, `workflow_export`, `run_list`, `run_get`, `run_cancel`, `run_undo`, `schedule_create`, `schedule_list`, `schedule_update`, `schedule_delete` |
+| Control and audit | `approval_rules`, `audit_query`, `get_tool_tiers`, `confirm_action`, `cancel_action`, `autodom_diagnostics`, `get_session_summary` |
+| Output | `recall`, `token_stats` |
+| Page-provided | `webmcp_list_tools`, `webmcp_call_tool` (tools a page registers through WebMCP) |
+
+Every tool has a safety tier, returned by `get_tool_tiers`:
+
+| Tier | Meaning | Examples |
+|---|---|---|
+| read | no side effects | `take_snapshot`, `get_html`, `get_console_logs`, `list_tabs` |
+| write | changes page or browser state | `click`, `type_text`, `set_cookie`, `scroll`, `emulate` |
+| destructive | navigation, data loss or arbitrary code | `navigate`, `fill_form`, `batch_actions`, `execute_code`, `evaluate_script`, `clear_cookies`, `workflow_run` |
+
+Destructive calls are held for confirmation according to
+`AUTODOM_CONFIRM_MODE`. Clients that support MCP elicitation get an inline
+approval prompt; others use `confirm_action` / `cancel_action`. Per-site rules
+(`approval_rules`) and domain allow/deny lists apply on top. Every write and
+destructive call is recorded in the audit log (`audit_query`).
+
+Workflows (record a task once, replay it without a model, self-heal when the
+page changes, export to Playwright or Markdown, schedule it) are described in
+[docs/WORKFLOWS.md](docs/WORKFLOWS.md).
+
+## Output compaction (ATK)
+
+Tool results are the largest part of an agent's token spend. ATK rewrites them
+before they leave the server. It is on by default; each cut is stored so the
+original is always recoverable.
+
+| Tool | Default output |
+|---|---|
+| `get_console_logs` | Repeats grouped with counts (`ERR [x37] ...`), errors first, stacks capped at 4 frames, one-line summary when empty |
+| `get_network_requests` | Grouped by method, endpoint pattern and status; failures first; static assets and known trackers hidden unless `urlPattern` is set |
+| `get_html` | Scripts, styles, svg bodies, comments and noise attributes removed; about 8 KB budget |
+| `extract_text` | Duplicate lines and whitespace collapsed; about 6 KB budget |
+| `evaluate_script`, `execute_code` | Large JSON shrunk level by level to a size budget |
+| `take_snapshot` | Interactive mode by default: one line per actionable element, `@e12 button "Save"` |
+| everything else | 24 KB cap |
+
+Measured on one Wikipedia article: `get_html` 489 KB to 8.1 KB, an
+`execute_code` link dump 101 KB to 4.7 KB, `extract_text` 20.7 KB to 6.1 KB.
+Results vary by page.
+
+Recovering what was cut:
+
+```
+[full output: 1833 lines · recall {id:"2eb8de"} · grep/from/lines to page]
+```
+
+`recall {id, from, lines}` pages through the original; `recall {id, grep}`
+returns matching lines with line numbers. Entries live in bridge memory for 30
+minutes (64 entries, 32 MB).
+
+Other controls:
+
+- `verbose: true` on a call, or `AUTODOM_OUTPUT=full` on the server, returns
+  the raw result.
+- `take_snapshot {mode: "diff"}` returns only the elements added, changed or
+  removed since the last snapshot of the page. `click`, `type_text`,
+  `select_option`, `press_key` and `navigate` accept `snapshot: "diff"` or
+  `"full"` to append a snapshot to the action result.
+- `token_stats` reports raw versus returned tokens per tool (estimated at 4
+  bytes per token). `autodom_diagnostics` includes the same summary.
+- Output rules in `~/.autodom/filters.json` strip or cap lines per tool and
+  URL:
+
+  ```json
+  { "rules": [ {
+      "tool": "get_console_logs",
+      "match_url": "localhost:3000",
+      "strip_lines_matching": "\\[HMR\\]|Download the React DevTools",
+      "max_lines": 60,
+      "on_empty": "console: clean"
+  } ] }
+  ```
+
+  A `.autodom/filters.json` in the working directory is ignored unless
+  `AUTODOM_TRUST_PROJECT_FILTERS=1`, because a project file can hide errors
+  from the agent.
+
+Source: [`server/atk/`](server/atk), tests in `tests/atk.test.mjs`.
+
+## Tab isolation
+
+On by default. Automation runs in its own tab group named AutoDOM, in
+background tabs that are never activated, so the browser stays usable while an
+agent works. A tab you own is only touched after the agent adopts it with
+`pin_tab` (or `switch_tab`); it is restored to where it was when the session
+ends. `finish_session`, an IDE disconnect, or the idle timeout
+(`AUTODOM_ISOLATION_IDLE_MS`) closes the tabs AutoDOM opened.
+`AUTODOM_ISOLATION=0` returns to following the active tab.
+
+## Configuration reference
+
+The server port is a flag, not an environment variable: `--port N`.
+
+Bridge and runtime:
 
 | Variable | Default | Purpose |
-|:---|:---|:---|
-| `WS_PORT` | `9876` | Local WebSocket bridge port |
-| `AUTODOM_TOKEN` | *random* | Override the auto-generated auth token |
-| `AUTODOM_ALLOWED_EXTENSION_ORIGINS` / `AUTODOM_ALLOWED_EXTENSION_IDS` | canonical AutoDOM Chrome ID | Comma-separated extra extension origins or IDs for dev/fork builds |
-| `AUTODOM_HEARTBEAT_MS` | `3000` | Parent/launcher liveness check interval (ms) |
-| `AUTODOM_BOOTSTRAP_WAIT` | `12000` | Tool-call wait for the primary/proxy election to settle (ms) |
-| `AUTODOM_TOOL_TIMEOUT` | `30000` | Per-tool-call timeout (ms) |
-| `AUTODOM_INACTIVITY_TIMEOUT` | `600000` | Idle session timeout; `0` disables |
-| `AUTODOM_AUTO_RESTART` | `1` | `0` stops a bridge from restarting itself onto a newer `server/` found on disk |
-| `AUTODOM_SERVER_SELF_UPDATE` | `1` | `0` stops the bridge from downloading and installing its own server update |
-| `AUTODOM_ISOLATION` | `1` | `0` makes this bridge opt out of tab-group isolation (agent follows the active tab, as before) |
-| `AUTODOM_ISOLATION_IDLE_MS` | `300000` | Idle time before an unfinished session's AutoDOM tabs are closed; `0` disables |
-| `AUTODOM_HOME` | `~/.autodom` | Workflow mirrors, exports and the audit log |
-| `AUTODOM_AUDIT` | `on` | `0` disables the audit log; `all` also records read-only calls |
-| `AUTODOM_DEBUG` | `0` | `1` for verbose stderr logs |
-| `AUTODOM_WIRE_LOG` | `0` | `1` to log every wire frame |
+|---|---|---|
+| `AUTODOM_TOKEN` | random | Override the generated bridge token |
+| `AUTODOM_ALLOWED_EXTENSION_IDS`, `AUTODOM_ALLOWED_EXTENSION_ORIGINS` | canonical AutoDOM ID | Extra extension IDs or origins, comma separated, for fork or dev builds |
+| `AUTODOM_TOOL_TIMEOUT` | `30000` | Per tool call, ms |
+| `AUTODOM_RECONNECT_GRACE` | `8000` | How long a call waits for the extension to reconnect before failing, ms |
+| `AUTODOM_BOOTSTRAP_WAIT` | `12000` | How long a call waits for the primary/proxy election, ms |
+| `AUTODOM_HEARTBEAT_MS` | `3000` | Launcher liveness check, ms |
+| `AUTODOM_INACTIVITY_TIMEOUT` | `600000` | Idle shutdown, ms; `0` disables |
+| `AUTODOM_AUTO_RESTART` | `1` | `0`: do not restart onto a newer `server/` found on disk |
+| `AUTODOM_SERVER_SELF_UPDATE` | `1` | `0`: do not download and install server updates |
+| `AUTODOM_ISOLATION` | `1` | `0`: disable tab-group isolation |
+| `AUTODOM_ISOLATION_IDLE_MS` | `300000` | Idle time before an unfinished session's tabs are closed; `0` disables |
+| `AUTODOM_HOME` | `~/.autodom` | Workflow mirrors, exports, audit log |
+| `AUTODOM_AUDIT` | on | `0` disables the audit log; `all` also records read-only calls |
+| `AUTODOM_DEBUG` | `0` | `1`: verbose stderr logging |
+| `AUTODOM_WIRE_LOG` | `0` | `1`: log every wire frame |
 
-</details>
+Output and tool listing:
 
-<details>
-<summary><b>Tool gating</b></summary>
-<br>
+| Variable | Default | Purpose |
+|---|---|---|
+| `AUTODOM_OUTPUT` | compact | `full`: disable ATK compaction |
+| `AUTODOM_TRUST_PROJECT_FILTERS` | `0` | `1`: honour a project-local `.autodom/filters.json` |
+| `AUTODOM_PLAYWRIGHT_COMPAT` | `0` | `1`: list the Playwright-compatible aliases |
+
+Tool gating:
 
 | Variable | Purpose |
-|:---|:---|
-| `AUTODOM_ALLOWED_DOMAINS` | Comma-separated domain allowlist |
-| `AUTODOM_BLOCKED_DOMAINS` | Comma-separated denylist *(wins over allow)* |
-| `AUTODOM_CONFIRM_MODE` | `auto` / `always` / `never` for destructive actions |
+|---|---|
+| `AUTODOM_ALLOWED_DOMAINS` | Comma-separated allowlist |
+| `AUTODOM_BLOCKED_DOMAINS` | Comma-separated denylist; wins over the allowlist |
+| `AUTODOM_CONFIRM_MODE` | `auto`, `always` or `never` for destructive tools |
 
-</details>
-
-<details>
-<summary><b>AI providers (in-browser chat panel only)</b></summary>
-<br>
+In-browser chat panel providers (not used by IDE agents):
 
 | Variable | Default |
-|:---|:---|
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `AUTODOM_OPENAI_MODEL` | — / `https://api.openai.com/v1` / `gpt-4o-mini` |
-| `ANTHROPIC_API_KEY` / `AUTODOM_ANTHROPIC_MODEL` | — / `claude-3-5-sonnet-latest` |
-| `OLLAMA_BASE_URL` / `AUTODOM_OLLAMA_MODEL` | `http://127.0.0.1:11434` / `llama3.1` |
+|---|---|
+| `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `AUTODOM_OPENAI_MODEL` | unset, `https://api.openai.com/v1`, `gpt-4.1-mini` |
+| `ANTHROPIC_API_KEY`, `AUTODOM_ANTHROPIC_MODEL` | unset, `claude-3-5-sonnet-latest` |
+| `OLLAMA_BASE_URL`, `AUTODOM_OLLAMA_MODEL` | `http://localhost:11434`, `llama3.2` |
 
-> Keys entered in the popup are stored in `chrome.storage.session` (RAM only). See [SECURITY.md](SECURITY.md).
+Keys entered in the popup are held in `chrome.storage.session` (memory only).
 
-</details>
+Keyboard shortcuts: Cmd/Ctrl+Shift+K toggles the chat sidebar,
+Cmd/Ctrl+Shift+L the inline overlay.
 
-### Keyboard shortcuts
+## Security model
 
-| Shortcut | Action |
-|:---|:---|
-| <kbd>Cmd/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>K</kbd> | Toggle AI chat sidebar |
-| <kbd>Cmd/Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>L</kbd> | Toggle inline AI overlay |
+- Loopback only. The bridge binds `127.0.0.1`.
+- Two checks on every WebSocket connection: an origin allowlist (the packaged
+  extension's ID; other extension origins are rejected unless configured) and,
+  for non-browser local clients, a 256-bit bearer token from the `0600` lock
+  file, compared in constant time.
+- Frame size is limited during receipt; messages are type- and id-checked
+  before routing.
+- Page content sent to direct AI providers is wrapped as untrusted data.
+- Tools that run arbitrary code are in the destructive tier.
+- Recall entries hold page content and live only in bridge memory. Nothing is
+  sent off the machine except by the chat providers you configure.
 
----
+Details and extension permissions: [SECURITY.md](SECURITY.md).
 
-## ✅ Verifying the server
-
-```bash
-cd server && echo '{}' | node index.js 2>&1 | head -2
-# 🚀 AutoDOM Bridge Server Started (Primary)
-# 🌐 WebSocket listening on: ws://127.0.0.1:9876
-```
-
-```bash
-node server/index.js --stop      # graceful shutdown
-```
-
----
-
-## 🧯 Troubleshooting
+## Troubleshooting
 
 | Symptom | Fix |
-|:---|:---|
-| IDE says **Transport closed** | Kill orphan processes on port `9876`, restart IDE |
-| Popup shows **Disconnected** | Click *Connect*; reload extension; verify port matches server |
-| Custom/forked extension cannot connect | Add its exact ID or origin via `AUTODOM_ALLOWED_EXTENSION_IDS` / `AUTODOM_ALLOWED_EXTENSION_ORIGINS` |
-| **No tools** in IDE | Ensure MCP path is absolute; restart IDE; check `node -v` ≥ 18 |
-| AI chat shows `Ollama 403` | Ollama is blocking browser-extension origin. Run `OLLAMA_ORIGINS="chrome-extension://*,http://localhost,http://127.0.0.1" ollama serve`, then retry. |
-| AI chat shows `model 'llama3.2' not found` | Open provider settings and select an installed model (for example `gemma4:latest`), save, then retry. |
-| Tools fail on `chrome://` pages | Extensions can't inject into `chrome://` or Web Store pages |
-| Update status or bridge-port hint looks stale | Popup → **Updates** → **Clear extension cache**, then click again to confirm |
-| Port `9876` in use | `lsof -ti:9876 \| xargs kill -9` or use `--port 9877` |
+|---|---|
+| IDE reports "Transport closed" | Kill stale processes on the bridge port, restart the IDE |
+| Popup shows Disconnected | Click Connect; reload the extension; check the port matches the server's `--port` |
+| Forked or dev extension cannot connect | Add its ID to `AUTODOM_ALLOWED_EXTENSION_IDS` |
+| IDE lists no tools | Use an absolute path in the MCP config; run `node -v` (needs 20.19+); restart the IDE |
+| Tool calls fail on `chrome://` or Web Store pages | Extensions cannot inject there |
+| Console or network tools prompt for permission | They ask once per site, by design |
+| Output looks truncated | Follow the `recall {id:"..."}` hint, or pass `verbose: true` |
+| Port in use | `node server/index.js --stop`, or run a second instance with `--port 9877` |
+| Chat panel: `Ollama 403` | Start Ollama with `OLLAMA_ORIGINS="chrome-extension://*,http://localhost,http://127.0.0.1"` |
+| Chat panel: model not found | Pick an installed model in the provider settings |
+| Update status looks stale | Popup, Updates, Clear extension cache |
 
-> Full troubleshooting guide → [INSTALL.md](INSTALL.md#troubleshooting)
+More in [INSTALL.md](INSTALL.md#troubleshooting).
 
----
-
-## 📚 Documentation
-
-| Document | Description |
-|:---|:---|
-| **[INSTALL.md](INSTALL.md)** | Manual install, per-IDE setup, ports, uninstall |
-| **[CHANGELOG.md](CHANGELOG.md)** | Version history and release notes |
-| **[docs/WORKFLOWS.md](docs/WORKFLOWS.md)** | Record, replay, self-heal, export and schedule workflows; approval rules, take-over, audit log |
-| **[AUTOMATION.md](AUTOMATION.md)** | Local browser automation without AI |
-| **[UPDATES.md](UPDATES.md)** | Release channel, popup update controls, and enterprise rollout |
-| **[SECURITY.md](SECURITY.md)** | Auth tokens, secret storage, permissions |
-
----
-
-## 🏗 Advanced Architecture
-
-This section describes the internal design for contributors and anyone who wants to understand how AutoDOM works under the hood.
-
-### System overview
+## Repository layout
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                         YOUR MACHINE                                            │
-│                                                                                                 │
-│  ┌───────────────────┐         ┌──────────────────────────────┐         ┌──────────────────────┐ │
-│  │   IDE / AI Agent  │  stdio  │      AutoDOM MCP Server      │   WS    │  Chrome Extension    │ │
-│  │                   │◀───────▶│                              │◀───────▶│                      │ │
-│  │  Copilot, Claude, │ JSON-RPC│  ┌────────┐  ┌───────────┐  │ Bearer  │  ┌────────────────┐  │ │
-│  │  Cursor, Gemini,  │         │  │ MCP SDK │  │ WS Bridge │  │  Token  │  │ Service Worker │  │ │
-│  │  JetBrains AI     │         │  │ Router  │  │  Server   │  │         │  │  (background)  │  │ │
-│  └───────────────────┘         │  └────┬───┘  └─────┬─────┘  │         │  └───────┬────────┘  │ │
-│                                │       │            │         │         │          │           │ │
-│                                │  ┌────▼────────────▼──────┐  │         │  ┌───────▼────────┐  │ │
-│                                │  │    Tool Dispatcher     │  │         │  │ Content Scripts │  │ │
-│                                │  │ browser tools · 3 tiers│  │         │  │  Chat · Border  │  │ │
-│                                │  │  read / write / destr. │  │         │  └───────┬────────┘  │ │
-│                                │  └────────────────────────┘  │         │          │           │ │
-│                                │                              │         │  ┌───────▼────────┐  │ │
-│                                │  ┌────────────────────────┐  │         │  │   Popup / UI   │  │ │
-│                                │  │  Lockfile + Session    │  │         │  │  Config panel  │  │ │
-│                                │  │  Auth · Timeout · Logs │  │         │  └────────────────┘  │ │
-│                                │  └────────────────────────┘  │         │                      │ │
-│                                └──────────────────────────────┘         └──────────────────────┘ │
-│                                                                                                 │
-│                               Everything on 127.0.0.1 — nothing leaves your machine             │
-└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+extension/
+  background/    service worker, tool handlers, workflow engine, action gate,
+                 tab isolation, tool lanes, debug capture, HAR recorder, scheduler
+  content/       chat panel, session border overlay
+  popup/         connection and settings UI
+  sidepanel/     side panel
+  common/        shared helpers
+  offscreen.js   keeps the MV3 service worker alive
+  manifest.json
+server/
+  index.js       MCP server, WebSocket bridge, tool registry
+  atk/           output compaction, recall store, snapshot diff, stats, rules
+  self-restart.js, update-utils.js, bridge-reaper.js, native-host.js
+  automation-store.js, viewer-app.js
+  test/          bridge integration tests (reconnect, proxy, self-update, ...)
+enterprise/      managed-policy templates (macOS plist, Windows registry, Linux JSON)
+scripts/         build, pack, version bump, update manifests, mcp-selftest
+tests/           unit tests (node:test)
+docs/            workflow guide, release notes; also the update channel site
+examples/        usage examples
+setup.sh, setup.ps1, update.sh
 ```
 
-### Component breakdown
+Server tools are registered in `server/index.js` through `server.addTool`;
+extension handlers live in the `TOOL_HANDLERS` map in
+`extension/background/service-worker.js`.
 
-#### 🔵 MCP Server (`server/`)
+## Development
 
-The bridge is a single-file Node.js server (`index.js`) built on the official **MCP TypeScript SDK v2** and **ws**. It speaks MCP `2026-07-28` over stdio and can optionally expose stateless Streamable HTTP at `/mcp` with `--mcp-http-port`.
+```bash
+cd server && npm ci
 
-| Concern | How it works |
-|:---|:---|
-| **MCP transport** | Stateless MCP `2026-07-28` over `stdin/stdout`; optional stateless Streamable HTTP at `/mcp` |
-| **WebSocket bridge** | Listens on `ws://127.0.0.1:9876` for the extension to connect |
-| **Primary / proxy mode** | First instance owns the port and writes a lockfile (PID, port, token). Subsequent instances enter **proxy mode** — they connect *to* the primary via the lockfile token instead of fighting for the port |
-| **Lockfile** | Stored in OS temp dir with `0600` permissions. Contains port, PID, server path, and auth token |
-| **Message batching** | Outgoing WS frames are micro-batched in a short window to reduce overhead |
-| **Session lifecycle** | Heartbeat pings (`AUTODOM_HEARTBEAT_MS`), inactivity timeout, and graceful `--stop` flag |
-| **Tab isolation** | Automation runs in its own `AutoDOM` tab group (background tabs, never activated). A tab of yours is touched only when adopted with `pin_tab`. `finish_session`, IDE disconnect, or an idle timeout closes the tabs AutoDOM opened and restores adopted ones |
+# unit tests (from the repo root)
+node --test tests/*.test.mjs server/test/test-update-utils.mjs
 
-#### 🟢 Chrome Extension (`extension/`)
+# bridge integration tests (from server/), each on its own port
+node test/test-reconnect.cjs
+node test/test-concurrency.cjs
+node test/e2e.cjs
+# the full list is in .github/workflows/build.yml
 
-A Manifest V3 Chromium extension with four main layers:
-
-| Layer | File | Role |
-|:---|:---|:---|
-| **Service worker** | `background/service-worker.js` | Owns the WebSocket connection to the bridge. Dispatches tool calls to content scripts. Manages state, keepalive, and auto-connect |
-| **Content scripts** | `content/chat-panel.js`, `content/session-border.js` | Inject the floating chat UI and the viewport session-border overlay into web pages |
-| **Popup** | `popup/popup.js` | Connection controls, provider config, API key management, update checks |
-| **Offscreen** | `offscreen.js` | Sends `SW_KEEPALIVE` every 20s to prevent MV3 from suspending the service worker |
-
-#### 🔴 Security model
-
-```
-  Extension ──▶ WS Bridge
-                  │
-                  ├─ 1. Origin check: canonical extension ID, plus configured dev/fork IDs
-                  │
-                  └─ 2. Bearer token: auto-generated 32-byte hex
-                        (or AUTODOM_TOKEN override)
-                        stored in 0600 lockfile
+# before a release or any dependency change
+cd server && npm audit --audit-level=high
 ```
 
-- **API keys** (OpenAI, Anthropic) are stored in `chrome.storage.session` — RAM only, cleared when the browser closes
-- Legacy keys are auto-migrated from `chrome.storage.local` → `session` on first run
-- Browser-extension origins are not wildcarded; unknown extensions must present the bearer token or be explicitly allowlisted
-- WebSocket payloads are capped and routed only after basic type/id validation
-- Page/tab context sent to direct AI providers is wrapped as untrusted data, and account/internal identifiers are scrubbed before display or model use
-- Powerful tools (`execute_code`, `evaluate_script`, `execute_async_script`, `browser_evaluate`) are classified as destructive and gated behind bridge auth
+Adding a tool: define it in `server/index.js`, add its tier to `TOOL_TIERS`,
+add the extension handler, and update the inventory count in
+`tests/tool-contract.test.mjs`.
 
-> Full details → [SECURITY.md](SECURITY.md)
+Releases: pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which
+builds the CRX, the Chrome zip and the share bundle and attaches them to a
+GitHub release. `scripts/bump-version.sh` updates every committed version
+string; the Prepare Release workflow can do the bump, commit and tag for you.
+Signing is described in [docs/RELEASE-SIGNING.md](docs/RELEASE-SIGNING.md).
 
-#### 🟡 Message flow
+## Documentation
 
-```
-  User prompt in IDE
-        │
-        ▼
-  IDE sends MCP tool_call (stdio)
-        │
-        ▼
-  Server resolves tool → dispatches via WS
-        │
-        ▼
-  Extension service worker receives call
-        │
-        ├──▶ DOM tools      → chrome.scripting.executeScript()
-        ├──▶ Tab tools       → chrome.tabs API
-        ├──▶ Network tools   → chrome.debugger / devtools protocol
-        └──▶ Chat tools      → chrome.tabs.sendMessage → content script
-                │
-                ▼
-        Result streams back: content → SW → WS → server → stdio → IDE
-```
+| Document | Contents |
+|---|---|
+| [INSTALL.md](INSTALL.md) | Manual install, per-IDE setup, ports, uninstall |
+| [CHANGELOG.md](CHANGELOG.md) | Release history |
+| [docs/WORKFLOWS.md](docs/WORKFLOWS.md) | Record, replay, self-heal, export, schedule; approvals, take-over, audit log |
+| [AUTOMATION.md](AUTOMATION.md) | Running automation without an AI model |
+| [UPDATES.md](UPDATES.md) | Update channel, popup controls, enterprise rollout |
+| [SECURITY.md](SECURITY.md) | Authentication, secret storage, permissions |
+| [enterprise/README.md](enterprise/README.md) | Force-install policy for managed fleets |
 
-#### 🟠 Tool tiers
+## License
 
-All public browser tools are classified into three tiers for access control:
-
-| Tier | Examples | Behavior |
-|:---|:---|:---|
-| **Read** | `get_page_html`, `screenshot`, `get_cookies`, `get_console_logs`, `list_tabs`, `get_bounding_box`, `get_computed_style` | Safe, no side effects |
-| **Write** | `click`, `type_text`, `scroll`, `set_viewport`, `double_click`, `middle_click`, `force_click`, `click_at_coordinates`, `key_down`, `key_up`, `set_geolocation`, `delete_cookie`, `emulate_media` | Modifies page state |
-| **Destructive** | `navigate`, `fill_form`, `batch_actions`, `execute_code`, `evaluate_script`, `execute_async_script`, `close_tab`, `clear_cookies`, `print_to_pdf` | Navigation / data loss / arbitrary-code risk — gated by `AUTODOM_CONFIRM_MODE` |
-
-#### 🏢 Enterprise deployment (`enterprise/`)
-
-Force-install the extension across managed fleets without user interaction:
-
-| OS | Template |
-|:---|:---|
-| **macOS** | `com.google.Chrome.plist.tmpl`, `com.microsoft.Edge.plist.tmpl`, `com.brave.Browser.plist.tmpl` |
-| **Windows** | `autodom-policy.reg.tmpl` (Group Policy / Registry) |
-| **Linux** | `autodom-policy.json.tmpl` (`/etc/opt/chrome/policies/`) |
-
-Enterprise installers (`install.sh`, `install.ps1`) write and verify policy
-files for Chrome/Edge and best-effort Brave. Confirm the policy is active in
-the browser before relying on the GitHub Pages update channel. Arc, Ulaa, and
-other browsers use the unpacked/manual path unless vendor policy support is
-verified separately.
-
-### Repository layout
-
-```
-autodom-extension/
-│
-├── extension/                 Chromium MV3 extension
-│   ├── background/            Service worker (WS client, tool dispatch)
-│   ├── content/               Chat panel, session border overlay
-│   ├── popup/                 Connection UI, provider settings
-│   ├── common/                Shared utilities
-│   ├── offscreen.js           MV3 keepalive helper
-│   └── manifest.json          Extension manifest
-│
-├── server/
-│   ├── index.js               MCP server + WS bridge (single file)
-│   └── package.json           Dependencies: official MCP SDK v2, ws, zod
-│
-├── enterprise/                Policy templates for managed deployment
-│   ├── macos/                 plist templates (Chrome, Edge, Brave)
-│   ├── windows/               Registry template
-│   ├── linux/                 JSON policy template
-│   └── common/                Shared extension settings
-│
-├── scripts/                   Build & release tooling
-│   ├── build-chrome.sh        Package extension → dist/chrome/
-│   ├── pack-release.sh        Create distributable archive
-│   ├── build-update-manifests.mjs   Generate Chromium update XML
-│   └── bump-version.sh        Version bump helper
-│
-├── dist/                      Build output (zip, CRX, manifests)
-├── docs/                      GitHub Pages (update channel)
-├── tests/                     Test suites
-├── examples/                  Usage examples
-│
-├── setup.sh                   Guided installer (macOS/Linux)
-├── setup.ps1                  Guided installer (Windows)
-│
-├── INSTALL.md                 Detailed setup guide
-├── CHANGELOG.md               Release history
-├── AUTOMATION.md              Script runner docs
-├── UPDATES.md                 Update channel docs
-└── SECURITY.md                Security model docs
-```
-
----
-
-<div align="center">
-
-**[⬆ Back to top](#)**
-
-<sub>MIT License · Built with ❤️ by <a href="https://github.com/eziocode">eziocode</a></sub>
-
-</div>
+MIT, as declared in `server/package.json`.
