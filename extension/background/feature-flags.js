@@ -32,7 +32,7 @@
     parallelConcurrency: 3,
     runHistoryLimit: 50,
     // Performance
-    compactSnapshotsDefault: false,
+    compactSnapshotsDefault: true,
     webmcp: true,
     perfMode: "fast",
     toolLanes: true,

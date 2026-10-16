@@ -4,6 +4,73 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 7.0.0
+
+### Breaking
+- Tool output is compacted by default (ATK, below). Agents or scripts that parse
+  raw JSON from `get_console_logs`, `get_network_requests`, `get_html`,
+  `extract_text`, `evaluate_script` or `execute_code` must pass `verbose: true`
+  or run the bridge with `AUTODOM_OUTPUT=full`.
+- `take_snapshot` defaults to `mode: "interactive"` (was `tree`).
+- Playwright-compatible aliases are no longer listed in `tools/list`
+  (still callable; `AUTODOM_PLAYWRIGHT_COMPAT=1` lists them).
+- Plain-object results no longer carry a duplicate `structuredContent`.
+
+### Added
+- **ATK (AutoDOM Token Killer)**: RTK-style compaction of MCP tool output, on by
+  default. Opt out per call with `verbose: true` or globally with
+  `AUTODOM_OUTPUT=full`.
+  - `get_console_logs`: repeats grouped with counts (`ERR [x37] …`), errors
+    first, stacks capped at 4 frames, one-line summary when empty.
+  - `get_network_requests`: grouped by method + endpoint pattern + status,
+    failures first, static assets and trackers hidden unless `urlPattern` is
+    set, duplicate `artifactCandidates` list dropped.
+  - `get_html`: skeleton without scripts, styles, svg bodies, comments and
+    noise attributes, sent as raw HTML instead of JSON-escaped.
+  - `extract_text`, `evaluate_script`, `execute_code`, `take_snapshot`:
+    budgeted with head/tail cuts and progressive JSON shrinking.
+  - Every other tool: a 24 KB generic cap.
+  - Anything cut is kept for 30 minutes and readable with the new `recall`
+    tool (`from`/`lines` paging, `grep`).
+- `token_stats` tool and an `atk` section in `autodom_diagnostics`: per-tool
+  raw vs returned tokens.
+- Optional output rules in `~/.autodom/filters.json` (`strip_lines_matching`,
+  `keep_lines_matching`, `max_lines`, `on_empty`, `match_url`). Project-local
+  `.autodom/filters.json` only with `AUTODOM_TRUST_PROJECT_FILTERS=1`.
+- `take_snapshot {mode:"diff"}` returns only elements added, changed or removed
+  since the last snapshot of the page. `click`, `type_text`, `select_option`,
+  `press_key` and `navigate` accept `snapshot:"diff"|"full"` to append one
+  after the action.
+
+### Changed
+- `take_snapshot` defaults to the interactive mode; `tree` is legacy.
+- The 19 Playwright-compatible aliases (`browser_*` except `browser_fetch_raw`,
+  plus `fetch_page_source`) are hidden from `tools/list` but still callable.
+  Set `AUTODOM_PLAYWRIGHT_COMPAT=1` to list them. With shorter descriptions,
+  `tools/list` shrinks from 80.6 KB to 61.9 KB.
+- Plain-object results are no longer sent twice (`structuredContent` copy).
+  `batch_actions` and `get_tool_tiers` return compact JSON; batch steps are
+  compacted per tool and screenshots inside batches become a pointer.
+- `execute_async_script` is marked deprecated in favour of `execute_code`.
+- Features → compact snapshots is on by default for the in-extension agent.
+- Dependencies: `@modelcontextprotocol/server` 2.3.1, `@modelcontextprotocol/node`
+  2.1.1, `zod` 4.6.7, `ws` 8.22.0.
+
+### Performance
+- `execute_code` runs in the page's main world first. The isolated world is
+  bound by the extension's MV3 CSP, so it always fell back to a CDP
+  attach/detach. On pages whose CSP blocks eval, the origin goes straight to
+  CDP next time and the debugger stays attached until 20 s idle.
+- Extension keepalive every 20 s (was 45 s, above Chrome's 30 s service-worker
+  idle limit); first reconnect after 750 ms (was 5 s). The bridge waits up to
+  8 s (was 5 s) for a reconnect before failing a call.
+- Ref actions and interactive snapshots inject the workflow library only when
+  the page lacks it; the WebMCP probe runs alongside candidate collection.
+- The tab-isolation setting is cached (invalidated on change) and the sweep
+  alarm is checked once instead of on every call.
+- `browser_wait_for {textGone}` uses the MutationObserver wait instead of a
+  150 ms poll.
+
 ## 6.3.0
 
 ### Added

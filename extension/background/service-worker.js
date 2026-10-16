@@ -126,14 +126,22 @@ const ISOLATION_SWEEP_ALARM = "autodom-tab-isolation-sweep";
 const ISOLATION_DISCONNECT_GRACE_MS = 30000;
 let _isolationDisconnectTimer = null;
 
+// Called on every bridge tool call; only the first call per worker (or
+// after the alarm is cleared) needs to touch chrome.alarms.
+let _isolationSweepAlarmArmed = false;
+
 function _ensureIsolationSweepAlarm() {
+  if (_isolationSweepAlarmArmed) return;
+  _isolationSweepAlarmArmed = true;
   try {
     chrome.alarms?.get?.(ISOLATION_SWEEP_ALARM, (existing) => {
       if (!existing) {
         chrome.alarms.create(ISOLATION_SWEEP_ALARM, { periodInMinutes: 0.5 });
       }
     });
-  } catch (_) {}
+  } catch (_) {
+    _isolationSweepAlarmArmed = false;
+  }
 }
 
 async function _isolationSweepTick() {
@@ -142,6 +150,7 @@ async function _isolationSweepTick() {
   await Tab.ready();
   await Tab.sweepIdle();
   if (Tab.snapshot().length === 0) {
+    _isolationSweepAlarmArmed = false;
     try {
       chrome.alarms.clear(ISOLATION_SWEEP_ALARM);
     } catch (_) {}
@@ -4834,7 +4843,7 @@ function connectWebSocket(port) {
             `Disconnected from ws://127.0.0.1:${currentPort}. Falling back to last working port ${fallbackPort}.`,
             "warn",
           );
-          startAutoConnect(fallbackPort, { initialDelayMs: 5000 });
+          startAutoConnect(fallbackPort, { initialDelayMs: RECONNECT_INITIAL_DELAY_MS });
         } else if (shouldRunMcp) {
           // After the fallback cycle is exhausted, always retry the user-requested
           // port so the extension doesn't permanently drift to lastConnectedPort.
@@ -4845,11 +4854,11 @@ function connectWebSocket(port) {
             "Disconnected from MCP bridge server. Auto-reconnect is retrying.",
             "warn",
           );
-          // Wait 5 s before the first reconnect attempt so a node-server
-          // restart can finish binding the port. Without this delay Chrome
-          // logs ERR_CONNECTION_REFUSED for every retry that lands during
-          // the boot window — which is harmless but visually noisy.
-          startAutoConnect(_requestedPort, { initialDelayMs: 5000 });
+          // Short pause before the first reconnect so a node-server restart
+          // can bind the port; backoff (3s, 6s, …) covers slower restarts.
+          // Kept well under the bridge's RECONNECT_GRACE_MS so a tool call
+          // made during a blip waits for the reconnect instead of failing.
+          startAutoConnect(_requestedPort, { initialDelayMs: RECONNECT_INITIAL_DELAY_MS });
         } else {
           stopAutoConnect();
           chrome.storage.local.set({ mcpRunning: false });
@@ -4897,7 +4906,7 @@ function connectWebSocket(port) {
             `Connection refused on port ${currentPort}. Trying last working port ${lastConnectedPort}.`,
             "warn",
           );
-          startAutoConnect(lastConnectedPort, { initialDelayMs: 5000 });
+          startAutoConnect(lastConnectedPort, { initialDelayMs: RECONNECT_INITIAL_DELAY_MS });
         }
       }
       // Port-mismatch guardrail: when the configured port is unreachable,
@@ -4954,7 +4963,10 @@ function _kickBridgeConnect(reason = "chat_request") {
 // MV3 keep-alive: send a small message to keep the service worker alive
 // and detect dead connections via response timeout.
 let _lastPongTime = 0;
-const KEEPALIVE_INTERVAL_MS = 45000;
+// Under Chrome's 30s MV3 idle limit: WebSocket traffic resets the service
+// worker's idle timer, so an interval above 30s let it suspend between pings.
+const KEEPALIVE_INTERVAL_MS = 20000;
+const RECONNECT_INITIAL_DELAY_MS = 750;
 const KEEPALIVE_TIMEOUT_MS = 10000; // If no pong within this time, disconnect
 
 const _KEEPALIVE_MSG = JSON.stringify({ type: "KEEPALIVE" });
@@ -6409,21 +6421,8 @@ async function toolBrowserWaitFor(params = {}, ctx) {
     return toolWaitForText({ text: params.text, timeout }, ctx);
   }
   if (typeof params.textGone === "string" && params.textGone) {
-    const tab = await getActiveTab(ctx);
-    const start = Date.now();
-    while (Date.now() - start < timeout) {
-      const present = await executeInTab(
-        tab.id,
-        (text) => document.body.innerText.includes(text),
-        [params.textGone],
-      );
-      if (!present) return { success: true, elapsed: Date.now() - start };
-      await _sleep(150, ctx?.signal);
-    }
-    return {
-      success: false,
-      error: `Text "${params.textGone}" still present after ${timeout}ms`,
-    };
+    // Same MutationObserver wait as wait_for_text, not a 150 ms poll.
+    return toolWaitForText({ text: params.textGone, timeout, gone: true }, ctx);
   }
   await _sleep(timeout, ctx?.signal);
   return { success: true, elapsed: timeout };
@@ -7400,12 +7399,21 @@ function _refParam(params) {
   return m ? m[1] : null;
 }
 
+// Call a workflow-lib page entry point; inject the library only when the
+// entry answers { needLib } (new document or another build). The library
+// is idempotent per document, so this saves an executeScript per call.
+async function _callWfPage(tabId, fn, args) {
+  const first = await executeInTab(tabId, fn, args, "ISOLATED");
+  if (!first?.needLib) return first;
+  await executeInTab(tabId, globalThis.AutoDOMWorkflow._page._pageWfLib, [], "ISOLATED");
+  return executeInTab(tabId, fn, args, "ISOLATED");
+}
+
 async function _actByRef(ref, step, ctx) {
   const P = globalThis.AutoDOMWorkflow?._page;
   if (!P) return { error: "workflow engine not loaded" };
   const tab = await getActiveTab(ctx);
-  await executeInTab(tab.id, P._pageWfLib, [], "ISOLATED");
-  const res = await executeInTab(tab.id, P._pageWfActOnRef, [ref, step], "ISOLATED");
+  const res = await _callWfPage(tab.id, P._pageWfActOnRef, [ref, step]);
   if (!res?.ok) {
     return {
       error: res?.error || `Action on @${ref} failed`,
@@ -7424,21 +7432,24 @@ async function _interactiveSnapshot(params, ctx) {
   const W = globalThis.AutoDOMWorkflow;
   if (!W) return { error: "workflow engine not loaded" };
   const tab = await getActiveTab(ctx);
-  await executeInTab(tab.id, W._page._pageWfLib, [], "ISOLATED");
   const limit = Math.max(10, Math.min(1000, Number(params?.limit) || 300));
-  const res = await executeInTab(tab.id, W._page._pageWfCandidates, [limit], "ISOLATED");
-  const all = res?.candidates || [];
-  const shown = params?.includeHidden ? all : all.filter((c) => c.visible !== false);
-  let webmcp = 0;
-  if ((await _getFeatures()).webmcp !== false) {
+  // The WebMCP probe runs alongside candidate collection, not after it.
+  const webmcpProbe = (async () => {
+    if ((await _getFeatures()).webmcp === false) return 0;
     try {
       const listed = await Promise.race([
         executeInTab(tab.id, _pageWebMcpList, [], "MAIN"),
         new Promise((r) => setTimeout(() => r(null), 800)),
       ]);
-      webmcp = listed?.tools?.length || 0;
-    } catch (_) {}
-  }
+      return listed?.tools?.length || 0;
+    } catch (_) {
+      return 0;
+    }
+  })();
+  const res = await _callWfPage(tab.id, W._page._pageWfCandidates, [limit]);
+  const all = res?.candidates || [];
+  const shown = params?.includeHidden ? all : all.filter((c) => c.visible !== false);
+  const webmcp = await webmcpProbe;
   const header = [`Page: ${tab.title || ""} — ${tab.url || ""}`];
   if (webmcp) header.push(`WebMCP: this page exposes ${webmcp} tool${webmcp === 1 ? "" : "s"} (webmcp_list_tools / webmcp_call_tool)`);
   const lines = shown.map(W.compactLine);
@@ -8183,15 +8194,18 @@ async function toolGetPageInfo(params, ctx) {
 }
 
 // 11. Wait for text
+// gone: wait for the text to disappear instead (browser_wait_for textGone).
 async function toolWaitForText(params, ctx) {
   const tab = await getActiveTab(ctx);
   const { text, timeout } = params;
+  const gone = params?.gone === true;
   const maxWait = timeout || 10000;
 
   const res = await _waitInPage(
     tab.id,
-    (text, sliceMs) => {
-      const has = () => !!document.body && document.body.innerText.includes(text);
+    (text, gone, sliceMs) => {
+      const present = () => !!document.body && document.body.innerText.includes(text);
+      const has = gone ? () => !present() : present;
       if (has()) return true;
       return new Promise((resolve) => {
         let done = false;
@@ -8229,10 +8243,15 @@ async function toolWaitForText(params, ctx) {
         const endTimer = setTimeout(() => finish(has()), sliceMs);
       });
     },
-    [text],
+    [text, gone],
     maxWait,
     ctx?.signal,
   );
+  if (gone) {
+    return res.met
+      ? { success: true, elapsed: res.elapsed }
+      : { success: false, error: `Text "${text}" still present after ${maxWait}ms` };
+  }
   if (res.met) return { success: true, found: true, elapsed: res.elapsed };
 
   return {
@@ -12848,10 +12867,31 @@ async function toolPerformanceAnalyzeInsight({ insightName, insightSetId }, ctx)
 // only what the LLM actually needs instead of full page dumps.
 
 // execute_code: Run arbitrary JS in page context, return only extracted data
+// Origins whose CSP rejected eval: go straight to CDP next time, so the
+// page sees (and may report) at most one violation per origin.
+const _evalBlockedOrigins = new Set();
+
+function _originOf(url) {
+  try {
+    return new URL(url).origin;
+  } catch (_) {
+    return "";
+  }
+}
+
 async function toolExecuteCode(params, ctx) {
   const tab = await getActiveTab(ctx);
   const { code, timeout } = params;
   const timeoutMs = timeout || 15000;
+  const origin = _originOf(tab.url);
+
+  if (!IS_FIREFOX && origin && _evalBlockedOrigins.has(origin)) {
+    try {
+      return await executeCodeViaCdp(tab.id, code, timeoutMs);
+    } catch (_) {
+      // Fall through to the in-page attempt (debugger busy or detached).
+    }
+  }
 
   const result = await executeInTab(
     tab.id,
@@ -12862,9 +12902,10 @@ async function toolExecuteCode(params, ctx) {
         }, timeoutMs);
 
         try {
-          // Wrap in async IIFE so the code can use await
+          // Wrap in async IIFE so the code can use await. Indirect eval:
+          // global scope, none of this wrapper's locals leak into the code.
           const wrapped = `(async () => { ${code} })()`;
-          const result = eval(wrapped);
+          const result = (0, eval)(wrapped);
 
           // Handle promise results (async code)
           if (result && typeof result.then === "function") {
@@ -12907,7 +12948,11 @@ async function toolExecuteCode(params, ctx) {
       });
     },
     [code, timeoutMs],
-    "ISOLATED",
+    // MAIN world: only the page's CSP applies. The ISOLATED world is bound
+    // by the extension's MV3 CSP (script-src 'self'), which rejects eval on
+    // every page, so it always fell through to a CDP attach/detach. CDP
+    // Runtime.evaluate runs in the main world too, so results are the same.
+    "MAIN",
   );
 
   // If the page's CSP blocked eval (no 'unsafe-eval' in script-src), fall
@@ -12919,6 +12964,7 @@ async function toolExecuteCode(params, ctx) {
     !IS_FIREFOX &&
     isCspEvalError(result.error, result.errorName)
   ) {
+    if (origin) _evalBlockedOrigins.add(origin);
     try {
       return await executeCodeViaCdp(tab.id, code, timeoutMs);
     } catch (cdpErr) {
@@ -12944,7 +12990,25 @@ function isCspEvalError(message, name) {
   );
 }
 
+// CSP-strict pages send every execute_code through CDP. Detaching right
+// after each call made the next one pay a fresh attach (and re-showed
+// Chrome's debugging banner), so detach only once the tab has been idle.
+const CDP_EXEC_IDLE_DETACH_MS = 20000;
+const _cdpExecDetachTimers = new Map(); // tabId -> timeout
+
+function _scheduleCdpExecDetach(tabId) {
+  clearTimeout(_cdpExecDetachTimers.get(tabId));
+  _cdpExecDetachTimers.set(
+    tabId,
+    setTimeout(() => {
+      _cdpExecDetachTimers.delete(tabId);
+      detachDebuggerSafe(tabId).catch(() => {});
+    }, CDP_EXEC_IDLE_DETACH_MS),
+  );
+}
+
 async function executeCodeViaCdp(tabId, code, timeoutMs) {
+  clearTimeout(_cdpExecDetachTimers.get(tabId));
   await ensureDebugger(tabId);
   const expression = `(async () => { ${code} })()`;
   let detachAfter = false;
@@ -12968,12 +13032,9 @@ async function executeCodeViaCdp(tabId, code, timeoutMs) {
     const value = res && res.result ? res.result.value : undefined;
     return { success: true, result: value };
   } finally {
-    // Detach so Chrome's "started debugging this browser" banner clears
-    // — execute_code is a one-shot operation and we don't need to keep
-    // the debugger attached between calls.
-    if (detachAfter) {
-      detachDebuggerSafe(tabId).catch(() => {});
-    }
+    // Detach once idle so Chrome's "started debugging this browser" banner
+    // clears, without paying a re-attach on back-to-back calls.
+    if (detachAfter) _scheduleCdpExecDetach(tabId);
   }
 }
 

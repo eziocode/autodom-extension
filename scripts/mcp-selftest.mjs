@@ -125,6 +125,8 @@ try {
   const tools = await request("tools/list", {});
   const toolList = tools.result.tools || [];
   report.toolCount = toolList.length;
+  report.toolNames = toolList.map((t) => t.name);
+  report.toolListBytes = JSON.stringify(tools.result).length;
   failed = !check("tools/list returns tools", toolList.length > 0, `${toolList.length} tools`) || failed;
   failed = !check(
     "tool schemas carry no $schema key",

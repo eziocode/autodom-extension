@@ -64,7 +64,7 @@ test("normalize fills every default from empty or garbage input", () => {
   assert.equal(F.DEFAULTS.runHistoryLimit, 50);
   assert.equal(F.DEFAULTS.perfMode, "fast");
   assert.equal(F.DEFAULTS.toolLanes, true);
-  assert.equal(F.DEFAULTS.compactSnapshotsDefault, false);
+  assert.equal(F.DEFAULTS.compactSnapshotsDefault, true);
 });
 
 test("normalize clamps numeric ranges and rounds", () => {

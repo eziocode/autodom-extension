@@ -34,6 +34,7 @@ for (const f of [
 ]) {
   fs.copyFileSync(path.join(REAL, f), path.join(DIR, f));
 }
+fs.cpSync(path.join(REAL, "atk"), path.join(DIR, "atk"), { recursive: true });
 fs.symlinkSync(path.join(REAL, "node_modules"), path.join(DIR, "node_modules"));
 const writeVersion = (version) => {
   const pkg = JSON.parse(fs.readFileSync(path.join(DIR, "package.json"), "utf8"));

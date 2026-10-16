@@ -94,6 +94,12 @@ test("tools/list is client-safe: no $schema, object roots, no -32601 probes", as
     assert.equal(byName.get(name)?.pass, true, `${name} failed`);
   }
   assert.ok(report.toolCount > 100, `only ${report.toolCount} tools`);
+  // Playwright aliases stay callable but are not listed by default (ATK).
+  assert.ok(report.toolNames.includes("recall"), "recall tool missing");
+  assert.ok(report.toolNames.includes("token_stats"), "token_stats tool missing");
+  assert.ok(!report.toolNames.includes("browser_click"), "compat aliases should be hidden from tools/list");
+  assert.ok(report.toolNames.includes("verify_artifact_counts"), "non-alias catalog tools stay listed");
+  assert.equal(report.toolCount, 117, "136 registered minus 19 hidden Playwright aliases");
   // listChanged is advertised false because nothing ever emits the
   // corresponding notification.
   assert.equal(report.capabilities.tools.listChanged, false);

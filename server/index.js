@@ -68,6 +68,16 @@ import {
   autodomHome,
 } from "./automation-store.js";
 import { decideReap } from "./bridge-reaper.js";
+import {
+  AtkOutput,
+  atkStats,
+  compactResult,
+  finalizeResult,
+  hasFilter,
+  recallStore,
+  recallText,
+  snapshotBaselines,
+} from "./atk/index.js";
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 
 // Local Playwright/Node automation backends were intentionally removed: AutoDOM
@@ -509,7 +519,7 @@ const SHUTDOWN_GRACE_MS = 1500;
 // MCP server going "inactive" and stop calling it until the user manually
 // restarts it from Settings → Tools → MCP.
 const RECONNECT_GRACE_MS = parseInt(
-  process.env.AUTODOM_RECONNECT_GRACE || "5000",
+  process.env.AUTODOM_RECONNECT_GRACE || "8000",
   10,
 );
 const INACTIVITY_TIMEOUT_MS = parseInt(
@@ -966,6 +976,8 @@ const TOOL_TIERS = new Map([
   ["get_pinned_tab", "read"],
   ["finish_session", "read"],
   ["autodom_diagnostics", "read"],
+  ["recall", "read"],
+  ["token_stats", "read"],
   ["get_recording", "read"],
   ["get_session_summary", "read"],
   ["wait_for_text", "read"],
@@ -7632,6 +7644,44 @@ const server = {
   },
 };
 
+// ATK opt-out, only on tools whose output ATK rewrites.
+const VERBOSE_PARAM = z
+  .boolean()
+  .optional()
+  .describe("Raw output, skip ATK compaction");
+
+const SNAPSHOT_AFTER_PARAM = z
+  .enum(["diff", "full"])
+  .optional()
+  .describe('Append snapshot after action: diff = changes since last snapshot, full = whole');
+
+function _withoutAtkParams(params = {}) {
+  const { verbose, snapshot, ...rest } = params || {};
+  return rest;
+}
+
+// Interactive snapshot as the agent should see it. "diff" shows only what
+// changed since the last snapshot of the same page; anything else records
+// the baseline so a later diff has one.
+function _snapshotView(snap, mode) {
+  const entry = { url: snap.url, snapshot: snap.snapshot };
+  if (mode === "diff") return snapshotBaselines.update(entry).text;
+  snapshotBaselines.remember(entry);
+  return snap.snapshot;
+}
+
+// Run an action tool, then optionally append the page's interactive
+// snapshot so the agent needs no separate take_snapshot round trip.
+async function _actionWithSnapshot(tool, params) {
+  const mode = params?.snapshot;
+  const result = await callExtensionTool(tool, _withoutAtkParams(params));
+  const text = stringifyToolResult(result);
+  if (!mode || (result && typeof result === "object" && result.error)) return text;
+  const snap = await callExtensionTool("take_snapshot", { mode: "interactive" });
+  if (typeof snap?.snapshot !== "string") return text;
+  return `${text}\n--- snapshot ---\n${_snapshotView(snap, mode)}`;
+}
+
 function normalizeMcpToolResult(value) {
   if (value && typeof value === "object" && Array.isArray(value.content)) {
     return value;
@@ -7639,10 +7689,9 @@ function normalizeMcpToolResult(value) {
   if (typeof value === "string") {
     return { content: [{ type: "text", text: value }] };
   }
-  const text = stringifyToolResult(value);
-  const result = { content: [{ type: "text", text }] };
-  if (value !== undefined) result.structuredContent = value;
-  return result;
+  // Text only: no tool declares an outputSchema, so structuredContent would
+  // just send the same payload a second time.
+  return { content: [{ type: "text", text: stringifyToolResult(value) }] };
 }
 
 // ─── tools/list payload ──────────────────────────────────────
@@ -7679,6 +7728,15 @@ function _stripSchemaKeyword(node) {
   return out;
 }
 
+// `default: false` on a boolean says nothing an absent flag does not, and
+// zod still applies the default when the call omits it.
+function _dropFalseDefaults(schema) {
+  for (const prop of Object.values(schema?.properties || {})) {
+    if (prop && prop.type === "boolean" && prop.default === false) delete prop.default;
+  }
+  return schema;
+}
+
 function _jsonSchemaForTool(parameters) {
   // A handful of tools take no arguments and omit `parameters` entirely.
   // Mirror the SDK's EMPTY_OBJECT_JSON_SCHEMA for those.
@@ -7687,14 +7745,22 @@ function _jsonSchemaForTool(parameters) {
   const raw = standard?.jsonSchema
     ? standard.jsonSchema.input({ target: "draft-2020-12" })
     : z.toJSONSchema(parameters, { target: "draft-2020-12", io: "input" });
-  const stripped = _stripSchemaKeyword(raw);
+  const stripped = _dropFalseDefaults(_stripSchemaKeyword(raw));
   // MCP requires an object root; the SDK asserts the same.
   return stripped.type === "object" ? stripped : { type: "object", ...stripped };
 }
 
+// The Playwright-compatible aliases duplicate core tools and cost ~6KB of
+// schema on every session. They stay callable by name; only clients that
+// discover tools by listing need AUTODOM_PLAYWRIGHT_COMPAT=1.
+function _listedToolDefinitions(env = process.env) {
+  if (env.AUTODOM_PLAYWRIGHT_COMPAT === "1") return toolDefinitions;
+  return toolDefinitions.filter((t) => !PLAYWRIGHT_COMPAT_NAMES.has(t.name));
+}
+
 function toolListPayload() {
   if (!_toolListPayload) {
-    _toolListPayload = toolDefinitions.map(({ name, description, parameters, _meta }) => ({
+    _toolListPayload = _listedToolDefinitions().map(({ name, description, parameters, _meta }) => ({
       name,
       description,
       inputSchema: _jsonSchemaForTool(parameters),
@@ -7743,9 +7809,9 @@ function createAutoDomMcpServer() {
       async (params, context) =>
         mcpRequestContext.run({ signal: context?.mcpReq?.signal || null, tool: name, params, execute }, async () => {
           const resumed = await _resumeApprovedTool(name, params, context, execute);
-          if (resumed !== undefined) return normalizeMcpToolResult(resumed);
+          if (resumed !== undefined) return normalizeMcpToolResult(finalizeResult(name, resumed, params));
           const value = await execute(params, context);
-          return _askForApproval(name, value, context) || normalizeMcpToolResult(value);
+          return _askForApproval(name, value, context) || normalizeMcpToolResult(finalizeResult(name, value, params));
         }),
     );
   }
@@ -7996,20 +8062,32 @@ async function _callPlaywrightCompatTool(toolName, params = {}) {
   }
 }
 
+// Aliases of core tools (browser_* and the fetch_page_source duplicate of
+// browser_fetch_raw). The catalog's other entries are real tools and stay
+// listed.
+const PLAYWRIGHT_COMPAT_NAMES = new Set();
+
+function _isPlaywrightAlias(name) {
+  return (name.startsWith("browser_") && name !== "browser_fetch_raw") || name === "fetch_page_source";
+}
+
 function _registerPlaywrightCompatTool({ name, description, parameters }) {
+  const alias = _isPlaywrightAlias(name);
+  if (alias) PLAYWRIGHT_COMPAT_NAMES.add(name);
   server.addTool({
     name,
-    description:
-      `${description} MCP browser tool backed by AutoDOM. ` +
-      "Prefer raw fetch tools for artifact/report/API payload evidence, and browser_snapshot/get_dom_state before UI actions so element targets are deterministic.",
+    description: alias ? `${description} [Playwright-compatible alias]` : description,
     parameters,
     execute: async (params) => {
       const result = await _callPlaywrightCompatTool(name, params);
       // Compact snapshots are plain text; JSON-escaping them wastes tokens.
       if (name === "browser_snapshot" && typeof result?.snapshot === "string") {
-        return result.snapshot;
+        return compactResult(name, result.snapshot, params);
       }
       if (name === "browser_take_screenshot") return screenshotToolResult(result, params);
+      if (name === "browser_console_messages" || name === "browser_network_requests" || name === "browser_evaluate") {
+        return compactResult(name, result, params);
+      }
       return stringifyToolResult(result);
     },
   });
@@ -8397,31 +8475,26 @@ function screenshotToolResult(result, params = {}) {
 server.addTool({
   name: "execute_code",
   description:
-    "Execute JavaScript code in the active tab's page context and return the result. " +
-    "This is the most token-efficient way to interact with pages — write JS to extract " +
-    "only the data you need, manipulate DOM, fill forms, click elements, or run multi-step " +
-    "logic in a single call. The code is wrapped in an async IIFE so you can use await. " +
-    "Return values are serialized as JSON. Use this instead of multiple individual tool " +
-    "calls whenever possible to minimize round-trips and token usage.",
+    "Run JavaScript in the active tab's page (async IIFE, await ok, return value JSON-serialized). Most token-efficient tool: extract only what you need, or do multi-step DOM work in one call instead of many tool calls. Large results are shrunk (recallable) unless verbose.",
   parameters: z.object({
     code: z
       .string()
       .describe(
-        "JavaScript code to execute in the page context. Wrap in (async()=>{...})() for async. " +
-          "Use 'return' to return values. Has access to full DOM, window, document, fetch, etc.",
+        "JS run in the page (async IIFE: await ok). Use return for the result. Full DOM, window, fetch.",
       ),
     timeout: z
       .number()
       .optional()
       .default(15000)
       .describe("Max execution time in milliseconds"),
+    verbose: VERBOSE_PARAM,
   }),
-  execute: async ({ code, timeout }) => {
+  execute: async ({ code, timeout, verbose }) => {
     const result = await callExtensionTool("execute_code", {
       code,
       timeout: timeout || 15000,
     });
-    return stringifyToolResult(result);
+    return compactResult("execute_code", result, { verbose });
   },
 });
 
@@ -8431,15 +8504,7 @@ server.addTool({
 server.addTool({
   name: "get_dom_state",
   description:
-    "Get a compact map of all interactive elements on the page with numeric indices. " +
-    "Returns only elements the user can interact with (links, buttons, inputs, selects, " +
-    "textareas, clickable elements) with their index, tag, text, type, name, placeholder, " +
-    "href, and value. Use the index with click_by_index or type_by_index for precise " +
-    "interaction. This is 50-200x smaller than a full DOM snapshot. " +
-    "Set autoScroll:true to scroll through lazy-loaded / virtualized lists, collect " +
-    "off-screen rows, then reposition the page — use this when a list looks truncated. " +
-    "If you mention an index in a user-facing answer, call it element #7 (or similar), not IC7. " +
-    "Always call this before interacting with page elements to discover what's available.",
+    "Compact list of interactive elements (links, buttons, inputs, selects, clickables) with numeric index, tag, text, type, name, placeholder, href, value. Use index with click_by_index/type_by_index. autoScroll:true sweeps lazy/virtualized lists first. Call it 'element #7' in user-facing text.",
   parameters: z.object({
     includeHidden: z
       .boolean()
@@ -8464,7 +8529,7 @@ server.addTool({
       .optional()
       .default(false)
       .describe(
-        "Scroll through the page (or inner scroll container) to reveal lazy-loaded/virtualized off-screen elements, then restore the original scroll position",
+        "Scroll page/inner container to reveal lazy or virtualized elements, then restore scroll",
       ),
     maxScrolls: z
       .number()
@@ -8540,10 +8605,7 @@ server.addTool({
 server.addTool({
   name: "batch_actions",
   description:
-    "Execute multiple browser actions in a single call to minimize round-trips and tokens. " +
-    "Each action is {tool, params} where tool is any AutoDOM tool name. Actions execute sequentially. " +
-    "Returns an array of results. Use this to chain navigate→wait→extract in one call. " +
-    "Set dryRun=true to validate and preview the execution plan without actually running actions.",
+    "Run several tool calls in order in one request: actions [{tool, params}]. Results are compacted per step (screenshots omitted). stopOnError halts on first failure; dryRun:true returns the plan with tool tiers and risk without running.",
   parameters: z.object({
     actions: z
       .array(
@@ -8571,7 +8633,7 @@ server.addTool({
       .optional()
       .default(false)
       .describe(
-        "If true, validate and return the execution plan with tool tiers and risk assessment without executing any actions",
+        "Return the plan with tool tiers and risk, run nothing",
       ),
   }),
   execute: async ({ actions, stopOnError, dryRun }) => {
@@ -8593,19 +8655,15 @@ server.addTool({
       const hasDestructive = tiers.includes("destructive");
       const hasWrite = tiers.includes("write");
       const riskLevel = hasDestructive ? "high" : hasWrite ? "medium" : "low";
-      return JSON.stringify(
-        {
-          dryRun: true,
-          riskLevel,
-          totalSteps: plan.length,
-          readSteps: tiers.filter((t) => t === "read").length,
-          writeSteps: tiers.filter((t) => t === "write").length,
-          destructiveSteps: tiers.filter((t) => t === "destructive").length,
-          plan,
-        },
-        null,
-        2,
-      );
+      return JSON.stringify({
+        dryRun: true,
+        riskLevel,
+        totalSteps: plan.length,
+        readSteps: tiers.filter((t) => t === "read").length,
+        writeSteps: tiers.filter((t) => t === "write").length,
+        destructiveSteps: tiers.filter((t) => t === "destructive").length,
+        plan,
+      });
     }
 
     // ─── Normal Execution ──────────────────────────────────
@@ -8618,7 +8676,7 @@ server.addTool({
           step: i,
           tool,
           tier: getToolTier(tool, params || {}),
-          result,
+          result: _compactBatchStepResult(tool, result, params || {}),
         });
         if (stopOnError && result && result.error) {
           results.push({
@@ -8643,9 +8701,23 @@ server.addTool({
         }
       }
     }
-    return JSON.stringify(results, null, 2);
+    return JSON.stringify(results);
   },
 });
+
+// A batch step's result goes inside the batch JSON: screenshots become a
+// pointer (base64 in a text block is pure token cost) and heavy results
+// get the same ATK filter their standalone tool would.
+function _compactBatchStepResult(tool, result, params) {
+  if (result && typeof result === "object" && typeof result.screenshot === "string") {
+    const { screenshot, ...rest } = result;
+    return { ...rest, screenshot: `<image ${screenshot.length} chars omitted: call take_screenshot>` };
+  }
+  if (!hasFilter(tool) || (result && typeof result === "object" && result.error)) return result;
+  const interactive = tool === "take_snapshot" && typeof result?.snapshot === "string";
+  const out = compactResult(tool, interactive ? result.snapshot : result, params);
+  return out instanceof AtkOutput ? out.text : result;
+}
 
 // Expose tool tier classification to agents so they can reason about safety
 server.addTool({
@@ -8661,7 +8733,7 @@ server.addTool({
     for (const [tool, tier] of TOOL_TIERS) {
       tiers[tool] = tier;
     }
-    return JSON.stringify({ tiers, totalTools: TOOL_TIERS.size }, null, 2);
+    return JSON.stringify({ tiers, totalTools: TOOL_TIERS.size });
   },
 });
 
@@ -8739,10 +8811,7 @@ server.addTool({
 server.addTool({
   name: "extract_data",
   description:
-    "Extract structured data from the page using a CSS selector and field mapping. " +
-    "Returns a compact JSON array — much more token-efficient than getting full HTML. " +
-    "Example: selector='.product', fields={name: '.title', price: '.price'} returns " +
-    "[{name: 'Widget', price: '$9.99'}, ...]",
+    "Extract structured rows: selector='.product', fields={name:'.title', price:'.price'} -> [{name, price}, ...]. Field '.' = container text. Far cheaper than get_html.",
   parameters: z.object({
     selector: z
       .string()
@@ -8784,11 +8853,10 @@ server.addTool({
       .optional()
       .describe('"none" returns as soon as the navigation starts (default "load")'),
     timeout: z.number().optional().describe("Max ms to wait for the load (default 15000)"),
+    snapshot: SNAPSHOT_AFTER_PARAM,
   }),
-  execute: async ({ url, action, waitUntil, timeout }) => {
-    const result = await callExtensionTool("navigate", { url, action, waitUntil, timeout });
-    return stringifyToolResult(result);
-  },
+  execute: async ({ url, action, waitUntil, timeout, snapshot }) =>
+    _actionWithSnapshot("navigate", { url, action, waitUntil, timeout, snapshot }),
 });
 
 // 2. Click
@@ -8797,7 +8865,7 @@ server.addTool({
   description:
     "Click an element on the page by CSS selector or visible text content.",
   parameters: z.object({
-    ref: z.string().optional().describe('Element ref from take_snapshot {mode:"interactive"}, e.g. "@e12"'),
+    ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
     selector: z
       .string()
       .optional()
@@ -8811,11 +8879,9 @@ server.addTool({
       .optional()
       .default(false)
       .describe("Double-click instead of single click"),
+    snapshot: SNAPSHOT_AFTER_PARAM,
   }),
-  execute: async (params) => {
-    const result = await callExtensionTool("click", params);
-    return stringifyToolResult(result);
-  },
+  execute: async (params) => _actionWithSnapshot("click", params),
 });
 
 // 3. Type text
@@ -8823,7 +8889,7 @@ server.addTool({
   name: "type_text",
   description: "Type text into an input or textarea element (by CSS selector or snapshot ref).",
   parameters: z.object({
-    ref: z.string().optional().describe('Element ref from take_snapshot {mode:"interactive"}, e.g. "@e12"'),
+    ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
     selector: z.string().optional().describe("CSS selector of the input element"),
     text: z.string().describe("Text to type"),
     clearFirst: z
@@ -8831,20 +8897,16 @@ server.addTool({
       .optional()
       .default(false)
       .describe("Clear the field before typing"),
+    snapshot: SNAPSHOT_AFTER_PARAM,
   }),
-  execute: async (params) => {
-    const result = await callExtensionTool("type_text", params);
-    return stringifyToolResult(result);
-  },
+  execute: async (params) => _actionWithSnapshot("type_text", params),
 });
 
 // 4. Screenshot
 server.addTool({
   name: "take_screenshot",
   description:
-    "Capture a screenshot of the visible viewport. By default the image is sized to the page's CSS viewport " +
-    "(image pixels = the x/y click_at_coordinates takes) and capped at 1568px on the long side / ~1.2 MP; " +
-    "the reply states the image size and its scale (image px per CSS px — divide by it to get click coordinates when the cap applied).",
+    "Screenshot of the viewport, sized to CSS pixels (= click_at_coordinates x/y) and capped at 1568px long side / ~1.2 MP; reply states size and scale (divide coordinates by scale when capped). Prefer take_snapshot for finding elements.",
   parameters: z.object({
     format: z
       .enum(["png", "jpeg", "webp"])
@@ -8874,18 +8936,13 @@ server.addTool({
 server.addTool({
   name: "take_snapshot",
   description:
-    "Get a structured DOM snapshot of the page (element tree with attributes, text, roles). Lightweight and fast. " +
-    "Set autoScroll:true to sweep the page first so lazy-loaded/append-style content renders before the snapshot, " +
-    "then it repositions to the original scroll offset. (For virtualized lists where off-screen rows are unmounted, " +
-    "prefer get_dom_state with autoScroll:true to collect the full set.)",
+    "Page snapshot. Default interactive: one line per actionable element (@e12 button \"Save\"); pass ref to click/type_text/hover/select_option/press_key. mode:\"diff\" = only elements added/changed/removed since your last snapshot of this page. mode:\"tree\" = legacy DOM tree (large). autoScroll:true renders lazy content first (virtualized lists: use get_dom_state autoScroll).",
   parameters: z.object({
     mode: z
-      .enum(["tree", "interactive"])
+      .enum(["interactive", "diff", "tree"])
       .optional()
-      .default("tree")
-      .describe(
-        'tree = full structured DOM snapshot. interactive = compact list of actionable elements, one line each ("@e12 button \"Save\""), typically a few hundred tokens; pass the ref to click/type_text/hover/select_option/press_key.',
-      ),
+      .default("interactive")
+      .describe("interactive (default) | diff (changes since last snapshot) | tree (legacy full DOM tree)"),
     limit: z.coerce.number().optional().describe("interactive mode: max elements (default 300)"),
     includeHidden: z.boolean().optional().describe("interactive mode: include hidden form fields"),
     maxDepth: z
@@ -8898,7 +8955,7 @@ server.addTool({
       .optional()
       .default(false)
       .describe(
-        "Scroll through the page to trigger lazy/append-style rendering before snapshotting, then restore the scroll position",
+        "Scroll page to render lazy content first, then restore scroll",
       ),
     maxScrolls: z
       .number()
@@ -8917,11 +8974,13 @@ server.addTool({
       .describe("Overall time budget for the autoScroll sweep (ms)"),
   }),
   execute: async (params) => {
-    const result = await callExtensionTool("take_snapshot", params);
-    if (params.mode === "interactive" && typeof result?.snapshot === "string") {
-      return result.snapshot;
+    const mode = params.mode || "interactive";
+    const forward = { ..._withoutAtkParams(params), mode: mode === "diff" ? "interactive" : mode };
+    const result = await callExtensionTool("take_snapshot", forward);
+    if (mode !== "tree" && typeof result?.snapshot === "string") {
+      return compactResult("take_snapshot", _snapshotView(result, mode), params);
     }
-    return stringifyToolResult(result);
+    return compactResult("take_snapshot", result, params);
   },
 });
 
@@ -8936,10 +8995,11 @@ server.addTool({
       .describe(
         'JavaScript code to execute (the body of a function). Use "return" to return values.',
       ),
+    verbose: VERBOSE_PARAM,
   }),
   execute: async (params) => {
-    const result = await callExtensionTool("evaluate_script", params);
-    return stringifyToolResult(result);
+    const result = await callExtensionTool("evaluate_script", _withoutAtkParams(params));
+    return compactResult("evaluate_script", result, params);
   },
 });
 
@@ -8969,7 +9029,7 @@ server.addTool({
   description:
     "Hover over an element to trigger hover effects, tooltips, or dropdowns.",
   parameters: z.object({
-    ref: z.string().optional().describe('Element ref from take_snapshot {mode:"interactive"}, e.g. "@e12"'),
+    ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
     selector: z.string().optional().describe("CSS selector of the element to hover"),
   }),
   execute: async (params) => {
@@ -8987,18 +9047,16 @@ server.addTool({
     key: z
       .string()
       .describe('Key or combination, e.g. "Enter", "Control+A", "Escape"'),
-    ref: z.string().optional().describe('Element ref from take_snapshot {mode:"interactive"}, e.g. "@e12"'),
+    ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
     selector: z
       .string()
       .optional()
       .describe(
         "CSS selector of target element (uses focused element if omitted)",
       ),
+    snapshot: SNAPSHOT_AFTER_PARAM,
   }),
-  execute: async (params) => {
-    const result = await callExtensionTool("press_key", params);
-    return stringifyToolResult(result);
-  },
+  execute: async (params) => _actionWithSnapshot("press_key", params),
 });
 
 // 10. Get page info
@@ -9059,10 +9117,11 @@ server.addTool({
       .string()
       .optional()
       .describe("CSS selector (extracts full page text if omitted)"),
+    verbose: VERBOSE_PARAM,
   }),
   execute: async (params) => {
-    const result = await callExtensionTool("extract_text", params);
-    return stringifyToolResult(result);
+    const result = await callExtensionTool("extract_text", _withoutAtkParams(params));
+    return compactResult("extract_text", result, params);
   },
 });
 
@@ -9070,7 +9129,7 @@ server.addTool({
 server.addTool({
   name: "get_network_requests",
   description:
-    "List network requests made by the page (method, URL, type, status, failures, duration, size), captured over the DevTools protocol, including likely artifact/report payload candidates. Capture starts on the first call for a tab and keeps running; requests made before that are not included, so reload or repeat the action and call again. Sensitive query values are shown as REDACTED. Buffers reset when the tab moves to another site. Falls back to Performance API entries (no method/status) where the debugger is unavailable. Asks the user once per site.",
+    "Network requests of the page over CDP (method, URL, type, status, failures, duration). Compact by default: grouped by endpoint, failures first, static/tracker noise hidden (pass urlPattern to include). Capture starts on first call per tab: reload or repeat the action, then call again. Sensitive query values REDACTED. Buffers reset on site change. Asks the user once per site.",
   parameters: z.object({
     limit: z
       .number()
@@ -9082,10 +9141,11 @@ server.addTool({
     failedOnly: z.boolean().optional().describe("Return only failed requests and HTTP status >= 400"),
     clear: z.boolean().optional().describe("Clear the buffer after reading, so the next call only returns new requests"),
     stop: z.boolean().optional().describe("Stop capturing on this tab after reading and detach the debugger"),
+    verbose: VERBOSE_PARAM,
   }),
   execute: async (params) => {
-    const result = await callExtensionTool("get_network_requests", params);
-    return stringifyToolResult(result);
+    const result = await callExtensionTool("get_network_requests", _withoutAtkParams(params));
+    return compactResult("get_network_requests", result, params);
   },
 });
 
@@ -9093,7 +9153,7 @@ server.addTool({
 server.addTool({
   name: "get_console_logs",
   description:
-    "Get console messages, uncaught exceptions (with stack) and browser-side messages (CSP, failed loads) captured over the DevTools protocol. Capture starts on the first call for a tab and keeps running; output from before that is not included, so reload or repeat the action and call again. Buffers reset when the tab moves to another site. Falls back to in-page console.* capture where the debugger is unavailable. Asks the user once per site.",
+    "Console messages, uncaught exceptions (with stack) and browser messages (CSP, failed loads) over CDP. Compact by default: repeats grouped with counts, errors first. Capture starts on first call per tab: reload or repeat the action, then call again. Buffers reset on site change. Asks the user once per site.",
   parameters: z.object({
     pattern: z.string().optional().describe("Regex (case-insensitive) or substring to filter message text, e.g. 'error|warn' or 'MyApp'"),
     level: z.string().optional().describe("Only this level: log, info, warn, error, debug, exception"),
@@ -9101,10 +9161,11 @@ server.addTool({
     limit: z.number().optional().default(100).describe("Max number of messages to return (most recent)"),
     clear: z.boolean().optional().describe("Clear the buffer after reading, so the next call only returns new messages"),
     stop: z.boolean().optional().describe("Stop capturing on this tab after reading and detach the debugger"),
+    verbose: VERBOSE_PARAM,
   }),
   execute: async (params) => {
-    const result = await callExtensionTool("get_console_logs", params);
-    return stringifyToolResult(result);
+    const result = await callExtensionTool("get_console_logs", _withoutAtkParams(params));
+    return compactResult("get_console_logs", result, params);
   },
 });
 
@@ -9112,9 +9173,7 @@ server.addTool({
 server.addTool({
   name: "har_start",
   description:
-    "Start recording a HAR (HTTP Archive) of the active tab over the DevTools protocol, together with the user's own clicks, typing and navigations in that tab. " +
-    "Use it when the user should perform a flow by hand while you capture it: call har_start, ask the user to do the steps in the AutoDOM tab, then call har_stop. " +
-    "Entries record method, URL, headers, request/response bodies (text types), status, timings and which user action triggered them. Credentials, cookies and sensitive parameters are redacted unless includeSensitive is true. Asks the user once per site.",
+    "Record a HAR of the active tab over CDP plus the user's own clicks, typing and navigations. Use when the user performs a flow by hand: har_start, ask user to act in the AutoDOM tab, har_stop. Entries: method, URL, headers, text bodies, status, timings, triggering action. Credentials, cookies and sensitive params redacted unless includeSensitive. Asks the user once per site.",
   parameters: z.object({
     url: z.string().optional().describe("Open this URL first (its load is recorded)"),
     actions: z.boolean().optional().describe("Also record the user's clicks/typing/navigations (default true)"),
@@ -9135,8 +9194,7 @@ server.addTool({
 server.addTool({
   name: "har_stop",
   description:
-    "Stop the HAR recording on the active tab and write the .har file (default ~/Downloads/autodom-har/<host>-<time>.har). " +
-    "Returns the file path and a summary: entry counts by status, pages, and each user action with how many requests it triggered. Pass inline:true to also get the HAR JSON (can be large).",
+    "Stop HAR recording on the active tab and write the .har (default ~/Downloads/autodom-har/<host>-<time>.har). Returns path plus summary: counts by status, pages, requests per user action. inline:true also returns the HAR JSON (large).",
   parameters: z.object({
     path: z.string().optional().describe("Absolute .har path to write instead of the default"),
     inline: z.boolean().optional().describe("Also return the HAR JSON in the result"),
@@ -9165,7 +9223,7 @@ server.addTool({
 server.addTool({
   name: "list_tabs",
   description:
-    "List open browser tabs with their IDs, titles, URLs, and active status. With tab isolation on (default) this lists only the AutoDOM tab group; pass all:true to also see the user's own tabs (read-only) so one can be adopted with pin_tab. Essential for multi-tab workflows.",
+    "List tabs (id, title, URL, active). With tab isolation (default) only the AutoDOM group; all:true also shows the user's tabs (read-only) so one can be adopted with pin_tab.",
   parameters: z.object({
     currentWindow: z
       .boolean()
@@ -9200,13 +9258,13 @@ server.addTool({
 server.addTool({
   name: "pin_tab",
   description:
-    "Pin a browser tab to this MCP client so subsequent tool calls always target it, even if the user clicks another tab in the same window. Auto-pinning happens after a successful navigate/open_new_tab; call this only to re-pin after PINNED_TAB_GONE or to pin a tab without navigating. Pass tabId to pin a specific tab. With tab isolation on (default), pinning a tab the user owns ADOPTS it: it is moved into the AutoDOM tab group and put back where it was on unpin_tab / finish_session. Only adopt a user tab when the user asked you to work in it.",
+    "Pin a tab to this MCP client so later calls target it. navigate/open_new_tab auto-pin; use this to re-pin after PINNED_TAB_GONE or pin without navigating. With tab isolation (default), pinning a user's tab ADOPTS it into the AutoDOM group until unpin_tab/finish_session. Only adopt a user tab when the user asked you to work in it.",
   parameters: z.object({
     tabId: z
       .number()
       .optional()
       .describe(
-        "Specific tab id (from list_tabs) to pin. Without tab isolation, omitting it pins whatever tab is currently active in the focused window. With isolation, omitting it re-pins AutoDOM's own most recent tab.",
+        "Tab id from list_tabs. Omitted: active tab (no isolation) or AutoDOM's most recent tab (isolation).",
       ),
     adoptActive: z
       .boolean()
@@ -9226,7 +9284,7 @@ server.addTool({
 server.addTool({
   name: "unpin_tab",
   description:
-    "Release this MCP client's pinned tab. Without tab isolation, subsequent tool calls then target whatever tab is currently active. With tab isolation (default), an adopted user tab is put back where it was, a tab AutoDOM opened stays in the AutoDOM group, and further tab-bound calls need navigate/open_new_tab/pin_tab first.",
+    "Release this client's pinned tab. Without isolation, calls then follow the active tab. With isolation (default), an adopted user tab is put back, AutoDOM tabs stay in the group, and tab-bound calls need navigate/open_new_tab/pin_tab first.",
   parameters: z.object({}),
   execute: async () => {
     const result = await callExtensionTool("__unpin_tab", {});
@@ -9252,7 +9310,7 @@ server.addTool({
 server.addTool({
   name: "finish_session",
   description:
-    "Call when the browsing task is complete. Closes every tab AutoDOM opened for this session, removes the AutoDOM tab group, and puts any tab you adopted from the user (via pin_tab/switch_tab) back exactly where it was. Also clears the pin. Safe to call repeatedly. Sessions are also released automatically when the IDE disconnects or after a period of inactivity.",
+    "Call when the task is done: closes tabs AutoDOM opened, removes the AutoDOM tab group, returns adopted user tabs to where they were, clears the pin. Idempotent. Also happens on IDE disconnect or inactivity.",
   parameters: z.object({}),
   execute: async () => {
     const result = await callExtensionTool("__finish_session", {});
@@ -9280,6 +9338,7 @@ server.addTool({
       bridge: collectBridgeStatus(),
       recentToolErrors: _toolErrorBuf.slice(-10),
       recentToolCalls: toolCallLog.slice(-10),
+      atk: { ...atkStats.summary({ top: 5 }), recall: recallStore.stats() },
       extension: null,
     };
     // Reach into the extension for its pin map + service-worker state.
@@ -9310,11 +9369,38 @@ server.addTool({
   },
 });
 
+// ATK: page back through output that compact mode cut.
+server.addTool({
+  name: "recall",
+  description:
+    'Read the full output behind an ATK cut. Tools that trim output end with [full output: … recall {id:"a1b2c3"}]. Page with from/lines or filter with grep. Entries live 30 min in bridge memory.',
+  parameters: z.object({
+    id: z.string().describe("Recall id from the cut output, e.g. a1b2c3"),
+    from: z.coerce.number().optional().describe("First line, 1-based (default 1)"),
+    lines: z.coerce.number().optional().describe("Lines to return (default 200, max 400)"),
+    grep: z.string().optional().describe("Regex (case-insensitive) — return matching lines with line numbers instead of a range"),
+  }),
+  execute: async (params) => recallText(params),
+});
+
+server.addTool({
+  name: "token_stats",
+  description: "ATK token savings for this bridge session: per-tool raw vs returned tokens, savings %, recall count.",
+  parameters: z.object({
+    reset: z.boolean().optional().describe("Clear the counters after reading"),
+  }),
+  execute: async ({ reset }) => {
+    const text = atkStats.format();
+    if (reset) atkStats.reset();
+    return text;
+  },
+});
+
 // 17. Switch tab
 server.addTool({
   name: "switch_tab",
   description:
-    "Switch AutoDOM's working target to a different browser tab by its ID or index. Use after list_tabs or wait_for_new_tab. With tab isolation on (default) this does NOT bring the tab to the foreground: it only re-targets subsequent tool calls, and switching to a tab the user owns adopts it into the AutoDOM group. Pass focus:true only if the user asked to see the tab.",
+    "Re-target later calls to another tab by ID or index (after list_tabs/wait_for_new_tab). With tab isolation (default) the tab is NOT brought forward, and switching to a user's tab adopts it into the AutoDOM group. focus:true only if the user asked to see it.",
   parameters: z.object({
     tabId: z.number().optional().describe("Tab ID to switch to"),
     index: z
@@ -9413,16 +9499,14 @@ server.addTool({
   description:
     "Select an option from a <select> dropdown by value, visible text, or index.",
   parameters: z.object({
-    ref: z.string().optional().describe('Element ref from take_snapshot {mode:"interactive"}, e.g. "@e12"'),
+    ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
     selector: z.string().optional().describe("CSS selector of the <select> element"),
     value: z.string().optional().describe("Option value to select"),
     text: z.string().optional().describe("Option visible text to select"),
     index: z.number().optional().describe("Option index to select (0-based)"),
+    snapshot: SNAPSHOT_AFTER_PARAM,
   }),
-  execute: async (params) => {
-    const result = await callExtensionTool("select_option", params);
-    return stringifyToolResult(result);
-  },
+  execute: async (params) => _actionWithSnapshot("select_option", params),
 });
 
 // 22. Wait for element
@@ -9580,7 +9664,7 @@ server.addTool({
 server.addTool({
   name: "get_html",
   description:
-    "Get the innerHTML or outerHTML of an element or the entire page.",
+    "Get the innerHTML or outerHTML of an element or the page. Compact by default: scripts, styles, svg bodies and noise attributes are stripped and long pages are cut (recallable).",
   parameters: z.object({
     selector: z
       .string()
@@ -9591,10 +9675,11 @@ server.addTool({
       .optional()
       .default(false)
       .describe("Return outerHTML instead of innerHTML"),
+    verbose: VERBOSE_PARAM,
   }),
   execute: async (params) => {
-    const result = await callExtensionTool("get_html", params);
-    return stringifyToolResult(result);
+    const result = await callExtensionTool("get_html", _withoutAtkParams(params));
+    return compactResult("get_html", result, params);
   },
 });
 
@@ -9662,17 +9747,18 @@ server.addTool({
 server.addTool({
   name: "execute_async_script",
   description:
-    'Execute async JavaScript with await support in the page context. Use "return" to return values.',
+    '[Deprecated: use execute_code, which also supports await] Execute async JavaScript in the page context. Use "return" to return values.',
   parameters: z.object({
     script: z
       .string()
       .describe(
         "Async JavaScript to execute (can use await). Wrap in return for results.",
       ),
+    verbose: VERBOSE_PARAM,
   }),
   execute: async (params) => {
-    const result = await callExtensionTool("execute_async_script", params);
-    return stringifyToolResult(result);
+    const result = await callExtensionTool("execute_async_script", _withoutAtkParams(params));
+    return compactResult("execute_async_script", result, params);
   },
 });
 
@@ -9811,7 +9897,7 @@ async function _mirrorWorkflow(result) {
 server.addTool({
   name: "workflow_record_start",
   description:
-    "Teach AutoDOM a task. Starts recording clicks, typing, selects, checkboxes, Enter/Escape and navigations on the AutoDOM tab (whether the user or the agent drives it). Each target is stored with several locators (test id, role + name, label, placeholder, text, CSS, XPath) so replays survive page changes. Pass url to open a page first. Stop with workflow_record_stop.",
+    "Start recording a workflow: clicks, typing, selects, checkboxes, Enter/Escape and navigations on the AutoDOM tab (user or agent driven). Each target stores several locators so replays survive page changes. url opens a page first. Stop with workflow_record_stop.",
   parameters: z.object({
     url: z.string().optional().describe("Page to open before recording"),
     tabId: z.number().optional().describe("Record an existing tab instead of the AutoDOM tab"),
@@ -9836,7 +9922,7 @@ server.addTool({
 server.addTool({
   name: "workflow_save",
   description:
-    "Save a workflow. With no workflow argument it saves the last recorded draft. Pass `workflow` (object, JSON text or a Markdown routine exported by workflow_export) to import or update one, or `path` to import a .json/.md file. Literal typed values are turned into {{variables}} unless parameterize:false. Saved workflows are mirrored to ~/.autodom/workflows/<id>.json.",
+    "Save a workflow. No argument: saves the last recorded draft. workflow (object, JSON or Markdown from workflow_export) imports/updates; path imports a .json/.md file. Typed literals become {{variables}} unless parameterize:false. Mirrored to ~/.autodom/workflows/<id>.json.",
   parameters: z.object({
     workflow: z.union([z.string(), z.record(z.string(), z.any())]).optional(),
     path: z.string().optional().describe("Import from a .json or .md file on disk"),
@@ -9886,7 +9972,7 @@ server.addTool({
 server.addTool({
   name: "workflow_run",
   description:
-    "Replay a saved workflow without an LLM. mode 'heal' (default) re-finds elements that moved or were renamed (heuristics, then your AI provider, then a screenshot with numbered boxes) and saves the healed locator so later runs are deterministic again; 'strict' fails instead; 'dry' only checks that every step's target can be found, without clicking or typing. Supply values for {{variables}} (secrets are required). Waits up to waitMs for the result; longer runs return a runId to poll with run_get. Returns a step-by-step report with before/after page diffs. Stopping a run does not undo steps that already ran.",
+    "Replay a saved workflow without an LLM. mode heal (default) re-finds moved elements and saves the fix; strict fails instead; dry only checks targets. Supply {{variables}} (secrets required). Waits up to waitMs, else returns runId for run_get. Report has per-step before/after diffs. Stopping does not undo finished steps.",
   parameters: z.object({
     id: z.string().optional().describe("Workflow id or exact name"),
     workflow: z.union([z.string(), z.record(z.string(), z.any())]).optional().describe("Run an unsaved workflow (object, JSON or Markdown routine)"),
@@ -9896,7 +9982,7 @@ server.addTool({
       .optional()
       .default("heal")
       .describe("heal = self-heal moved elements; strict = fail instead; dry = resolve every step against the page without clicking or typing"),
-    vision: z.boolean().optional().describe("Allow the vision fallback (screenshot + numbered boxes to your AI provider) when other healing fails; default on if a provider is configured"),
+    vision: z.boolean().optional().describe("Allow screenshot-based healing via your AI provider when other healing fails (default on if configured)"),
     newTab: z.boolean().optional().describe("Run in a fresh background AutoDOM tab, closed afterwards unless keepTab"),
     keepTab: z.boolean().optional(),
     wait: z.boolean().optional().default(true),
@@ -9914,7 +10000,7 @@ server.addTool({
 server.addTool({
   name: "workflow_run_many",
   description:
-    "Run several saved workflows at once, each in its own background AutoDOM tab (default 3 at a time, max 5), and return one combined report. Each entry may carry its own variables. Longer batches return a batchId to poll with run_get { batchId } or stop with run_cancel { batchId }.",
+    "Run several saved workflows in parallel background AutoDOM tabs (default 3, max 5), each with its own variables; one combined report. Long batches return batchId for run_get/run_cancel.",
   parameters: z.object({
     runs: z
       .array(
@@ -9945,7 +10031,7 @@ server.addTool({
 server.addTool({
   name: "run_undo",
   description:
-    "Reverse what a workflow run changed, where that is safe: typed values, selects and checkboxes go back to what they held before (sensitive fields only if they were empty), storage keys and cookies the run added are removed, and navigation can be stepped back with navigation:true. Clicks, submitted forms and anything the site did server-side cannot be undone and are listed under irreversible. Use dryRun:true to preview. Undo data is kept in memory for the 20 most recent runs.",
+    "Reverse a workflow run where safe: typed values, selects, checkboxes restored (sensitive fields only if they were empty); storage keys/cookies it added removed; navigation:true steps back. Clicks, submits and server-side effects cannot be undone (listed as irreversible). dryRun:true previews. Kept for the 20 most recent runs.",
   parameters: z.object({
     runId: z.string(),
     steps: z.array(z.number().int()).optional().describe("Only these 0-based step indexes"),
@@ -10047,7 +10133,7 @@ function _runSummaryText(r) {
 server.addTool({
   name: "run_report_view",
   description:
-    "Show a workflow run report (or a workflow_run_many batch) as an interactive timeline in hosts that support MCP Apps: steps, locator strategy, self-heals, before/after page diffs, a screenshot where it failed, and buttons to preview an undo or re-check the workflow. Other hosts get the same report as text.",
+    "Show a workflow run (or workflow_run_many batch) report as an interactive timeline in MCP Apps hosts: steps, locators, self-heals, before/after diffs, failure screenshot, undo preview. Other hosts get text.",
   _meta: VIEWER_META,
   parameters: z.object({
     runId: z.string().optional(),
@@ -10120,7 +10206,7 @@ server.addTool({
 server.addTool({
   name: "webmcp_list_tools",
   description:
-    "List the agent tools the current page registered through WebMCP (document.modelContext.registerTool, Chrome origin trial 149–156). Calling a site's own tool is faster and more reliable than driving its UI. Returns name, description, inputSchema and annotations (readOnlyHint etc.).",
+    "List tools the page registered via WebMCP (document.modelContext.registerTool). Calling a site's own tool beats driving its UI. Returns name, description, inputSchema, annotations.",
   execute: async () => stringifyToolResult(await callExtensionTool("webmcp_list_tools", {})),
 });
 
@@ -10150,7 +10236,7 @@ const _scheduleWhen = {
 server.addTool({
   name: "schedule_create",
   description:
-    "Run a saved workflow (no LLM needed) or a prompt (needs a direct AI provider in the extension) on a schedule: every N minutes, daily at HH:MM, or weekly on chosen days. Runs happen in a background AutoDOM tab; failures raise a desktop notification and the report is kept in run_list. Schedules fire only while the browser is open; a run missed while it was closed fires once at the next start-up.",
+    "Schedule a saved workflow (no LLM) or a prompt (needs an AI provider in the extension): every N minutes, daily at HH:MM, or weekly. Runs in a background AutoDOM tab; failures notify, reports go to run_list. Fires only while the browser is open; a missed run fires once at next start-up.",
   parameters: z.object({
     workflowId: z.string().optional().describe("Workflow id or exact name"),
     prompt: z.string().optional().describe("Task for the in-extension agent instead of a workflow"),
@@ -10352,10 +10438,7 @@ server.addTool({
 server.addTool({
   name: "get_pending_chat_requests",
   description:
-    "Returns pending natural language requests from the AutoDOM browser extension's chat panel. " +
-    "These are requests the user typed in the browser that need AI processing. " +
-    "Call this tool to see what the user needs, then use other AutoDOM tools to fulfill their request, " +
-    "and finally call respond_to_chat to send your answer back to the chat panel.",
+    "Pending requests the user typed in the AutoDOM chat panel. Fulfil them with other tools, then answer with respond_to_chat.",
   parameters: z.object({
     limit: z
       .number()
@@ -10393,9 +10476,7 @@ server.addTool({
 server.addTool({
   name: "respond_to_chat",
   description:
-    "Sends a response back to the AutoDOM browser extension's chat panel for a pending request. " +
-    "Use this after processing a pending chat request (from get_pending_chat_requests) to deliver " +
-    "your answer to the user in the browser. The response will appear in the chat panel.",
+    "Send your answer to a pending AutoDOM chat panel request (from get_pending_chat_requests).",
   parameters: z.object({
     requestId: z
       .number()
@@ -10538,9 +10619,7 @@ server.addTool({
 server.addTool({
   name: "list_iframes",
   description:
-    "List all iframes on the current page with their frame IDs, URLs, dimensions, and DOM attributes. " +
-    "Use the returned frameId values with iframe_interact to interact with elements inside iframes. " +
-    "This is essential for pages that embed content in iframes (payment forms, ads, embedded widgets, etc.).",
+    "List iframes with frameId, URL, size and attributes. Use frameId with iframe_interact.",
   parameters: z.object({}),
   execute: async (params) => {
     const result = await callExtensionTool("list_iframes", params);
@@ -10551,11 +10630,7 @@ server.addTool({
 server.addTool({
   name: "iframe_interact",
   description:
-    "Interact with elements inside a specific iframe. Supports click, type, query, extract_text, " +
-    "fill_form, and get_dom_state actions inside the iframe. Use list_iframes first to get the " +
-    "frameId, or provide an iframeSelector (CSS selector for the iframe element in the parent page). " +
-    "This is required for any interaction with elements inside iframes — regular click/type/query " +
-    "tools cannot reach inside iframe boundaries.",
+    "Act inside an iframe (regular tools cannot cross iframe boundaries). Actions: click, type, query, extract_text, fill_form, get_dom_state. Target by frameId from list_iframes or iframeSelector.",
   parameters: z.object({
     frameId: z
       .number()
@@ -10608,10 +10683,7 @@ server.addTool({
 server.addTool({
   name: "list_shadow_roots",
   description:
-    "List all elements on the page that host an open shadow DOM. Returns each host element's " +
-    "tag, id, class, a CSS selector to reach it, and the count of elements inside the shadow root. " +
-    "Use the returned selectors with shadow_interact to interact with elements inside shadow DOMs. " +
-    "Web components (custom elements) typically use shadow DOM to encapsulate their internal structure.",
+    "List elements hosting an open shadow DOM: tag, id, class, selector, inner element count. Use selectors with shadow_interact.",
   parameters: z.object({
     maxDepth: z
       .number()
@@ -10628,12 +10700,7 @@ server.addTool({
 server.addTool({
   name: "shadow_interact",
   description:
-    "Interact with elements inside shadow DOMs using a piercing selector syntax. " +
-    "Use ' >>> ' to pierce through shadow boundaries: 'host-selector >>> inner-selector'. " +
-    "For nested shadow DOMs: 'outer-host >>> inner-host >>> target'. " +
-    "Supports actions: click, type, query (single element), query_all (multiple), " +
-    "extract_text, fill_form, and get_dom_state. " +
-    "Use list_shadow_roots first to discover shadow DOM hosts and their selectors.",
+    "Act inside shadow DOM with piercing selectors: 'host >>> inner' (nest: 'outer >>> inner-host >>> target'). Actions: click, type, query, query_all, extract_text, fill_form, get_dom_state. Find hosts with list_shadow_roots.",
   parameters: z.object({
     piercingSelector: z
       .string()
@@ -10674,10 +10741,7 @@ server.addTool({
 server.addTool({
   name: "deep_query",
   description:
-    "Search for elements across the entire page including inside all iframes and shadow DOMs. " +
-    "This is a universal search tool — use it when you're not sure where an element is " +
-    "(main page, iframe, or shadow DOM). Returns each match with its context " +
-    "(main, iframe[frameId=N], or shadow path). Use CSS selector and/or text search.",
+    "Find elements anywhere: main page, all iframes, all shadow DOMs, by CSS selector and/or text. Each match reports its context (main, iframe[frameId=N], shadow path). Use when you do not know where an element lives.",
   parameters: z.object({
     selector: z
       .string()

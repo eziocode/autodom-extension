@@ -40,7 +40,8 @@ test("public MCP registration is unique and structurally complete", async () => 
   const inventory = [...direct, ...compat];
 
   assert.equal(new Set(inventory).size, inventory.length);
-  assert.equal(inventory.length, 134, "review public inventory when adding/removing tools");
+  assert.equal(inventory.length, 136, "review public inventory when adding/removing tools");
+  assert.equal(compat.length, 23, "browser_* aliases are hidden from tools/list; keep mcp-handshake's listed count in sync");
   assert.match(server, /function getToolTier\(toolName, params = \{\}\)/);
 
   for (const name of direct) {
@@ -74,8 +75,12 @@ test("official MCP SDK v2 remains pinned to reviewed compatible range", async ()
   ]) {
     assert.equal(packageJson.dependencies[dependency], "^2.0.0");
     assert.equal(lock.packages[""].dependencies[dependency], "^2.0.0");
-    // client is 2.3.1: 2.0.0-2.1.0 has GHSA-6qxp-vccf-f47h (high severity).
-    const reviewed = dependency === "@modelcontextprotocol/client" ? "2.3.1" : "2.0.0";
+    // client >= 2.3.1: 2.0.0-2.1.0 has GHSA-6qxp-vccf-f47h (high severity).
+    const reviewed = {
+      "@modelcontextprotocol/server": "2.3.1",
+      "@modelcontextprotocol/client": "2.3.1",
+      "@modelcontextprotocol/node": "2.1.1",
+    }[dependency];
     assert.equal(lock.packages[`node_modules/${dependency}`].version, reviewed);
   }
 });

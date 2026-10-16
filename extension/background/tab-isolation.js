@@ -46,11 +46,31 @@
     return !!(c && c.tabs && c.tabs.group && c.tabs.ungroup && c.tabGroups);
   }
 
+  // isEnabled() runs on every bridge tool call. Cache the setting, but only
+  // where storage.onChanged can invalidate it (the popup writes it from
+  // another context); without that listener every call reads storage.
+  let enabledCache = null;
+  let watchingSetting = false;
+
+  function watchSetting() {
+    if (watchingSetting) return true;
+    const changed = api()?.storage?.onChanged;
+    if (!changed?.addListener) return false;
+    changed.addListener((changes, area) => {
+      if (area === "local" && changes && SETTING_KEY in changes) enabledCache = null;
+    });
+    watchingSetting = true;
+    return true;
+  }
+
   async function isEnabled() {
     if (serverDisabled || !supported()) return false;
+    if (enabledCache !== null) return enabledCache;
     try {
       const got = await api().storage.local.get(SETTING_KEY);
-      return got?.[SETTING_KEY] !== false;
+      const enabled = got?.[SETTING_KEY] !== false;
+      if (watchSetting()) enabledCache = enabled;
+      return enabled;
     } catch (_) {
       return true;
     }

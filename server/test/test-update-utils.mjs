@@ -625,6 +625,8 @@ async function makeBundle(root, version, { lock = "lock-a", serverFiles = true }
     for (const f of ["index.js", "self-restart.js", "update-utils.js", "automation-store.js", "viewer-app.js"]) {
       await writeFile(join(top, "server", f), "// " + version);
     }
+    await mkdir(join(top, "server/atk"), { recursive: true });
+    await writeFile(join(top, "server/atk/index.js"), "// " + version);
   }
   return top;
 }
