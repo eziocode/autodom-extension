@@ -8,7 +8,7 @@ It is two programs that talk over a local WebSocket:
 - `extension/`: a Manifest V3 extension. Executes the tool calls in the
   browser through `chrome.scripting`, `chrome.tabs` and the DevTools protocol.
 
-Current release: **7.0.0** ([changelog](CHANGELOG.md)). License: MIT.
+Current release: **7.1.0** ([changelog](CHANGELOG.md)). License: MIT.
 
 Targeted clients: GitHub Copilot, JetBrains AI Assistant, Claude (Desktop and
 Code), Cursor and Gemini CLI. Anything that speaks MCP over stdio should work.
@@ -59,7 +59,7 @@ itself in place (`AUTODOM_AUTO_RESTART=0` disables this).
 | Item | Requirement |
 |---|---|
 | Node.js | 20.19+, 22.12+ or 23+ (`node -v`) |
-| Browser | Chrome or Edge for managed install; Brave best effort; other MV3 browsers use the unpacked extension |
+| Browser | Chrome or Edge for managed install; Brave best effort; Arc, Ulaa, and other browsers use the unpacked/manual path |
 | Client | Any MCP client; the installer configures IntelliJ-family IDEs, VS Code, Cursor, Claude Desktop and Gemini CLI |
 | Port | `9876` on `127.0.0.1`, changeable with `--port` |
 | Privileges | One-time admin prompt for managed browser policy (skippable) |

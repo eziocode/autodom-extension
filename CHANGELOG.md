@@ -4,7 +4,7 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
-## Unreleased
+## 7.1.0
 
 ### Added
 - Code Mode (experimental, phase 1). `run_code` runs a model-written script
