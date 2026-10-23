@@ -6,9 +6,15 @@
 // Every `autodom.<tool>(params)` is the same tool the MCP client could call
 // directly: params are validated by its zod schema and it runs through its
 // own execute(), so domain guardrails, confirm mode, approval rules and the
-// audit log apply per call exactly as they do today. A call that is held for
-// approval stops the run (phase 1); the steps before it have already run and
-// are listed in the result.
+// audit log apply per call exactly as they do today.
+//
+// A call that is held for approval pauses the script: its promise stays
+// pending inside the sandbox, run_code answers with the hold (confirmRequired
+// first, so inline elicitation and confirm_action both see it), and the run
+// waits in `suspended`. Approving runs that one call and feeds its result to
+// the script, which carries on; declining makes the call throw ApprovalDenied
+// inside the script. Either way the caller gets the script's next outcome:
+// its result, or the next hold.
 import { AtkOutput } from "../atk/index.js";
 import { buildApi, tierAllows } from "./api-gen.js";
 import { runInSandbox, StopRun } from "./sandbox.js";
@@ -37,6 +43,10 @@ export const CODE_MODE_TOOL_NAMES = new Set(["run_code", "code_api"]);
 const MAX_IMAGES_PER_RUN = 10;
 const MAX_EMITTED_IMAGES = 4;
 const MAX_CALL_LOG = 60;
+// Each paused run keeps a QuickJS runtime (up to its heap limit) alive.
+const MAX_SUSPENDED_RUNS = 8;
+// Matches the lifetime of a held confirmation.
+const SUSPEND_TTL_MS = 300000;
 
 class ToolCallError extends Error {
   constructor(name, message, details) {
@@ -66,6 +76,16 @@ function zodIssues(error) {
     .join("; ");
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 /**
  * @param {object} deps
  * @param {() => object[]} deps.getDefinitions       server tool definitions
@@ -75,11 +95,24 @@ function zodIssues(error) {
  *        Runs one tool exactly as the MCP layer would (its execute()).
  * @param {(value: any) => object|null} deps.parseHeld  held-for-approval detector
  * @param {Set<string>} [deps.hidden]                 extra names to leave unbound (e.g. Playwright aliases)
+ * @param {number} [deps.suspendTtlMs]
+ * @param {(confirmId: number) => void} [deps.onHoldDiscarded]  a paused run ended with this hold undecided
  */
-export function createCodeMode({ getDefinitions, jsonSchemaFor, tierOf, invoke, parseHeld, hidden = new Set() }) {
+export function createCodeMode({
+  getDefinitions,
+  jsonSchemaFor,
+  tierOf,
+  invoke,
+  parseHeld,
+  hidden = new Set(),
+  suspendTtlMs = SUSPEND_TTL_MS,
+  onHoldDiscarded,
+}) {
   let api = null;
   let defsByName = null;
   let prelude = null;
+  const suspended = new Map(); // confirmId -> run state
+  let runSeq = 0;
 
   const include = (def) =>
     def && typeof def.execute === "function" && !def._meta && !CODE_MODE_EXCLUDED.has(def.name) && !hidden.has(def.name);
@@ -93,140 +126,298 @@ export function createCodeMode({ getDefinitions, jsonSchemaFor, tierOf, invoke, 
     return api;
   }
 
-  async function run({ code, allow = "destructive", timeoutMs, signal, context } = {}) {
+  async function run({ code, allow = "destructive", timeoutMs, signal, context, meta } = {}) {
     ensureApi();
-    const images = new Map(); // imageRef -> { data, mimeType }
-    const emitted = [];
-    const callLog = [];
-    let imageSeq = 0;
-
-    const storeImage = (data, mimeType) => {
-      if (images.size >= MAX_IMAGES_PER_RUN) return null;
-      const ref = `img${++imageSeq}`;
-      images.set(ref, { data, mimeType });
-      return ref;
+    const state = {
+      id: ++runSeq,
+      allow,
+      meta,
+      context,
+      images: new Map(), // imageRef -> { data, mimeType }
+      emitted: [],
+      callLog: [],
+      reportedCalls: 0,
+      reportedLogs: 0,
+      reports: 0,
+      imageSeq: 0,
+      queue: [], // holds waiting for a decision, oldest first
+      active: null, // the hold last reported to the caller
+      ctl: null,
+      abort: new AbortController(),
+      outcome: null,
+      wake: null,
+      ttl: null,
     };
 
-    // Turn whatever a tool's execute() returned into plain JSON for the
-    // guest: unwrap ATK output and MCP content, parse JSON text, and swap
-    // image bytes for a ref (base64 inside a script is pure cost).
-    const normalize = (value) => {
-      if (value instanceof AtkOutput) value = value.text;
-      if (value && typeof value === "object" && Array.isArray(value.content)) {
-        const texts = [];
-        const refs = [];
-        for (const block of value.content) {
-          if (block?.type === "text") texts.push(block.text || "");
-          else if (block?.type === "image" && block.data) {
-            const ref = storeImage(block.data, block.mimeType || "image/png");
-            refs.push(ref ? { imageRef: ref, mimeType: block.mimeType || "image/png" } : { omitted: "image limit reached" });
-          }
-        }
-        let parsed = texts.length === 1 ? tryParseJson(texts[0]) : texts.join("\n");
-        if (refs.length) {
-          const base = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : parsed ? { text: parsed } : {};
-          parsed = { ...base, images: refs, ...(refs[0].imageRef ? { imageRef: refs[0].imageRef } : {}) };
-        }
-        value = parsed;
+    runInSandbox({
+      code: String(code || ""),
+      prelude,
+      call: (op, args) => hostCall(state, op, args),
+      signal: state.abort.signal,
+      timeoutMs,
+      onControl: (ctl) => (state.ctl = ctl),
+    }).then(
+      (out) => settleRun(state, out),
+      (err) =>
+        settleRun(state, {
+          ok: false,
+          error: { name: "InternalError", message: String(err?.message || err) },
+          logs: [],
+          logsTruncated: false,
+          calls: 0,
+          ms: 0,
+        }),
+    );
+    return nextOutcome(state, signal);
+  }
+
+  function settleRun(state, out) {
+    state.outcome = out;
+    clearTimeout(state.ttl);
+    // Holds of a script that is gone must not stay approvable on their own.
+    for (const hold of [...state.queue, ...(state.active ? [state.active] : [])]) {
+      suspended.delete(hold.confirmId);
+      onHoldDiscarded?.(hold.confirmId);
+    }
+    state.queue = [];
+    state.active = null;
+    state.wake?.();
+  }
+
+  // Wait for the run's next reportable event: a hold, or its end. The
+  // caller's signal cancels the run only while someone is waiting on it.
+  async function nextOutcome(state, signal) {
+    const onAbort = () => state.abort.abort();
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+    try {
+      for (;;) {
+        if (state.outcome) return finalOutput(state);
+        if (state.queue.length) return holdOutput(state, state.queue.shift());
+        await new Promise((res) => (state.wake = res));
+        state.wake = null;
       }
-      value = tryParseJson(value);
-      if (value && typeof value === "object" && typeof value.screenshot === "string" && value.screenshot.startsWith("data:")) {
-        const m = /^data:([^;,]+);base64,(.*)$/s.exec(value.screenshot);
-        const { screenshot, ...rest } = value;
-        const ref = m ? storeImage(m[2], m[1]) : null;
-        value = { ...rest, ...(ref ? { imageRef: ref } : { screenshot: "<omitted>" }) };
-      }
-      return value;
+    } finally {
+      signal?.removeEventListener?.("abort", onAbort);
+    }
+  }
+
+  function freshActivity(state) {
+    const snap = state.ctl?.snapshot() || { logs: [], logsTruncated: false };
+    const calls = state.callLog.slice(state.reportedCalls);
+    const logs = (state.outcome?.logs || snap.logs).slice(state.reportedLogs);
+    state.reportedCalls = state.callLog.length;
+    state.reportedLogs += logs.length;
+    const out = {};
+    // Calls and logs are only the ones since the previous report.
+    if (state.reports++ > 0) out.resumed = true;
+    out.calls = calls.length > MAX_CALL_LOG ? [...calls.slice(0, MAX_CALL_LOG), `... +${calls.length - MAX_CALL_LOG} more`] : calls;
+    if (logs.length) out.logs = logs;
+    if (state.outcome?.logsTruncated || snap.logsTruncated) out.logsTruncated = true;
+    return out;
+  }
+
+  function holdOutput(state, hold) {
+    state.active = hold;
+    suspended.set(hold.confirmId, state);
+    clearTimeout(state.ttl);
+    state.ttl = setTimeout(() => {
+      state.ctl?.stop("Approval expired; the script was discarded");
+    }, suspendTtlMs);
+    state.ttl.unref?.();
+    const { held } = hold;
+    const report = {
+      // Field order matters: the MCP layer recognises a hold by this prefix.
+      confirmRequired: true,
+      confirmId: hold.confirmId,
+      tool: held.tool || hold.tool,
+      tier: held.tier || hold.tier,
+      ...(held.domain ? { domain: held.domain } : {}),
+      ...(held.rule ? { rule: held.rule } : {}),
+      params: held.params,
+      message:
+        `${held.message || `${hold.tool} needs approval.`} ` +
+        "The run_code script is paused at this call: confirm_action runs it and resumes the script (you get the script's result), " +
+        "cancel_action makes the call throw ApprovalDenied inside the script.",
+      suspended: true,
+      ...freshActivity(state),
     };
+    return { suspended: true, report, images: [], meta: state.meta };
+  }
 
-    const call = async (op, args) => {
-      if (op === "__emitImage") {
-        const ref = args?.ref;
-        if (!images.has(ref)) throw new ToolCallError("ToolError", `Unknown image ref ${JSON.stringify(ref)}`);
-        if (emitted.length < MAX_EMITTED_IMAGES && !emitted.includes(ref)) emitted.push(ref);
-        return null;
-      }
-      const def = defsByName.get(op);
-      if (!def) throw new ToolCallError("UnknownTool", `No tool "${op}" in the Code Mode API. Call code_api to list tools.`);
+  function finalOutput(state) {
+    const out = state.outcome;
+    const report = { ok: out.ok };
+    if (out.ok) report.result = out.result;
+    if (out.error) report.error = out.error;
+    if (out.stopped) report.stopped = out.stopped;
+    Object.assign(report, freshActivity(state));
+    report.ms = out.ms;
+    if (out.pausedMs) report.pausedMs = out.pausedMs;
+    const images = state.emitted.map((ref) => {
+      const img = state.images.get(ref);
+      return { type: "image", data: img.data, mimeType: img.mimeType };
+    });
+    return { suspended: false, report, images, meta: state.meta };
+  }
 
-      const tier = tierOf(op, args || {});
-      if (!tierAllows(allow, tier)) {
-        callLog.push(`${op} denied(${tier})`);
-        throw new ToolCallError(
-          "TierDenied",
-          `${op} is a ${tier} tool and this run was started with allow:"${allow}". Re-run with a higher allow if intended.`,
-        );
-      }
+  function takeSuspended(confirmId) {
+    const state = suspended.get(confirmId);
+    if (!state || state.active?.confirmId !== confirmId) return null;
+    suspended.delete(confirmId);
+    clearTimeout(state.ttl);
+    const hold = state.active;
+    state.active = null;
+    if (!state.queue.length) state.ctl?.resume();
+    return { state, hold };
+  }
 
-      let params = args && typeof args === "object" && !Array.isArray(args) ? args : {};
-      if (def.parameters?.safeParse) {
-        const parsed = def.parameters.safeParse(params);
-        if (!parsed.success) {
-          callLog.push(`${op} invalid`);
-          throw new ToolCallError("InvalidParams", `${op}: ${zodIssues(parsed.error)}`);
+  /**
+   * Feed the approved call's result to its paused script and wait for the
+   * script's next outcome. Pass `error` instead when running the call threw.
+   * Returns null when confirmId does not belong to a paused run.
+   */
+  async function resume(confirmId, { value, error, signal, context } = {}) {
+    const taken = takeSuspended(confirmId);
+    if (!taken) return null;
+    const { state, hold } = taken;
+    if (context) state.context = context;
+    if (error) hold.waiter.reject(new ToolCallError("ToolError", `${hold.tool}: ${error?.message || error}`));
+    else hold.waiter.resolve({ approvedValue: value });
+    return nextOutcome(state, signal);
+  }
+
+  /** The held call was declined: it throws ApprovalDenied in the script. */
+  async function deny(confirmId, { signal, reason } = {}) {
+    const taken = takeSuspended(confirmId);
+    if (!taken) return null;
+    const { state, hold } = taken;
+    state.callLog.push(`${hold.tool} declined`);
+    hold.waiter.reject(
+      new ToolCallError("ApprovalDenied", reason || `${hold.tool} was not approved; it did not run.`, { confirmId }),
+    );
+    return nextOutcome(state, signal);
+  }
+
+  const storeImage = (state, data, mimeType) => {
+    if (state.images.size >= MAX_IMAGES_PER_RUN) return null;
+    const ref = `img${++state.imageSeq}`;
+    state.images.set(ref, { data, mimeType });
+    return ref;
+  };
+
+  // Turn whatever a tool's execute() returned into plain JSON for the
+  // guest: unwrap ATK output and MCP content, parse JSON text, and swap
+  // image bytes for a ref (base64 inside a script is pure cost).
+  function normalize(state, value) {
+    if (value instanceof AtkOutput) value = value.text;
+    if (value && typeof value === "object" && Array.isArray(value.content)) {
+      const texts = [];
+      const refs = [];
+      for (const block of value.content) {
+        if (block?.type === "text") texts.push(block.text || "");
+        else if (block?.type === "image" && block.data) {
+          const ref = storeImage(state, block.data, block.mimeType || "image/png");
+          refs.push(ref ? { imageRef: ref, mimeType: block.mimeType || "image/png" } : { omitted: "image limit reached" });
         }
-        params = parsed.data;
       }
-      // Scripts filter results themselves, so skip ATK compaction.
-      if (def.parameters?.shape && "verbose" in def.parameters.shape && params.verbose === undefined) {
-        params = { ...params, verbose: true };
+      let parsed = texts.length === 1 ? tryParseJson(texts[0]) : texts.join("\n");
+      if (refs.length) {
+        const base = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : parsed ? { text: parsed } : {};
+        parsed = { ...base, images: refs, ...(refs[0].imageRef ? { imageRef: refs[0].imageRef } : {}) };
       }
+      value = parsed;
+    }
+    value = tryParseJson(value);
+    if (value && typeof value === "object" && typeof value.screenshot === "string" && value.screenshot.startsWith("data:")) {
+      const m = /^data:([^;,]+);base64,(.*)$/s.exec(value.screenshot);
+      const { screenshot, ...rest } = value;
+      const ref = m ? storeImage(state, m[2], m[1]) : null;
+      value = { ...rest, ...(ref ? { imageRef: ref } : { screenshot: "<omitted>" }) };
+    }
+    return value;
+  }
 
-      const t0 = Date.now();
-      let raw;
-      try {
-        raw = await invoke(def, params, { signal, context });
-      } catch (err) {
-        callLog.push(`${op} threw ${Date.now() - t0}ms`);
-        throw new ToolCallError("ToolError", `${op}: ${err?.message || err}`);
-      }
-      const ms = Date.now() - t0;
+  async function hostCall(state, op, args) {
+    if (op === "__emitImage") {
+      const ref = args?.ref;
+      if (!state.images.has(ref)) throw new ToolCallError("ToolError", `Unknown image ref ${JSON.stringify(ref)}`);
+      if (state.emitted.length < MAX_EMITTED_IMAGES && !state.emitted.includes(ref)) state.emitted.push(ref);
+      return null;
+    }
+    const def = defsByName.get(op);
+    if (!def) throw new ToolCallError("UnknownTool", `No tool "${op}" in the Code Mode API. Call code_api to list tools.`);
 
-      const held = parseHeld(raw) || parseHeld(tryParseJson(raw instanceof AtkOutput ? raw.text : raw));
-      if (held) {
-        callLog.push(`${op} held ${ms}ms`);
+    const tier = tierOf(op, args || {});
+    if (!tierAllows(state.allow, tier)) {
+      state.callLog.push(`${op} denied(${tier})`);
+      throw new ToolCallError(
+        "TierDenied",
+        `${op} is a ${tier} tool and this run was started with allow:"${state.allow}". Re-run with a higher allow if intended.`,
+      );
+    }
+
+    let params = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+    if (def.parameters?.safeParse) {
+      const parsed = def.parameters.safeParse(params);
+      if (!parsed.success) {
+        state.callLog.push(`${op} invalid`);
+        throw new ToolCallError("InvalidParams", `${op}: ${zodIssues(parsed.error)}`);
+      }
+      params = parsed.data;
+    }
+    // Scripts filter results themselves, so skip ATK compaction.
+    if (def.parameters?.shape && "verbose" in def.parameters.shape && params.verbose === undefined) {
+      params = { ...params, verbose: true };
+    }
+
+    const t0 = Date.now();
+    let raw;
+    try {
+      raw = await invoke(def, params, { signal: state.abort.signal, context: state.context });
+    } catch (err) {
+      state.callLog.push(`${op} threw ${Date.now() - t0}ms`);
+      throw new ToolCallError("ToolError", `${op}: ${err?.message || err}`);
+    }
+    let ms = Date.now() - t0;
+
+    const held = parseHeld(raw) || parseHeld(tryParseJson(raw instanceof AtkOutput ? raw.text : raw));
+    if (held) {
+      if (!held.confirmId || suspended.size >= MAX_SUSPENDED_RUNS) {
+        state.callLog.push(`${op} held ${ms}ms`);
         throw new StopRun(`${op} needs approval`, {
           confirmId: held.confirmId,
           tool: held.tool || op,
           tier: held.tier || tier,
           ...(held.domain ? { domain: held.domain } : {}),
-          message: held.message,
+          message: `${held.message || ""} Too many paused scripts; this one stopped instead. Steps before it already ran.`.trim(),
         });
       }
-
-      const value = normalize(raw);
-      if (value && typeof value === "object" && !Array.isArray(value) && typeof value.error === "string" && value.success !== true) {
-        callLog.push(`${op} error ${ms}ms`);
-        const { error, ...details } = value;
-        throw new ToolCallError("ToolError", `${op}: ${error}`, Object.keys(details).length ? details : undefined);
-      }
-      callLog.push(`${op} ${ms}ms`);
-      return value;
-    };
-
-    const out = await runInSandbox({ code: String(code || ""), prelude, call, signal, timeoutMs });
-
-    const report = { ok: out.ok };
-    if (out.ok) report.result = out.result;
-    if (out.error) report.error = out.error;
-    if (out.stopped) {
-      report.stopped = out.stopped;
-      if (out.stopped.info?.confirmId) {
-        report.hint =
-          `Run stopped before ${out.stopped.info.tool}: it needs approval (confirmId ${out.stopped.info.confirmId}). ` +
-          "Calls listed before it already ran. confirm_action runs only that one call; then run_code the remaining steps.";
+      state.callLog.push(`${op} held`);
+      const hold = { confirmId: held.confirmId, tool: op, tier, held, waiter: deferred() };
+      state.queue.push(hold);
+      if (!state.active) state.ctl?.pause();
+      state.wake?.();
+      const decided = await hold.waiter.promise; // rejects on decline / failure
+      raw = decided.approvedValue;
+      ms = 0;
+      // Approved calls are logged as their own entry when they come back.
+      state.callLog.push(`${op} approved`);
+      if (parseHeld(raw) || parseHeld(tryParseJson(raw instanceof AtkOutput ? raw.text : raw))) {
+        throw new ToolCallError("ToolError", `${op} was approved but held again; not run.`);
       }
     }
-    if (out.logs.length) report.logs = out.logs;
-    if (out.logsTruncated) report.logsTruncated = true;
-    report.calls = callLog.length > MAX_CALL_LOG ? [...callLog.slice(0, MAX_CALL_LOG), `... +${callLog.length - MAX_CALL_LOG} more`] : callLog;
-    report.ms = out.ms;
 
-    const imageBlocks = emitted.map((ref) => {
-      const img = images.get(ref);
-      return { type: "image", data: img.data, mimeType: img.mimeType };
-    });
-    return { report, images: imageBlocks };
+    const value = normalize(state, raw);
+    if (value && typeof value === "object" && !Array.isArray(value) && typeof value.error === "string" && value.success !== true) {
+      state.callLog.push(`${op} error ${ms}ms`);
+      const { error, ...details } = value;
+      throw new ToolCallError("ToolError", `${op}: ${error}`, Object.keys(details).length ? details : undefined);
+    }
+    if (!held) state.callLog.push(`${op} ${ms}ms`);
+    return value;
   }
 
   /** Body of the code_api tool. */
@@ -250,6 +441,11 @@ export function createCodeMode({ getDefinitions, jsonSchemaFor, tierOf, invoke, 
 
   return {
     run,
+    resume,
+    deny,
+    /** True when confirmId is the hold a paused script is waiting on. */
+    isSuspended: (confirmId) => suspended.get(confirmId)?.active?.confirmId === confirmId,
+    suspendedCount: () => new Set(suspended.values()).size,
     describe,
     /** Full TypeScript declaration (globals + every bound tool). */
     dts: () => ensureApi().dts(),
@@ -265,7 +461,7 @@ export function createCodeMode({ getDefinitions, jsonSchemaFor, tierOf, invoke, 
 
 const GLOBALS_HINT =
   "// run_code globals: autodom.<tool>(params) | page.eval(fn, ...args) runs fn in the active tab | " +
-  "emitImage(ref) attaches a screenshot | sleep(ms) | console.log. A failed call throws (name ToolError/InvalidParams/TierDenied). " +
+  "emitImage(ref) attaches a screenshot | sleep(ms) | console.log. A failed call throws (name ToolError/InvalidParams/TierDenied/ApprovalDenied). " +
   "No fetch/require/timers. Return only what you need.";
 
 function buildPrelude(names) {

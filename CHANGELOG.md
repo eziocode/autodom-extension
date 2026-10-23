@@ -11,8 +11,11 @@ All notable changes to AutoDOM are documented in this file.
   against a typed `autodom.*` API in a QuickJS (wasm) sandbox and returns only
   the script's value and console output; `code_api` serves the API (one-line
   index or exact TypeScript declarations). Every inner call keeps its zod
-  validation, guardrails, confirm mode, approval rules and audit entry; a call
-  held for approval stops the run. Listed only with `AUTODOM_CODE_MODE=1`.
+  validation, guardrails, confirm mode, approval rules and audit entry. A call
+  held for approval pauses the script: approving (inline elicitation or
+  `confirm_action`) runs the call and resumes the script, declining
+  (`cancel_action`) throws `ApprovalDenied` inside it. Listed only with
+  `AUTODOM_CODE_MODE=1`.
   New server dependencies: `quickjs-emscripten-core`,
   `@jitl/quickjs-wasmfile-release-sync`.
 

@@ -82,15 +82,22 @@ globalThis.sleep = (ms) => __invoke("__sleep", { ms: Number(ms) || 0 });
  *        (`name`, `message` and an optional `details` property cross over);
  *        throw StopRun to end the run.
  * @param {AbortSignal} [opts.signal]   Aborts the run (client cancelled).
+ * @param {(ctl: {pause(): void, resume(): void, stop(reason: string): void,
+ *   snapshot(): {logs: string[], logsTruncated: boolean, calls: number}}) => void} [opts.onControl]
+ *        Receives the run's controller before the code starts. pause() stops
+ *        the wall-clock deadline while the guest waits on a human (approval);
+ *        resume() restarts it with the time that was left.
  * @returns {Promise<{ok: boolean, result?: any, error?: {name: string, message: string},
  *   stopped?: {reason: string, info?: object}, logs: object[], logsTruncated: boolean,
  *   calls: number, ms: number}>}
  */
 export async function runInSandbox(opts) {
   const limits = { ...SANDBOX_DEFAULTS, ...pickLimits(opts) };
-  const { code, prelude = "", call, signal } = opts;
+  const { code, prelude = "", call, signal, onControl } = opts;
   const started = Date.now();
-  const deadline = started + limits.timeoutMs;
+  let deadline = started + limits.timeoutMs;
+  let pausedAt = null;
+  let pausedMs = 0;
 
   const logs = [];
   let logBytes = 0;
@@ -220,7 +227,29 @@ export async function runInSandbox(opts) {
     if (signal.aborted) onAbort();
     else signal.addEventListener("abort", onAbort, { once: true });
   }
-  const deadlineTimer = setTimeout(() => stop(`Timed out after ${limits.timeoutMs}ms`), limits.timeoutMs);
+  const onDeadline = () => stop(`Timed out after ${limits.timeoutMs}ms`);
+  let deadlineTimer = setTimeout(onDeadline, limits.timeoutMs);
+
+  // While paused the timer is off; the interrupt handler still holds any
+  // guest code that runs meanwhile (a parallel call settling) to the old
+  // deadline, so a pause never buys unbounded CPU.
+  onControl?.({
+    pause() {
+      if (pausedAt !== null || stopped) return;
+      pausedAt = Date.now();
+      clearTimeout(deadlineTimer);
+    },
+    resume() {
+      if (pausedAt === null || stopped) return;
+      const waited = Date.now() - pausedAt;
+      pausedAt = null;
+      pausedMs += waited;
+      deadline += waited;
+      deadlineTimer = setTimeout(onDeadline, Math.max(0, deadline - Date.now()));
+    },
+    stop: (reason) => stop(reason),
+    snapshot: () => ({ logs: logs.slice(), logsTruncated, calls }),
+  });
 
   try {
     for (const [source, filename] of [
@@ -274,7 +303,9 @@ export async function runInSandbox(opts) {
     }
   }
 
-  const base = { logs, logsTruncated, calls, ms: Date.now() - started };
+  if (pausedAt !== null) pausedMs += Date.now() - pausedAt;
+  // ms is running time; time spent waiting for approvals is reported apart.
+  const base = { logs, logsTruncated, calls, ms: Date.now() - started - pausedMs, ...(pausedMs ? { pausedMs } : {}) };
   if (stopped && !outcome) return { ok: false, stopped, ...base };
   if (stopped && outcome?.ok === false && /interrupted/i.test(outcome.error?.message || "")) {
     return { ok: false, stopped, ...base };

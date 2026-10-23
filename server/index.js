@@ -7819,7 +7819,10 @@ function createAutoDomMcpServer() {
       async (params, context) =>
         mcpRequestContext.run({ signal: context?.mcpReq?.signal || null, tool: name, params, execute }, async () => {
           const resumed = await _resumeApprovedTool(name, params, context, execute);
-          if (resumed !== undefined) return normalizeMcpToolResult(finalizeResult(name, resumed, params));
+          // A resumed run_code script can pause at its next held call.
+          if (resumed !== undefined) {
+            return _askForApproval(name, resumed, context) || normalizeMcpToolResult(finalizeResult(name, resumed, params));
+          }
           const value = await execute(params, context);
           return _askForApproval(name, value, context) || normalizeMcpToolResult(finalizeResult(name, value, params));
         }),
@@ -7941,8 +7944,12 @@ async function _resumeApprovedTool(tool, params, context, execute) {
   const answer = acceptedContent(responses, "approve");
   if (answer?.approve !== true) {
     _auditToolCall({ tool, params: pending.mcpParams ?? pending.params, tier: pending.tier, result: { blocked: true, domain: pending.domain } });
+    if (codeMode.isSuspended(confirmId)) {
+      return _codeModeOutput(await codeMode.deny(confirmId, { signal: context?.mcpReq?.signal, reason: `The user declined ${pending.tool}; it did not run.` }));
+    }
     return { cancelled: true, tool, message: `The user declined ${pending.tool}.` };
   }
+  if (codeMode.isSuspended(confirmId)) return _resumeCodeModeRun(confirmId, pending, context);
   // Run what the user approved: the held call's own params, never the
   // retried request's (they could differ from what the prompt showed).
   return _runApprovedCall(pending, context, tool === pending.mcpTool ? execute : null);
@@ -8758,18 +8765,46 @@ const codeMode = createCodeMode({
   tierOf: getToolTier,
   parseHeld: _parseHeld,
   hidden: PLAYWRIGHT_COMPAT_NAMES,
+  onHoldDiscarded: (confirmId) => pendingConfirmations.delete(confirmId),
   invoke: (def, params, { signal, context }) =>
     mcpRequestContext.run({ signal: signal || null, tool: def.name, params, execute: def.execute }, () =>
       def.execute(params, context),
     ),
 });
 
+// run_code's answer: a hold (pause) goes out as plain JSON starting with
+// confirmRequired so _askForApproval and clients recognise it; a finished
+// run goes through ATK, or as MCP content when it emitted images.
+function _codeModeOutput(out) {
+  if (!out) return JSON.stringify({ error: "That script is no longer paused (finished, expired or already resumed)." });
+  if (out.suspended) return JSON.stringify(out.report);
+  if (out.images.length) {
+    return { content: [{ type: "text", text: stringifyToolResult(out.report) }, ...out.images] };
+  }
+  return compactResult("run_code", out.report, { verbose: out.meta?.verbose });
+}
+
+// Run the approved held call for a paused script, then hand its result
+// back to the script and return the script's next outcome.
+async function _resumeCodeModeRun(confirmId, pending, context) {
+  const signal = context?.mcpReq?.signal || null;
+  let value;
+  let error;
+  try {
+    value = await _runApprovedCall(pending, context, null);
+  } catch (err) {
+    error = err;
+  }
+  return _codeModeOutput(await codeMode.resume(confirmId, { value, error, signal, context }));
+}
+
 server.addTool({
   name: "run_code",
   description:
     "Run a JavaScript script (async function body: await, return) that drives the browser through autodom.<tool>(params), the same tools as MCP, " +
     "plus page.eval(fn, ...args) to run fn in the active tab. Chain steps, branch and filter in one call; only the return value and console.log come back. " +
-    "Call code_api first for the API. Sandboxed: no fetch/require/timers. Guardrails and approvals apply to every inner call; a held call stops the run.",
+    "Call code_api first for the API. Sandboxed: no fetch/require/timers. Guardrails and approvals apply to every inner call: a held call pauses the script " +
+    "(confirm_action resumes it and returns its result; cancel_action makes that call throw ApprovalDenied in the script).",
   parameters: z.object({
     code: z.string().describe("Async function body. Example: await autodom.navigate({url}); return await page.eval(() => document.title);"),
     allow: z
@@ -8782,11 +8817,7 @@ server.addTool({
   }),
   execute: async ({ code, allow, timeoutMs, verbose }, context) => {
     const signal = context?.mcpReq?.signal || mcpRequestContext.getStore()?.signal || null;
-    const { report, images } = await codeMode.run({ code, allow, timeoutMs, signal, context });
-    if (images.length) {
-      return { content: [{ type: "text", text: stringifyToolResult(report) }, ...images] };
-    }
-    return compactResult("run_code", report, { verbose });
+    return _codeModeOutput(await codeMode.run({ code, allow, timeoutMs, signal, context, meta: { verbose } }));
   },
 });
 
@@ -8821,6 +8852,10 @@ server.addTool({
       });
     }
     pendingConfirmations.delete(confirmId);
+    if (codeMode.isSuspended(confirmId)) {
+      _auditToolCall({ tool: "confirm_action", params: { confirmId, tool: pending.tool }, tier: pending.tier, result: { confirmed: true } });
+      return _resumeCodeModeRun(confirmId, pending, context);
+    }
 
     try {
       const result = _parseToolValue(await _runApprovedCall(pending, context, null));
@@ -8855,7 +8890,7 @@ server.addTool({
   parameters: z.object({
     confirmId: z.number().describe("The confirmId to cancel"),
   }),
-  execute: async ({ confirmId }) => {
+  execute: async ({ confirmId }, context) => {
     const pending = pendingConfirmations.get(confirmId);
     if (!pending) {
       return JSON.stringify({
@@ -8863,6 +8898,11 @@ server.addTool({
       });
     }
     pendingConfirmations.delete(confirmId);
+    // A paused run_code script: the call throws ApprovalDenied inside it and
+    // the script carries on; return what it does next.
+    if (codeMode.isSuspended(confirmId)) {
+      return _codeModeOutput(await codeMode.deny(confirmId, { signal: context?.mcpReq?.signal }));
+    }
     return JSON.stringify({
       cancelled: true,
       tool: pending.tool,

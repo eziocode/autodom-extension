@@ -207,28 +207,98 @@ test("code mode: allow ceiling denies higher-tier calls before they run", async 
   assert.deepEqual(calls.map((c) => c[0]), ["get_page_info"]);
 });
 
-test("code mode: a held call stops the run and later steps never execute", async () => {
-  const { codeMode, calls } = fakeServer({
-    defs: [
-      {
-        name: "submit",
-        description: "Submit (held).",
-        parameters: z.object({}),
-        execute: async () =>
-          JSON.stringify({ confirmRequired: true, confirmId: 7, tool: "submit", tier: "destructive", message: "confirm" }),
-      },
-    ],
-  });
-  const { report } = await codeMode.run({
+function heldDef(name = "submit", confirmIds = [7]) {
+  let i = 0;
+  return {
+    name,
+    description: "Submit (held).",
+    parameters: z.object({ form: z.string().optional() }),
+    execute: async (p) =>
+      JSON.stringify({ confirmRequired: true, confirmId: confirmIds[i++] ?? 99, tool: name, tier: "destructive", message: "confirm", params: p }),
+  };
+}
+
+test("code mode: a held call pauses the script; approving resumes it", async () => {
+  const { codeMode, calls } = fakeServer({ defs: [heldDef()] });
+  const first = await codeMode.run({
     code: `await autodom.click({ selector: "#a" });
-      try { await autodom.submit(); } catch (e) { /* must not swallow the stop */ }
+      console.log("before");
+      const r = await autodom.submit({ form: "f1" });
+      console.log("after");
       await autodom.click({ selector: "#after" });
-      return "finished";`,
+      return { r };`,
   });
-  assert.equal(report.ok, false);
-  assert.equal(report.stopped.info.confirmId, 7);
-  assert.match(report.hint, /confirmId 7/);
-  assert.deepEqual(calls.map((c) => c[0]), ["click", "submit"]);
+  assert.equal(first.suspended, true);
+  assert.equal(Object.keys(first.report)[0], "confirmRequired", "hold prefix is what the MCP layer detects");
+  assert.equal(first.report.confirmId, 7);
+  assert.deepEqual(first.report.params, { form: "f1" });
+  assert.deepEqual(first.report.logs, ["before"]);
+  assert.ok(codeMode.isSuspended(7));
+  assert.deepEqual(calls.map((c) => c[0]), ["click", "submit"], "nothing after the hold has run");
+
+  const done = await codeMode.resume(7, { value: JSON.stringify({ success: true, submitted: "f1" }) });
+  assert.equal(done.suspended, false);
+  assert.equal(done.report.ok, true, JSON.stringify(done.report));
+  assert.deepEqual(done.report.result, { r: { success: true, submitted: "f1" } });
+  assert.equal(done.report.resumed, true);
+  assert.deepEqual(done.report.logs, ["after"], "only logs since the last report");
+  assert.deepEqual(done.report.calls.map((c) => c.split(" ")[0]), ["submit", "click"]);
+  assert.deepEqual(calls.map((c) => c[0]), ["click", "submit", "click"]);
+  assert.equal(codeMode.isSuspended(7), false);
+  assert.equal(await codeMode.resume(7, { value: "{}" }), null, "a hold resumes once");
+});
+
+test("code mode: declining throws ApprovalDenied inside the script", async () => {
+  const { codeMode } = fakeServer({ defs: [heldDef()] });
+  const first = await codeMode.run({
+    code: `try { await autodom.submit(); return "ran"; } catch (e) { return [e.name, e.details]; }`,
+  });
+  assert.equal(first.suspended, true);
+  const done = await codeMode.deny(7);
+  assert.deepEqual(done.report.result, ["ApprovalDenied", { confirmId: 7 }]);
+});
+
+test("code mode: parallel holds are reported one at a time", async () => {
+  const { codeMode } = fakeServer({ defs: [heldDef("submit", [1, 2])] });
+  const first = await codeMode.run({
+    code: `const [a, b] = await Promise.all([autodom.submit({ form: "a" }), autodom.submit({ form: "b" })]); return [a.ok, b.ok];`,
+  });
+  assert.equal(first.report.confirmId, 1);
+  const second = await codeMode.resume(1, { value: JSON.stringify({ ok: "a" }) });
+  assert.equal(second.suspended, true);
+  assert.equal(second.report.confirmId, 2);
+  const done = await codeMode.resume(2, { value: JSON.stringify({ ok: "b" }) });
+  assert.deepEqual(done.report.result, ["a", "b"]);
+});
+
+test("code mode: time spent waiting for approval does not count toward timeoutMs", async () => {
+  const { codeMode } = fakeServer({ defs: [heldDef()] });
+  const first = await codeMode.run({ timeoutMs: 200, code: `await autodom.submit(); return "done";` });
+  assert.equal(first.suspended, true);
+  await new Promise((r) => setTimeout(r, 400));
+  const done = await codeMode.resume(7, { value: "{}" });
+  assert.equal(done.report.ok, true, JSON.stringify(done.report));
+  assert.ok(done.report.pausedMs >= 350, `pausedMs ${done.report.pausedMs}`);
+});
+
+test("code mode: an unanswered hold expires and is discarded", async () => {
+  const discarded = [];
+  const defs = [heldDef()];
+  const codeMode = createCodeMode({
+    getDefinitions: () => defs,
+    jsonSchemaFor: (p) => z.toJSONSchema(p, { io: "input" }),
+    tierOf: () => "destructive",
+    parseHeld: (v) => (v && typeof v === "object" && v.confirmRequired ? v : null),
+    invoke: async (def, params) => def.execute(params),
+    suspendTtlMs: 50,
+    onHoldDiscarded: (id) => discarded.push(id),
+  });
+  const first = await codeMode.run({ code: `await autodom.submit(); return 1;` });
+  assert.equal(first.suspended, true);
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(codeMode.isSuspended(7), false);
+  assert.deepEqual(discarded, [7], "the server drops the pending confirmation too");
+  assert.equal(await codeMode.resume(7, { value: "{}" }), null);
 });
 
 test("code mode: page.eval serializes the function and unwraps the result", async () => {

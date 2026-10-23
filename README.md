@@ -200,10 +200,14 @@ return links.filter((h) => h.includes("/docs/")).slice(0, 10);
   `sleep(ms)`, `console`. No `fetch`, `require`, timers or filesystem.
 - Every inner call is the same tool an MCP client would call: zod-validated,
   then run through domain guardrails, confirm mode, approval rules and the
-  audit log. A call held for approval stops the run; the steps before it have
-  already run and are listed in `calls`. `confirm_action` runs only the held
-  call. Meta tools (`batch_actions`, `confirm_action`, `approval_rules`, ...)
-  are not reachable from a script.
+  audit log. A call held for approval pauses the script and `run_code`
+  returns the hold. Approving it (inline prompt or `confirm_action`) runs that
+  call and resumes the script, and you get the script's result or its next
+  hold. Declining (`cancel_action`) makes the call throw `ApprovalDenied`
+  inside the script. Time spent waiting does not count toward `timeoutMs`. A
+  paused script is discarded after 5 minutes, together with its hold; at most
+  8 scripts can be paused at once. Meta tools (`batch_actions`,
+  `confirm_action`, `approval_rules`, ...) are not reachable from a script.
 - `allow: "read" | "write" | "destructive"` caps the tiers a script may use.
   Limits per run: 60 s by default (`timeoutMs` up to 300 s), 32 MB heap, 200
   tool calls.
