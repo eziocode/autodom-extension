@@ -10,6 +10,7 @@ const { z } = await import(pathToFileURL(serverRequire.resolve("zod")).href);
 const { runInSandbox } = await import("../server/codemode/sandbox.js");
 const { createCodeMode, CODE_MODE_EXCLUDED } = await import("../server/codemode/index.js");
 const { schemaToTs } = await import("../server/codemode/api-gen.js");
+const { RESULT_TYPES, AREAS } = await import("../server/codemode/result-types.js");
 const { AtkOutput } = await import("../server/atk/index.js");
 
 const TIERS = { get_page_info: "read", click: "write", navigate: "destructive", execute_code: "destructive" };
@@ -332,7 +333,7 @@ test("code mode: code_api index, query and declarations", async () => {
   assert.match(decl, /button\?: "left" \| "right";/);
   assert.match(decl, /Unknown: nope/);
   assert.ok(!/verbose/.test(codeMode.describe({ tools: ["get_page_info"] })), "verbose is hidden from the API");
-  assert.match(codeMode.describe({ query: "screenshot" }), /take_screenshot\(\): Promise<any>/);
+  assert.match(codeMode.describe({ query: "screenshot" }), /take_screenshot\(\): Promise<\{ \/\*\* Pass to emitImage/);
   assert.match(codeMode.dts(), /declare const page/);
 });
 
@@ -342,4 +343,43 @@ test("schemaToTs handles unions, arrays, records and nullables", () => {
   assert.equal(schemaToTs({ type: "object", additionalProperties: { type: "number" } }), "Record<string, number>");
   assert.equal(schemaToTs({ type: ["integer", "null"] }), "number | null");
   assert.equal(schemaToTs({}), "any");
+});
+
+test("code mode: actions with an appended snapshot come back as one object", async () => {
+  const { codeMode } = fakeServer({
+    defs: [
+      {
+        name: "click_snap",
+        description: "Click and append a snapshot.",
+        parameters: z.object({}),
+        execute: async () => `${JSON.stringify({ success: true, tag: "BUTTON" })}\n--- snapshot ---\n@e1 button "Go"`,
+      },
+    ],
+  });
+  const { report } = await codeMode.run({ code: `return await autodom.click_snap();` });
+  assert.deepEqual(report.result, { success: true, tag: "BUTTON", snapshot: '@e1 button "Go"' });
+});
+
+test("code mode: index is grouped by area and marks untyped results", async () => {
+  const { codeMode } = fakeServer();
+  const index = codeMode.describe();
+  const sections = [...index.matchAll(/^## (\w+)$/gm)].map((m) => m[1]);
+  assert.deepEqual(sections, ["observe", "act", "navigate", "script", "other"]);
+  assert.match(index, /## observe\nget_page_info \[read\]/);
+  assert.match(index, /^fails \[write\] .*\(returns any\)$/m, "untyped tools say so");
+  assert.doesNotMatch(index, /^click \[write\].*returns any/m, "typed tools do not");
+  const act = codeMode.describe({ area: "act" });
+  assert.match(act, /click\(p: \{[\s\S]*\}\): Promise<\{ success: true; tag\?: string;/);
+  assert.doesNotMatch(act, /get_page_info/);
+  assert.match(codeMode.describe({ area: "nope" }), /Unknown area/);
+});
+
+test("result types and areas stay consistent", () => {
+  const areaNames = AREAS.flatMap(([, names]) => names);
+  assert.equal(new Set(areaNames).size, areaNames.length, "a tool is listed in two areas");
+  for (const name of Object.keys(RESULT_TYPES)) assert.ok(areaNames.includes(name), `${name} has a result type but no area`);
+  for (const [name, type] of Object.entries(RESULT_TYPES)) {
+    const depth = [...type].reduce((d, c) => d + (c === "{" ? 1 : c === "}" ? -1 : 0), 0);
+    assert.equal(depth, 0, `${name}: unbalanced braces`);
+  }
 });

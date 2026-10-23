@@ -99,22 +99,23 @@ async function startServer(port, env) {
   await sleep(500);
 
   let nextId = 1;
-  async function call(name, args, meta = LEGACY_META, extra = {}) {
+  async function request(method, params) {
     const id = nextId++;
-    proc.stdin.write(
-      JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args, _meta: meta, ...extra } }) + '\n',
-    );
+    proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
     for (let i = 0; i < 200; i++) {
       if (responses.has(id)) return responses.get(id);
       await sleep(25);
     }
-    throw new Error(`no response for ${name}`);
+    throw new Error(`no response for ${method}`);
   }
+  const call = (name, args, meta = LEGACY_META, extra = {}) =>
+    request('tools/call', { name, arguments: args, _meta: meta, ...extra });
+  const listTools = async () => (await request('tools/list', { _meta: LEGACY_META })).result.tools.map((t) => t.name);
   const stop = () => {
     ext.close();
     proc.kill();
   };
-  return { call, extCalls, stop };
+  return { call, listTools, extCalls, stop };
 }
 
 async function plainRun() {
@@ -180,9 +181,26 @@ async function inlineApprovalRun() {
   }
 }
 
+async function onlyModeListing() {
+  const s = await startServer(19884, { AUTODOM_CODE_MODE: 'only' });
+  try {
+    const names = (await s.listTools()).sort().join();
+    assert(names === 'cancel_action,code_api,confirm_action,finish_session,recall,run_code', 'only mode lists the Code Mode set: ' + names);
+    const listed = await s.call('code_api', {});
+    const index = text(listed);
+    assert(!/^## other$/m.test(index), 'every bound tool has an area: ' + (index.split('## other')[1] || '').slice(0, 300));
+    assert(/^## observe$/m.test(index) && /^get_dom_state \[read\]/m.test(index), 'index is grouped');
+    const typed = text(await s.call('code_api', { tools: ['get_dom_state'] }));
+    assert(/elements: Array<\{ index: number; tag: string;/.test(typed), 'get_dom_state has a result type: ' + typed.slice(-400));
+  } finally {
+    s.stop();
+  }
+}
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of [
+    ['only mode: grouped, typed API for every bound tool', onlyModeListing],
     ['script fans out into extension calls', plainRun],
     ['confirm mode pauses and resumes the script', confirmModeRun],
     ['inline approval resumes the same script', inlineApprovalRun],

@@ -78,7 +78,7 @@ import {
   recallText,
   snapshotBaselines,
 } from "./atk/index.js";
-import { CODE_MODE_TOOL_NAMES, createCodeMode } from "./codemode/index.js";
+import { CODE_MODE_TOOL_NAMES, CODE_ONLY_LISTED, createCodeMode } from "./codemode/index.js";
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 
 // Local Playwright/Node automation backends were intentionally removed: AutoDOM
@@ -7757,14 +7757,37 @@ function _jsonSchemaForTool(parameters) {
 // The Playwright-compatible aliases duplicate core tools and cost ~6KB of
 // schema on every session. They stay callable by name; only clients that
 // discover tools by listing need AUTODOM_PLAYWRIGHT_COMPAT=1.
-// Code Mode (run_code / code_api) is opt-in while it matures: callable by
-// name always, listed only with AUTODOM_CODE_MODE=1.
+// Code Mode (run_code / code_api) is opt-in while it matures and always
+// callable by name. AUTODOM_CODE_MODE=1 (or hybrid) lists it next to every
+// tool; =only lists just the Code Mode set, so the model reaches the browser
+// through scripts and the tools/list payload stays small.
+function _codeModeListing(env = process.env) {
+  const v = String(env.AUTODOM_CODE_MODE || "").toLowerCase();
+  if (v === "only") return "only";
+  return v === "1" || v === "hybrid" || v === "true" ? "hybrid" : "off";
+}
+
 function _listedToolDefinitions(env = process.env) {
-  const codeMode = env.AUTODOM_CODE_MODE === "1";
+  const codeMode = _codeModeListing(env);
+  if (codeMode === "only") return toolDefinitions.filter((t) => CODE_ONLY_LISTED.has(t.name));
   return toolDefinitions.filter(
     (t) =>
       (env.AUTODOM_PLAYWRIGHT_COMPAT === "1" || !PLAYWRIGHT_COMPAT_NAMES.has(t.name)) &&
-      (codeMode || !CODE_MODE_TOOL_NAMES.has(t.name)),
+      (codeMode === "hybrid" || !CODE_MODE_TOOL_NAMES.has(t.name)),
+  );
+}
+
+function _serverInstructions(env = process.env) {
+  const base =
+    "Inspect page state before UI actions. Use explicit identifiers returned by tools across calls; MCP transport sessions are not application state. " +
+    "AutoDOM works in its own background tab group and never takes over the tab the user is using: navigate/open_new_tab open tabs in that group, and a user's tab is only touched when you adopt it explicitly with pin_tab {tabId}. Call finish_session when the task is done to close the tabs AutoDOM opened and put any adopted tab back.";
+  const codeMode = _codeModeListing(env);
+  if (codeMode === "off") return base;
+  return (
+    base +
+    (codeMode === "only"
+      ? " Drive the browser with run_code scripts: call code_api first for the autodom.* API, then do the whole task in as few run_code calls as you can."
+      : " For multi-step browser work prefer one run_code script over many tool calls; code_api returns its autodom.* API.")
   );
 }
 
@@ -7785,9 +7808,7 @@ function createAutoDomMcpServer() {
   const mcpServer = new McpServer(
     { name: "autodom", version: SERVER_VERSION },
     {
-      instructions:
-        "Inspect page state before UI actions. Use explicit identifiers returned by tools across calls; MCP transport sessions are not application state. " +
-        "AutoDOM works in its own background tab group and never takes over the tab the user is using: navigate/open_new_tab open tabs in that group, and a user's tab is only touched when you adopt it explicitly with pin_tab {tabId}. Call finish_session when the task is done to close the tabs AutoDOM opened and put any adopted tab back.",
+      instructions: _serverInstructions(),
       cacheHints: {
         "server/discover": { ttlMs: 60000, cacheScope: "public" },
         "tools/list": { ttlMs: 60000, cacheScope: "public" },
@@ -8824,12 +8845,16 @@ server.addTool({
 server.addTool({
   name: "code_api",
   description:
-    "TypeScript API for run_code. No args: globals plus one line per tool. {tools:[names]}: exact declarations. {query}: declarations of the best matches.",
+    "TypeScript API for run_code. No args: globals plus one line per tool, grouped by area. {tools:[names]}, {area} or {query}: exact declarations with param and result types.",
   parameters: z.object({
     tools: z.array(z.string()).optional().describe("Tool names to declare in full"),
+    area: z
+      .enum(["observe", "act", "navigate", "tabs", "script", "debug", "storage", "workflow", "audit"])
+      .optional()
+      .describe("Declare every tool in one area"),
     query: z.string().optional().describe("Free-text search over tool names and descriptions"),
   }),
-  execute: async ({ tools, query }) => codeMode.describe({ tools, query }),
+  execute: async ({ tools, query, area }) => codeMode.describe({ tools, query, area }),
 });
 
 // Confirm a destructive action that was held for confirmation

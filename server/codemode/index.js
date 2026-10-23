@@ -40,6 +40,13 @@ export const CODE_MODE_EXCLUDED = new Set([
 
 export const CODE_MODE_TOOL_NAMES = new Set(["run_code", "code_api"]);
 
+// AUTODOM_CODE_MODE=only lists just these: the two Code Mode tools plus what
+// a client needs around them (approvals, recalling shrunk output, cleanup).
+// Every other tool stays callable by name.
+export const CODE_ONLY_LISTED = new Set([...CODE_MODE_TOOL_NAMES, "confirm_action", "cancel_action", "recall", "finish_session"]);
+
+const SNAPSHOT_SEPARATOR = "\n--- snapshot ---\n";
+
 const MAX_IMAGES_PER_RUN = 10;
 const MAX_EMITTED_IMAGES = 4;
 const MAX_CALL_LOG = 60;
@@ -330,6 +337,14 @@ export function createCodeMode({
       }
       value = parsed;
     }
+    // Actions called with snapshot:"diff"|"full" return their JSON with the
+    // snapshot text appended; give the script both halves.
+    if (typeof value === "string" && value.includes(SNAPSHOT_SEPARATOR)) {
+      const at = value.indexOf(SNAPSHOT_SEPARATOR);
+      const head = tryParseJson(value.slice(0, at));
+      const snapshot = value.slice(at + SNAPSHOT_SEPARATOR.length);
+      value = head && typeof head === "object" && !Array.isArray(head) ? { ...head, snapshot } : value;
+    }
     value = tryParseJson(value);
     if (value && typeof value === "object" && typeof value.screenshot === "string" && value.screenshot.startsWith("data:")) {
       const m = /^data:([^;,]+);base64,(.*)$/s.exec(value.screenshot);
@@ -421,8 +436,12 @@ export function createCodeMode({
   }
 
   /** Body of the code_api tool. */
-  function describe({ query, tools } = {}) {
+  function describe({ query, tools, area } = {}) {
     const a = ensureApi();
+    if (area) {
+      if (!a.areas().includes(area)) return `// Unknown area ${JSON.stringify(area)}. Areas: ${a.areas().join(", ")}`;
+      return a.declare(a.names.filter((n) => a.entry(n).area === area)).text;
+    }
     if (Array.isArray(tools) && tools.length) {
       const { text, missing } = a.declare(tools);
       return [text, missing.length ? `// Unknown: ${missing.join(", ")}` : ""].filter(Boolean).join("\n");
@@ -433,8 +452,8 @@ export function createCodeMode({
       return a.declare(names).text;
     }
     return (
-      `${GLOBALS_HINT}\n\n// ${a.names.length} tools as autodom.<name>(params): Promise<any>. ` +
-      "Get exact param types with code_api {tools:[...]} or {query}.\n" +
+      `${GLOBALS_HINT}\n\n// ${a.names.length} tools as autodom.<name>(params), grouped by area. ` +
+      "Exact param and result types: code_api {tools:[...]}, {area} or {query}.\n" +
       a.index()
     );
   }

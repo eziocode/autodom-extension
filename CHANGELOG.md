@@ -15,7 +15,10 @@ All notable changes to AutoDOM are documented in this file.
   held for approval pauses the script: approving (inline elicitation or
   `confirm_action`) runs the call and resumes the script, declining
   (`cancel_action`) throws `ApprovalDenied` inside it. Listed only with
-  `AUTODOM_CODE_MODE=1`.
+  `AUTODOM_CODE_MODE=1`; `AUTODOM_CODE_MODE=only` lists just the Code Mode
+  set (about 3.5 KB of `tools/list` instead of 63 KB). The `code_api` index
+  is grouped by area (`{area}` declares one), and the most used tools
+  declare their result types.
   New server dependencies: `quickjs-emscripten-core`,
   `@jitl/quickjs-wasmfile-release-sync`.
 

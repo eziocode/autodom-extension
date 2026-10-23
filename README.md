@@ -192,9 +192,17 @@ const links = await page.eval(() => [...document.links].map((a) => a.href));
 return links.filter((h) => h.includes("/docs/")).slice(0, 10);
 ```
 
-- `code_api` returns the API: no arguments gives one line per tool (about
-  11 KB against about 63 KB for `tools/list`); `{tools: [...]}` or `{query}`
-  gives exact TypeScript declarations.
+- `code_api` returns the API: no arguments gives one line per tool grouped
+  by area (observe, act, navigate, tabs, script, debug, storage, workflow,
+  audit; about 12 KB against about 63 KB for `tools/list`); `{tools: [...]}`,
+  `{area}` or `{query}` gives exact TypeScript declarations. The most used
+  tools (`get_dom_state`, `navigate`, `click`, `list_tabs`, `query_elements`,
+  ...) declare their result type; the index marks the rest `(returns any)`.
+- `AUTODOM_CODE_MODE=1` lists `run_code` and `code_api` next to every tool.
+  `AUTODOM_CODE_MODE=only` lists just `run_code`, `code_api`,
+  `confirm_action`, `cancel_action`, `recall` and `finish_session` (about
+  3.5 KB of `tools/list`); every other tool stays callable by name. Both add
+  a line to the server instructions pointing the model at `run_code`.
 - Globals: `autodom.<tool>(params)` for 104 tools, `page.eval(fn, ...args)`
   (runs `fn` in the active tab through `execute_code`), `emitImage(ref)`,
   `sleep(ms)`, `console`. No `fetch`, `require`, timers or filesystem.
@@ -312,7 +320,7 @@ Output and tool listing:
 | `AUTODOM_OUTPUT` | compact | `full`: disable ATK compaction |
 | `AUTODOM_TRUST_PROJECT_FILTERS` | `0` | `1`: honour a project-local `.autodom/filters.json` |
 | `AUTODOM_PLAYWRIGHT_COMPAT` | `0` | `1`: list the Playwright-compatible aliases |
-| `AUTODOM_CODE_MODE` | `0` | `1`: list `run_code` and `code_api` (Code Mode) |
+| `AUTODOM_CODE_MODE` | `0` | `1`: also list `run_code` and `code_api` (Code Mode); `only`: list just the Code Mode set |
 
 Tool gating:
 

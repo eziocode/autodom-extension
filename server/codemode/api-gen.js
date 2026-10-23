@@ -2,6 +2,8 @@
 // TypeScript declaration the model codes against, plus a one-line-per-tool
 // index for progressive discovery through `code_api`.
 
+import { AREA_NAMES, RESULT_TYPES, areaOf } from "./result-types.js";
+
 const TIER_RANK = { read: 0, write: 1, destructive: 2 };
 
 export function tierAllows(ceiling, tier) {
@@ -88,6 +90,15 @@ function propDoc(prop) {
   return parts.join(". ");
 }
 
+// Result types are written with two-space nesting from column 0; shift
+// continuation lines under the declaration's indent.
+function reindent(type, indent) {
+  return type
+    .split("\n")
+    .map((line, i) => (i === 0 ? line : indent + line))
+    .join("\n");
+}
+
 function firstSentence(text) {
   const flat = oneLine(text);
   const m = /^(.{20,}?[.!?])(\s|$)/.exec(flat);
@@ -122,12 +133,15 @@ export function buildApi(definitions, { jsonSchemaFor, tierOf, include }) {
     const required = (schema?.required || []).filter((n) => !("default" in (schema.properties?.[n] || {})));
     const paramType = props.length ? schemaToTs(schema, "  ") : null;
     const argList = paramType ? `p${required.length ? "" : "?"}: ${paramType}` : "";
+    const resultType = RESULT_TYPES[def.name] ? reindent(RESULT_TYPES[def.name], "  ") : "any";
     const decl =
       `  /** ${oneLine(def.description)} @tier ${tier} */\n` +
-      `  ${def.name}(${argList}): Promise<any>;`;
+      `  ${def.name}(${argList}): Promise<${resultType}>;`;
     entries.push({
       name: def.name,
       tier,
+      area: areaOf(def.name),
+      typed: !!RESULT_TYPES[def.name],
       summary: firstSentence(def.description),
       description: oneLine(def.description),
       decl,
@@ -144,8 +158,19 @@ export function buildApi(definitions, { jsonSchemaFor, tierOf, include }) {
     entry: (name) => byName.get(name),
     /** Full declaration for every bound tool. */
     dts: () => `${GLOBALS_DTS}\n${declare(entries)}`,
-    /** One line per tool: `name [tier] summary`. */
-    index: () => entries.map((e) => `${e.name} [${e.tier}] ${e.summary}`).join("\n"),
+    /** One line per tool, `name [tier] summary`, grouped under `## area` (or one area only). */
+    index: (onlyArea) => {
+      const out = [];
+      for (const area of AREA_NAMES) {
+        if (onlyArea && area !== onlyArea) continue;
+        const list = entries.filter((e) => e.area === area);
+        if (!list.length) continue;
+        out.push(`## ${area}`);
+        for (const e of list) out.push(`${e.name} [${e.tier}] ${e.summary}${e.typed ? "" : " (returns any)"}`);
+      }
+      return out.join("\n");
+    },
+    areas: () => AREA_NAMES.filter((a) => entries.some((e) => e.area === a)),
     /** Declarations for the given names; unknown names are reported. */
     declare: (names) => {
       const found = [];
@@ -187,6 +212,6 @@ declare const page: {
 /** Attach a screenshot to the run_code result. ref comes from autodom.take_screenshot(). */
 declare function emitImage(ref: { imageRef: string } | string): void;
 declare function sleep(ms: number): Promise<void>;
-declare const console: { log(...a: any[]): void; info(...a: any[]): void; warn(...a: any[]): void; error(...a: any[]): void };
+// console.log/info/warn/error are captured and returned as logs.
 // A failed tool call throws Error { name: "ToolError" | "InvalidParams" | "TierDenied", message, tool, details? }.
 // No fetch, require, timers or filesystem: reach the browser only through autodom.* and page.eval.`;
