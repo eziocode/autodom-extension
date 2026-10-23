@@ -25,6 +25,10 @@ All notable changes to AutoDOM are documented in this file.
   {scriptId}` schedules one: the extension fires it and the connected bridge
   runs it unattended in its own tab isolation client (a held call stops the
   run with status `held`; no bridge connected means `skipped`).
+- Code Mode benchmark (`scripts/codemode-bench/`, results in
+  `docs/CODE_MODE.md`): replays recorded real pages through a real server and
+  compares what the model reads with the standard tools and with Code Mode.
+  CI runs it with `--check`.
   New server dependencies: `quickjs-emscripten-core`,
   `@jitl/quickjs-wasmfile-release-sync`.
 

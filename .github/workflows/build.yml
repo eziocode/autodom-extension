@@ -66,5 +66,8 @@ jobs:
           node test/test-chat-stream.cjs
           node test/test-codemode-e2e.cjs
 
+      - name: Code Mode benchmark
+        run: node scripts/codemode-bench/bench.mjs --check
+
       - name: Build Chrome zip
         run: bash scripts/build-chrome.sh

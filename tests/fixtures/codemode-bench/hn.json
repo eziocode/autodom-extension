@@ -1,0 +1,448 @@
+{
+  "url": "https://news.ycombinator.com/",
+  "capturedAt": "2026-10-23T05:40:54.550Z",
+  "results": {
+    "navigate": {
+      "success": true,
+      "url": "https://news.ycombinator.com/",
+      "title": "Hacker News",
+      "status": "complete",
+      "loaded": true,
+      "elapsedMs": 1155,
+      "autoCreatedTab": true,
+      "tabId": 1249072820
+    },
+    "get_page_info": {
+      "forms": 1,
+      "images": 2,
+      "lang": "en",
+      "links": 228,
+      "metas": {
+        "referrer": "origin",
+        "viewport": "width=device-width, initial-scale=1.0"
+      },
+      "readyState": "complete",
+      "title": "Hacker News",
+      "url": "https://news.ycombinator.com/",
+      "tabId": 1249072820,
+      "windowId": 1249072731
+    },
+    "get_dom_state": {
+      "elementCount": 60,
+      "elements": [
+        {
+          "href": "https://news.ycombinator.com",
+          "index": 0,
+          "tag": "a"
+        },
+        {
+          "href": "news",
+          "index": 1,
+          "tag": "a",
+          "text": "Hacker News"
+        },
+        {
+          "href": "newest",
+          "index": 2,
+          "tag": "a",
+          "text": "new"
+        },
+        {
+          "href": "front",
+          "index": 3,
+          "tag": "a",
+          "text": "past"
+        },
+        {
+          "href": "newcomments",
+          "index": 4,
+          "tag": "a",
+          "text": "comments"
+        },
+        {
+          "href": "ask",
+          "index": 5,
+          "tag": "a",
+          "text": "ask"
+        },
+        {
+          "href": "show",
+          "index": 6,
+          "tag": "a",
+          "text": "show"
+        },
+        {
+          "href": "jobs",
+          "index": 7,
+          "tag": "a",
+          "text": "jobs"
+        },
+        {
+          "href": "submit",
+          "index": 8,
+          "tag": "a",
+          "text": "submit"
+        },
+        {
+          "href": "login?goto=news",
+          "index": 9,
+          "tag": "a",
+          "text": "login"
+        },
+        {
+          "href": "vote?id=50204754&how=up&goto=news",
+          "id": "up_50204754",
+          "index": 10,
+          "selector": "#up_50204754",
+          "tag": "a"
+        },
+        {
+          "href": "https://endler.dev/2024/move-slow-and-fix-things/",
+          "index": 11,
+          "tag": "a",
+          "text": "Move Slow and Fix Things"
+        },
+        {
+          "href": "from?site=endler.dev",
+          "index": 12,
+          "tag": "a",
+          "text": "endler.dev"
+        },
+        {
+          "href": "user?id=ahmedhossamdev",
+          "index": 13,
+          "tag": "a",
+          "text": "ahmedhossamdev"
+        },
+        {
+          "href": "item?id=50204754",
+          "index": 14,
+          "tag": "a",
+          "text": "26 minutes ago"
+        },
+        {
+          "href": "hide?id=50204754&goto=news",
+          "index": 15,
+          "tag": "a",
+          "text": "hide"
+        },
+        {
+          "href": "item?id=50204754",
+          "index": 16,
+          "tag": "a",
+          "text": "discuss"
+        },
+        {
+          "href": "vote?id=50202681&how=up&goto=news",
+          "id": "up_50202681",
+          "index": 17,
+          "selector": "#up_50202681",
+          "tag": "a"
+        },
+        {
+          "href": "https://codeandcake.dev/posts/2026-10-22-docker-is-weird",
+          "index": 18,
+          "tag": "a",
+          "text": "Docker is weird"
+        },
+        {
+          "href": "from?site=codeandcake.dev",
+          "index": 19,
+          "tag": "a",
+          "text": "codeandcake.dev"
+        },
+        {
+          "href": "user?id=psxuaw",
+          "index": 20,
+          "tag": "a",
+          "text": "psxuaw"
+        },
+        {
+          "href": "item?id=50202681",
+          "index": 21,
+          "tag": "a",
+          "text": "5 hours ago"
+        },
+        {
+          "href": "hide?id=50202681&goto=news",
+          "index": 22,
+          "tag": "a",
+          "text": "hide"
+        },
+        {
+          "href": "item?id=50202681",
+          "index": 23,
+          "tag": "a",
+          "text": "142 comments"
+        },
+        {
+          "href": "vote?id=50202217&how=up&goto=news",
+          "id": "up_50202217",
+          "index": 24,
+          "selector": "#up_50202217",
+          "tag": "a"
+        },
+        {
+          "href": "https://www.anthropic.com/research/formal-verification",
+          "index": 25,
+          "tag": "a",
+          "text": "LLMs are making formal software verification feasible at a much larger scale"
+        },
+        {
+          "href": "from?site=anthropic.com",
+          "index": 26,
+          "tag": "a",
+          "text": "anthropic.com"
+        },
+        {
+          "href": "user?id=johnbender",
+          "index": 27,
+          "tag": "a",
+          "text": "johnbender"
+        },
+        {
+          "href": "item?id=50202217",
+          "index": 28,
+          "tag": "a",
+          "text": "6 hours ago"
+        },
+        {
+          "href": "hide?id=50202217&goto=news",
+          "index": 29,
+          "tag": "a",
+          "text": "hide"
+        },
+        {
+          "href": "item?id=50202217",
+          "index": 30,
+          "tag": "a",
+          "text": "129 comments"
+        },
+        {
+          "href": "vote?id=50195959&how=up&goto=news",
+          "id": "up_50195959",
+          "index": 31,
+          "selector": "#up_50195959",
+          "tag": "a"
+        },
+        {
+          "href": "https://quad9.net/news/blog/au-revoir-france/",
+          "index": 32,
+          "tag": "a",
+          "text": "Quad9 (DNS Resolver) to Exit France"
+        },
+        {
+          "href": "from?site=quad9.net",
+          "index": 33,
+          "tag": "a",
+          "text": "quad9.net"
+        },
+        {
+          "href": "user?id=farrokhi",
+          "index": 34,
+          "tag": "a",
+          "text": "farrokhi"
+        },
+        {
+          "href": "item?id=50195959",
+          "index": 35,
+          "tag": "a",
+          "text": "15 hours ago"
+        },
+        {
+          "href": "hide?id=50195959&goto=news",
+          "index": 36,
+          "tag": "a",
+          "text": "hide"
+        },
+        {
+          "href": "item?id=50195959",
+          "index": 37,
+          "tag": "a",
+          "text": "385 comments"
+        },
+        {
+          "href": "vote?id=50162431&how=up&goto=news",
+          "id": "up_50162431",
+          "index": 38,
+          "selector": "#up_50162431",
+          "tag": "a"
+        },
+        {
+          "href": "https://blog.coredump.cx/p/the-secret-life-of-circuits-is-now",
+          "index": 39,
+          "tag": "a",
+          "text": "The Secret Life of Circuits is now in stock everywhere"
+        },
+        {
+          "href": "from?site=coredump.cx",
+          "index": 40,
+          "tag": "a",
+          "text": "coredump.cx"
+        },
+        {
+          "href": "user?id=surprisetalk",
+          "index": 41,
+          "tag": "a",
+          "text": "surprisetalk"
+        },
+        {
+          "href": "item?id=50162431",
+          "index": 42,
+          "tag": "a",
+          "text": "5 hours ago"
+        },
+        {
+          "href": "hide?id=50162431&goto=news",
+          "index": 43,
+          "tag": "a",
+          "text": "hide"
+        },
+        {
+          "href": "item?id=50162431",
+          "index": 44,
+          "tag": "a",
+          "text": "15 comments"
+        },
+        {
+          "href": "vote?id=50204125&how=up&goto=news",
+          "id": "up_50204125",
+          "index": 45,
+          "selector": "#up_50204125",
+          "tag": "a"
+        },
+        {
+          "href": "item?id=50204125",
+          "index": 46,
+          "tag": "a",
+          "text": "Median product \"lifespan\" has fallen from ~4y down to ~1.5y"
+        },
+        {
+          "href": "user?id=stanislavb",
+          "index": 47,
+          "tag": "a",
+          "text": "stanislavb"
+        },
+        {
+          "href": "item?id=50204125",
+          "index": 48,
+          "tag": "a",
+          "text": "2 hours ago"
+        },
+        {
+          "href": "hide?id=50204125&goto=news",
+          "index": 49,
+          "tag": "a",
+          "text": "hide"
+        },
+        {
+          "href": "item?id=50204125",
+          "index": 50,
+          "tag": "a",
+          "text": "10 comments"
+        },
+        {
+          "href": "vote?id=50173516&how=up&goto=news",
+          "id": "up_50173516",
+          "index": 51,
+          "selector": "#up_50173516",
+          "tag": "a"
+        },
+        {
+          "href": "https://jamanetwork.com/journals/jamanetworkopen/fullarticle/2855472",
+          "index": 52,
+          "tag": "a",
+          "text": "Mortality Among People with Attention-Deficit/Hyperactivity Disorder"
+        },
+        {
+          "href": "from?site=jamanetwork.com",
+          "index": 53,
+          "tag": "a",
+          "text": "jamanetwork.com"
+        },
+        {
+          "href": "user?id=gumby",
+          "index": 54,
+          "tag": "a",
+          "text": "gumby"
+        },
+        {
+          "href": "item?id=50173516",
+          "index": 55,
+          "tag": "a",
+          "text": "4 hours ago"
+        },
+        {
+          "href": "hide?id=50173516&goto=news",
+          "index": 56,
+          "tag": "a",
+          "text": "hide"
+        },
+        {
+          "href": "item?id=50173516",
+          "index": 57,
+          "tag": "a",
+          "text": "44 comments"
+        },
+        {
+          "href": "vote?id=50194833&how=up&goto=news",
+          "id": "up_50194833",
+          "index": 58,
+          "selector": "#up_50194833",
+          "tag": "a"
+        },
+        {
+          "href": "https://www.404media.co/amanda-smith-opened-a-cashapp-in-her-name-she-faces-years-in-prison-cashapp-fraud/",
+          "index": 59,
+          "tag": "a",
+          "text": "Woman charged with computer fraud due to scam CashApp account being in her name"
+        }
+      ],
+      "scope": {
+        "label": "document body",
+        "strategy": "document-filtered"
+      },
+      "title": "Hacker News",
+      "url": "https://news.ycombinator.com/"
+    },
+    "take_snapshot": {
+      "snapshot": "Page: Hacker News — https://news.ycombinator.com/\n@e1 link\n@e2 link \"Hacker News\"\n@e3 link \"new\"\n@e4 link \"past\"\n@e5 link \"comments\"\n@e6 link \"ask\"\n@e7 link \"show\"\n@e8 link \"jobs\"\n@e9 link \"submit\"\n@e10 link \"login\"\n@e11 link\n@e12 link \"Move Slow and Fix Things\"\n@e13 link \"endler.dev\"\n@e14 link \"ahmedhossamdev\"\n@e15 link \"26 minutes ago\"\n@e16 link \"hide\"\n@e17 link \"discuss\"\n@e18 link\n@e19 link \"Docker is weird\"\n@e20 link \"codeandcake.dev\"\n@e21 link \"psxuaw\"\n@e22 link \"5 hours ago\"\n@e23 link \"hide\"\n@e24 link \"142 comments\"\n@e25 link\n@e26 link \"LLMs are making formal software verification feasible at a much larger scale\"\n@e27 link \"anthropic.com\"\n@e28 link \"johnbender\"\n@e29 link \"6 hours ago\"\n@e30 link \"hide\"\n@e31 link \"129 comments\"\n@e32 link\n@e33 link \"Quad9 (DNS Resolver) to Exit France\"\n@e34 link \"quad9.net\"\n@e35 link \"farrokhi\"\n@e36 link \"15 hours ago\"\n@e37 link \"hide\"\n@e38 link \"385 comments\"\n@e39 link\n@e40 link \"The Secret Life of Circuits is now in stock everywhere\"\n@e41 link \"coredump.cx\"\n@e42 link \"surprisetalk\"\n@e43 link \"5 hours ago\"\n@e44 link \"hide\"\n@e45 link \"15 comments\"\n@e46 link\n@e47 link \"Median product \"lifespan\" has fallen from ~4y down to ~1.5y\"\n@e48 link \"stanislavb\"\n@e49 link \"2 hours ago\"\n@e50 link \"hide\"\n@e51 link \"10 comments\"\n@e52 link\n@e53 link \"Mortality Among People with Attention-Deficit/Hyperactivity Disorder\"\n@e54 link \"jamanetwork.com\"\n@e55 link \"gumby\"\n@e56 link \"4 hours ago\"\n@e57 link \"hide\"\n@e58 link \"44 comments\"\n@e59 link\n@e60 link \"Woman charged with computer fraud due to scam CashApp account being in her name\"\n@e61 link \"404media.co\"\n@e62 link \"oidar\"\n@e63 link \"16 hours ago\"\n@e64 link \"hide\"\n@e65 link \"604 comments\"\n@e66 link\n@e67 link \"OpenShell – A safe, private runtime for fleets of autonomous AI agents\"\n@e68 link \"github.com/nvidia\"\n@e69 link \"niemandhier\"\n@e70 link \"11 hours ago\"\n@e71 link \"hide\"\n@e72 link \"184 comments\"\n@e73 link\n@e74 link \"Every AI model has the same \"controversial\" take on humans\"\n@e75 link \"modelcompare.ai\"\n@e76 link \"rakannimer\"\n@e77 link \"13 hours ago\"\n@e78 link \"hide\"\n@e79 link \"351 comments\"\n@e80 link\n@e81 link \"Run full iOS 16.5 firmware on Android Devices\"\n@e82 link \"github.com/oosexgang\"\n@e83 link \"aghuang\"\n@e84 link \"14 hours ago\"\n@e85 link \"hide\"\n@e86 link \"136 comments\"\n@e87 link\n@e88 link \"This I Believe\"\n@e89 link \"awakin.org\"\n@e90 link \"ctoth\"\n@e91 link \"3 hours ago\"\n@e92 link \"hide\"\n@e93 link \"4 comments\"\n@e94 link\n@e95 link \"Getting ready to operate GNU Taler in Germany\"\n@e96 link \"taler.net\"\n@e97 link \"dewey\"\n@e98 link \"13 hours ago\"\n@e99 link \"hide\"\n@e100 link \"99 comments\"\n@e101 link\n@e102 link \"Jank – The native Clojure dialect with seamless C++ interop\"\n@e103 link \"jank-lang.org\"\n@e104 link \"giancarlostoro\"\n@e105 link \"5 hours ago\"\n@e106 link \"hide\"\n@e107 link \"2 comments\"\n@e108 link\n@e109 link \"The foolishness of \"natural language programming\" (1978)\"\n@e110 link \"utexas.edu\"\n@e111 link \"xiaoyu2006\"\n@e112 link \"4 hours ago\"\n@e113 link \"hide\"\n@e114 link \"60 comments\"\n@e115 link\n@e116 link \"Why My Asus Laptop Kept Rebooting After Sleep and How to Fix It\"\n@e117 link \"idiallo.com\"\n@e118 link \"surprisetalk\"\n@e119 link \"4 hours ago\"\n@e120 link \"hide\"\n@e121 link \"17 comments\"\n@e122 link\n@e123 link \"Postgres recovery_prefetch can cause outages\"\n@e124 link \"ardentperf.com\"\n@e125 link \"plaur782\"\n@e126 link \"4 hours ago\"\n@e127 link \"hide\"\n@e128 link \"discuss\"\n@e129 link\n@e130 link \"What Is Gridifcation\"\n@e131 link \"musicalform.substack.com\"\n@e132 link \"gumby\"\n@e133 link \"18 hours ago\"\n@e134 link \"hide\"\n@e135 link \"207 comments\"\n@e136 link\n@e137 link \"Tell HN: I unknowingly broke the PHP RCE embargo. I am sorry.\"\n@e138 link \"petecooper\"\n@e139 link \"19 hours ago\"\n@e140 link \"hide\"\n@e141 link \"188 comments\"\n@e142 link\n@e143 link \"Hedra is a 3D open world game I wrote from scratch while in highschool\"\n@e144 link \"github.com/maxilevi\"\n@e145 link \"maxilevi\"\n@e146 link \"10 hours ago\"\n@e147 link \"hide\"\n@e148 link \"31 comments\"\n@e149 link\n@e150 link \"Xbox wants you to pay 24 to 40 cents per hour to stream games you bought\"\n@e151 link \"arstechnica.com\"\n@e152 link \"entryleveljobsc\"\n@e153 link \"17 hours ago\"\n@e154 link \"hide\"\n@e155 link \"231 comments\"\n@e156 link\n@e157 link \"eMudhra to exit global SSL/TLS certificate business\"\n@e158 link \"emudhra.com\"\n@e159 link \"bo0tzz\"\n@e160 link \"16 hours ago\"\n@e161 link \"hide\"\n@e162 link \"664 comments\"\n@e163 link\n@e164 link \"Railpass\"\n@e165 link \"samismith.com\"\n@e166 link \"CharlesW\"\n@e167 link \"8 hours ago\"\n@e168 link \"hide\"\n@e169 link \"23 comments\"\n@e170 link\n@e171 link \"Mapping the Northern Sky\"\n@e172 link \"maps.com\"\n@e173 link \"tmseidman\"\n@e174 link \"5 hours ago\"\n@e175 link \"hide\"\n@e176 link \"10 comments\"\n@e177 link\n@e178 link \"AI and the Enclosure of the Scientific Commons\"\n@e179 link \"arxiv.org\"\n@e180 link \"jrepinc\"\n@e181 link \"11 hours ago\"\n@e182 link \"hide\"\n@e183 link \"74 comments\"\n@e184 link\n@e185 link \"Show HN: Uberblok – an interactive museum of ZFS internals\"\n@e186 link \"storagebits.workers.dev\"\n@e187 link \"storagebits\"\n@e188 link \"15 hours ago\"\n@e189 link \"hide\"\n@e190 link \"26 comments\"\n@e191 link\n@e192 link \"Faster than earcut: triangulating 3.7M map polygons in 489 ms\"\n@e193 link \"globus.software\"\n@e194 link \"molind\"\n@e195 link \"20 hours ago\"\n@e196 link \"hide\"\n@e197 link \"40 comments\"\n@e198 link\n@e199 link \"Dungeon Generation in the Gnomish Mines of NetHack\"\n@e200 link \"boristhebrave.com\"\n@e201 link \"ibobev\"\n@e202 link \"14 hours ago\"\n@e203 link \"hide\"\n@e204 link \"18 comments\"\n@e205 link\n@e206 link \"How to Design Flowers\"\n@e207 link \"asimov.press\"\n@e208 link \"surprisetalk\"\n@e209 link \"7 hours ago\"\n@e210 link \"hide\"\n@e211 link \"2 comments\"\n@e212 link\n@e213 link \"Jailbreaking the Switch 2\"\n@e214 link \"pepsipu.com\"\n@e215 link \"ledoge\"\n@e216 link \"21 hours ago\"\n@e217 link \"hide\"\n@e218 link \"266 comments\"\n@e219 link \"More\"\n@e220 link \"Consider applying for YC's Winter 2027 batch! Applications are open till Novembe\"\n@e221 link \"Guidelines\"\n@e222 link \"FAQ\"\n@e223 link \"Lists\"\n@e224 link \"API\"\n@e225 link \"Security\"\n@e226 link \"Legal\"\n@e227 link \"Apply to YC\"\n@e228 link \"Contact\"\n@e229 textbox\n(229 interactive elements. Pass ref:\"@eN\" to click, type_text, hover or select_option.)",
+      "url": "https://news.ycombinator.com/"
+    },
+    "extract_text": {
+      "text": "\tHacker Newsnew | past | comments | ask | show | jobs | submit\tlogin\n\n\n\n1.\t\n\tMove Slow and Fix Things (endler.dev)\n\t20 points by ahmedhossamdev 26 minutes ago | hide | discuss\n\n2.\t\n\tDocker is weird (codeandcake.dev)\n\t289 points by psxuaw 5 hours ago | hide | 142 comments\n\n3.\t\n\tLLMs are making formal software verification feasible at a much larger scale (anthropic.com)\n\t233 points by johnbender 6 hours ago | hide | 129 comments\n\n4.\t\n\tQuad9 (DNS Resolver) to Exit France (quad9.net)\n\t1090 points by farrokhi 15 hours ago | hide | 385 comments\n\n5.\t\n\tThe Secret Life of Circuits is now in stock everywhere (coredump.cx)\n\t81 points by surprisetalk 5 hours ago | hide | 15 comments\n\n6.\t\n\tMedian product \"lifespan\" has fallen from ~4y down to ~1.5y\n\t30 points by stanislavb 2 hours ago | hide | 10 comments\n\n7.\t\n\tMortality Among People with Attention-Deficit/Hyperactivity Disorder (jamanetwork.com)\n\t75 points by gumby 4 hours ago | hide | 44 comments\n\n8.\t\n\tWoman charged with computer fraud due to scam CashApp account being in her name (404media.co)\n\t612 points by oidar 16 hours ago | hide | 604 comments\n\n9.\t\n\tOpenShell – A safe, private runtime for fleets of autonomous AI agents (github.com/nvidia)\n\t348 points by niemandhier 11 hours ago | hide | 184 comments\n\n10.\t\n\tEvery AI model has the same \"controversial\" take on humans (modelcompare.ai)\n\t317 points by rakannimer 13 hours ago | hide | 351 comments\n\n11.\t\n\tRun full iOS 16.5 firmware on Android Devices (github.com/oosexgang)\n\t370 points by aghuang 14 hours ago | hide | 136 comments\n\n12.\t\n\tThis I Believe (awakin.org)\n\t26 points by ctoth 3 hours ago | hide | 4 comments\n\n13.\t\n\tGetting ready to operate GNU Taler in Germany (taler.net)\n\t247 points by dewey 13 hours ago | hide | 99 comments\n\n14.\t\n\tJank – The native Clojure dialect with seamless C++ interop (jank-lang.org)\n\t56 points by giancarlostoro 5 hours ago | hide | 2 comments\n\n15.\t\n\tThe foolishness of \"natural language programming\" (1978) (utexas.edu)\n\t86 points by xiaoyu2006 4 hours ago | hide | 60 comments\n\n16.\t\n\tWhy My Asus Laptop Kept Rebooting After Sleep and How to Fix It (idiallo.com)\n\t26 points by surprisetalk 4 hours ago | hide | 17 comments\n\n17.\t\n\tPostgres recovery_prefetch can cause outages (ardentperf.com)\n\t28 points by plaur782 4 hours ago | hide | discuss\n\n18.\t\n\tWhat Is Gridifcation (musicalform.substack.com)\n\t436 points by gumby 18 hours ago | hide | 207 comments\n\n19.\t\n\tTell HN: I unknowingly broke the PHP RCE embargo. I am sorry.\n\t462 points by petecooper 19 hours ago | hide | 188 comments\n\n20.\t\n\tHedra is a 3D open world game I wrote from scratch while in highschool (github.com/maxilevi)\n\t171 points by maxilevi 10 hours ago | hide | 31 comments\n\n21.\t\n\tXbox wants you to pay 24 to 40 cents per hour to stream games you bought (arstechnica.com)\n\t265 points by entryleveljobsc 17 hours ago | hide | 231 comments\n\n22.\t\n\teMudhra to exit global SSL/TLS certificate business (emudhra.com)\n\t992 points by bo0tzz 16 hours ago | hide | 664 comments\n\n23.\t\n\tRailpass (samismith.com)\n\t79 points by CharlesW 8 hours ago | hide | 23 comments\n\n24.\t\n\tMapping the Northern Sky (maps.com)\n\t28 points by tmseidman 5 hours ago | hide | 10 comments\n\n25.\t\n\tAI and the Enclosure of the Scientific Commons (arxiv.org)\n\t128 points by jrepinc 11 hours ago | hide | 74 comments\n\n26.\t\n\tShow HN: Uberblok – an interactive museum of ZFS internals (storagebits.workers.dev)\n\t103 points by storagebits 15 hours ago | hide | 26 comments\n\n27.\t\n\tFaster than earcut: triangulating 3.7M map polygons in 489 ms (globus.software)\n\t211 points by molind 20 hours ago | hide | 40 comments\n\n28.\t\n\tDungeon Generation in the Gnomish Mines of NetHack (boristhebrave.com)\n\t137 points by ibobev 14 hours ago | hide | 18 comments\n\n29.\t\n\tHow to Design Flowers (asimov.press)\n\t26 points by surprisetalk 7 hours ago | hide | 2 comments\n\n30.\t\n\tJailbreaking the Switch 2 (pepsipu.com)\n\t763 points by ledoge 21 hours ago | hide | 266 comments\n\n\n\tMore\n\n\n\n\nConsider applying for YC's Winter 2027 batch! Applications are open till November 2.\n\n\nGuidelines | FAQ | Lists | API | Security | Legal | Apply to YC | Contact\n\n\nSearch: "
+    }
+  },
+  "evals": {
+    "hn_top5": {
+      "success": true,
+      "result": [
+        {
+          "comments": 0,
+          "points": 20,
+          "title": "Move Slow and Fix Things"
+        },
+        {
+          "comments": 142,
+          "points": 289,
+          "title": "Docker is weird"
+        },
+        {
+          "comments": 129,
+          "points": 233,
+          "title": "LLMs are making formal software verification feasible at a much larger scale"
+        },
+        {
+          "comments": 385,
+          "points": 1090,
+          "title": "Quad9 (DNS Resolver) to Exit France"
+        },
+        {
+          "comments": 15,
+          "points": 81,
+          "title": "The Secret Life of Circuits is now in stock everywhere"
+        }
+      ]
+    }
+  }
+}

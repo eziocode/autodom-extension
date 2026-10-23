@@ -217,6 +217,11 @@ return links.filter((h) => h.includes("/docs/")).slice(0, 10);
   notified) instead of waiting. A scheduled script runs only while a bridge
   is connected, that is while an MCP client has AutoDOM running; otherwise
   the run is `skipped` and notified.
+- Measured cost: [docs/CODE_MODE.md](docs/CODE_MODE.md). On three recorded
+  tasks, `AUTODOM_CODE_MODE=only` read 86-92% less input than the standard
+  tools. Most of that is the smaller tool list; leaving the tool list out, it
+  read 53-79% less than the standard tools used the usual way, and about the
+  same as an agent that already uses `execute_code` well.
 - Globals: `autodom.<tool>(params)` for 104 tools, `page.eval(fn, ...args)`
   (runs `fn` in the active tab through `execute_code`), `emitImage(ref)`,
   `sleep(ms)`, `console`. No `fetch`, `require`, timers or filesystem.

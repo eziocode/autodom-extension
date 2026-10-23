@@ -1,0 +1,40 @@
+{
+  "url": "https://en.wikipedia.org/wiki/WebAssembly",
+  "capturedAt": "2026-10-23T05:40:56.371Z",
+  "results": {
+    "navigate": {
+      "success": true,
+      "url": "https://en.wikipedia.org/wiki/WebAssembly",
+      "title": "WebAssembly - Wikipedia",
+      "status": "complete",
+      "loaded": true,
+      "elapsedMs": 115
+    },
+    "get_page_info": {
+      "forms": 2,
+      "images": 11,
+      "lang": "en",
+      "links": 1502,
+      "metas": {
+        "ResourceLoaderDynamicStyles": "",
+        "format-detection": "telephone=no",
+        "generator": "MediaWiki 1.47.0-wmf.24",
+        "mw:PageProp/toc": null,
+        "og:image": "https://thumb.wikimedia.org/wikipedia/commons/thumb/1/1f/WebAssembly_Logo.svg/1280px-WebAssembly_Logo.svg.png?utm_source=en.wikipedia.org&utm_campaign=index&utm_content=thumbnail",
+        "og:image:height": "1200",
+        "og:image:width": "1200",
+        "og:title": "WebAssembly - Wikipedia",
+        "og:type": "website",
+        "referrer": "origin-when-cross-origin",
+        "robots": "max-image-preview:standard",
+        "viewport": "width=1120"
+      },
+      "readyState": "complete",
+      "title": "WebAssembly - Wikipedia",
+      "url": "https://en.wikipedia.org/wiki/WebAssembly",
+      "tabId": 1249072820,
+      "windowId": 1249072731
+    }
+  },
+  "evals": {}
+}

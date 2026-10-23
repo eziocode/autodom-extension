@@ -1,0 +1,514 @@
+{
+  "url": "https://en.wikipedia.org/wiki/WebAssembly",
+  "capturedAt": "2026-10-23T05:40:55.242Z",
+  "results": {
+    "navigate": {
+      "success": true,
+      "url": "https://en.wikipedia.org/wiki/WebAssembly",
+      "title": "WebAssembly - Wikipedia",
+      "status": "complete",
+      "loaded": true,
+      "elapsedMs": 591
+    },
+    "get_page_info": {
+      "forms": 2,
+      "images": 11,
+      "lang": "en",
+      "links": 1502,
+      "metas": {
+        "ResourceLoaderDynamicStyles": "",
+        "format-detection": "telephone=no",
+        "generator": "MediaWiki 1.47.0-wmf.24",
+        "mw:PageProp/toc": null,
+        "og:image": "https://thumb.wikimedia.org/wikipedia/commons/thumb/1/1f/WebAssembly_Logo.svg/1280px-WebAssembly_Logo.svg.png?utm_source=en.wikipedia.org&utm_campaign=index&utm_content=thumbnail",
+        "og:image:height": "1200",
+        "og:image:width": "1200",
+        "og:title": "WebAssembly - Wikipedia",
+        "og:type": "website",
+        "referrer": "origin-when-cross-origin",
+        "robots": "max-image-preview:standard",
+        "viewport": "width=1120"
+      },
+      "readyState": "complete",
+      "title": "WebAssembly - Wikipedia",
+      "url": "https://en.wikipedia.org/wiki/WebAssembly",
+      "tabId": 1249072820,
+      "windowId": 1249072731
+    },
+    "get_dom_state": {
+      "elementCount": 60,
+      "elements": [
+        {
+          "href": "https://en.wikipedia.org/wiki/File:WebAssembly_Logo.svg",
+          "index": 0,
+          "tag": "a"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Programming_paradigm",
+          "index": 1,
+          "tag": "a",
+          "text": "Paradigm"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Structured_programming",
+          "index": 2,
+          "tag": "a",
+          "text": "structured"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Stack_machine",
+          "index": 3,
+          "tag": "a",
+          "text": "stack machine"
+        },
+        {
+          "href": "#cite_note-1",
+          "id": "mwCA",
+          "index": 4,
+          "selector": "#mwCA",
+          "tag": "a",
+          "text": "[1]"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Software_design",
+          "index": 5,
+          "tag": "a",
+          "text": "Designed by"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/World_Wide_Web_Consortium",
+          "index": 6,
+          "tag": "a",
+          "text": "W3C"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Software_developer",
+          "index": 7,
+          "tag": "a",
+          "text": "Developer"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/World_Wide_Web_Consortium",
+          "index": 8,
+          "tag": "a",
+          "text": "W3C"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Mozilla",
+          "index": 9,
+          "tag": "a",
+          "text": "Mozilla"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Microsoft",
+          "index": 10,
+          "tag": "a",
+          "text": "Microsoft"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Google",
+          "index": 11,
+          "tag": "a",
+          "text": "Google"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Apple_Inc.",
+          "index": 12,
+          "tag": "a",
+          "text": "Apple"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Operating_system",
+          "index": 13,
+          "tag": "a",
+          "text": "OS"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Platform_independent",
+          "index": 14,
+          "tag": "a",
+          "text": "Platform independent"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Software_license",
+          "index": 15,
+          "tag": "a",
+          "text": "License"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Apache_License_2.0",
+          "index": 16,
+          "tag": "a",
+          "text": "Apache License 2.0"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Filename_extension",
+          "index": 17,
+          "tag": "a",
+          "text": "Filename extensions"
+        },
+        {
+          "href": "https://webassembly.org/",
+          "index": 18,
+          "tag": "a",
+          "text": "webassembly.org"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Asm.js",
+          "index": 19,
+          "tag": "a",
+          "text": "asm.js"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Google_Native_Client",
+          "index": 20,
+          "tag": "a",
+          "text": "PNaCl"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Lisp_(programming_language)",
+          "index": 21,
+          "tag": "a",
+          "text": "Lisp"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Software_portability",
+          "id": "mwDw",
+          "index": 22,
+          "selector": "#mwDw",
+          "tag": "a",
+          "text": "portable"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Binary_code",
+          "id": "mwEA",
+          "index": 23,
+          "selector": "#mwEA",
+          "tag": "a",
+          "text": "binary code"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Executable",
+          "id": "mwEQ",
+          "index": 24,
+          "selector": "#mwEQ",
+          "tag": "a",
+          "text": "executable"
+        },
+        {
+          "href": "#cite_note-2",
+          "id": "mwEg",
+          "index": 25,
+          "selector": "#mwEg",
+          "tag": "a",
+          "text": "[2]"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Software",
+          "id": "mwFg",
+          "index": 26,
+          "selector": "#mwFg",
+          "tag": "a",
+          "text": "software"
+        },
+        {
+          "href": "#cite_note-3",
+          "id": "mwFw",
+          "index": 27,
+          "selector": "#mwFw",
+          "tag": "a",
+          "text": "[3]"
+        },
+        {
+          "href": "#cite_note-4",
+          "id": "mwGw",
+          "index": 28,
+          "selector": "#mwGw",
+          "tag": "a",
+          "text": "[4]"
+        },
+        {
+          "href": "#cite_note-:0-5",
+          "id": "mwHw",
+          "index": 29,
+          "selector": "#mwHw",
+          "tag": "a",
+          "text": "[5]"
+        },
+        {
+          "href": "#cite_note-6",
+          "id": "mwIw",
+          "index": 30,
+          "selector": "#mwIw",
+          "tag": "a",
+          "text": "[6]"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Web_page",
+          "id": "mwKA",
+          "index": 31,
+          "selector": "#mwKA",
+          "tag": "a",
+          "text": "web pages"
+        },
+        {
+          "href": "#cite_note-7",
+          "id": "mwKQ",
+          "index": 32,
+          "selector": "#mwKQ",
+          "tag": "a",
+          "text": "[7]"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Open_standard",
+          "id": "mwLQ",
+          "index": 33,
+          "selector": "#mwLQ",
+          "tag": "a",
+          "text": "open standard"
+        },
+        {
+          "href": "#cite_note-8",
+          "id": "mwLg",
+          "index": 34,
+          "selector": "#mwLg",
+          "tag": "a",
+          "text": "[8]"
+        },
+        {
+          "href": "#cite_note-:1-9",
+          "id": "mwMg",
+          "index": 35,
+          "selector": "#mwMg",
+          "tag": "a",
+          "text": "[9]"
+        },
+        {
+          "href": "#cite_note-Wasmer-10",
+          "id": "mwNg",
+          "index": 36,
+          "selector": "#mwNg",
+          "tag": "a",
+          "text": "[10]"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/World_Wide_Web_Consortium",
+          "id": "mwPw",
+          "index": 37,
+          "selector": "#mwPw",
+          "tag": "a",
+          "text": "World Wide Web Consortium"
+        },
+        {
+          "href": "#cite_note-11",
+          "id": "mwQA",
+          "index": 38,
+          "selector": "#mwQA",
+          "tag": "a",
+          "text": "[11]"
+        },
+        {
+          "href": "#cite_note-12",
+          "id": "mwRA",
+          "index": 39,
+          "selector": "#mwRA",
+          "tag": "a",
+          "text": "[12]"
+        },
+        {
+          "href": "#cite_note-13",
+          "id": "mwSA",
+          "index": 40,
+          "selector": "#mwSA",
+          "tag": "a",
+          "text": "[13]"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Association_for_Computing_Machinery",
+          "id": "mwTQ",
+          "index": 41,
+          "selector": "#mwTQ",
+          "tag": "a",
+          "text": "Association for Computing Machinery"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/SIGPLAN",
+          "id": "mwTg",
+          "index": 42,
+          "selector": "#mwTg",
+          "tag": "a",
+          "text": "SIGPLAN"
+        },
+        {
+          "href": "#cite_note-14",
+          "id": "mwTw",
+          "index": 43,
+          "selector": "#mwTw",
+          "tag": "a",
+          "text": "[14]"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Mozilla",
+          "id": "mwUw",
+          "index": 44,
+          "selector": "#mwUw",
+          "tag": "a",
+          "text": "Mozilla"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Microsoft",
+          "id": "mwVA",
+          "index": 45,
+          "selector": "#mwVA",
+          "tag": "a",
+          "text": "Microsoft"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Google",
+          "id": "mwVQ",
+          "index": 46,
+          "selector": "#mwVQ",
+          "tag": "a",
+          "text": "Google"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Apple_Inc.",
+          "id": "mwVg",
+          "index": 47,
+          "selector": "#mwVg",
+          "tag": "a",
+          "text": "Apple"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Fastly",
+          "id": "mwVw",
+          "index": 48,
+          "selector": "#mwVw",
+          "tag": "a",
+          "text": "Fastly"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Intel",
+          "id": "mwWA",
+          "index": 49,
+          "selector": "#mwWA",
+          "tag": "a",
+          "text": "Intel"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Red_Hat",
+          "id": "mwWQ",
+          "index": 50,
+          "selector": "#mwWQ",
+          "tag": "a",
+          "text": "Red Hat"
+        },
+        {
+          "href": "#cite_note-ars-15",
+          "id": "mwWg",
+          "index": 51,
+          "selector": "#mwWg",
+          "tag": "a",
+          "text": "[15]"
+        },
+        {
+          "href": "#cite_note-bytecode-16",
+          "id": "mwXg",
+          "index": 52,
+          "selector": "#mwXg",
+          "tag": "a",
+          "text": "[16]"
+        },
+        {
+          "href": "/w/index.php?title=WebAssembly&action=edit&section=1",
+          "index": 53,
+          "tag": "a",
+          "text": "edit"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Assembly_language",
+          "id": "mwZQ",
+          "index": 54,
+          "selector": "#mwZQ",
+          "tag": "a",
+          "text": "assembly language"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/World_Wide_Web",
+          "id": "mwZg",
+          "index": 55,
+          "selector": "#mwZg",
+          "tag": "a",
+          "text": "World Wide Web"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Client–server_model",
+          "id": "mwZw",
+          "index": 56,
+          "selector": "#mwZw",
+          "tag": "a",
+          "text": "client-side"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Web_browser",
+          "id": "mwaA",
+          "index": 57,
+          "selector": "#mwaA",
+          "tag": "a",
+          "text": "web browser"
+        },
+        {
+          "href": "#cite_note-Launch_bug-17",
+          "id": "mwag",
+          "index": 58,
+          "selector": "#mwag",
+          "tag": "a",
+          "text": "[17]"
+        },
+        {
+          "href": "https://en.wikipedia.org/wiki/Unity_(game_engine)",
+          "id": "mwbg",
+          "index": 59,
+          "selector": "#mwbg",
+          "tag": "a",
+          "text": "Unity"
+        }
+      ],
+      "scope": {
+        "label": "main #content",
+        "strategy": "main-root"
+      },
+      "title": "WebAssembly - Wikipedia",
+      "url": "https://en.wikipedia.org/wiki/WebAssembly"
+    },
+    "take_snapshot": {
+      "snapshot": "Page: WebAssembly - Wikipedia — https://en.wikipedia.org/wiki/WebAssembly\n@e1 link \"Jump to content\"\n@e2 button \"Main menu\"\n@e3 link\n@e4 searchbox \"Search Wikipedia\"\n@e5 button \"Search\"\n@e7 link \"Donate\"\n@e8 link \"Create account\"\n@e9 link \"Log in\"\n@e11 button \"Hide Contents\"\n@e12 link \"(Top)\"\n@e13 link \"History\"\n@e14 link \"Implementations\"\n@e15 button \"Toggle Implementations subsection\"\n@e16 link \"Web browsers\"\n@e17 link \"Non-browser runtimes\"\n@e18 link \"Compilers\"\n@e19 link \"Compiler toolchains\"\n@e20 link \"Language support\"\n@e21 link \"Limits\"\n@e22 link \"Security considerations\"\n@e23 link \"Performance\"\n@e24 link \"WASI\"\n@e25 link \"Specification\"\n@e26 button \"Toggle Specification subsection\"\n@e27 link \"Host environment\"\n@e28 link \"Virtual machine\"\n@e29 link \"Wasm program\"\n@e30 link \"Instruction set\"\n@e31 link \"Code representation\"\n@e32 link \"Memory and variables\"\n@e33 link \"Control flow\"\n@e34 link \"Functions\"\n@e35 link \"See also\"\n@e36 link \"Notes\"\n@e37 link \"References\"\n@e38 link \"External links\"\n@e40 button \"28 languages\"\n@e41 link \"Article\"\n@e42 link \"Talk\"\n@e44 link \"Read\"\n@e45 link \"Edit\"\n@e46 link \"View history\"\n@e47 button \"Tools\"\n@e48 button \"Hide Appearance\"\n@e49 link\n@e50 link \"Paradigm\"\n@e51 link \"structured\"\n@e52 link \"stack machine\"\n@e53 link \"[1]\"\n@e54 link \"Designed by\"\n@e55 link \"W3C\"\n@e56 link \"Developer\"\n@e57 link \"W3C\"\n@e58 link \"Mozilla\"\n@e59 link \"Microsoft\"\n@e60 link \"Google\"\n@e61 link \"Apple\"\n@e62 link \"OS\"\n@e63 link \"Platform independent\"\n@e64 link \"License\"\n@e65 link \"Apache License 2.0\"\n@e66 link \"Filename extensions\"\n@e67 link \"webassembly.org\"\n@e68 link \"asm.js\"\n@e69 link \"PNaCl\"\n@e70 link \"Lisp\"\n@e71 link \"portable\"\n@e72 link \"binary code\"\n@e73 link \"executable\"\n@e74 link \"[2]\"\n@e75 link \"software\"\n@e76 link \"[3]\"\n@e77 link \"[4]\"\n@e78 link \"[5]\"\n@e79 link \"[6]\"\n@e80 link \"web pages\"\n@e81 link \"[7]\"\n@e82 link \"open standard\"\n@e83 link \"[8]\"\n@e84 link \"[9]\"\n@e85 link \"[10]\"\n@e86 link \"World Wide Web Consortium\"\n@e87 link \"[11]\"\n@e88 link \"[12]\"\n@e89 link \"[13]\"\n@e90 link \"Association for Computing Machinery\"\n@e91 link \"SIGPLAN\"\n@e92 link \"[14]\"\n@e93 link \"Mozilla\"\n@e94 link \"Microsoft\"\n@e95 link \"Google\"\n@e96 link \"Apple\"\n@e97 link \"Fastly\"\n@e98 link \"Intel\"\n@e99 link \"Red Hat\"\n@e100 link \"[15]\"\n@e101 link \"[16]\"\n@e102 link \"edit\"\n@e103 link \"assembly language\"\n@e104 link \"World Wide Web\"\n@e105 link \"client-side\"\n@e106 link \"web browser\"\n@e107 link \"[17]\"\n@e108 link \"Unity\"\n@e109 link \"Firefox\"\n@e110 link \"[18]\"\n@e111 link \"Google Chrome\"\n@e112 link \"[19]\"\n@e113 link \"Microsoft Edge [Legacy]\"\n@e114 link \"[20]\"\n@e115 link \"asm.js\"\n@e116 link \"Mozilla\"\n@e117 link \"Google Native Client\"\n@e118 link \"[21]\"\n@e119 link \"[22]\"\n@e120 link \"[23]\"\n@e121 link \"[note 1]\"\n@e122 link \"minimum viable product\"\n@e123 link \"[25]\"\n@e124 link \"Safari 11\"\n@e125 link \"[26]\"\n@e126 link \"[27]\"\n@e127 link \"[28]\"\n@e128 link \"[29]\"\n@e129 link \"C\"\n@e130 link \"C++\"\n@e131 link \"[30]\"\n@e132 link \"[31]\"\n@e133 link \"[32]\"\n@e134 link \"[33]\"\n@e135 link \"single instruction, multiple data\"\n@e136 link \"[34]\"\n@e137 link \"64-bit\"\n@e138 link \"[35]\"\n@e139 link \"[36]\"\n@e140 link \"[37]\"\n@e141 link \".NET\"\n@e142 link \"runtime\"\n@e143 link \"[38]\"\n@e144 link \"edit\"\n@e145 link \"[39]\"\n@e146 link \"[40]\"\n@e147 link \"virtual stack machine\"\n@e148 link \"JVM\"\n@e149 link \"Flash VM\"\n@e150 link \"Wasmtime\"\n@e151 link \"d\"\n@e152 link \"WebAssembly Micro Runtime\"\n@e153 link \"d\"\n@e154 link \"Wasmer\"\n@e155 link \"d\"\n@e156 link \"WasmEdge\"\n@e157 link \"d\"\n@e158 link \"wazero\"\n@e159 link \"d\"\n@e160 link \"[9]\"\n@e161 link \"[10]\"\n@e162 link \"application servers\"\n@e163 link \"plug-in\"\n@e164 link \"application binary interface\"\n@e165 link \"proxy servers\"\n@e166 link \"[41]\"\n@e167 link \"[42]\"\n@e168 link \"edit\"\n@e169 link \"[43]\"\n@e170 link \"[44]\"\n@e171 link \"[45]\"\n@e172 link \"asm.js\"\n@e173 link \"[46]\"\n@e174 link \"[47]\"\n@e175 link \"edit\"\n@e176 link \"[10]\"\n@e177 link \"[48]\"\n@e178 link \"[49]\"\n@e179 link \"[50]\"\n@e180 link \"edit\"\n@e181 link \"ahead-of-time\"\n@e182 link \"just-in-time\"\n@e183 link \"interpreter\"\n@e184 link \"edit\"\n@e185 link \"[51]\"\n@e186 link \"Emscripten\"\n@e187 link \"[25]\"\n@e188 link \"Clang\"\n@e189 link \"[52]\"\n@e190 link \"[53]\"\n@e191 link \"edit\"\n@e192 link \"[53]\"\n@e193 link \"C\"\n@e194 link \"C++\"\n@e195 link \"Clang\"\n@e196 link \"[25]\"\n@e197 link \"Rust\"\n@e198 link \"[54]\"\n@e199 link \"[53]\"\n@e200 link \"AssemblyScript\"\n@e201 link \"[55]\"\n@e202 link \"Go\"\n@e203 link \"[56]\"\n@e204 link \".NET\"\n@e205 link \"Blazor\"\n@e206 link \"Bolero\"\n@e207 link \"[57]\"\n@e208 link \"[58]\"\n@e209 link \"[59]\"\n@e210 link \"Python\"\n@e211 link \"[60]\"\n@e212 link \"Java\"\n@e213 link \"Java virtual machine\"\n@e214 link \"[61]\"\n@e215 link \"[62]\"\n@e216 link \"[63]\"\n@e217 link \"Kotlin\"\n@e218 link \"[64]\"\n@e219 link \"[65]\"\n@e220 link \"Haskell\"\n@e221 link \"Glasgow Haskell Compiler\"\n@e222 link \"[66]\"\n@e223 link \"Julia\"\n@e224 link \"[67]\"\n@e225 link \"Ruby\"\n@e226 link \"[68]\"\n@e227 link \"[69]\"\n@e228 link \"Dart\"\n@e229 link \"[70]\"\n@e230 link \"Scheme\"\n@e231 link \"GNU Guile\"\n@e232 link \"[71]\"\n@e233 link \"edit\"\n@e234 link \"Web browsers\"\n@e235 link \"Document Object Model\"\n@e236 link \"JavaScript\"\n@e237 link \"[note 2]\"\n@e238 link \"§ WASI\"\n@e239 link \"[74]\"\n@e240 link \"[75]\"\n@e241 link \"[76]\"\n@e242 link \"[77]\"\n@e243 link \"[78]\"\n@e244 link \"[78]\"\n@e245 link \"edit\"\n@e246 link \"Spectre\"\n@e247 link \"Meltdown\"\n@e248 link \"threads\"\n@e249 link \"[79]\"\n@e250 link \"[80]\"\n@e251 link \"[81]\"\n@e252 link \"malware\"\n@e253 link \"phishing\"\n@e254 link \"[82]\"\n@e255 link \"crypto mining\"\n@e256 link \"[82]\"\n@e257 link \"[83]\"\n@e258 link \"citation needed\"\n@e259 link \"Technische Universität Braunschweig\"\n@e260 link \"[84]\"\n@e261 link \"[85]\"\n@e262 link \"Universität Stuttgart\"\n@e263 link \"[86]\"\n@e264 link \"control flow\"\n@e265 link \"symbolic execution\"\n@e266 link \"[87]\"\n@e267 link \"edit\"\n@e268 link \"citation needed\"\n@e269 link \"University of Massachusetts Amherst\"\n@e270 link \"[88]\"\n@e271 link \"SPEC CPU\"\n@e272 link \"Just-in-time compilation\"\n@e273 link \"[89]\"\n@e274 link \"[90]\"\n@e275 link \"startup company\"\n@e276 link \"[91]\"\n@e277 link \"web apps\"\n@e278 link \"Rust\"\n@e279 link \"Figma\"\n@e280 link \"C++\"\n@e281 link \"WebGL\"\n@e282 link \"[92]\"\n@e283 link \"[note 3]\"\n@e284 link \"[94]\"\n@e285 link \"edit\"\n@e286 link \"application binary interface\"\n@e287 link \"application programming interface\"\n@e288 link \"Mozilla\"\n@e289 link \"[95]\"\n@e290 link \"POSIX\"\n@e291 link \"input/output\"\n@e292 link \"capability-based security\"\n@e293 link \"[96]\"\n@e294 link \"[97]\"\n@e295 link \"[98]\"\n@e296 link \"[99]\"\n@e297 link \"CloudABI\"\n@e298 link \"Capsicum\"\n@e299 link \"[100]\"\n@e300 link \"Solomon Hykes\"\n(296 interactive elements, capped at 300. Pass ref:\"@eN\" to click, type_text, hover or select_option.)",
+      "url": "https://en.wikipedia.org/wiki/WebAssembly"
+    },
+    "extract_text": {
+      "text": "Jump to content\nMain menu\nSearch\nDonate\nCreate account\nLog in\nContents hide\n(Top)\nHistory\nImplementations\nToggle Implementations subsection\nWeb browsers\nNon-browser runtimes\nCompilers\nCompiler toolchains\nLanguage support\nLimits\nSecurity considerations\nPerformance\nWASI\nSpecification\nToggle Specification subsection\nHost environment\nVirtual machine\nWasm program\nInstruction set\nCode representation\nMemory and variables\nControl flow\nFunctions\nSee also\nNotes\nReferences\nExternal links\nWebAssembly\n28 languages\nArticle\nTalk\nRead\nEdit\nView history\nTools\nAppearance hide\nFrom Wikipedia, the free encyclopedia\nWebAssembly\n\nParadigm\tstructured; stack machine[1]\nDesigned by\tW3C\nDeveloper\t\nW3C\nMozilla\nMicrosoft\nGoogle\nApple\n\nFirst appeared\tMarch 2017; 9 years ago\nOS\tPlatform independent\nLicense\tApache License 2.0\nFilename extensions\t\n.wat (text format)\n.wasm (binary format)\n\nWebsite\twebassembly.org\nInfluenced by\n\nasm.jsPNaClLisp\n\nWebAssembly (Wasm) defines a portable binary code format and a corresponding text format for executable programs[2] and software interfaces for facilitating communication between such programs and their host environment.[3][4][5][6]\n\nThe main goal of WebAssembly is to facilitate high-performance applications on web pages, but it is also designed to be usable in non-web environments.[7] It is an open standard[8][9] intended to support any language on any operating system,[10] and in practice many of the most popular languages already have at least some level of support.\n\nAnnounced in 2015 and first released in March 2017, WebAssembly became a World Wide Web Consortium (W3C) recommendation on 5 December 2019[11][12][13] and it received the Programming Languages Software Award from the Association for Computing Machinery (ACM) SIGPLAN in 2021.[14] The W3C maintains the standard with contributions from Mozilla, Microsoft, Google, Apple, Fastly, Intel, and Red Hat.[15][16]\n\nHistoryedit\n\nThe name \"WebAssembly\" is intended to suggest bringing assembly language programming to the World Wide Web, where it will be executed client-side, by the website-user's computer via the user's web browser. To accomplish this, WebAssembly must be much more hardware-independent than a true assembly language.\n\nWebAssembly was first announced in 2015,[17] and the first demonstration was executing Unity's Angry Bots in Firefox,[18] Google Chrome,[19] and Microsoft Edge [Legacy].[20] The precursor technologies were asm.js from Mozilla and Google Native Client,[21][22] and the initial implementation was based on the feature set of asm.js.[23][note 1]\n\nIn March 2017, the design of the minimum viable product (MVP) was declared to be finished and the preview phase ended.[25] In late September 2017, Safari 11 was released with support. In February 2018, the WebAssembly Working Group published three public working drafts for the Core Specification, JavaScript Interface, and Web API.[26][27][28][29]\n\nThe MVP was focused on low-level languages such as C and C++, with the intent to add features useful for high-level languages in a future version.[30]\n\nMultithreading is currently a draft, but has been supported by Chrome since version 75 in June 2019, Firefox version 79, and Safari version 14.1[31][32][33]\n\nThe WebAssembly 2.0 specification was finished in 2022 and became a W3C standard in December 2024. It adds many single instruction, multiple data (SIMD) related instructions and a new v128 datatype, with the ability for functions to return multiple values, mass memory initialize/copy instructions, and reference types, which are opaque pointers to objects outside of the linear memory.[34]\n\nWebAssembly 3.0 was released in September 2025. New features include a 64-bit address space, multiple address spaces, exception handling, and garbage collected struct and array types.[35] Support for garbage collection enables more efficient compiling for high-level languages,[36][37] but WasmGC from WebAssembly 3.0 lacks the abilities needed by .NET runtime.[38]\n\nImplementationsedit\n\nWhile WebAssembly was initially designed to permit near-native code execution speed in the web browser, it has been considered valuable outside of such, in more generalized contexts.[39][40] A WebAssembly runtime environment is a low-level virtual stack machine, akin to JVM or Flash VM; it can be embedded into any host application, and thus there have been created standalone WebAssembly runtime environments, including Wasmtime [d], WebAssembly Micro Runtime [d], Wasmer [d], WasmEdge [d] and wazero [d].[9][10] WebAssembly runtime environments are embedded in application servers to host \"server-side\" WebAssembly applications and in other applications to support plug-in-based software extension architectures, e.g., WebAssembly for Proxies (Proxy-Wasm) which specifies a WebAssembly-based application binary interface (ABI) to extend proxy servers.[41][42]\n\nWeb browsersedit\n\nIn November 2017, Mozilla declared support \"in all major browsers\",[43] after WebAssembly was enabled by default in Edge [Legacy] 16.[44] This support also includes mobile web browsers for iOS and Android. As of March 2024, 99% of tracked web browsers support WebAssembly (version 1.0),[45] more than for its predecessor asm.js.[46] For some extensions, from the 2.0 draft standard, support may be lower, but still more than 90% of web browsers may already support, e.g. the reference types extension.[47]\n\nNon-browser runtimesedit\n\nNon-browser WebAssembly runtimes include Wasmer,[10] Wasmtime,[48] WAMR, WAVM, wasm3, and others.[49] These systems execute precompiled Wasm modules and often provide additional APIs for embedding WebAssembly in different environments. Use cases for wasm outside the browser include plug-in interfaces and lightweight virtualization.[50]\n\nCompilersedit\n\nWebAssembly implementations generally use either ahead-of-time (AOT) or just-in-time (JIT) compiling, though some may also use an interpreter. While the first implementations appeared in web browsers, there are now many non-browser implementations for general-purpose use.\n\nCompiler toolchainsedit\n\nBecause WebAssembly executables are precompiled, a variety of programming languages can target Wasm.[51] Compiling is done either through direct output to Wasm or via intermediate virtual machines implemented in Wasm.\n\nNotable toolchains include:\n\nEmscripten, which compiles C and C++ to Wasm using Clang as a frontend, Binaryen as an optimizer, and can also target any LLVM-supported language.[25]\nStandalone Clang (version 8 and later), which supports direct compiling to Wasm.[52]\nLLVM-based workflows for languages such as Rust and AssemblyScript.[53]\nLanguage supportedit\n\nAs of 2021, around 40 programming languages support WebAssembly as a compiling target.[53] Examples include:\n\nC and C++: via Emscripten or Clang standalone.[25]\nRust: via rustc with Wasm target.[54][53]\nAssemblyScript: a TypeScript-like language compiling directly to Wasm.[55]\nGo: native WebAssembly support introduced in Go 1.11.[56]\n.NET languages: C# (via Blazor), F# (via Bolero and Blazor).[57][58][59]\nPython: implementations such as Pyodide.[60]\nJava and Java virtual machine (JVM) languages: via CheerpJ,[61] JWebAssembly,[62] and TeaVM.[63]\nKotlin: direct Wasm compiling support.[64][65]\nHaskell: supported via Glasgow Haskell Compiler (GHC) backend.[66]\nJulia: community implementations.[67]\nRuby: supported through MRuby.[68]\nRing: supported with Wasm backend.[69]\nDart: supported WebAssembly as a compiling target when building Dart and Flutter applications for the web.[70]\nScheme: GNU Guile via Hoot.[71]\nLimitsedit\n\nWeb browsers prevent WebAssembly code from directly manipulating the Document Object Model. Wasm code must defer to JavaScript for this.[note 2]\n\nIn an October 2023 survey of developers, less than half of the 303 participants were satisfied with the state of WebAssembly. A large majority cited the need for improvement in four areas: § WASI, debugging support, integration with JavaScript and browser APIs, and build tooling.[74]\n\nFor memory-intensive allocations in WebAssembly, there are \"grave limitations that make many applications infeasible to be reliably deployed on mobile browsers [..] Currently allocating more than ~300MB of memory is not reliable on Chrome on Android without resorting to Chrome-specific workarounds, nor in Safari on iOS.\"[75]\n\nAll major browsers allow WebAssembly if Content-Security-Policy is not specified, or if the value unsafe-eval is used, but behave differently otherwise;[76] Chrome requires unsafe-eval,[77][78] though a worker thread can be a workaround.[78]\n\nSecurity considerationsedit\n\nIn June 2018, a security researcher presented the possibility of using WebAssembly to circumvent browser mitigations for Spectre and Meltdown security vulnerabilities once support for threads with shared memory is added. Due to this concern, WebAssembly developers put the feature on hold.[79][80] However, in order to explore these future language extensions, Google Chrome added experimental support for the WebAssembly thread proposal in October 2018.[81]\n\nWebAssembly has been criticized for allowing greater ease of hiding the evidence for malware writers, scammers and phishing attackers; WebAssembly is present on the user's machine only in its compiled form, which \"[makes malware] detection difficult\".[82] Speed and the easy ability to conceal in WebAssembly have led to its use in hidden crypto mining within the website visitor's device.[82][83] Coinhive, a now defunct service facilitating cryptocurrency mining in website visitors' browsers, claims their \"miner uses WebAssembly and runs with about 65% of the performance of a native Miner.\"[citation needed] A June 2019 study from the Technische Universität Braunschweig analyzed the usage of WebAssembly in the Alexa top 1 million websites and found the prevalent use was for malicious crypto mining, and that malware accounted for more than half of the WebAssembly-using websites studied.[84][85] An April 2021 study from Universität Stuttgart found that since then crypto mining has been marginalized, falling to below 1% of all WebAssembly modules gathered from a wide range of sources, also including the Alexa top 1 million websites.[86]\n\nAs WebAssembly supports only structured control flow, it is amenable toward security verification techniques including symbolic execution.[87]\n\nPerformanceedit\n\nEarly on, the execution speed of a Wasm program was benchmarked to be around 91% of (or about 10% slower than) a comparable native program, not including load/instantiation time; however, various later benchmarks indicate a wide range of performance characteristics, from 33% to 200%[citation needed] of the execution speed of native code, depending on the task.\n\nIn 2019, a group of researchers from the University of Massachusetts Amherst presented a comprehensive analysis of WebAssembly's performance compared to native code.[88] This study used the SPEC CPU suite of benchmarks and a system called \"Browsix-Wasm\" to run unmodified Unix applications in the browser, thereby allowing for a test of real-world applications, finding a significant performance gap between Wasm execution and native execution; in particular, Wasm programs showed an average slowdown of 45% in Firefox and 55% in Chrome across the real-world benchmarks; peak slowdowns resulted in a Wasm program taking 2.08 times as long to run in Firefox and 2.5 times as long to run in Chrome. The paper identified several reasons for this performance difference, including missing optimizations, code generation issues in WebAssembly compilers, and inherent limits of the WebAssembly platform.\n\nA 2021 study suggested that WebAssembly is much faster than JavaScript in certain cases, such as running a complex function on a small file (e.g., processing a graphics file); however, at the time, the JavaScript interpreter had some optimizations available that the WebAssembly implementations did not have (e.g., Just-in-time compilation).[89]\n\nIn 2022, it was determined by researchers that a Wasm program runs at about 120% of (or 20% faster than) the speed of a comparable JavaScript program.[90] Those findings align with the experience of a startup company named \"Zaplib\", whose founders summarized in a blog that it was shutting down due to lack of performance in WebAssembly.[91] Their goal had been to significantly increase the performance of existing web apps by incrementally porting them to Rust/Wasm; however, porting a customer's simulator from JavaScript yielded only a 5% improvement in performance. Similarly, regarding Figma, they stated the following:\n\n[Upon] closer inspection it seems that [Figma's] use of Wasm is more due to historical accidents—wanting to build in C++ to hedge for their native app—than for critical performance needs. Figma files are processed in C++/Wasm, and this is likely a huge speedup, but most of Figma's performance magic is due to their WebGL renderer.\n\nIn 2023, a study of Wasm's performance for cryptographic tasks indicated that \"when using the fastest runtime, WebAssembly was only about 2.32 times slower (median) than native code with architecture-specific optimizations.\" This result excluded 2 tests where the native code benefited from special instructions implemented directly in the CPU of the target platform; for those particular tests, the Wasm programs were \"80 times slower than native code\".[92]\n\nBenchmarking has revealed several other pain-points for WebAssembly, such as poor performance because of no direct access to the DOM,[note 3] a problem which is being addressed.[94]\n\nWASIedit\n\nWebAssembly System Interface (WASI) is a simple interface (application binary interface (ABI) and application programming interface (API)) designed by Mozilla, which is intended to be portable to any platform.[95] It provides features similar to the Portable Operating System Interface (POSIX), such as file input/output (I/O) constrained by capability-based security.[96][97] There are additional proposed ABI/APIs.[98][99]\n\nWASI is influenced by CloudABI and Capsicum.[100]\n\nSolomon Hykes [fr], a co-founder of Docker, wrote in 2019, \"If WASM+WASI existed in 2008, we wouldn't have needed to create Docker. That's how important it is. WebAssembly on the server is the future of computing.\"[101]\n\nWASI 0.1 provides a few POSIX-like APIs such as file I/O, reading environment variables, and random-number generation, but has very little support for networking. WASI 0.2 is redesigned based on the WebAssembly Component Model.[102][103] WASI 0.3 will add support for async functions; the host translates between blocking and async function calls, so an exported function that blocks may be called as an asynchronous function, and vice-versa.[104][105]\n\nStarting in 0.2, WASI is defined in terms of the component model. Interfaces in the component model are specified in an IDL called WIT (WebAssembly Interface Types). While core wasm only supports integer and floating-point numbers, interfaces in WIT can express types such as strings, lists, and user-defined record and variant types, and are language-agnostic.[106] Components cannot access each other's memory, and so interact only via imported and exported functions. The component model is designed around composition: two components can be composed into a single component when the exports of one component match another's imports, allowing any interface to be virtualized.[103] Interfaces in WIT are grouped together into a \"world\". WASI 0.2 defines a CLI world similar to the POSIX-like API of WASI 0.1, and an HTTP proxy world for web servers.[107] WASI 0.2 (also known as Preview 2) was released on January 25, 2024, introducing the Component Model and WIT (WebAssembly Interface Types), which enable cross-language module composition and networking support via TCP/UDP sockets.[108]\n\nThe component model is not currently supported by browsers.[109]\n\nSpecificationedit\nHost environmentedit\n\nThe general standard provides core specifications for the JavaScript API and details on embedding.[5]\n\nVirtual machineedit\n\nWasm code (binary code, i.e. bytecode) is intended to be run on a portable virtual stack machine (VM).[110] The VM is designed to be faster to parse and execute than JavaScript and to have compact code representation.[111] Any external functionality (like syscalls) that may be expected by Wasm binary code is not stipulated by the standard; instead, the standard specifies how the host environment can provide such an interface via a \"module\".[112][9]\n\nWasm programedit\n\nA Wasm program is designed as a separate module containing collections of various Wasm-defined values and program type definitions. These are provided in either binary or textual format (see below) that have a common structure.[113] Such a module may provide a start function that is executed upon instantiation of a wasm binary.\n\nInstruction setedit\n\nThe core standard for the binary format of a Wasm program defines an instruction set architecture (ISA); each operation that can be executed by the VM is assigned a specific binary encoding (an \"opcode\"), but the exact way in which the operation is implemented is not specified, allowing for flexibility in the construction of a VM.[114] The list of instruction types includes those for standard memory load/store, numeric, parametric, control flow, and Wasm-specific variables.[115]\n\nThe number of opcodes used in the original standard (§ MVP) was a bit fewer than 200 of the 256 possible opcodes. Subsequent versions of WebAssembly pushed the number of opcodes a bit over 200. The WebAssembly SIMD proposal (for parallel processing) introduces an alternate opcode prefix (0xfd) for 128-bit wide SIMD instructions; the concatenation of the SIMD prefix, plus an opcode that is valid after the SIMD prefix, forms each SIMD opcode. The SIMD opcodes bring an additional 236 instructions to the MVP's SIMD ability (for a total of around 436 instructions).[116][117] This set of instructions[118] is enabled by default across a number of important implementations:[119]\n\nGoogle's V8 (in Google Chrome)\nThe SpiderMonkey engine in Mozilla Firefox\nThe JavaScriptCore engine in Apple's Safari\n\nThese SIMD opcodes are both portable and intended to map directly to native instruction sets like x86-64 and ARM. In contrast, SIMD instructions are not directly supported by Java's JVM[note 4] or .NET's CIL; however, both do have some APIs for parallel processing, which provide SIMD speedups. A newer set of \"relaxed SIMD\" instructions allow for a limited amount of implementation-defined behavior to improve performance.[121][122]\n\nCode representationedit\n\nIn March 2017, the WebAssembly Community Group reached consensus on the initial (\"MVP\") binary format, JavaScript API, and reference interpreter.[123] It defines a WebAssembly binary format (.wasm), which is designed to be used by computers, not humans, and a text format that is human-readable (.wat), resembling a cross between S-expressions and traditional assembly languages. The binary format is straightforward and designed to allow streaming compiling, so compiling can begin before the module is finished downloading, and to allow functions to be compiled in parallel.[30]\n\nThe table below shows an example of a factorial function written in C and its corresponding WebAssembly code after compiling, shown both in .wat text format (a human-readable textual representation of WebAssembly) and in .wasm binary format (the raw bytecode, expressed below in hexadecimal), that is executed by a Web browser or run-time environment that supports WebAssembly.\n\nC source code and corresponding WebAssembly\nC source code\tWebAssembly .wat text format\tWebAssembly .wasm binary format\n\nint factorial(int n) {\n    if (n == 0) {\n        return 1;\n    } else {\n        return n * factorial(n - 1);\n    }\n}\n\n\t\n(func (param i64) (result i64)\n  local.get 0\n  i64.eqz\n  if (result i64)\n      i64.const 1\n  else\n      local.get 0\n      local.get 0\n      i64.const 1\n      i64.sub\n      call 0\n      i64.mul\n  end)\n\n\t\n00 61 73 6D 01 00 00 00\n01 06 01 60 01 7E 01 7E\n03 02 01 00\n0A 17 01\n15 00\n20 00\n50\n04 7E\n42 01\n05\n20 00\n20 00\n42 01\n7D\n10 00\n7E\n0B\n0B\n\n\nAll integer constants are encoded using a space-efficient, variable-length LEB128 encoding.[124]\n\nThe WebAssembly text format is more canonically written in a folded format using S-expressions. For instructions and expressions, this format is purely syntactic sugar and has no behavioral differences with the linear format.[125] Through wasm2wat, the code above decompiles to:\n\n(module\n  (type $t0 (func (param i64) (result i64)))\n  (func $f0 (type $t0) (param $p0 i64) (result i64)\n    (if $I0 (result i64) ;; $I0 is an unused label name\n      (i64.eqz\n        (local.get $p0)) ;; the name $p0 is the same as 0 here\n      (then\n        (i64.const 1))\n      (else\n        (i64.mul\n          (local.get $p0)\n          (call $f0      ;; the name $f0 is the same as 0 here\n            (i64.sub\n              (local.get $p0)\n              (i64.const 1))))))))\n\n\nA module is implicitly generated by the compiler. The function is referenced by an entry of the type table in the binary, hence a type section and the type emitted by the decompiler.[126] The compiler and decompiler can be accessed online.[127]\n\nMemory and variablesedit\n\nData in memory is stored in a large, growable array of bytes termed a linear memory. Linear memory is separate from the wasm module's call stack and code and the engine's memory. This allows running wasm code in the same process as the JavaScript virtual machine it's embedded in without violating memory safety.[30]\n\nA module contains a list of global variables separate from linear memory, which may be mutable or immutable. Functions declare a list of local variables. A function's parameters are also local variables.\n\nInstructions operate on a stack of values. The stack layout is fixed (branches must push and pop the same number of operands), so wasm engines can compile the stack away, producing efficient machine code operations on registers, rather than managing a stack at runtime. A stack machine architecture was chosen as it can have higher code density than a register machine.[30]\n\nControl flowedit\n\nUnlike typical assembly languages, wasm only uses structured control flow similar to high-level programming languages. The intentional lack of support for jump instructions makes it simple to validate and compile wasm code in a single pass, and makes it easier to read code disassembled into the text format.\n\nBlocks are delimited with the block, loop, and if/else constructs. Branch instructions contain a label that identifies the depth of a block it is nested in: br 0 will branch to the block the instruction is contained in, br 1 will branch to the block that block is contained in, and so on. Branches to a block or if jump to the end of the block like a break statement, while branches to a loop jump back to the beginning of the loop, similar to a continue statement. The br_table instruction takes an input index and jumps to a target from a list of labels. A C-style switch statement can be expressed with a br_table inside a series of nested blocks.[30][128]\n\nCompilers targeting wasm convert unstructured control flow into high-level loops using Emscripten's Relooper algorithm, originally designed to target JavaScript.[129]\n\nFunctionsedit\n\nFunction declarations are listed in a separate section before the section containing the function bodies. Function pointers are emulated using an index into the global functions table, since code is not inside the linear memory. Functions can also be imported and exported, providing the foreign function interface to communicate with JavaScript or other embedders.[30]\n\nSee alsoedit\nArchitecture Neutral Distribution Format (ANDF)\nUNCOL\nJava bytecode\nCommon Language Runtime\nLLVM\nCompiler\nSoftware portability\nNotesedit\n The asm.js file already provides near-native code execution speeds: \"Even discarding the one score where asm.js did better, it executes at around 70% of the speed (i.e., slower) of native C++ code.[24] and can be considered a viable alternative for browsers that do not support WebAssembly or have it disabled for security reasons.\n For Rust/Wasm development, third-party libraries can provide some of the necessary JavaScript I/O.[72][73]\n \"WebAssembly provides no access to the surrounding environment other than via the JavaScript API described in the JS API specification.\"[93]\n There is an extension for Java adding intrinsics for x86-64 SIMD instructions,[120] that is not portable, i.e. not usable on ARM or smartphones.\nReferencesedit\n \"WebAssembly/design/Semantics.md\". GitHub. Archived from the original on 15 June 2021. Retrieved 23 February 2021. WebAssembly code can be considered a structured stack machine; a machine where most computations use a stack of values, but control flow is expressed in structured constructs such as blocks, ifs, and loops. In practice, implementations need not maintain an actual value stack, nor actual data structures for control; they need only behave as if they did so.\n Mozilla. \"Understanding WebAssembly text format\". MDN Web Docs. Archived from the original on 5 February 2022. Retrieved 9 December 2019.\n \"Introduction: WebAssembly 1.0\". webassembly.github.io. Archived from the original on 22 November 2021. Retrieved 18 June 2019. WebAssembly is an open standard...\n \"Introduction: WebAssembly 1.0\". webassembly.github.io. Archived from the original on 22 November 2021. Retrieved 18 June 2019. WebAssembly is a ... code format\n \"Conventions: WebAssembly 1.0\". webassembly.github.io. Archived from the original on 6 May 2019. Retrieved 17 May 2019. WebAssembly is a programming language that has multiple concrete representations (its binary format and the text format). Both map to a common structure.\n \"Introduction: WebAssembly 1.0\". webassembly.github.io. Archived from the original on 22 November 2021. Retrieved 18 June 2019. ... this specification is complemented by additional documents defining interfaces to specific embedding environments such as the Web. These will each define a WebAssembly application programming interface (API) suitable for a given environment.\n \"Introduction — WebAssembly 1.1\". webassembly.github.io. Archived from the original on 22 November 2021. Retrieved 19 February 2021. Its main goal is to enable high performance applications on the Web, but it does not make any Web-specific assumptions or provide Web-specific features, so it can be employed in other environments as well.\n Haas, Andreas; Rossberg, Andreas; Schuff, Derek L.; Titzer, Ben L.; Holman, Michael; Gohman, Dan; Wagner, Luke; Zakai, Alon; Bastien, JF (14 June 2017). \"Bringing the Web Up to Speed with WebAssembly\". SIGPLAN Notices. 52 (6): 185–200. doi:10.1145/3140587.3062363. ISSN 0362-1340. While the Web is the primary motivation for WebAssembly, nothing in its design depends on the Web or a JavaScript environment. It is an open standard specifically designed for embedding in multiple contexts, and we expect that stand-alone implementations will become available in the future.\n \"Outside the web: standalone WebAssembly binaries using Emscripten · V8\". v8.dev. Archived from the original on 19 July 2020. Retrieved 28 July 2020.\n \"Wasmer - The Universal WebAssembly Runtime\". wasmer.io. Archived from the original on 2 March 2021. Retrieved 19 February 2021. Compile everything to WebAssembly. Run it on any OS or embed it into other languages.\n World Wide Web Consortium. \"WebAssembly Core Specification\". World Wide Web Consortium (W3). Archived from the original on 6 December 2019. Retrieved 9 December 2019.\n Couriol, Bruno. \"WebAssembly 1.0 Becomes a W3C Recommendation and the Fourth Language to Run Natively in Browsers\". infoq.com. Archived from the original on 25 November 2021. Retrieved 9 December 2019.\n \"WebAssembly Specification — WebAssembly 1.1\". webassembly.github.io. Archived from the original on 22 September 2022. Retrieved 22 March 2021.\n \"Programming Languages Software Award\". www.sigplan.org. Archived from the original on 29 October 2022. Retrieved 5 October 2021.\n Bright, Peter (18 June 2015). \"The Web is getting its bytecode: WebAssembly\". Ars Technica. Condé Nast. Archived from the original on 11 April 2019. Retrieved 15 June 2017.\n \"New Bytecode Alliance Brings the Security, Ubiquity, and Interoperability of the Web to the World of Pervasive Computing\". Mozilla. 12 November 2019. Archived from the original on 10 December 2019. Retrieved 27 May 2019.\n \"Launch bug\". GitHub / WebAssembly / design. 11 June 2015. Archived from the original on 21 November 2021. Retrieved 21 March 2016.\n Wagner, Luke (14 March 2016). \"A WebAssembly Milestone: Experimental Support in Multiple Browsers\". Mozilla Hacks. Archived from the original on 11 August 2017. Retrieved 21 March 2016.\n Thompson, Seth (15 March 2016). \"Experimental support for WebAssembly in V8\". V8 Blog. Archived from the original on 9 February 2018. Retrieved 25 July 2019.\n Zhu, Limin (15 March 2016). \"Previewing WebAssembly experiments in Microsoft Edge\". Microsoft Edge dev blog. Archived from the original on 18 August 2021. Retrieved 21 March 2016.\n Lardinois, Frederic (17 June 2015). \"Google, Microsoft, Mozilla And Others Team Up To Launch WebAssembly, A New Binary Format For The Web\". TechCrunch. Archived from the original on 17 January 2018. Retrieved 24 December 2017.\n Avram, Abel (31 May 2017). \"Google Is to Remove Support for PNaCl\". InfoQ. Archived from the original on 23 December 2017. Retrieved 22 December 2017.\n \"WebAssembly: a binary format for the web\". ②ality – JavaScript and more. 18 June 2015. Archived from the original on 6 November 2023. Retrieved 25 July 2019.\n \"Staring at the Sun: Dalvik vs. ASM.js vs. Native\". blog.mozilla.org. August 2013. Archived from the original on 7 December 2019. Retrieved 7 December 2019.\n Krill, Paul (6 March 2017). \"WebAssembly is now ready for browsers to use\". InfoWorld. Archived from the original on 1 April 2020. Retrieved 23 December 2017.\n \"WebAssembly First Public Working Drafts\". W3C. 15 February 2018. Archived from the original on 16 July 2021. Retrieved 20 April 2018.\n \"WebAssembly Core Specification\". W3C. 15 February 2018. Archived from the original on 8 March 2021. Retrieved 20 April 2018.\n \"WebAssembly JavaScript Interface\". W3C. 15 February 2018. Archived from the original on 30 November 2020. Retrieved 20 April 2018.\n \"WebAssembly Web API\". W3C. 15 February 2018. Archived from the original on 19 April 2021. Retrieved 20 April 2018.\n Haas, Andreas; Rossberg, Andreas; Schuff, Derek L.; Titzer, Ben L.; Holman, Michael; Gohman, Dan; Wagner, Luke; Zakai, Alon; Bastien, JF (14 June 2017). \"Bringing the web up to speed with WebAssembly\". Proceedings of the 38th ACM SIGPLAN Conference on Programming Language Design and Implementation. PLDI 2017. New York, NY, USA: Association for Computing Machinery. pp. 185–200. doi:10.1145/3062341.3062363. ISBN 978-1-4503-4988-8.\n \"WebAssembly Worker Based Threads - Chrome Platform Status\". chromestatus.com. Archived from the original on 19 February 2022. Retrieved 19 February 2022.\n \"Feature Status - WebAssembly\". webassembly.org. Retrieved 5 January 2026.\n WebAssembly/threads, WebAssembly, 3 January 2026, retrieved 5 January 2026\n \"Wasm 2.0 Completed - WebAssembly\". webassembly.org. Retrieved 5 January 2026.\n \"Wasm 3.0 Completed - WebAssembly\". webassembly.org. Retrieved 5 January 2026.\n \"WebAssembly Garbage Collection (WasmGC) now enabled by default in Chrome\". Retrieved 11 December 2023.\n \"A new way to bring garbage collected programming languages efficiently to WebAssembly\". V8.dev. Retrieved 11 December 2023.\n Kotas, Jan (18 September 2025). \"[wasm][post-MVP] garbage collection proposal in .NET\". GitHub. Retrieved 2 February 2026. WASM-GC does not have capabilities required by .NET runtime. It is not possible to replace .NET runtime's GC with WASM-GC.\n \"Non-Web Embeddings\". WebAssembly. Archived from the original on 15 May 2019. Retrieved 15 May 2019.\n \"Non-Web Embeddings\". GitHub / WebAssembly. Archived from the original on 13 November 2020. Retrieved 15 May 2019.\n Freese, Danny (October 3, 2023). \"Proxy-Wasm: It's WebAssembly for Proxies\". Blog. Kong. Retrieved 2024-05-06.\n \"proxy-wasm/spec: WebAssembly for Proxies (ABI specification)\". GitHub. Archived from the original on 6 May 2024. Retrieved 6 May 2024.\n \"WebAssembly support now shipping in all major browsers\". The Mozilla Blog. Archived from the original on 31 October 2019. Retrieved 21 November 2017.\n \"Introducing new JavaScript optimizations, WebAssembly, SharedArrayBuffer, and Atomics in EdgeHTML 16\". Microsoft Edge Dev Blog. 31 October 2017. Archived from the original on 15 November 2017. Retrieved 21 November 2017.\n \"WebAssembly | Can I use... Support tables for HTML5, CSS3, etc\". canIuse.com. Archived from the original on 13 November 2021. Retrieved 1 March 2024.\n \"asm.js | Can I use... Support tables for HTML5, CSS3, etc\". caniuse.com. Retrieved 29 September 2024.\n \"WebAssembly Reference Types | Can I use... Support tables for HTML5, CSS3, etc\". caniuse.com. Retrieved 3 March 2024.\n \"Wasmtime — a small and efficient runtime for WebAssembly & WASI\". wasmtime.dev. Archived from the original on 4 December 2020. Retrieved 18 December 2020.\n \"Roadmap\". Archived from the original on 7 December 2021. Retrieved 7 December 2021.\n Wingo, Andy (30 June 2025). \"WebAssembly: Yes, but for What?\". ACM Queue. 23 (3): 18–30. doi:10.1145/3746171.\n Ball, Kevin (26 June 2018). \"How WebAssembly is Accelerating the Future of Web Development\". Archived from the original on 12 February 2019. Retrieved 22 October 2018.\n \"LLVM 8.0.0 Release Notes — LLVM 8 documentation\". Archived from the original on 22 October 2019. Retrieved 22 October 2019.\n \"Awesome WebAssembly Languages\". GitHub. 26 June 2018. Archived from the original on 12 February 2019. Retrieved 15 February 2022.\n Krill, Paul (29 November 2017). \"Direct WebAssembly compilation comes to Rust language\". InfoWorld. Archived from the original on 1 April 2020. Retrieved 24 December 2017.\n \"AssemblyScript/assemblyscript\". The AssemblyScript Project. 9 September 2020. Archived from the original on 11 September 2020. Retrieved 9 September 2020.\n Bonventre, Andrew (24 August 2018). \"Go 1.11 is released\". The Go Blog. Archived from the original on 14 June 2025. Retrieved 11 August 2025.\n \"Frequently asked questions (FAQ) about Blazor\". Archived from the original on 18 June 2018. Retrieved 18 June 2018.\n \"Bolero: F# in WebAssembly\". fsbolero.io. Archived from the original on 4 June 2019. Retrieved 25 July 2019.\n \"Running F# in WebAssembly with Bolero\". Microsoft Learn. Microsoft. 20 November 2019. Retrieved 17 September 2025.\n \"Pyodide: Bringing the scientific Python stack to the browser – Mozilla Hacks\". Archived from the original on 3 September 2020. Retrieved 9 September 2020.\n \"Java to WebAssembly Compiler - CheerpJ\". Archived from the original on 27 April 2023. Retrieved 27 April 2023.\n \"JWebAssembly\". 27 April 2023. Archived from the original on 27 April 2023. Retrieved 27 April 2023 – via GitHub.\n \"TeaVM: Overview\". Archived from the original on 27 April 2023. Retrieved 27 April 2023.\n \"Bringing Kotlin to the Web\". Retrieved 11 December 2023.\n Deleuze, Sébastien (13 February 2023). \"The huge potential of Kotlin/Wasm\". Retrieved 11 December 2023.\n \"Using the GHC WebAssembly backend\". Archived from the original on 1 May 2025. Retrieved 1 May 2025.\n \"Julia in the Browser\". nextjournal.com. Archived from the original on 24 March 2019. Retrieved 9 April 2019.\n \"MRuby in Your Browser\". ruby.dj. Archived from the original on 8 August 2019. Retrieved 25 July 2019.\n Paul Krill (24 August 2020). \"Ring language upgrade focuses on WebAssembly\". InfoWorld. Archived from the original on 14 October 2020. Retrieved 17 August 2024.\n \"WebAssembly (Wasm) compilation\". dart.dev. Retrieved 21 December 2025.\n \"Hoot: Scheme on WebAssembly\". Retrieved 11 March 2026.\n \"stdweb - Rust\". docs.rs. Archived from the original on 21 February 2019. Retrieved 5 June 2019. The goal of this crate is to provide Rust bindings to the Web APIs and to allow a high degree of interoperability between Rust and JavaScript.\n \"web_sys - Rust\". docs.rs. Archived from the original on 15 May 2020. Retrieved 5 June 2019. Raw API bindings for Web APIs. This is a procedurally generated crate from browser WebIDL which provides a binding to all APIs that browser provide on the web.\n \"The State of WebAssembly 2023\". Scott Logic. 18 October 2023. Archived from the original on 14 March 2024. Retrieved 14 March 2024.\n \"Wasm needs a better memory management story · Issue #1397 · WebAssembly/design\". GitHub. Archived from the original on 27 March 2021. Retrieved 15 February 2021.\n \"WebAssembly/content-security-policy\". GitHub. Archived from the original on 12 September 2020. Retrieved 17 February 2021.\n \"948834 - chromium - An open-source project to help move the web forward. - Monorail\". bugs.chromium.org. Archived from the original on 2 June 2021. Retrieved 17 February 2021.\n \"No way to use WebAssembly on Chrome without 'unsafe-eval' · Issue #7 · WebAssembly/content-security-policy\". GitHub. Archived from the original on 18 March 2021. Retrieved 17 February 2021.\n Cimpanu, Catalin (24 June 2018). \"Changes in WebAssembly Could Render Meltdown and Spectre Browser Patches Useless\". Bleeping Computer. Archived from the original on 10 July 2019. Retrieved 8 June 2019.\n Sanders, James (25 June 2018). \"How opaque WebAssembly code could increase the risk of Spectre attacks online\". Tech Republic. Archived from the original on 9 June 2019. Retrieved 9 June 2019.\n R, Bhagyashree (30 October 2018). \"Google Chrome 70 now supports WebAssembly threads to build multi-threaded web applications\". Packt Pub. Archived from the original on 18 April 2019. Retrieved 9 June 2019.\n Lonkar, Aishwarya; Chandrayan, Siddhesh (October 2018). \"The dark side of WebAssembly\". Virus Bulletin. Archived from the original on 9 June 2019. Retrieved 8 June 2019.\n Segura, Jérôme (29 November 2017). \"Persistent drive-by cryptomining coming to a browser near you\". Malwarebytes. Archived from the original on 15 April 2019. Retrieved 8 June 2019.\n \"Recent Study Estimates That 50% of Websites Using WebAssembly Apply It for Malicious Purposes\". InfoQ. Archived from the original on 31 October 2019. Retrieved 3 November 2019.\n Musch, Marius; Wressnegger, Christian; Johns, Martin; Rieck, Konrad (June 2019). \"New Kid on the Web: A Study on the Prevalence of WebAssembly in the Wild\". Detection of Intrusions and Malware, and Vulnerability Assessment (PDF). Lecture Notes in Computer Science. Vol. 11543. Detection of Intrusions and Malware, and Vulnerability Assessment. pp. 23–42. doi:10.1007/978-3-030-22038-9_2. ISBN 978-3-030-22037-2. S2CID 184482682. Archived from the original (PDF) on 26 July 2022. Retrieved 15 February 2022. Slides (PDF) Archived 3 November 2019 at the Wayback Machine\n Aaron Hilbig, Daniel Lehmann, and Michael Pradel (April 2021). \"An Empirical Study of Real-World WebAssembly Binaries: Security, Languages, Use Cases.\" (Archived April 2021) https://software-lab.org/publications/www2021.pdf\n Watt, Conrad (8 January 2018). \"Mechanising and verifying the WebAssembly specification\". Proceedings of the 7th ACM SIGPLAN International Conference on Certified Programs and Proofs. CPP 2018. Los Angeles CA USA: ACM. pp. 53–65. doi:10.1145/3167082. ISBN 978-1-4503-5586-5. S2CID 9401691. Archived from the original on 1 March 2021. Retrieved 9 August 2023.\n Jangda, Abhinav; Powers, Bobby; Berger, Emery; Guha, Arjun (31 May 2019). Not So Fast: Analyzing the Performance of WebAssembly vs. Native Code (PDF). 2019 USENIX Annual Technical Conference. Renton, WA. pp. 107–120. arXiv:1901.09056v3. OCLC 1106328738. Archived (PDF) from the original on 20 March 2025. Retrieved 20 March 2025.\n Yan, Yutian; Tu, Tengfei; Zhao, Lijian; Zhou, Yuchen; Wang, Weihang (2 November 2021). \"Understanding the performance of webassembly applications\". Proceedings of the 21st ACM Internet Measurement Conference. pp. 533–549. doi:10.1145/3487552.3487827. ISBN 978-1-4503-9129-0.\n De Macedo, Joao; Abreu, Rui; Pereira, Rui; Saraiva, Joao (June 2022). \"WebAssembly versus JavaScript: Energy and Runtime Performance\". 2022 International Conference on ICT for Sustainability (ICT4S). pp. 24–34. doi:10.1109/ICT4S55073.2022.00014. hdl:1822/90291. ISBN 978-1-6654-8286-8.\n \"Zaplib post-mortem\". zaplib.com. April 2022. Archived from the original on 21 March 2024. Retrieved 14 March 2024.\n Denis, Frank (4 January 2023). \"Performance of WebAssembly runtimes in 2023\". 00f.net. Retrieved 6 December 2024.\n \"WebAssembly Web API\". webassembly.github.io. Archived from the original on 9 December 2024. Retrieved 6 December 2024.\n Kambale, Enoch. \"WebAssembly in 2024: Promises, Challenges, and the Road Ahead\". blog.enkambale.com. Archived from the original on 17 January 2025. Retrieved 6 December 2024.\n \"WebAssembly System Interface Repo\". GitHub: WebAssembly. 10 February 2020. Archived from the original on 30 October 2022. Retrieved 15 May 2019.\n \"Additional background on Capabilities\". GitHub. bytecodealliance. 4 March 2022. Archived from the original on 24 February 2020. Retrieved 8 April 2020.\n \"Standardizing WASI: A system interface to run WebAssembly outside the web\". Mozilla Hacks: the Web developer blog. Archived from the original on 30 October 2022. Retrieved 9 April 2020.\n \"reference-sysroot Repo\". GitHub: WebAssembly. 12 January 2020. Archived from the original on 21 August 2022. Retrieved 15 May 2019.\n \"wasm-c-api Repo\". GitHub: WebAssembly. 3 February 2020. Archived from the original on 31 October 2022. Retrieved 15 May 2019.\n NuxiNL/cloudlibc, Nuxi, 6 December 2024, archived from the original on 1 April 2025, retrieved 1 April 2025\n Hykes, Solomon (27 March 2019). \"Solomon Hykes on X\". Twitter. Archived from the original on 31 May 2024. Retrieved 29 September 2024.\n \"WASI and the WebAssembly Component Model: Current Status - eunomia\". eunomia.dev. Retrieved 30 March 2026.\n \"Why the Component Model? - The WebAssembly Component Model\". component-model.bytecodealliance.org. Retrieved 30 March 2026.\n Dice, Joel (13 March 2025). \"Looking Ahead to WASIp3\". www.fermyon.com. Retrieved 30 March 2026.\n WebAssembly. \"component-model/design/mvp/Concurrency.md at main · WebAssembly/component-model\". GitHub. Retrieved 30 March 2026.\n \"WIT Reference - The WebAssembly Component Model\". component-model.bytecodealliance.org. Retrieved 30 March 2026.\n Gohman, Dan (25 January 2024). \"WASI 0.2 Launched\". Bytecode Alliance. Retrieved 30 March 2026.\n \"The WebAssembly Component Model\". Bytecode Alliance. Retrieved 18 August 2026.\n \"Why is WebAssembly a second-class language on the web? – Mozilla Hacks - the Web developer blog\". Mozilla Hacks – the Web developer blog. Retrieved 30 March 2026.\n \"Design Rationale\". GitHub / WebAssembly / design. 1 October 2016. Archived from the original on 25 September 2022. Retrieved 25 September 2022.\n \"WebAssembly High-Level Goals\". GitHub / WebAssembly / design. 11 December 2015. Archived from the original on 25 September 2022. Retrieved 25 September 2022.\n \"Portability - WebAssembly\". webassembly.org. Archived from the original on 28 July 2020. Retrieved 28 July 2020.\n \"Conventions — WebAssembly 1.0\". webassembly.github.io. Archived from the original on 6 May 2019. Retrieved 12 November 2019.\n \"Introduction: WebAssembly 1.0\". webassembly.github.io. Archived from the original on 2 June 2021. Retrieved 17 May 2019.\n \"Instructions — WebAssembly 1.0\". webassembly.github.io. Archived from the original on 21 October 2019. Retrieved 12 November 2019.\n Lively, Thomas (19 February 2021) [Pull Request opened on 2021-02-05]. \"Final opcodes by tlively · Pull Request #452 · WebAssembly/simd · GitHub\". Bytecode Alliance. Archived from the original on 30 October 2022. Retrieved 12 May 2021 – via GitHub.\n Delendik, Yury (19 February 2021) [SIMD changes committed on 2021-02-19]. \"File wasm-tools/expr.rs at b5c3d98e40590512a3b12470ef358d5c7b983b15 · bytecodealliance/wasm-tools · GitHub\". Bytecode Alliance. Archived from the original on 22 May 2022. Retrieved 12 May 2021 – via GitHub.\n \"Update interpreter and text with finalized opcodes by ngzhian · Pull Request #486 · WebAssembly/simd\". GitHub. Archived from the original on 30 October 2022. Retrieved 14 May 2021.\n \"WebAssembly/simd\". GitHub. Archived from the original on 10 May 2021. Retrieved 14 May 2021.\n \"How we made the JVM 40x faster\". astojanov.github.io. Archived from the original on 26 December 2020. Retrieved 17 February 2021.\n WebAssembly/relaxed-simd, WebAssembly, 3 May 2021, archived from the original on 17 April 2022, retrieved 14 May 2021\n \"Wasm 3.0 Completed - WebAssembly\". webassembly.org. Retrieved 5 January 2026.\n \"Roadmap\". WebAssembly. March 2017. Archived from the original on 7 December 2021. Retrieved 25 July 2019.\n WebAssembly Community Group (January 2020). \"WebAssembly Specification Release 1.0\". Archived from the original on 21 October 2019. Retrieved 13 January 2020.\n \"Folded instructions\". GitHub. Archived from the original on 12 July 2018. Retrieved 18 June 2018. / WebAssembly / spec\n \"Modules (Binary)\". WebAssembly 1.0. Archived from the original on 30 October 2022. Retrieved 9 April 2020.\n \"WebAssembly Binary Toolkit (wabt) demos\". webassembly.github.io. Archived from the original on 30 October 2022. Retrieved 9 April 2020.\n \"WebAssembly control flow instructions - WebAssembly | MDN\". MDN Web Docs. 23 November 2025. Retrieved 5 January 2026.\n Zakai, Alon (22 October 2011). \"Emscripten: An LLVM-to-JavaScript compiler\". Proceedings of the ACM international conference companion on Object oriented programming systems languages and applications companion. OOPSLA '11. New York, NY, USA: Association for Computing Machinery. pp. 301–312. doi:10.1145/2048147.2048224. ISBN 978-1-4503-0942-4.\n\n This article incorporates text from a free content work. Licensed under Apache License 2.0 (license statement/permission). Text taken from Text Format​, jfbastien; rossberg-chromium; kripken; titzer; s3ththompson; sunfishcode; lukewagner; flagxor; enricobacis; c3d; binji; andrewosh, GitHub. WebAssembly/design.\n\nExternal linksedit\nWebAssembly\nat Wikipedia's sister projects\nMedia from Commons\nData from Wikidata\nOfficial website \nWebAssembly on GitHub, hosts Design Documents\nW3C Community Group Archived 18 June 2015 at the Wayback Machine\nWebAssembly Specification Archived 22 September 2022 at the Wayback Machine\n\"WebAssembly\". MDN Web Docs. 16 April 2024. Archived from the original on 13 May 2022. Retrieved 14 February 2018. Has info on browser compatibility and specifications (WebAssembly JavaScript API)\nvte\nWorld Wide Web Consortium (W3C)\n\nProducts,\nstandards\t\nRecommendations\t\nActivityPubActivity StreamsARIACanonical XMLCDFCSS AnimationsFlexboxGridDOMEXIGeolocation APIGRDDLHTML HTML5IndexedDBInkMLITSJSON-LDLinked Data NotificationsMathMLMicropubMTOMOWLPLSRDF SchemaRDFaRIFSAWSDLSISRSKOSSMILSOAPSRGSSRISSMLSVG AnimationFilter EffectsSCXMLSHACLSPARQLTimed textVoiceXMLWebAssemblyWoT TDWeb storageWSDLWebmentionWebSubWebVTTWOFFWS-AddressingXHTML +RDFaXML BaseEncryptionEventsInformation SetNamespaceSchemaSignatureXFormsXIncludeXLinkXOPXPath 2.03.xXPointerXProcXQueryXSLXSL-FOXSLT elements\n\nNotes\t\nIndieAuthXAdESXBLXHTML+SMILXUP\n\nWorking drafts\t\nCCXMLCURIEEMEMSESMIL TimesheetssXBLWebGPUWebXRXFDLXFramesXMLHttpRequest\n\nGuidelines\t\nWeb Content Accessibility Guidelines\n\nInitiative\t\nMarkup Validation ServiceWeb Accessibility InitiativeWeb Components\n\nDeprecated\t\nC-HTMLHDMLJSSSPGMLVMLWebPlatform\n\nObsoleted\t\nP3PXHTML+MathML+SVG\n\nGroups,\norganizations\t\nWHATWGDefunct: World Wide Web Foundation\n\nElected\t\nABBoardTAG\n\nWorking\t\nCSSSVGWebAssemblyWebAuthn\n\nCommunity, business\t\nWeb Advertising BGWebAssembly CG\n\nClosed\t\nDevice Description (DDWG)HTMLMultimodal Interaction Activity (MMI)\n\nSoftware\t\nCERN httpdLibwww\n\nBrowsers\t\nLine Mode (1990–)Arena (1993–98)Agora (1994–97)Argo (1994–97)Amaya (browser/editor, 1996–2012)\n\nConferences\t\nInternational World Wide Web Conference (IW3C) Steering Committee (IW3C2)First conference (\"WWW1\", 1994)\n\n\n World Wide Web Consortium standards\nvte\nWeb browsers\n\n\nFeatures, standards & protocols\n\n\nFeatures\t\nBookmarksExtensionsPrivacy mode\n\nWeb standards\t\nHTML v5CSSDOMJavaScript WebAssemblyWeb storageIndexedDBWebGLWebGPU\n\nProtocols\t\nHTTP EncryptionCookies third-partyOCSPWebRTCWebSocket\n\n\nActive\n\n\nDiscontinued\n\n\nListComparisonCategory\nvte\nWeb interfaces\n\n\nServer-side\n\nProtocols\t\nHTTP v2v3EncryptionWebDAVCGISCGIFCGIAJPWSRPWebSocket\n\nServer APIs\t\nC NSAPIC ASAPIC ISAPICOM ASPJakarta Servlet containerCLI OWINASP.NET HandlerPython WSGIPython ASGIRuby RackJavaScript JSGIPerl PSGIPortlet container\n\nApache modules\t\nmod_includemod_jkmod_lispmod_monomod_parrotmod_perlmod_phpmod_proxymod_pythonmod_wsgimod_rubyPhusion Passenger\n\nTopics\t\nWeb service vs. Web resourceWOA vs. ROAOpen APIWebhookApplication server comparisonScripting\n\n\nClient-side\n\nBrowser APIs\t\nC NPAPI LiveConnectXPConnectC NPRuntimeC PPAPI NaClActiveXBHOXBAP\n\nWeb APIs\t\nWHATWG\t\nAudioCanvasDOMSSEVideoWebSocketsWeb messagingWeb storageWeb workerXMLHttpRequest\n\nW3C\t\nDOM eventsEMEFileGeolocationIndexedDBMSESVGWebAssemblyWebAuthnWebGPUWebRTCWebXR\n\nKhronos\t\nWebCLWebGL\n\nOthers\t\nGears (discontinued)Web SQL Database (discontinued)WebUSB\n\nTopics\t\nAjax and Remote scripting vs. DHTMLBrowser extensionCross-site scripting and CORSHydrationMashupPersistent dataWeb IDLScripting\n\n\nRelated topics\n\n\nFrontend and backendMicroservices RESTGraphQLPush technologySolution stackWeb page StaticDynamicWeb standardsWeb API securityWeb application RichSingle-pageProgressiveWeb framework\nvte\nJavaScript\n\nCode analysis\t\nESLintJSHintJSLint\n\nSubsets, supersets\t\nJS++Source*TypeScript (ArkTS)\n\nTranspilers\t\nAtScriptBabelClojureScriptCoffeeScriptDartElmEmscriptenGoogle Closure CompilerGoogle Web ToolkitHaxeLiveScriptMorfikNimOpaPureScriptReScriptV (Vlang)WebSharper\n\nConcepts\t\nJavaScript libraryJavaScript syntax\n\nDebuggers\t\nChrome DevToolsFirefox Inspector (formerly Firebug)Komodo IDESafari Web Inspector\n\nDocumentation generators\t\nJSDoc\n\nEngines\t\nList of JavaScript engines\n\nFrameworks\t\nComparison of JavaScript frameworksList of JavaScript libraries\n\nRelated technologies\t\nAjaxAssemblyScriptasm.jsCSSDOMHTML HTML5JSONWebAssemblyWebAuthn\n\nPackage managers\t\nnpmpnpmyarnBunDeno\n\nModule bundlers\t\nBunesbuildViteWebpack\n\nServer-side\t\nBunCommonJSDenoJSGINode.js\n\nUnit testing frameworks (list)\t\nJasmineMochaQUnit\n\nPeople\t\nDouglas CrockfordRyan DahlBrendan EichJohn ResigJesse James Garrett\n\n\nCategoryOutlineIndexWikibook\nCategories: Assembly languagesInternet properties established in 2015World Wide Web Consortium standardsWeb programmingBytecodesProgramming languages created in 2015Programming language comparisons\nThis page was last edited on 9 September 2026, at 07:48 (UTC). Page was rendered with Parsoid.\nText is available under the Creative Commons Attribution-ShareAlike 4.0 License; additional terms may apply. By using this site, you agree to the Terms of Use and Privacy Policy. Wikipedia® is a registered trademark of the Wikimedia Foundation, Inc., a non-profit organization.\nPrivacy policy\nAbout Wikipedia\nDisclaimers\nContact Wikipedia\nLegal & safety contacts\nCode of Conduct\nDevelopers\nStatistics\nCookie statement\nMobile view"
+    }
+  },
+  "evals": {
+    "wiki_outline": {
+      "result": {
+        "intro": "WebAssembly (Wasm) defines a portable binary code format and a corresponding text format for executable programs[2] and software interfaces for facilitating communication between such programs and their host environment.[3][4][5][6]",
+        "sections": [
+          "History",
+          "Implementations",
+          "Limits",
+          "Security considerations",
+          "Performance",
+          "WASI",
+          "Specification",
+          "See also",
+          "Notes",
+          "References",
+          "External links"
+        ],
+        "title": "WebAssembly"
+      },
+      "success": true
+    }
+  }
+}

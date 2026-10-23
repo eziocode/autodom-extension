@@ -1,0 +1,343 @@
+{
+  "url": "https://en.wikipedia.org/w/index.php?search=WebAssembly+runtime&fulltext=1&ns0=1",
+  "capturedAt": "2026-10-23T05:40:56.246Z",
+  "results": {
+    "navigate": {
+      "success": true,
+      "url": "https://en.wikipedia.org/w/index.php?search=WebAssembly+runtime&fulltext=1&ns0=1",
+      "title": "WebAssembly runtime - Search results - Wikipedia",
+      "status": "complete",
+      "loaded": true,
+      "elapsedMs": 974
+    },
+    "get_page_info": {
+      "forms": 5,
+      "images": 12,
+      "lang": "en",
+      "links": 89,
+      "metas": {
+        "ResourceLoaderDynamicStyles": "",
+        "format-detection": "telephone=no",
+        "generator": "MediaWiki 1.47.0-wmf.24",
+        "og:title": "WebAssembly runtime - Search results - Wikipedia",
+        "og:type": "website",
+        "referrer": "origin-when-cross-origin",
+        "robots": "noindex,nofollow,max-image-preview:standard",
+        "viewport": "width=1120"
+      },
+      "readyState": "complete",
+      "title": "WebAssembly runtime - Search results - Wikipedia",
+      "url": "https://en.wikipedia.org/w/index.php?search=WebAssembly+runtime&fulltext=1&ns0=1",
+      "tabId": 1249072820,
+      "windowId": 1249072731
+    },
+    "get_dom_state": {
+      "elementCount": 47,
+      "elements": [
+        {
+          "id": "ooui-php-1",
+          "index": 0,
+          "name": "search",
+          "selector": "#ooui-php-1",
+          "tag": "input",
+          "type": "search",
+          "value": "WebAssembly runtime"
+        },
+        {
+          "index": 1,
+          "tag": "button",
+          "text": "Search",
+          "type": "submit"
+        },
+        {
+          "href": "/w/index.php?title=WebAssembly_runtime&action=edit&redlink=1",
+          "index": 2,
+          "tag": "a",
+          "text": "WebAssembly runtime"
+        },
+        {
+          "href": "/wiki/Wikipedia:Article_wizard",
+          "index": 3,
+          "tag": "a",
+          "text": "create a draft and submit it for review"
+        },
+        {
+          "href": "/wiki/Wikipedia:Articles_for_creation/Redirects",
+          "index": 4,
+          "tag": "a",
+          "text": "request that a redirect be created"
+        },
+        {
+          "index": 5,
+          "name": "limit",
+          "selector": "select[name=\"limit\"]",
+          "tag": "select",
+          "text": "20 items50 items100 items250 items500 items",
+          "value": "20"
+        },
+        {
+          "ariaLabel": "First page",
+          "index": 6,
+          "role": "button",
+          "tag": "a"
+        },
+        {
+          "ariaLabel": "Previous page",
+          "index": 7,
+          "role": "button",
+          "tag": "a"
+        },
+        {
+          "ariaLabel": "Next page",
+          "href": "/w/index.php?title=Special:Search&limit=20&offset=20&profile=default&search=WebAssembly+runtime",
+          "index": 8,
+          "role": "button",
+          "tag": "a"
+        },
+        {
+          "href": "/wiki/WebAssembly",
+          "index": 9,
+          "tag": "a"
+        },
+        {
+          "href": "/wiki/WebAssembly",
+          "index": 10,
+          "tag": "a",
+          "text": "WebAssembly"
+        },
+        {
+          "href": "/wiki/Emscripten",
+          "index": 11,
+          "tag": "a",
+          "text": "Emscripten"
+        },
+        {
+          "href": "/wiki/AssemblyScript",
+          "index": 12,
+          "tag": "a"
+        },
+        {
+          "href": "/wiki/AssemblyScript",
+          "index": 13,
+          "tag": "a",
+          "text": "AssemblyScript"
+        },
+        {
+          "href": "/wiki/Cranelift",
+          "index": 14,
+          "tag": "a",
+          "text": "Cranelift"
+        },
+        {
+          "href": "/wiki/WAMR",
+          "index": 15,
+          "tag": "a",
+          "text": "WAMR"
+        },
+        {
+          "href": "/wiki/V8_(JavaScript_engine)",
+          "index": 16,
+          "tag": "a",
+          "text": "V8 (JavaScript engine)"
+        },
+        {
+          "href": "/wiki/OpenSilver",
+          "index": 17,
+          "tag": "a"
+        },
+        {
+          "href": "/wiki/OpenSilver",
+          "index": 18,
+          "tag": "a",
+          "text": "OpenSilver"
+        },
+        {
+          "href": "/wiki/List_of_assembly_software_and_tools",
+          "index": 19,
+          "tag": "a",
+          "text": "List of assembly software and tools"
+        },
+        {
+          "href": "/wiki/Blazor",
+          "index": 20,
+          "tag": "a",
+          "text": "Blazor"
+        },
+        {
+          "href": "/wiki/Runtime_system",
+          "index": 21,
+          "tag": "a",
+          "text": "Runtime system"
+        },
+        {
+          "href": "/wiki/Dart_(programming_language)",
+          "index": 22,
+          "tag": "a",
+          "text": "Dart (programming language)"
+        },
+        {
+          "href": "/wiki/Deno_(software)",
+          "index": 23,
+          "tag": "a"
+        },
+        {
+          "href": "/wiki/Deno_(software)",
+          "index": 24,
+          "tag": "a",
+          "text": "Deno (software)"
+        },
+        {
+          "href": "/wiki/Windows_Runtime",
+          "index": 25,
+          "tag": "a",
+          "text": "Windows Runtime"
+        },
+        {
+          "href": "/wiki/BLAKE_(hash_function)",
+          "index": 26,
+          "tag": "a",
+          "text": "BLAKE (hash function)"
+        },
+        {
+          "href": "/wiki/Rust_compiler",
+          "index": 27,
+          "tag": "a"
+        },
+        {
+          "href": "/wiki/Rust_compiler",
+          "index": 28,
+          "tag": "a",
+          "text": "Rust compiler"
+        },
+        {
+          "href": "/wiki/List_of_JavaScript_engines",
+          "index": 29,
+          "tag": "a",
+          "text": "List of JavaScript engines"
+        },
+        {
+          "href": "/wiki/Node.js",
+          "index": 30,
+          "tag": "a"
+        },
+        {
+          "href": "/wiki/Node.js",
+          "index": 31,
+          "tag": "a",
+          "text": "Node.js"
+        },
+        {
+          "href": "/wiki/GraalVM",
+          "index": 32,
+          "tag": "a",
+          "text": "GraalVM"
+        },
+        {
+          "href": "/wiki/GraalVM#Language_and_runtime_support",
+          "index": 33,
+          "tag": "a",
+          "text": "Language and runtime support"
+        },
+        {
+          "href": "/wiki/Elements_(toolchain)",
+          "index": 34,
+          "tag": "a",
+          "text": "Elements (toolchain)"
+        },
+        {
+          "href": "/wiki/Electron_(software_framework)",
+          "index": 35,
+          "tag": "a"
+        },
+        {
+          "href": "/wiki/Electron_(software_framework)",
+          "index": 36,
+          "tag": "a",
+          "text": "Electron (software framework)"
+        },
+        {
+          "href": "https://en.wikiquote.org/wiki/Special:Search?search=WebAssembly+runtime&fulltext=1",
+          "index": 37,
+          "tag": "a",
+          "text": "Quotes from Wikiquote"
+        },
+        {
+          "href": "https://en.wikiquote.org/wiki/Zero_Punctuation",
+          "index": 38,
+          "tag": "a",
+          "text": "Zero Punctuation"
+        },
+        {
+          "href": "https://en.wikiquote.org/wiki/Special:Search?search=WebAssembly+runtime&fulltext=1",
+          "index": 39,
+          "tag": "a",
+          "text": "See all results"
+        },
+        {
+          "href": "https://en.wikibooks.org/wiki/Special:Search?search=WebAssembly+runtime&fulltext=1",
+          "index": 40,
+          "tag": "a",
+          "text": "Textbooks from Wikibooks"
+        },
+        {
+          "href": "https://en.wikibooks.org/wiki/.NET_Development_Foundation/Introduction",
+          "index": 41,
+          "tag": "a",
+          "text": ".NET Development Foundation/Introduction"
+        },
+        {
+          "href": "https://en.wikibooks.org/wiki/Special:Search?search=WebAssembly+runtime&fulltext=1",
+          "index": 42,
+          "tag": "a",
+          "text": "See all results"
+        },
+        {
+          "index": 43,
+          "name": "limit",
+          "selector": "select[name=\"limit\"]",
+          "tag": "select",
+          "text": "20 items50 items100 items250 items500 items",
+          "value": "20"
+        },
+        {
+          "ariaLabel": "First page",
+          "index": 44,
+          "role": "button",
+          "tag": "a"
+        },
+        {
+          "ariaLabel": "Previous page",
+          "index": 45,
+          "role": "button",
+          "tag": "a"
+        },
+        {
+          "ariaLabel": "Next page",
+          "href": "/w/index.php?title=Special:Search&limit=20&offset=20&profile=default&search=WebAssembly+runtime",
+          "index": 46,
+          "role": "button",
+          "tag": "a"
+        }
+      ],
+      "scope": {
+        "label": "main #content",
+        "strategy": "main-root"
+      },
+      "title": "WebAssembly runtime - Search results - Wikipedia",
+      "url": "https://en.wikipedia.org/w/index.php?search=WebAssembly+runtime&fulltext=1&ns0=1"
+    },
+    "take_snapshot": {
+      "snapshot": "Page: WebAssembly runtime - Search results - Wikipedia — https://en.wikipedia.org/w/index.php?search=WebAssembly+runtime&fulltext=1&ns0=1\n@e1 link \"Jump to content\"\n@e2 button \"Main menu\"\n@e3 link\n@e4 searchbox \"Search Wikipedia\"\n@e5 button \"Search\"\n@e7 link \"Donate\"\n@e8 link \"Create account\"\n@e9 link \"Log in\"\n@e11 link \"Help\"\n@e13 button \"Tools\"\n@e14 button \"Hide Appearance\"\n@e15 searchbox \"Search Wikipedia\"\n@e16 button \"Search\"\n@e17 link \"WebAssembly runtime\"\n@e18 link \"create a draft and submit it for review\"\n@e19 link \"request that a redirect be created\"\n@e20 combobox\n@e21 button \"First page\"\n@e22 button \"Previous page\"\n@e23 button \"Next page\"\n@e24 link \"WebAssembly\"\n@e25 link \"WebAssembly\"\n@e26 link \"Emscripten\"\n@e27 link \"AssemblyScript\"\n@e28 link \"AssemblyScript\"\n@e29 link \"Cranelift\"\n@e30 link \"WAMR\"\n@e31 link \"V8 (JavaScript engine)\"\n@e32 link \"OpenSilver\"\n@e33 link \"OpenSilver\"\n@e34 link \"List of assembly software and tools\"\n@e35 link \"Blazor\"\n@e36 link \"Runtime system\"\n@e37 link \"Dart (programming language)\"\n@e38 link \"Deno (software)\"\n@e39 link \"Deno (software)\"\n@e40 link \"Windows Runtime\"\n@e41 link \"BLAKE (hash function)\"\n@e42 link \"Rust compiler\"\n@e43 link \"Rust compiler\"\n@e44 link \"List of JavaScript engines\"\n@e45 link \"Node.js\"\n@e46 link \"Node.js\"\n@e47 link \"GraalVM\"\n@e48 link \"Language and runtime support\"\n@e49 link \"Elements (toolchain)\"\n@e50 link \"Electron (software framework)\"\n@e51 link \"Electron (software framework)\"\n@e52 link \"Quotes from Wikiquote\"\n@e53 link \"Zero Punctuation\"\n@e54 link \"See all results\"\n@e55 link \"Textbooks from Wikibooks\"\n@e56 link \".NET Development Foundation/Introduction\"\n@e57 link \"See all results\"\n@e58 combobox\n@e59 button \"First page\"\n@e60 button \"Previous page\"\n@e61 button \"Next page\"\n@e62 link \"Privacy policy\"\n@e63 link \"About Wikipedia\"\n@e64 link \"Disclaimers\"\n@e65 link \"Contact Wikipedia\"\n@e66 link \"Legal & safety contacts\"\n@e67 link \"Code of Conduct\"\n@e68 link \"Developers\"\n@e69 link \"Statistics\"\n@e70 link \"Cookie statement\"\n@e71 link \"Mobile view\"\n@e72 link \"Wikimedia Foundation\"\n@e73 link \"Powered by MediaWiki\"\n(70 interactive elements. Pass ref:\"@eN\" to click, type_text, hover or select_option.)",
+      "url": "https://en.wikipedia.org/w/index.php?search=WebAssembly+runtime&fulltext=1&ns0=1"
+    }
+  },
+  "evals": {
+    "search_first": {
+      "result": {
+        "href": "https://en.wikipedia.org/wiki/WebAssembly",
+        "title": "WebAssembly"
+      },
+      "success": true
+    }
+  }
+}

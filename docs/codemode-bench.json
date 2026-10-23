@@ -1,0 +1,305 @@
+{
+  "generatedAt": "2026-10-23T05:43:12.692Z",
+  "rows": [
+    {
+      "task": "hn_top5",
+      "goal": "Top 5 Hacker News stories with points and comment counts",
+      "runs": {
+        "classic": {
+          "tools": 117,
+          "schemaBytes": 62158,
+          "historyBytes": 14034,
+          "turns": 4,
+          "resultBytes": 6806,
+          "argBytes": 505,
+          "inputBytes": 262666,
+          "calls": [
+            {
+              "name": "navigate",
+              "argBytes": 71,
+              "resultBytes": 168
+            },
+            {
+              "name": "take_snapshot",
+              "argBytes": 39,
+              "resultBytes": 6206
+            },
+            {
+              "name": "execute_code",
+              "argBytes": 395,
+              "resultBytes": 432
+            }
+          ]
+        },
+        "code (hybrid)": {
+          "tools": 123,
+          "schemaBytes": 65597,
+          "historyBytes": 2968,
+          "turns": 3,
+          "resultBytes": 1425,
+          "argBytes": 543,
+          "inputBytes": 199759,
+          "calls": [
+            {
+              "name": "code_api",
+              "argBytes": 54,
+              "resultBytes": 946
+            },
+            {
+              "name": "run_code",
+              "argBytes": 489,
+              "resultBytes": 479
+            }
+          ]
+        },
+        "code": {
+          "tools": 14,
+          "schemaBytes": 8115,
+          "historyBytes": 2968,
+          "turns": 3,
+          "resultBytes": 1425,
+          "argBytes": 543,
+          "inputBytes": 27313,
+          "calls": [
+            {
+              "name": "code_api",
+              "argBytes": 54,
+              "resultBytes": 946
+            },
+            {
+              "name": "run_code",
+              "argBytes": 489,
+              "resultBytes": 479
+            }
+          ]
+        }
+      }
+    },
+    {
+      "task": "wiki_outline",
+      "goal": "Outline of a Wikipedia article: title, intro, section headings",
+      "runs": {
+        "classic": {
+          "tools": 117,
+          "schemaBytes": 62158,
+          "historyBytes": 6300,
+          "turns": 3,
+          "resultBytes": 5946,
+          "argBytes": 121,
+          "inputBytes": 192774,
+          "calls": [
+            {
+              "name": "navigate",
+              "argBytes": 83,
+              "resultBytes": 150
+            },
+            {
+              "name": "extract_text",
+              "argBytes": 38,
+              "resultBytes": 5796
+            }
+          ]
+        },
+        "classic+exec": {
+          "tools": 117,
+          "schemaBytes": 62158,
+          "historyBytes": 1254,
+          "turns": 3,
+          "resultBytes": 604,
+          "argBytes": 417,
+          "inputBytes": 187728,
+          "calls": [
+            {
+              "name": "navigate",
+              "argBytes": 83,
+              "resultBytes": 150
+            },
+            {
+              "name": "execute_code",
+              "argBytes": 334,
+              "resultBytes": 454
+            }
+          ]
+        },
+        "code (hybrid)": {
+          "tools": 123,
+          "schemaBytes": 65597,
+          "historyBytes": 2940,
+          "turns": 3,
+          "resultBytes": 1446,
+          "argBytes": 494,
+          "inputBytes": 199731,
+          "calls": [
+            {
+              "name": "code_api",
+              "argBytes": 54,
+              "resultBytes": 946
+            },
+            {
+              "name": "run_code",
+              "argBytes": 440,
+              "resultBytes": 500
+            }
+          ]
+        },
+        "code": {
+          "tools": 14,
+          "schemaBytes": 8115,
+          "historyBytes": 2940,
+          "turns": 3,
+          "resultBytes": 1446,
+          "argBytes": 494,
+          "inputBytes": 27285,
+          "calls": [
+            {
+              "name": "code_api",
+              "argBytes": 54,
+              "resultBytes": 946
+            },
+            {
+              "name": "run_code",
+              "argBytes": 440,
+              "resultBytes": 500
+            }
+          ]
+        }
+      }
+    },
+    {
+      "task": "search_open_first",
+      "goal": "Search Wikipedia, open the first result, report its title and URL",
+      "runs": {
+        "classic": {
+          "tools": 117,
+          "schemaBytes": 62158,
+          "historyBytes": 16256,
+          "turns": 5,
+          "resultBytes": 5612,
+          "argBytes": 250,
+          "inputBytes": 327046,
+          "calls": [
+            {
+              "name": "navigate",
+              "argBytes": 122,
+              "resultBytes": 214
+            },
+            {
+              "name": "get_dom_state",
+              "argBytes": 39,
+              "resultBytes": 4593
+            },
+            {
+              "name": "click_by_index",
+              "argBytes": 50,
+              "resultBytes": 72
+            },
+            {
+              "name": "get_page_info",
+              "argBytes": 39,
+              "resultBytes": 733
+            }
+          ]
+        },
+        "classic+exec": {
+          "tools": 117,
+          "schemaBytes": 62158,
+          "historyBytes": 3458,
+          "turns": 5,
+          "resultBytes": 1197,
+          "argBytes": 436,
+          "inputBytes": 314248,
+          "calls": [
+            {
+              "name": "navigate",
+              "argBytes": 122,
+              "resultBytes": 214
+            },
+            {
+              "name": "execute_code",
+              "argBytes": 192,
+              "resultBytes": 100
+            },
+            {
+              "name": "navigate",
+              "argBytes": 83,
+              "resultBytes": 150
+            },
+            {
+              "name": "get_page_info",
+              "argBytes": 39,
+              "resultBytes": 733
+            }
+          ]
+        },
+        "code (hybrid)": {
+          "tools": 123,
+          "schemaBytes": 65597,
+          "historyBytes": 3335,
+          "turns": 3,
+          "resultBytes": 1434,
+          "argBytes": 589,
+          "inputBytes": 200126,
+          "calls": [
+            {
+              "name": "code_api",
+              "argBytes": 70,
+              "resultBytes": 1242
+            },
+            {
+              "name": "run_code",
+              "argBytes": 519,
+              "resultBytes": 192
+            }
+          ]
+        },
+        "code": {
+          "tools": 14,
+          "schemaBytes": 8115,
+          "historyBytes": 3335,
+          "turns": 3,
+          "resultBytes": 1434,
+          "argBytes": 589,
+          "inputBytes": 27680,
+          "calls": [
+            {
+              "name": "code_api",
+              "argBytes": 70,
+              "resultBytes": 1242
+            },
+            {
+              "name": "run_code",
+              "argBytes": 519,
+              "resultBytes": 192
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "totals": {
+    "classic": {
+      "input": 782486,
+      "history": 36590,
+      "results": 18364,
+      "tasks": 3
+    },
+    "code (hybrid)": {
+      "input": 599616,
+      "history": 9243,
+      "results": 4305,
+      "tasks": 3
+    },
+    "code": {
+      "input": 82278,
+      "history": 9243,
+      "results": 4305,
+      "tasks": 3
+    },
+    "classic+exec": {
+      "input": 501976,
+      "history": 4712,
+      "results": 1801,
+      "tasks": 2
+    }
+  }
+}
