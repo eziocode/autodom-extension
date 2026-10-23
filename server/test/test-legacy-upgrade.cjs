@@ -29,6 +29,7 @@ for (const f of ["index.js", "self-restart.js", "update-utils.js", "bridge-reape
   fs.copyFileSync(path.join(REAL, f), path.join(DIR, f));
 }
 fs.cpSync(path.join(REAL, "atk"), path.join(DIR, "atk"), { recursive: true });
+fs.cpSync(path.join(REAL, "codemode"), path.join(DIR, "codemode"), { recursive: true });
 fs.symlinkSync(path.join(REAL, "node_modules"), path.join(DIR, "node_modules"));
 const pkg = JSON.parse(fs.readFileSync(path.join(DIR, "package.json"), "utf8"));
 pkg.version = "5.3.9";

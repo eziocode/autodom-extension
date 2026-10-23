@@ -38,6 +38,7 @@ function writeServer(dir, version, { modules } = {}) {
   fs.mkdirSync(dir, { recursive: true });
   for (const f of SERVER_FILES) fs.copyFileSync(path.join(REAL, f), path.join(dir, f));
   fs.cpSync(path.join(REAL, "atk"), path.join(dir, "atk"), { recursive: true });
+  fs.cpSync(path.join(REAL, "codemode"), path.join(dir, "codemode"), { recursive: true });
   const pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
   pkg.version = version;
   fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify(pkg, null, 2));
