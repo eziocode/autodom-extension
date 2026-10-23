@@ -64,6 +64,7 @@ jobs:
           node test/test-tool-cancel.cjs
           node test/test-server-flush.cjs
           node test/test-chat-stream.cjs
+          node test/test-codemode-e2e.cjs
 
       - name: Build Chrome zip
         run: bash scripts/build-chrome.sh

@@ -141,9 +141,11 @@ Optional transports, both off by default:
 
 ## Tools
 
-136 tools are registered. 117 are listed to clients by default; the 19
+138 tools are registered. 117 are listed to clients by default; the 19
 Playwright-compatible aliases (`browser_click`, `browser_snapshot`, ...) stay
-callable by name but are only listed with `AUTODOM_PLAYWRIGHT_COMPAT=1`.
+callable by name but are only listed with `AUTODOM_PLAYWRIGHT_COMPAT=1`, and
+the two Code Mode tools (`run_code`, `code_api`, below) are only listed with
+`AUTODOM_CODE_MODE=1`.
 
 | Area | Tools |
 |---|---|
@@ -176,6 +178,35 @@ destructive call is recorded in the audit log (`audit_query`).
 Workflows (record a task once, replay it without a model, self-heal when the
 page changes, export to Playwright or Markdown, schedule it) are described in
 [docs/WORKFLOWS.md](docs/WORKFLOWS.md).
+
+### Code Mode (experimental)
+
+Instead of one MCP call per browser step, the model writes one script against
+a typed `autodom.*` API and `run_code` runs it in a QuickJS (wasm) sandbox.
+Intermediate results stay in the sandbox; only the script's return value and
+`console.log` output come back.
+
+```js
+await autodom.navigate({ url: "https://example.com" });
+const links = await page.eval(() => [...document.links].map((a) => a.href));
+return links.filter((h) => h.includes("/docs/")).slice(0, 10);
+```
+
+- `code_api` returns the API: no arguments gives one line per tool (about
+  11 KB against about 63 KB for `tools/list`); `{tools: [...]}` or `{query}`
+  gives exact TypeScript declarations.
+- Globals: `autodom.<tool>(params)` for 104 tools, `page.eval(fn, ...args)`
+  (runs `fn` in the active tab through `execute_code`), `emitImage(ref)`,
+  `sleep(ms)`, `console`. No `fetch`, `require`, timers or filesystem.
+- Every inner call is the same tool an MCP client would call: zod-validated,
+  then run through domain guardrails, confirm mode, approval rules and the
+  audit log. A call held for approval stops the run; the steps before it have
+  already run and are listed in `calls`. `confirm_action` runs only the held
+  call. Meta tools (`batch_actions`, `confirm_action`, `approval_rules`, ...)
+  are not reachable from a script.
+- `allow: "read" | "write" | "destructive"` caps the tiers a script may use.
+  Limits per run: 60 s by default (`timeoutMs` up to 300 s), 32 MB heap, 200
+  tool calls.
 
 ## Output compaction (ATK)
 
@@ -277,6 +308,7 @@ Output and tool listing:
 | `AUTODOM_OUTPUT` | compact | `full`: disable ATK compaction |
 | `AUTODOM_TRUST_PROJECT_FILTERS` | `0` | `1`: honour a project-local `.autodom/filters.json` |
 | `AUTODOM_PLAYWRIGHT_COMPAT` | `0` | `1`: list the Playwright-compatible aliases |
+| `AUTODOM_CODE_MODE` | `0` | `1`: list `run_code` and `code_api` (Code Mode) |
 
 Tool gating:
 

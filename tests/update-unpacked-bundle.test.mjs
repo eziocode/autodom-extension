@@ -27,6 +27,8 @@ function writeServer(dir, version, lock) {
   for (const f of ["index.js", "self-restart.js", "automation-store.js", "viewer-app.js"]) writeFileSync(join(dir, f), `// ${version}`);
   mkdirSync(join(dir, "atk"), { recursive: true });
   writeFileSync(join(dir, "atk/index.js"), `// ${version}`);
+  mkdirSync(join(dir, "codemode"), { recursive: true });
+  writeFileSync(join(dir, "codemode/index.js"), `// ${version}`);
   // The real module: the updater re-imports it from server/ on the next run.
   copyFileSync(join(repo, "server/update-utils.js"), join(dir, "update-utils.js"));
   writeFileSync(join(dir, "package.json"), JSON.stringify({ version, type: "module" }));

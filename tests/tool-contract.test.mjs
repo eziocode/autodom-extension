@@ -40,7 +40,7 @@ test("public MCP registration is unique and structurally complete", async () => 
   const inventory = [...direct, ...compat];
 
   assert.equal(new Set(inventory).size, inventory.length);
-  assert.equal(inventory.length, 136, "review public inventory when adding/removing tools");
+  assert.equal(inventory.length, 138, "review public inventory when adding/removing tools");
   assert.equal(compat.length, 23, "browser_* aliases are hidden from tools/list; keep mcp-handshake's listed count in sync");
   assert.match(server, /function getToolTier\(toolName, params = \{\}\)/);
 

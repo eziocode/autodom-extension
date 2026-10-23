@@ -78,6 +78,7 @@ import {
   recallText,
   snapshotBaselines,
 } from "./atk/index.js";
+import { CODE_MODE_TOOL_NAMES, createCodeMode } from "./codemode/index.js";
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 
 // Local Playwright/Node automation backends were intentionally removed: AutoDOM
@@ -950,6 +951,7 @@ const TOOL_TIERS = new Map([
   // Read-only / inspection tools
   ["get_dom_state", "read"],
   ["get_page_info", "read"],
+  ["code_api", "read"],
   ["take_screenshot", "read"],
   ["take_snapshot", "read"],
   ["query_elements", "read"],
@@ -1058,6 +1060,8 @@ const TOOL_TIERS = new Map([
   ["navigate", "destructive"],
   ["fill_form", "destructive"],
   ["batch_actions", "destructive"],
+  // A script can reach any bound tool; each inner call is tiered on its own.
+  ["run_code", "destructive"],
   ["respond_to_chat", "destructive"],
   ["execute_code", "destructive"],
   ["evaluate_script", "destructive"],
@@ -7753,9 +7757,15 @@ function _jsonSchemaForTool(parameters) {
 // The Playwright-compatible aliases duplicate core tools and cost ~6KB of
 // schema on every session. They stay callable by name; only clients that
 // discover tools by listing need AUTODOM_PLAYWRIGHT_COMPAT=1.
+// Code Mode (run_code / code_api) is opt-in while it matures: callable by
+// name always, listed only with AUTODOM_CODE_MODE=1.
 function _listedToolDefinitions(env = process.env) {
-  if (env.AUTODOM_PLAYWRIGHT_COMPAT === "1") return toolDefinitions;
-  return toolDefinitions.filter((t) => !PLAYWRIGHT_COMPAT_NAMES.has(t.name));
+  const codeMode = env.AUTODOM_CODE_MODE === "1";
+  return toolDefinitions.filter(
+    (t) =>
+      (env.AUTODOM_PLAYWRIGHT_COMPAT === "1" || !PLAYWRIGHT_COMPAT_NAMES.has(t.name)) &&
+      (codeMode || !CODE_MODE_TOOL_NAMES.has(t.name)),
+  );
 }
 
 function toolListPayload() {
@@ -8735,6 +8745,60 @@ server.addTool({
     }
     return JSON.stringify({ tiers, totalTools: TOOL_TIERS.size });
   },
+});
+
+// ─── Code Mode ──────────────────────────────────────────────
+// The model writes one script against autodom.* instead of making one MCP
+// call per step; see codemode/index.js. Each inner call runs through the
+// tool's own execute() under its own request context, so a hold records the
+// inner tool (confirm_action re-runs that one call, not the script).
+const codeMode = createCodeMode({
+  getDefinitions: () => toolDefinitions,
+  jsonSchemaFor: _jsonSchemaForTool,
+  tierOf: getToolTier,
+  parseHeld: _parseHeld,
+  hidden: PLAYWRIGHT_COMPAT_NAMES,
+  invoke: (def, params, { signal, context }) =>
+    mcpRequestContext.run({ signal: signal || null, tool: def.name, params, execute: def.execute }, () =>
+      def.execute(params, context),
+    ),
+});
+
+server.addTool({
+  name: "run_code",
+  description:
+    "Run a JavaScript script (async function body: await, return) that drives the browser through autodom.<tool>(params), the same tools as MCP, " +
+    "plus page.eval(fn, ...args) to run fn in the active tab. Chain steps, branch and filter in one call; only the return value and console.log come back. " +
+    "Call code_api first for the API. Sandboxed: no fetch/require/timers. Guardrails and approvals apply to every inner call; a held call stops the run.",
+  parameters: z.object({
+    code: z.string().describe("Async function body. Example: await autodom.navigate({url}); return await page.eval(() => document.title);"),
+    allow: z
+      .enum(["read", "write", "destructive"])
+      .optional()
+      .default("destructive")
+      .describe("Highest tool tier the script may call. read = inspection only. page.eval and navigate are destructive."),
+    timeoutMs: z.number().int().min(1000).max(300000).optional().default(60000).describe("Wall-clock limit for the whole script"),
+    verbose: VERBOSE_PARAM,
+  }),
+  execute: async ({ code, allow, timeoutMs, verbose }, context) => {
+    const signal = context?.mcpReq?.signal || mcpRequestContext.getStore()?.signal || null;
+    const { report, images } = await codeMode.run({ code, allow, timeoutMs, signal, context });
+    if (images.length) {
+      return { content: [{ type: "text", text: stringifyToolResult(report) }, ...images] };
+    }
+    return compactResult("run_code", report, { verbose });
+  },
+});
+
+server.addTool({
+  name: "code_api",
+  description:
+    "TypeScript API for run_code. No args: globals plus one line per tool. {tools:[names]}: exact declarations. {query}: declarations of the best matches.",
+  parameters: z.object({
+    tools: z.array(z.string()).optional().describe("Tool names to declare in full"),
+    query: z.string().optional().describe("Free-text search over tool names and descriptions"),
+  }),
+  execute: async ({ tools, query }) => codeMode.describe({ tools, query }),
 });
 
 // Confirm a destructive action that was held for confirmation

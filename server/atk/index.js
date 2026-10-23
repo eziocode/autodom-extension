@@ -55,6 +55,7 @@ const FILTERS = {
   browser_evaluate: (r) => shrinkJson(r, BUDGETS.json),
   execute_code: (r) => shrinkJson(r, BUDGETS.executeCode),
   execute_async_script: (r) => shrinkJson(r, BUDGETS.executeCode),
+  run_code: (r) => shrinkJson(r, BUDGETS.executeCode),
 };
 
 export function hasFilter(tool) {

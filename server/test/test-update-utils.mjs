@@ -627,6 +627,8 @@ async function makeBundle(root, version, { lock = "lock-a", serverFiles = true }
     }
     await mkdir(join(top, "server/atk"), { recursive: true });
     await writeFile(join(top, "server/atk/index.js"), "// " + version);
+    await mkdir(join(top, "server/codemode"), { recursive: true });
+    await writeFile(join(top, "server/codemode/index.js"), "// " + version);
   }
   return top;
 }
