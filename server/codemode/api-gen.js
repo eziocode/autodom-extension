@@ -212,6 +212,8 @@ declare const page: {
 /** Attach a screenshot to the run_code result. ref comes from autodom.take_screenshot(). */
 declare function emitImage(ref: { imageRef: string } | string): void;
 declare function sleep(ms: number): Promise<void>;
+/** run_code {input} / a saved script's run input (schedule variables). Frozen; {} when none. */
+declare const input: Readonly<Record<string, any>>;
 // console.log/info/warn/error are captured and returned as logs.
 // A failed tool call throws Error { name: "ToolError" | "InvalidParams" | "TierDenied", message, tool, details? }.
 // No fetch, require, timers or filesystem: reach the browser only through autodom.* and page.eval.`;

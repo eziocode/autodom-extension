@@ -73,8 +73,15 @@
     const base = existing ? { ...existing } : {};
     const s = { ...base, ...input };
     const errors = [];
-    if (!s.workflowId && !s.prompt) errors.push("give workflowId (a saved workflow) or prompt");
-    if (s.workflowId && s.prompt) errors.push("give either workflowId or prompt, not both");
+    const TARGETS = ["workflowId", "scriptId", "prompt"];
+    // A partial update may switch targets: the one given wins.
+    if (existing && input) {
+      const given = TARGETS.filter((k) => input[k]);
+      if (given.length === 1) for (const k of TARGETS) if (k !== given[0]) delete s[k];
+    }
+    const targets = TARGETS.filter((k) => s[k]);
+    if (!targets.length) errors.push("give workflowId (a saved workflow), scriptId (a saved run_code script) or prompt");
+    if (targets.length > 1) errors.push("give only one of workflowId, scriptId or prompt");
     const kinds = ["every", "daily", "weekly"].filter((k) => s[k] != null && s[k] !== "");
     // A partial update may switch kinds: the newest given kind wins.
     if (input && kinds.length > 1) {
@@ -143,7 +150,7 @@
         schedule.name = schedule.name || wf.name;
       }
       schedule.id = newId();
-      schedule.name = schedule.name || (schedule.prompt ? String(schedule.prompt).slice(0, 40) : schedule.id);
+      schedule.name = schedule.name || (schedule.prompt ? String(schedule.prompt).slice(0, 40) : schedule.scriptId || schedule.id);
       schedule.createdAt = Date.now();
       if (schedule.every) schedule.anchorAt = Date.now();
       schedule.nextRunAt = computeNext(schedule, Date.now());
@@ -183,7 +190,7 @@
       return {
         id: s.id,
         name: s.name,
-        target: s.workflowId ? { workflowId: s.workflowId } : { prompt: s.prompt },
+        target: s.workflowId ? { workflowId: s.workflowId } : s.scriptId ? { scriptId: s.scriptId } : { prompt: s.prompt },
         when: describeSchedule(s),
         every: s.every,
         daily: s.daily,
@@ -239,6 +246,16 @@
           status = report.status || (report.ok === false ? "failed" : "passed");
           detail = report.error || "";
           runId = report.runId || null;
+        } else if (s.scriptId) {
+          // Saved Code Mode scripts run in the MCP bridge, not here.
+          if (typeof ctx.runScript !== "function") throw new Error("Scheduled scripts are not supported by this build");
+          const report = await ctx.runScript(s.scriptId, {
+            input: s.variables || {},
+            trigger: trigger || "schedule",
+            keepTab: s.keepTab,
+          });
+          status = report.status || (report.ok ? "passed" : "failed");
+          detail = report.detail || report.error || "";
         } else {
           const result = await ctx.runPrompt(s.prompt, { trigger: trigger || "schedule" });
           status = result && result.error ? "failed" : "passed";

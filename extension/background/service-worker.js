@@ -4682,6 +4682,7 @@ const _WS_CONN_MESSAGE_HANDLERS = Object.freeze({
   SERVER_USAGE_RESULT: _onWsConn_SERVER_USAGE_RESULT,
   SERVER_FLUSH_RESULT: _onWsConn_SERVER_FLUSH_RESULT,
   PING: _onWsConn_PING,
+  RUN_SCRIPT_RESULT: (message) => _onWsConn_RUN_SCRIPT_RESULT(message),
 });
 
 const WS_MAX_MESSAGE_CHARS = 32 * 1024 * 1024;
@@ -4796,6 +4797,7 @@ function connectWebSocket(port) {
       stopKeepAlive();
       stopInactivityTimer();
       resolvePendingAiRequests("MCP disconnected before the AI agent replied.");
+      _resolvePendingScriptRuns("The bridge disconnected before the script finished.");
       _debugLog(
         `[AutoDOM] WebSocket disconnected: code=${event.code}, reason=${event.reason}, wasClean=${event.wasClean}`,
       );
@@ -6806,6 +6808,60 @@ async function _scheduledPromptRun(prompt) {
   }
 }
 
+// Saved Code Mode scripts run in the MCP bridge (its QuickJS sandbox and
+// guardrails), so a scheduled one asks the connected bridge to run it and
+// waits for the summary. No bridge connected: the run is skipped.
+const _pendingScriptRuns = new Map(); // requestId -> { resolve, timer }
+let _scriptRunSeq = 0;
+// Longest run_code timeout (300 s) plus room for the bridge to clean up.
+const SCRIPT_RUN_WAIT_MS = 330000;
+
+function _scheduledScriptRun(scriptId, { input, trigger, keepTab } = {}) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return Promise.resolve({
+      ok: false,
+      status: "skipped",
+      detail: "No AutoDOM bridge connected. Scheduled scripts run in the bridge, so an MCP client (your IDE) must have it running.",
+    });
+  }
+  const id = `script_${Date.now().toString(36)}_${++_scriptRunSeq}`;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      _pendingScriptRuns.delete(id);
+      resolve({ ok: false, status: "failed", detail: "The bridge did not report the script's result in time." });
+    }, SCRIPT_RUN_WAIT_MS);
+    _pendingScriptRuns.set(id, { resolve, timer });
+    try {
+      ws.send(JSON.stringify({ type: "RUN_SCRIPT", id, scriptId, input: input || {}, trigger: trigger || "schedule", keepTab: !!keepTab }));
+    } catch (err) {
+      clearTimeout(timer);
+      _pendingScriptRuns.delete(id);
+      resolve({ ok: false, status: "failed", detail: `Could not reach the bridge: ${err?.message || err}` });
+    }
+  });
+}
+
+function _resolvePendingScriptRuns(detail) {
+  for (const [id, pending] of _pendingScriptRuns) {
+    clearTimeout(pending.timer);
+    pending.resolve({ ok: false, status: "failed", detail });
+    _pendingScriptRuns.delete(id);
+  }
+}
+
+async function _onWsConn_RUN_SCRIPT_RESULT(message) {
+  const pending = _pendingScriptRuns.get(message.id);
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  _pendingScriptRuns.delete(message.id);
+  const r = message.result && typeof message.result === "object" ? message.result : {};
+  pending.resolve({
+    ok: r.ok === true,
+    status: ["passed", "failed", "held", "skipped"].includes(r.status) ? r.status : r.ok ? "passed" : "failed",
+    detail: String(r.detail || "").slice(0, 500),
+  });
+}
+
 let workflowScheduler = null;
 try {
   if (globalThis.AutoDOMScheduler?.makeScheduler && workflowEngine) {
@@ -6816,6 +6872,7 @@ try {
       findWorkflow: (ref) => workflowEngine.findWorkflow(ref),
       runWorkflow: _scheduledWorkflowRun,
       runPrompt: _scheduledPromptRun,
+      runScript: _scheduledScriptRun,
       notify: (title, message) =>
         new Promise((resolve) => {
           if (!chrome.notifications?.create) return resolve(false);

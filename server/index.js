@@ -66,6 +66,10 @@ import {
   appendAudit,
   queryAudit,
   autodomHome,
+  saveScriptFile,
+  readScriptFile,
+  listScriptFiles,
+  deleteScriptFile,
 } from "./automation-store.js";
 import { decideReap } from "./bridge-reaper.js";
 import {
@@ -79,6 +83,7 @@ import {
   snapshotBaselines,
 } from "./atk/index.js";
 import { CODE_MODE_TOOL_NAMES, CODE_ONLY_LISTED, createCodeMode } from "./codemode/index.js";
+import { checkScriptSyntax } from "./codemode/sandbox.js";
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 
 // Local Playwright/Node automation backends were intentionally removed: AutoDOM
@@ -701,7 +706,13 @@ const userTabRequestContext = new AsyncLocalStorage();
 // their pins and isolation opt-out never overwrite the agent's.
 const CHAT_CLIENT_ID = `${MY_CLIENT_ID}:chat`;
 let _chatClientUsed = false; // so shutdown only reports it gone when it existed
+// A scheduled Code Mode script runs as its own isolation client, so its tabs
+// (and the finish_session that closes them) never touch the IDE session's.
+const scriptRunContext = new AsyncLocalStorage();
+let _scriptRunSeq = 0;
 function frameClientId() {
+  const scriptClient = scriptRunContext.getStore()?.clientId;
+  if (scriptClient) return scriptClient;
   if (userTabRequestContext.getStore()?.userTab !== true) return MY_CLIENT_ID;
   _chatClientUsed = true;
   return CHAT_CLIENT_ID;
@@ -952,6 +963,8 @@ const TOOL_TIERS = new Map([
   ["get_dom_state", "read"],
   ["get_page_info", "read"],
   ["code_api", "read"],
+  ["script_list", "read"],
+  ["script_get", "read"],
   ["take_screenshot", "read"],
   ["take_snapshot", "read"],
   ["query_elements", "read"],
@@ -1062,6 +1075,9 @@ const TOOL_TIERS = new Map([
   ["batch_actions", "destructive"],
   // A script can reach any bound tool; each inner call is tiered on its own.
   ["run_code", "destructive"],
+  // A saved script can later run unattended from a schedule.
+  ["script_save", "destructive"],
+  ["script_delete", "write"],
   ["respond_to_chat", "destructive"],
   ["execute_code", "destructive"],
   ["evaluate_script", "destructive"],
@@ -4435,9 +4451,31 @@ function _handleWorkflowMirror(socket, message) {
   saveWorkflowFile(wf).catch((err) => diagLog(`workflow mirror failed id=${wf.id}: ${err.message}`));
 }
 
+// The extension's scheduler fires a saved Code Mode script: run it here,
+// unattended, and answer with a summary for the schedule's last status.
+// Only the extension socket may ask.
+async function _handleRunScript(socket, message) {
+  if (socket !== extensionSocket) return;
+  let result;
+  try {
+    const input = message.input && typeof message.input === "object" && !Array.isArray(message.input) ? message.input : {};
+    result = await _runSavedScriptUnattended(String(message.scriptId || ""), {
+      input,
+      trigger: String(message.trigger || "schedule"),
+      keepTab: message.keepTab === true,
+    });
+  } catch (err) {
+    result = { ok: false, status: "failed", detail: err?.message || String(err) };
+  }
+  try {
+    if (socket.readyState === 1) socket.send(JSON.stringify({ type: "RUN_SCRIPT_RESULT", id: message.id, result }));
+  } catch (_) {}
+}
+
 const _WS_MESSAGE_HANDLERS = Object.freeze({
   RESTART_STALE: _handleRestartStale,
   WORKFLOW_MIRROR: _handleWorkflowMirror,
+  RUN_SCRIPT: _handleRunScript,
   PROXY_HELLO: _handleProxyHello,
   BRIDGE_STATUS: _handleBridgeStatus,
   SELF_UPDATE: _handleSelfUpdate,
@@ -8799,6 +8837,7 @@ const codeMode = createCodeMode({
 function _codeModeOutput(out) {
   if (!out) return JSON.stringify({ error: "That script is no longer paused (finished, expired or already resumed)." });
   if (out.suspended) return JSON.stringify(out.report);
+  if (out.meta?.scriptId) _recordScriptRun(out.meta.scriptId, _scriptRunSummary(out.report), "manual");
   if (out.images.length) {
     return { content: [{ type: "text", text: stringifyToolResult(out.report) }, ...out.images] };
   }
@@ -8827,19 +8866,186 @@ server.addTool({
     "Call code_api first for the API. Sandboxed: no fetch/require/timers. Guardrails and approvals apply to every inner call: a held call pauses the script " +
     "(confirm_action resumes it and returns its result; cancel_action makes that call throw ApprovalDenied in the script).",
   parameters: z.object({
-    code: z.string().describe("Async function body. Example: await autodom.navigate({url}); return await page.eval(() => document.title);"),
+    code: z
+      .string()
+      .optional()
+      .describe("Async function body. Example: await autodom.navigate({url}); return await page.eval(() => document.title);"),
+    script: z.string().optional().describe("Run a saved script (script_save) by id instead of code"),
+    input: z.record(z.string(), z.any()).optional().describe("Exposed to the script as the global `input`"),
     allow: z
       .enum(["read", "write", "destructive"])
       .optional()
-      .default("destructive")
-      .describe("Highest tool tier the script may call. read = inspection only. page.eval and navigate are destructive."),
-    timeoutMs: z.number().int().min(1000).max(300000).optional().default(60000).describe("Wall-clock limit for the whole script"),
+      .describe("Highest tool tier the script may call (default destructive, or the saved script's). read = inspection only. page.eval and navigate are destructive."),
+    timeoutMs: z
+      .number()
+      .int()
+      .min(1000)
+      .max(300000)
+      .optional()
+      .describe("Wall-clock limit for the whole script (default 60000, or the saved script's)"),
     verbose: VERBOSE_PARAM,
   }),
-  execute: async ({ code, allow, timeoutMs, verbose }, context) => {
+  execute: async ({ code, script, input, allow, timeoutMs, verbose }, context) => {
+    if (!code === !script) return JSON.stringify({ error: "Give exactly one of code or script." });
+    let saved = null;
+    if (script) {
+      saved = await readScriptFile(script);
+      if (!saved) return JSON.stringify({ error: `No saved script "${script}". script_list shows what exists.` });
+    }
     const signal = context?.mcpReq?.signal || mcpRequestContext.getStore()?.signal || null;
-    return _codeModeOutput(await codeMode.run({ code, allow, timeoutMs, signal, context, meta: { verbose } }));
+    const out = await codeMode.run({
+      code: saved ? saved.code : code,
+      allow: allow || saved?.allow || "destructive",
+      timeoutMs: timeoutMs || saved?.timeoutMs || 60000,
+      input,
+      signal,
+      context,
+      meta: { verbose, ...(saved ? { scriptId: saved.id } : {}) },
+    });
+    return _codeModeOutput(out);
   },
+});
+
+// ─── Saved scripts ──────────────────────────────────────────
+// A script that worked can be saved and rerun without a model: run_code
+// {script} on demand, or a schedule ({scriptId}) that the extension fires.
+// Scripts live in ~/.autodom/scripts; scheduled runs happen here, so they
+// need a bridge connected at that time.
+
+function _slug(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 60);
+}
+
+function _scriptView(s) {
+  return {
+    id: s.id,
+    name: s.name,
+    ...(s.description ? { description: s.description } : {}),
+    allow: s.allow,
+    timeoutMs: s.timeoutMs,
+    bytes: Buffer.byteLength(s.code || ""),
+    updatedAt: s.updatedAt,
+    ...(s.lastRun ? { lastRun: s.lastRun } : {}),
+  };
+}
+
+// One-line outcome of a finished run, for schedules and script_list.
+function _scriptRunSummary(report) {
+  const held = /needs approval/.test(report?.stopped?.reason || "");
+  const status = report?.ok ? "passed" : held ? "held" : "failed";
+  const detail = report?.ok
+    ? ""
+    : report?.stopped?.info?.message || report?.stopped?.reason || report?.error?.message || "failed";
+  let result;
+  if (report?.ok && report.result !== undefined) {
+    const text = JSON.stringify(report.result);
+    result = text && text.length > 2000 ? `${text.slice(0, 2000)}...` : report.result;
+  }
+  return { ok: !!report?.ok, status, detail: String(detail).slice(0, 500), ms: report?.ms, ...(result !== undefined ? { result } : {}) };
+}
+
+async function _recordScriptRun(scriptId, summary, trigger) {
+  try {
+    const s = await readScriptFile(scriptId);
+    if (!s) return;
+    s.lastRun = { at: new Date().toISOString(), trigger, status: summary.status, ms: summary.ms, ...(summary.detail ? { detail: summary.detail } : {}) };
+    await saveScriptFile(s);
+  } catch (err) {
+    diagLog(`script lastRun update failed id=${scriptId}: ${err.message}`);
+  }
+}
+
+async function _runSavedScriptUnattended(scriptId, { input = {}, trigger = "schedule", keepTab = false } = {}) {
+  const script = await readScriptFile(scriptId);
+  if (!script) return { ok: false, status: "failed", detail: `Script not found: ${scriptId}` };
+  const clientId = `${MY_CLIENT_ID}:script:${++_scriptRunSeq}`;
+  return scriptRunContext.run({ clientId }, async () => {
+    let out;
+    try {
+      out = await codeMode.run({
+        code: script.code,
+        allow: script.allow || "destructive",
+        timeoutMs: script.timeoutMs || 60000,
+        input,
+        unattended: true,
+        meta: { scriptId: script.id },
+      });
+    } finally {
+      // Close what the run opened (its own isolation client only).
+      if (!keepTab) await callExtensionTool("__finish_session", {}).catch(() => {});
+    }
+    const summary = _scriptRunSummary(out.report);
+    await _recordScriptRun(script.id, summary, trigger);
+    return summary;
+  });
+}
+
+server.addTool({
+  name: "script_save",
+  description:
+    "Save a run_code script so it can rerun without a model: run_code {script:id} or schedule_create {scriptId}. Scheduled runs are unattended: a call that needs approval stops them. Saving an existing id replaces it.",
+  parameters: z.object({
+    name: z.string().min(1).describe("Human-readable name"),
+    code: z.string().min(1).describe("The script (same as run_code code)"),
+    id: z.string().optional().describe("Defaults to a slug of name"),
+    description: z.string().optional(),
+    allow: z.enum(["read", "write", "destructive"]).optional().default("destructive"),
+    timeoutMs: z.number().int().min(1000).max(300000).optional().default(60000),
+  }),
+  execute: async ({ name, code, id, description, allow, timeoutMs }) => {
+    const scriptId = id || _slug(name);
+    if (!/^[A-Za-z0-9_-]{1,80}$/.test(scriptId)) {
+      return JSON.stringify({ error: "id must be 1-80 characters of A-Z, a-z, 0-9, _ or -" });
+    }
+    const syntax = await checkScriptSyntax(code);
+    if (syntax) return JSON.stringify({ error: `Script does not parse: ${syntax}` });
+    const existing = await readScriptFile(scriptId);
+    const now = new Date().toISOString();
+    const script = {
+      id: scriptId,
+      name,
+      ...(description ? { description } : {}),
+      allow,
+      timeoutMs,
+      code,
+      createdAt: existing?.createdAt || now,
+      updatedAt: now,
+    };
+    const file = await saveScriptFile(script);
+    return JSON.stringify({ ok: true, replaced: !!existing, file, script: _scriptView(script) });
+  },
+});
+
+server.addTool({
+  name: "script_list",
+  description: "List saved run_code scripts with their limits and last finished run (no code; script_get has it).",
+  parameters: z.object({}),
+  execute: async () => {
+    const scripts = (await listScriptFiles()).map(_scriptView);
+    return JSON.stringify({ count: scripts.length, scripts });
+  },
+});
+
+server.addTool({
+  name: "script_get",
+  description: "Get a saved run_code script, including its code.",
+  parameters: z.object({ id: z.string() }),
+  execute: async ({ id }) => {
+    const s = await readScriptFile(id);
+    return JSON.stringify(s ? { ...s, bytes: Buffer.byteLength(s.code || "") } : { error: `No saved script "${id}"` });
+  },
+});
+
+server.addTool({
+  name: "script_delete",
+  description: "Delete a saved run_code script. Schedules that run it start failing with \"Script not found\".",
+  parameters: z.object({ id: z.string() }),
+  execute: async ({ id }) =>
+    JSON.stringify((await deleteScriptFile(id)) ? { ok: true, deleted: id } : { error: `No saved script "${id}"` }),
 });
 
 server.addTool({
@@ -10365,9 +10571,10 @@ const _scheduleWhen = {
 server.addTool({
   name: "schedule_create",
   description:
-    "Schedule a saved workflow (no LLM) or a prompt (needs an AI provider in the extension): every N minutes, daily at HH:MM, or weekly. Runs in a background AutoDOM tab; failures notify, reports go to run_list. Fires only while the browser is open; a missed run fires once at next start-up.",
+    "Schedule a saved workflow (no LLM), a saved run_code script (scriptId; runs in this bridge, so only while an MCP client has it running) or a prompt (needs an AI provider in the extension): every N minutes, daily at HH:MM, or weekly. Runs in a background AutoDOM tab; failures notify, reports go to run_list. Fires only while the browser is open; a missed run fires once at next start-up.",
   parameters: z.object({
     workflowId: z.string().optional().describe("Workflow id or exact name"),
+    scriptId: z.string().optional().describe("Saved run_code script id (script_save); variables become its `input`"),
     prompt: z.string().optional().describe("Task for the in-extension agent instead of a workflow"),
     name: z.string().optional(),
     variables: z.record(z.string(), z.any()).optional().describe("Values for the workflow's {{variables}}"),
@@ -10377,7 +10584,14 @@ server.addTool({
     keepTab: z.boolean().optional().default(false).describe("Leave the run's tab open afterwards"),
     enabled: z.boolean().optional().default(true),
   }),
-  execute: async (params) => stringifyToolResult(await callExtensionTool("schedule_create", params)),
+  execute: async (params) => {
+    if (params.scriptId) {
+      const script = await readScriptFile(params.scriptId);
+      if (!script) return stringifyToolResult({ ok: false, error: `No saved script "${params.scriptId}". script_list shows what exists.` });
+      params = { ...params, name: params.name || script.name };
+    }
+    return stringifyToolResult(await callExtensionTool("schedule_create", params));
+  },
 });
 
 server.addTool({
@@ -10438,6 +10652,7 @@ server.addTool({
   parameters: z.object({
     id: z.string(),
     name: z.string().optional(),
+    scriptId: z.string().optional().describe("Switch the schedule to this saved run_code script"),
     variables: z.record(z.string(), z.any()).optional(),
     ..._scheduleWhen,
     notifyOn: z.enum(["failure", "always", "never"]).optional(),
@@ -10447,6 +10662,9 @@ server.addTool({
     runNow: z.boolean().optional(),
   }),
   execute: async ({ runNow, ...params }) => {
+    if (params.scriptId && !(await readScriptFile(params.scriptId))) {
+      return stringifyToolResult({ ok: false, error: `No saved script "${params.scriptId}".` });
+    }
     const result = await callExtensionTool("schedule_update", params);
     if (result?.ok && runNow) Object.assign(result, await _scheduleRunNow(params.id));
     return stringifyToolResult(result);

@@ -7,7 +7,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const serverRequire = createRequire(resolve(root, "server/package.json"));
 const { z } = await import(pathToFileURL(serverRequire.resolve("zod")).href);
-const { runInSandbox } = await import("../server/codemode/sandbox.js");
+const { runInSandbox, checkScriptSyntax } = await import("../server/codemode/sandbox.js");
+const store = await import("../server/automation-store.js");
+const { mkdtemp, rm, readFile: readFileFs } = await import("node:fs/promises");
+const { tmpdir } = await import("node:os");
+const { join } = await import("node:path");
 const { createCodeMode, CODE_MODE_EXCLUDED } = await import("../server/codemode/index.js");
 const { schemaToTs } = await import("../server/codemode/api-gen.js");
 const { RESULT_TYPES, AREAS } = await import("../server/codemode/result-types.js");
@@ -382,4 +386,56 @@ test("result types and areas stay consistent", () => {
     const depth = [...type].reduce((d, c) => d + (c === "{" ? 1 : c === "}" ? -1 : 0), 0);
     assert.equal(depth, 0, `${name}: unbalanced braces`);
   }
+});
+
+test("code mode: input is a frozen global holding the run input", async () => {
+  const { codeMode } = fakeServer();
+  const { report } = await codeMode.run({
+    input: { sku: "A1", n: 2, "</script>": "\u2028" },
+    code: `"use strict"; let frozen = false; try { input.sku = "x"; } catch (e) { frozen = true; } return { input, frozen };`,
+  });
+  assert.equal(report.ok, true, JSON.stringify(report));
+  assert.deepEqual(report.result, { input: { sku: "A1", n: 2, "</script>": "\u2028" }, frozen: true });
+  const empty = await codeMode.run({ code: `return input;` });
+  assert.deepEqual(empty.report.result, {});
+});
+
+test("code mode: an unattended run stops at a hold and drops its confirmation", async () => {
+  const discarded = [];
+  const defs = [heldDef()];
+  const codeMode = createCodeMode({
+    getDefinitions: () => defs,
+    jsonSchemaFor: (p) => z.toJSONSchema(p, { io: "input" }),
+    tierOf: () => "destructive",
+    parseHeld: (v) => (v && typeof v === "object" && v.confirmRequired ? v : null),
+    invoke: async (def, params) => def.execute(params),
+    onHoldDiscarded: (id) => discarded.push(id),
+  });
+  const out = await codeMode.run({ unattended: true, code: `await autodom.submit(); return "after";` });
+  assert.equal(out.suspended, false, "never pauses: nobody can approve");
+  assert.equal(out.report.ok, false);
+  assert.match(out.report.stopped.reason, /needs approval/);
+  assert.match(out.report.stopped.info.message, /unattended run stopped/);
+  assert.equal(codeMode.isSuspended(7), false);
+  assert.deepEqual(discarded, [7]);
+});
+
+test("checkScriptSyntax parses without running", async () => {
+  assert.equal(await checkScriptSyntax(`while (true) {} return 1;`), null, "parsed, never executed");
+  assert.match(await checkScriptSyntax(`return (`), /expect|unexpected/i);
+});
+
+test("script store: save, read, list, delete under AUTODOM_HOME", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "autodom-scripts-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await assert.rejects(store.saveScriptFile({ id: "../x", code: "" }, home), /script id/);
+  assert.equal(await store.readScriptFile("../etc/passwd", home), null);
+  const file = await store.saveScriptFile({ id: "b_one", name: "B", code: "return 1" }, home);
+  await store.saveScriptFile({ id: "a_one", name: "A", code: "return 2" }, home);
+  assert.equal(JSON.parse(await readFileFs(file, "utf8")).code, "return 1");
+  assert.deepEqual((await store.listScriptFiles(home)).map((s) => s.id), ["a_one", "b_one"]);
+  assert.equal((await store.readScriptFile("a_one", home)).name, "A");
+  assert.equal(await store.deleteScriptFile("a_one", home), true);
+  assert.equal(await store.deleteScriptFile("a_one", home), false);
+  assert.equal(await store.readScriptFile("a_one", home), null);
 });

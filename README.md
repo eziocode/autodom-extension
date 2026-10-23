@@ -141,11 +141,11 @@ Optional transports, both off by default:
 
 ## Tools
 
-138 tools are registered. 117 are listed to clients by default; the 19
+142 tools are registered. 117 are listed to clients by default; the 19
 Playwright-compatible aliases (`browser_click`, `browser_snapshot`, ...) stay
 callable by name but are only listed with `AUTODOM_PLAYWRIGHT_COMPAT=1`, and
-the two Code Mode tools (`run_code`, `code_api`, below) are only listed with
-`AUTODOM_CODE_MODE=1`.
+the six Code Mode tools (`run_code`, `code_api`, `script_*`, below) are only
+listed with `AUTODOM_CODE_MODE`.
 
 | Area | Tools |
 |---|---|
@@ -199,10 +199,24 @@ return links.filter((h) => h.includes("/docs/")).slice(0, 10);
   tools (`get_dom_state`, `navigate`, `click`, `list_tabs`, `query_elements`,
   ...) declare their result type; the index marks the rest `(returns any)`.
 - `AUTODOM_CODE_MODE=1` lists `run_code` and `code_api` next to every tool.
-  `AUTODOM_CODE_MODE=only` lists just `run_code`, `code_api`,
-  `confirm_action`, `cancel_action`, `recall` and `finish_session` (about
-  3.5 KB of `tools/list`); every other tool stays callable by name. Both add
-  a line to the server instructions pointing the model at `run_code`.
+  `AUTODOM_CODE_MODE=only` lists just the Code Mode tools plus
+  `confirm_action`, `cancel_action`, `recall`, `finish_session` and the
+  `schedule_*` tools (about 8 KB of `tools/list`, against 63 KB); every other tool stays
+  callable by name. Both add a line to the server instructions pointing the
+  model at `run_code`.
+- Saved scripts: `script_save {name, code}` stores a script that worked in
+  `~/.autodom/scripts/<id>.json` (syntax-checked, not run). Rerun it with
+  `run_code {script: id, input}`; the script reads `input`. `script_list`,
+  `script_get` and `script_delete` manage them, and each script records its
+  last finished run.
+- Scheduled scripts: `schedule_create {scriptId, every | daily | weekly,
+  variables}`. The extension's scheduler fires it and asks the connected
+  bridge to run it; `variables` become `input`. Each run gets its own tab
+  isolation client and closes its tabs afterwards (unless `keepTab`). Runs
+  are unattended: a call that needs approval stops the run (status `held`,
+  notified) instead of waiting. A scheduled script runs only while a bridge
+  is connected, that is while an MCP client has AutoDOM running; otherwise
+  the run is `skipped` and notified.
 - Globals: `autodom.<tool>(params)` for 104 tools, `page.eval(fn, ...args)`
   (runs `fn` in the active tab through `execute_code`), `emitImage(ref)`,
   `sleep(ms)`, `console`. No `fetch`, `require`, timers or filesystem.

@@ -6,6 +6,8 @@
 //   exports/<file>          default target of workflow_export { save: true }
 //   audit/YYYY-MM-DD.jsonl  append-only log of tool calls and approval
 //                           decisions (one JSON object per line)
+//   scripts/<id>.json       saved Code Mode scripts (run_code {script}); the
+//                           server is their only copy
 
 import { promises as fs, createReadStream } from "fs";
 import { createInterface } from "node:readline";
@@ -35,6 +37,69 @@ export async function deleteWorkflowFile(id, home = autodomHome()) {
   if (!SAFE_ID.test(String(id || ""))) return false;
   try {
     await fs.unlink(join(home, "workflows", `${id}.json`));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── Saved Code Mode scripts ─────────────────────────────────
+
+function scriptFile(id, home) {
+  if (!SAFE_ID.test(String(id || ""))) {
+    throw new Error("script id must be 1-80 characters of A-Z, a-z, 0-9, _ or -");
+  }
+  return join(home, "scripts", `${id}.json`);
+}
+
+export async function saveScriptFile(script, home = autodomHome()) {
+  const file = scriptFile(script?.id, home);
+  await fs.mkdir(dirname(file), { recursive: true });
+  // Write then rename so a crash never leaves half a script behind.
+  const tmp = `${file}.${process.pid}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(script, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  await fs.rename(tmp, file);
+  return file;
+}
+
+/** The saved script, or null when there is none with that id. */
+export async function readScriptFile(id, home = autodomHome()) {
+  let file;
+  try {
+    file = scriptFile(id, home);
+  } catch {
+    return null;
+  }
+  try {
+    return JSON.parse(await fs.readFile(file, "utf8"));
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+export async function listScriptFiles(home = autodomHome()) {
+  const dir = join(home, "scripts");
+  let names;
+  try {
+    names = (await fs.readdir(dir)).filter((f) => f.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const name of names) {
+    try {
+      out.push(JSON.parse(await fs.readFile(join(dir, name), "utf8")));
+    } catch {
+      // A hand-edited file that no longer parses is skipped, not fatal.
+    }
+  }
+  return out.sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
+}
+
+export async function deleteScriptFile(id, home = autodomHome()) {
+  try {
+    await fs.unlink(scriptFile(id, home));
     return true;
   } catch {
     return false;

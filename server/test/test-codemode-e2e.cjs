@@ -55,6 +55,8 @@ function fakeExtension(msg) {
       return { url: 'https://example.test/', title: 'Example Domain' };
     case 'execute_code':
       return { success: true, result: ['https://example.test/a', 'https://example.test/b'] };
+    case '__finish_session':
+      return { ok: true, closed: 1 };
     default:
       return { error: `unexpected tool ${msg.tool}` };
   }
@@ -65,7 +67,7 @@ async function startServer(port, env) {
   fs.rmSync(lockFile, { force: true });
   const proc = cp.spawn('node', [path.join(__dirname, '..', 'index.js'), '--port', String(port)], {
     stdio: ['pipe', 'pipe', 'ignore'],
-    env: { ...process.env, AUTODOM_INACTIVITY_TIMEOUT: '0', AUTODOM_AUDIT: '0', ...env },
+    env: { ...process.env, AUTODOM_INACTIVITY_TIMEOUT: '0', AUTODOM_AUDIT: '0', AUTODOM_HOME: fs.mkdtempSync(path.join(os.tmpdir(), 'autodom-cm-')), ...env },
   });
   const responses = new Map();
   let buf = '';
@@ -90,10 +92,12 @@ async function startServer(port, env) {
   });
   ext.send(JSON.stringify({ type: 'KEEPALIVE' }));
   const extCalls = [];
+  const extMessages = [];
   ext.on('message', (m) => {
     const msg = JSON.parse(m.toString());
+    extMessages.push(msg);
     if (msg.type !== 'TOOL_CALL') return;
-    extCalls.push({ tool: msg.tool, confirmed: msg.confirmed === true });
+    extCalls.push({ tool: msg.tool, confirmed: msg.confirmed === true, clientId: msg.clientId });
     ext.send(JSON.stringify({ type: 'TOOL_RESULT', id: msg.id, result: fakeExtension(msg) }));
   });
   await sleep(500);
@@ -115,7 +119,18 @@ async function startServer(port, env) {
     ext.close();
     proc.kill();
   };
-  return { call, listTools, extCalls, stop };
+  // What the extension's scheduler does for a saved-script schedule.
+  async function runScriptFromExtension(scriptId, input) {
+    const id = `script_${Date.now()}`;
+    ext.send(JSON.stringify({ type: 'RUN_SCRIPT', id, scriptId, input, trigger: 'schedule' }));
+    for (let i = 0; i < 400; i++) {
+      const got = extMessages.find((m) => m.type === 'RUN_SCRIPT_RESULT' && m.id === id);
+      if (got) return got.result;
+      await sleep(25);
+    }
+    throw new Error('no RUN_SCRIPT_RESULT');
+  }
+  return { call, listTools, runScriptFromExtension, extCalls, stop };
 }
 
 async function plainRun() {
@@ -185,7 +200,11 @@ async function onlyModeListing() {
   const s = await startServer(19884, { AUTODOM_CODE_MODE: 'only' });
   try {
     const names = (await s.listTools()).sort().join();
-    assert(names === 'cancel_action,code_api,confirm_action,finish_session,recall,run_code', 'only mode lists the Code Mode set: ' + names);
+    assert(
+      names ===
+        'cancel_action,code_api,confirm_action,finish_session,recall,run_code,schedule_create,schedule_delete,schedule_list,schedule_update,script_delete,script_get,script_list,script_save',
+      'only mode lists the Code Mode set: ' + names,
+    );
     const listed = await s.call('code_api', {});
     const index = text(listed);
     assert(!/^## other$/m.test(index), 'every bound tool has an area: ' + (index.split('## other')[1] || '').slice(0, 300));
@@ -197,9 +216,70 @@ async function onlyModeListing() {
   }
 }
 
+const SAVED = `
+  await autodom.navigate({ url: input.url });
+  const info = await autodom.get_page_info();
+  return { title: info.title, sku: input.sku };
+`;
+
+async function savedScripts() {
+  const s = await startServer(19885, {});
+  try {
+    const bad = json(await s.call('script_save', { name: 'Broken', code: 'return (' }));
+    assert(/does not parse/.test(bad.error || ''), 'syntax checked on save: ' + JSON.stringify(bad));
+    const saved = json(await s.call('script_save', { name: 'Price check', code: SAVED, allow: 'destructive' }));
+    assert(saved.ok && saved.script.id === 'price_check', 'saved: ' + JSON.stringify(saved));
+
+    // On demand, with input.
+    const manual = json(await s.call('run_code', { script: 'price_check', input: { url: 'https://example.test/', sku: 'A1' } }));
+    assert(manual.ok && manual.result.sku === 'A1' && manual.result.title === 'Example Domain', 'manual run: ' + JSON.stringify(manual));
+    const both = json(await s.call('run_code', { script: 'price_check', code: 'return 1' }));
+    assert(/exactly one/.test(both.error || ''), 'code xor script');
+
+    // From the extension scheduler: own isolation client, cleaned up after.
+    const before = s.extCalls.length;
+    const sched = await s.runScriptFromExtension('price_check', { url: 'https://example.test/', sku: 'B2' });
+    assert(sched.ok && sched.status === 'passed' && sched.result.sku === 'B2', 'scheduled run: ' + JSON.stringify(sched));
+    const runCalls = s.extCalls.slice(before);
+    const interactiveClient = s.extCalls[0].clientId;
+    assert(runCalls.length === 3 && runCalls.at(-1).tool === '__finish_session', 'run then cleanup: ' + JSON.stringify(runCalls));
+    assert(runCalls.every((c) => c.clientId === runCalls[0].clientId), 'one client for the whole run');
+    assert(/:script:\d+$/.test(runCalls[0].clientId) && runCalls[0].clientId !== interactiveClient, 'separate isolation client: ' + runCalls[0].clientId);
+
+    const listed = json(await s.call('script_list', {}));
+    const entry = listed.scripts.find((x) => x.id === 'price_check');
+    assert(entry && entry.lastRun?.status === 'passed' && entry.lastRun.trigger === 'schedule' && !('code' in entry), 'lastRun recorded: ' + JSON.stringify(listed));
+
+    const missing = await s.runScriptFromExtension('nope', {});
+    assert(missing.status === 'failed' && /not found/.test(missing.detail), 'missing script: ' + JSON.stringify(missing));
+    const schedMissing = json(await s.call('schedule_create', { scriptId: 'nope', every: 30 }));
+    assert(schedMissing.ok === false && /No saved script/.test(schedMissing.error), 'schedule checks the script exists');
+
+    assert(json(await s.call('script_delete', { id: 'price_check' })).ok, 'deleted');
+    assert(/No saved script/.test(json(await s.call('script_get', { id: 'price_check' })).error), 'gone');
+  } finally {
+    s.stop();
+  }
+}
+
+async function unattendedHold() {
+  const s = await startServer(19886, { AUTODOM_CONFIRM_MODE: 'true' });
+  try {
+    await s.call('script_save', { name: 'Nav', code: SAVED });
+    const r = await s.runScriptFromExtension('nav', { url: 'https://example.test/' });
+    assert(r.ok === false && r.status === 'held' && /unattended run stopped/.test(r.detail), 'held: ' + JSON.stringify(r));
+    assert(!s.extCalls.some((c) => c.tool === 'navigate'), 'held call never ran');
+    assert(s.extCalls.at(-1)?.tool === '__finish_session', 'cleanup still runs');
+  } finally {
+    s.stop();
+  }
+}
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of [
+    ['saved scripts: save, run on demand, run from the scheduler', savedScripts],
+    ['unattended run stops at a hold', unattendedHold],
     ['only mode: grouped, typed API for every bound tool', onlyModeListing],
     ['script fans out into extension calls', plainRun],
     ['confirm mode pauses and resumes the script', confirmModeRun],

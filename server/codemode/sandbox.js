@@ -320,3 +320,30 @@ function pickLimits(opts) {
   }
   return out;
 }
+
+/**
+ * Parse `code` as a run_code body without running it. Returns null when it
+ * parses, else the syntax error message. Evaluating the function expression
+ * creates the function object but never calls it.
+ */
+export async function checkScriptSyntax(code) {
+  const mod = await quickjsModule();
+  const rt = mod.newRuntime();
+  rt.setMemoryLimit(SANDBOX_DEFAULTS.memoryLimitBytes);
+  const deadline = Date.now() + 1000;
+  rt.setInterruptHandler(() => Date.now() > deadline);
+  const ctx = rt.newContext();
+  try {
+    const r = ctx.evalCode(`(async function () {\n${String(code)}\n})`, "run_code.js");
+    if (r.error) {
+      const err = ctx.dump(r.error);
+      r.error.dispose();
+      return String(err?.message ?? err);
+    }
+    r.value.dispose();
+    return null;
+  } finally {
+    ctx.dispose();
+    rt.dispose();
+  }
+}

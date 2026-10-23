@@ -94,9 +94,14 @@ function fakes() {
       return { runId: "run_" + runs.length, status: nextStatus, error: nextStatus === "passed" ? null : "Step 2 failed" };
     },
     runPrompt: async (prompt) => ({ response: "done: " + prompt }),
+    runScript: async (id, opts) => {
+      runs.push(["script:" + id, opts.input]);
+      return nextScript;
+    },
     notify: async (title, msg) => notes.push([title, msg]),
   });
-  return { sched, data, alarmLog, notes, runs, setStatus: (s) => (nextStatus = s) };
+  let nextScript = { ok: true, status: "passed", detail: "" };
+  return { sched, data, alarmLog, notes, runs, setStatus: (s) => (nextStatus = s), setScript: (r) => (nextScript = r) };
 }
 
 test("scheduler: create arms an alarm, fire runs and re-arms, failures notify", async () => {
@@ -157,4 +162,36 @@ test("shortcuts: save, list, reject built-ins, delete", async () => {
   const listed = await f.sched.handlers.shortcut_list();
   assert.deepEqual(plain(listed.shortcuts.map((s) => s.name)), ["standup"]);
   assert.equal((await f.sched.handlers.shortcut_delete({ name: "standup" })).ok, true);
+});
+
+test("scheduler: saved scripts are a third target, run through ctx.runScript", async () => {
+  const f = fakes();
+  const both = await f.sched.handlers.schedule_create({ scriptId: "s1", workflowId: "wf_1", every: 5 });
+  assert.equal(both.ok, false, "one target only");
+  assert.match(both.error, /only one of workflowId, scriptId or prompt/);
+
+  const created = await f.sched.handlers.schedule_create({ scriptId: "price_check", every: 30, variables: { sku: "A1" } });
+  assert.equal(created.ok, true, created.error);
+  assert.deepEqual(plain(created.schedule.target), { scriptId: "price_check" });
+  assert.equal(created.schedule.name, "price_check");
+  const id = created.schedule.id;
+
+  const ok = await f.sched.fire(id, "manual");
+  assert.equal(ok.ok, true);
+  assert.deepEqual(plain(f.runs), [["script:price_check", { sku: "A1" }]], "variables become the script input");
+
+  // No bridge connected: skipped, and a failure notification says why.
+  f.setScript({ ok: false, status: "skipped", detail: "No AutoDOM bridge connected." });
+  const skipped = await f.sched.fire(id, "manual");
+  assert.equal(skipped.ok, false);
+  assert.equal(skipped.status, "skipped");
+  assert.match(f.notes.at(-1)[1], /No AutoDOM bridge connected/);
+  f.setScript({ ok: false, status: "held", detail: "navigate needs approval" });
+  assert.equal((await f.sched.fire(id, "manual")).status, "held");
+  assert.equal((await f.sched.handlers.schedule_list()).schedules[0].lastStatus, "held");
+
+  // Switching an existing schedule to a workflow drops the script target.
+  const switched = await f.sched.handlers.schedule_update({ id, workflowId: "wf_1" });
+  assert.equal(switched.ok, true, switched.error);
+  assert.deepEqual(plain(switched.schedule.target), { workflowId: "wf_1" });
 });

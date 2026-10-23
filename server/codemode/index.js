@@ -36,14 +36,29 @@ export const CODE_MODE_EXCLUDED = new Set([
   "token_stats",
   "respond_to_chat",
   "get_pending_chat_requests",
+  "script_save",
+  "script_list",
+  "script_get",
+  "script_delete",
 ]);
 
-export const CODE_MODE_TOOL_NAMES = new Set(["run_code", "code_api"]);
+export const CODE_MODE_TOOL_NAMES = new Set(["run_code", "code_api", "script_save", "script_list", "script_get", "script_delete"]);
 
 // AUTODOM_CODE_MODE=only lists just these: the two Code Mode tools plus what
 // a client needs around them (approvals, recalling shrunk output, cleanup).
 // Every other tool stays callable by name.
-export const CODE_ONLY_LISTED = new Set([...CODE_MODE_TOOL_NAMES, "confirm_action", "cancel_action", "recall", "finish_session"]);
+export const CODE_ONLY_LISTED = new Set([
+  ...CODE_MODE_TOOL_NAMES,
+  "confirm_action",
+  "cancel_action",
+  "recall",
+  "finish_session",
+  // Saved scripts can be scheduled; the schedules live in the extension.
+  "schedule_create",
+  "schedule_list",
+  "schedule_update",
+  "schedule_delete",
+]);
 
 const SNAPSHOT_SEPARATOR = "\n--- snapshot ---\n";
 
@@ -133,11 +148,18 @@ export function createCodeMode({
     return api;
   }
 
-  async function run({ code, allow = "destructive", timeoutMs, signal, context, meta } = {}) {
+  /**
+   * @param {object} opts
+   * @param {object} [opts.input]       exposed to the script as the frozen global `input`
+   * @param {boolean} [opts.unattended] nobody can approve (a scheduled run): a held
+   *        call stops the run and its confirmation is dropped instead of pausing
+   */
+  async function run({ code, allow = "destructive", timeoutMs, signal, context, meta, input, unattended = false } = {}) {
     ensureApi();
     const state = {
       id: ++runSeq,
       allow,
+      unattended,
       meta,
       context,
       images: new Map(), // imageRef -> { data, mimeType }
@@ -158,7 +180,8 @@ export function createCodeMode({
 
     runInSandbox({
       code: String(code || ""),
-      prelude,
+      // Double-encoded so the value is parsed as data, never evaluated as code.
+      prelude: `${prelude}\nglobalThis.input = Object.freeze(JSON.parse(${JSON.stringify(JSON.stringify(input ?? {}))}));`,
       call: (op, args) => hostCall(state, op, args),
       signal: state.abort.signal,
       timeoutMs,
@@ -400,6 +423,19 @@ export function createCodeMode({
 
     const held = parseHeld(raw) || parseHeld(tryParseJson(raw instanceof AtkOutput ? raw.text : raw));
     if (held) {
+      if (state.unattended) {
+        // Nobody to ask. The hold must not outlive the run either.
+        state.callLog.push(`${op} held ${ms}ms`);
+        if (held.confirmId) onHoldDiscarded?.(held.confirmId);
+        throw new StopRun(`${op} needs approval`, {
+          tool: held.tool || op,
+          tier: held.tier || tier,
+          ...(held.domain ? { domain: held.domain } : {}),
+          message:
+            `${held.tool || op} needs approval, so this unattended run stopped there (steps before it already ran). ` +
+            "Run the script from your MCP client to approve it, or relax the approval rule for this site.",
+        });
+      }
       if (!held.confirmId || suspended.size >= MAX_SUSPENDED_RUNS) {
         state.callLog.push(`${op} held ${ms}ms`);
         throw new StopRun(`${op} needs approval`, {
@@ -480,7 +516,7 @@ export function createCodeMode({
 
 const GLOBALS_HINT =
   "// run_code globals: autodom.<tool>(params) | page.eval(fn, ...args) runs fn in the active tab | " +
-  "emitImage(ref) attaches a screenshot | sleep(ms) | console.log. A failed call throws (name ToolError/InvalidParams/TierDenied/ApprovalDenied). " +
+  "emitImage(ref) attaches a screenshot | input (run_code {input}) | sleep(ms) | console.log. A failed call throws (name ToolError/InvalidParams/TierDenied/ApprovalDenied). " +
   "No fetch/require/timers. Return only what you need.";
 
 function buildPrelude(names) {
