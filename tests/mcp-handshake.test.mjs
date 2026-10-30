@@ -99,7 +99,7 @@ test("tools/list is client-safe: no $schema, object roots, no -32601 probes", as
   assert.ok(report.toolNames.includes("token_stats"), "token_stats tool missing");
   assert.ok(!report.toolNames.includes("browser_click"), "compat aliases should be hidden from tools/list");
   assert.ok(report.toolNames.includes("verify_artifact_counts"), "non-alias catalog tools stay listed");
-  assert.equal(report.toolCount, 117, "142 registered minus 19 hidden Playwright aliases and 6 opt-in Code Mode tools");
+  assert.equal(report.toolCount, 124, "149 registered minus 19 hidden Playwright aliases and 6 opt-in Code Mode tools");
   // listChanged is advertised false because nothing ever emits the
   // corresponding notification.
   assert.equal(report.capabilities.tools.listChanged, false);

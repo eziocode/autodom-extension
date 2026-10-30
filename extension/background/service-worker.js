@@ -1778,6 +1778,9 @@ async function _handleUnpinTabTool(clientId) {
 async function _handleFinishSessionTool(clientId) {
   if (!clientId) return { error: "finish_session requires a clientId" };
   _clientPins.delete(clientId);
+  // Free a finished tab recording still held in memory; a running one is
+  // left alone (the chat panel's record toggle may own it).
+  if (_offscreenRecorderReady) _sendRawOffscreenRecorderMessage({ type: "AUTODOM_REC_RELEASE" });
   const Tab = _AutoDOMTabGroup();
   if (!Tab || !Tab.supported()) {
     return { finished: true, isolated: false, closed: [], restored: [] };
@@ -5042,6 +5045,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (chrome.runtime.lastError) {
           sendResponse({ ok: false, error: chrome.runtime.lastError.message });
         } else {
+          _recordingDownloads.add(id);
           sendResponse({ ok: true, downloadId: id });
         }
       });
@@ -6639,6 +6643,9 @@ try {
     const mediaHandlers = globalThis.AutoDOMMediaTools.makeHandlers({
       getActiveTab,
       executeInTab,
+      executeInFrames,
+      captureRegion: _captureMediaRegion,
+      onCallCancel: _onCallCancel,
       sendToOffscreen: (msg) => _sendToOffscreenRecorder(msg),
     });
     for (const [name, fn] of Object.entries(mediaHandlers)) {
@@ -6922,6 +6929,16 @@ if (chrome.webNavigation?.onCommitted) {
 // waits for the response. Chrome requires the offscreen document to be
 // created with USER_MEDIA before it can call navigator.mediaDevices.getUserMedia.
 let _offscreenRecorderReady = false;
+
+// A recording saved through DOWNLOAD_LAST_RECORDING is freed from the
+// offscreen document once the file is complete. (Lost on SW restart; the
+// offscreen document frees it on its own timer then.)
+const _recordingDownloads = new Set();
+chrome.downloads?.onChanged?.addListener((delta) => {
+  if (!_recordingDownloads.has(delta.id) || delta.state?.current !== "complete") return;
+  _recordingDownloads.delete(delta.id);
+  _sendRawOffscreenRecorderMessage({ type: "AUTODOM_REC_RELEASE" });
+});
 async function _ensureOffscreenRecorder() {
   if (_offscreenRecorderReady) return true;
   if (!chrome.offscreen?.createDocument) {
@@ -7109,6 +7126,18 @@ async function getActiveTab(ctx) {
   );
   if (!tab) throw new Error("No active tab found");
   return tab;
+}
+
+// Like executeInTab, per frame: every frame of the tab, or just frameIds.
+// Frames that cannot be scripted are left out of the result.
+async function executeInFrames(tabId, func, args = [], frameIds = null, world = "MAIN") {
+  const results = await chrome.scripting.executeScript({
+    target: frameIds ? { tabId, frameIds } : { tabId, allFrames: true },
+    func,
+    args,
+    world,
+  });
+  return (results || []).map((r) => ({ frameId: r.frameId, result: r.result }));
 }
 
 // Inject and execute a function in the active tab's content script context
@@ -7701,15 +7730,15 @@ function _shotQuality(params) {
 // Downscale and/or re-encode a captured data URL (captureVisibleTab returns
 // device pixels, and no WebP). Returns null where OffscreenCanvas is
 // unavailable; the caller keeps the original.
-async function _resizeDataUrl(dataUrl, target, params) {
+// crop (optional): { x, y, width, height } in the source image's pixels.
+async function _resizeDataUrl(dataUrl, target, params, crop) {
   if (!target || typeof OffscreenCanvas !== "function" || typeof createImageBitmap !== "function") return null;
   try {
     const blob = await (await fetch(dataUrl)).blob();
-    const bitmap = await createImageBitmap(blob, {
-      resizeWidth: target.width,
-      resizeHeight: target.height,
-      resizeQuality: "high",
-    });
+    const opts = { resizeWidth: target.width, resizeHeight: target.height, resizeQuality: "high" };
+    const bitmap = crop
+      ? await createImageBitmap(blob, crop.x, crop.y, crop.width, crop.height, opts)
+      : await createImageBitmap(blob, opts);
     const canvas = new OffscreenCanvas(target.width, target.height);
     canvas.getContext("2d").drawImage(bitmap, 0, 0);
     bitmap.close?.();
@@ -7984,6 +8013,27 @@ async function toolScreenshot(params, ctx) {
   } finally {
     if (hidden) await setHiddenState(false);
   }
+}
+
+// A video frame the page cannot read (cross-origin, no CORS): screenshot
+// the tab and crop to the player's viewport rect (CSS px), downscaled to
+// maxWidth. Returns { dataUrl, width, height } or null.
+async function _captureMediaRegion(rect, params, ctx) {
+  const q = Number(params?.quality);
+  const quality = q > 0 ? (q > 1 ? Math.min(100, q) : q * 100) : 60;
+  const format = params?.format === "webp" || params?.format === "png" ? params.format : "jpeg";
+  const shot = await toolScreenshot({ format: "png" }, ctx);
+  if (!shot?.screenshot || !(shot.scale > 0) || !rect) return null;
+  const s = shot.scale;
+  const x = Math.max(0, Math.round(rect.x * s));
+  const y = Math.max(0, Math.round(rect.y * s));
+  const width = Math.min(shot.width - x, Math.round(rect.w * s));
+  const height = Math.min(shot.height - y, Math.round(rect.h * s));
+  if (!(width > 1) || !(height > 1)) return null;
+  const k = Math.min(1, Math.max(128, Math.min(1568, Number(params?.maxWidth) || 768)) / width);
+  const target = { width: Math.max(1, Math.round(width * k)), height: Math.max(1, Math.round(height * k)) };
+  const dataUrl = await _resizeDataUrl(shot.screenshot, target, { format, quality }, { x, y, width, height });
+  return dataUrl && { dataUrl, ...target };
 }
 
 // 5. Take snapshot (DOM/a11y tree)

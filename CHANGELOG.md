@@ -4,6 +4,49 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 7.2.0
+
+### Added
+- Video and image analysis over MCP: `media_list`, `media_control`,
+  `media_get_captions`, `media_capture_frame`, `media_sample_frames`,
+  `image_list` and `image_get_data` were only available to the in-panel
+  agent. Frames come back as image content blocks (no base64 in JSON text),
+  with a `media` area in Code Mode.
+- `media_list` searches every frame and open shadow root, lists player
+  iframes (YouTube, Vimeo, Wistia, Loom, ...), reports visibility, live, DRM,
+  seekable range and source type, and marks the primary video. Ids are stable
+  across calls (`"3:m1"` inside frame 3); other media tools default to the
+  primary video.
+- `media_sample_frames`: frames are downscaled in the page (`maxWidth`,
+  default 768) and encoded once; blank and near-duplicate frames are dropped
+  (difference hash); `mode: "scene"` keeps the biggest visual changes; live
+  streams sample within the DVR window or over time; a 4 MB payload budget.
+  Cross-origin video without CORS falls back to a cropped screenshot of the
+  player; DRM video reports that frames are unreadable.
+- `media_get_captions` loads disabled tracks, returns one track's cues
+  (`track`, `lang`, `fromSec`/`toSec`, capped), and on YouTube the full
+  transcript.
+- Tab recordings stop at `maxDurationSec` (default 600) or `maxBytes`
+  (default 200 MB), and are freed from memory once downloaded, on
+  `finish_session`, or after 10 minutes. `tab_recording_status` reports
+  `heldBytes`.
+
+### Fixed
+- Sampling no longer hangs when a seek fires no `seeked` event (3 s per
+  seek, 22 s overall), restores play state on every exit, and stops when the
+  call is cancelled.
+- `media_capture_frame` / `media_sample_frames` counted only `<video>` while
+  `media_list` counted `<video>` and `<audio>`, so an index could pick the
+  wrong element.
+- `count: 0` and `quality: 0` were treated as unset; 4K frames were returned
+  at full resolution.
+- A stopped recording's chunks stayed in memory and were still reported by
+  `tab_recording_status`.
+
+### Removed
+- The unused `AutoDOMMediaTools.tiers` copy (risk tiers live in
+  `action-gate.js`).
+
 ## 7.1.0
 
 ### Added

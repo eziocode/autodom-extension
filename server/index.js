@@ -967,6 +967,13 @@ const TOOL_TIERS = new Map([
   ["script_get", "read"],
   ["take_screenshot", "read"],
   ["take_snapshot", "read"],
+  ["media_list", "read"],
+  ["media_get_captions", "read"],
+  ["media_capture_frame", "read"],
+  ["media_sample_frames", "read"],
+  ["image_list", "read"],
+  ["image_get_data", "read"],
+  ["media_control", "write"],
   ["query_elements", "read"],
   ["extract_text", "read"],
   ["extract_data", "read"],
@@ -8514,18 +8521,17 @@ function stringifyToolResult(result) {
   }
 }
 
-// An image content block (never base64 inside JSON text, which a client
-// would read as text tokens) plus a one-line size/scale note.
+// A data URL as an MCP image content block (never base64 inside JSON
+// text, which a client would read as text tokens).
+function _imageBlock(dataUrl, fallbackMime = "image/jpeg") {
+  const m = /^data:([^;,]+);base64,/.exec(dataUrl);
+  return { type: "image", data: dataUrl.slice(m ? m[0].length : 0), mimeType: m ? m[1] : fallbackMime };
+}
+
+// An image content block plus a one-line size/scale note.
 function screenshotToolResult(result, params = {}) {
   if (!result?.screenshot) return stringifyToolResult(result);
-  const m = /^data:([^;,]+);base64,/.exec(result.screenshot);
-  const content = [
-    {
-      type: "image",
-      data: result.screenshot.slice(m ? m[0].length : 0),
-      mimeType: m ? m[1] : `image/${params.format || "jpeg"}`,
-    },
-  ];
+  const content = [_imageBlock(result.screenshot, `image/${params.format || "jpeg"}`)];
   if (result.width && result.viewport) {
     content.push({
       type: "text",
@@ -9265,6 +9271,129 @@ server.addTool({
     const result = await callExtensionTool("take_screenshot", params);
     return screenshotToolResult(result, params);
   },
+});
+
+// Video frames / page images: one image block per frame, then one JSON
+// text block whose frames[i] (time, size, hash for cross-call dedupe)
+// describes image i. A single text block keeps Code Mode's parse intact.
+function mediaImagesResult(result) {
+  const items = result?.frames || (result?.dataUrl ? [result] : null);
+  if (!result?.ok || !items?.length) return stringifyToolResult(result);
+  const { frames: _frames, dataUrl: _dataUrl, ...meta } = result;
+  const content = [];
+  const described = [];
+  for (const { dataUrl, ...info } of items) {
+    if (typeof dataUrl !== "string") continue;
+    content.push(_imageBlock(dataUrl));
+    described.push(info);
+  }
+  content.push({ type: "text", text: stringifyToolResult(result.frames ? { ...meta, frames: described } : meta) });
+  return { content };
+}
+
+// ─── Video / audio / image analysis ─────────────────────────
+// Cheapest first: media_list (what plays where) → media_get_captions
+// (what is said, a few hundred tokens) → media_sample_frames (an image per
+// frame). Frames are encoded in the page, downscaled, returned once and
+// never stored.
+const MEDIA_TARGET = {
+  id: z.string().optional().describe('Media id from media_list ("m1", or "3:m1" inside a frame). Default: the primary video'),
+  index: z.number().int().min(0).optional().describe("Position in media_list (top frame)"),
+  selector: z.string().optional().describe("CSS selector of the element or its player container"),
+};
+const MEDIA_ENCODING = {
+  maxWidth: z.number().int().min(128).max(1568).optional().describe("Frame width cap in px (default 768; smaller = fewer image tokens)"),
+  format: z.enum(["jpeg", "webp", "png"]).optional().describe("Default jpeg"),
+  quality: z.number().min(1).max(100).optional().describe("JPEG/WebP quality (default 60)"),
+};
+
+server.addTool({
+  name: "media_list",
+  description:
+    "Find videos/audio on the page: every frame and open shadow root, with state, size, visibility, live/DRM/seekable flags, plus player iframes (YouTube, Vimeo, ...). Marks the primary (largest visible) video; pass its id to the other media_* tools.",
+  parameters: z.object({
+    visibleOnly: z.boolean().optional().describe("Skip hidden/zero-size elements"),
+    limit: z.number().int().min(1).max(200).optional().describe("Max items per frame (default 50)"),
+  }),
+  execute: async (params) => callExtensionTool("media_list", params),
+});
+
+server.addTool({
+  name: "media_control",
+  description:
+    "Control playback of a video/audio (default: the primary video): play, pause, toggle, mute, unmute, seekTo, seekBy (value in seconds), playbackRate, volume (0-1), fullscreen, pip.",
+  parameters: z.object({
+    ...MEDIA_TARGET,
+    action: z.enum(["play", "pause", "toggle", "mute", "unmute", "seekTo", "seekBy", "playbackRate", "volume", "fullscreen", "pip"]),
+    value: z.number().optional().describe("Seconds, rate or volume, by action"),
+  }),
+  execute: async (params) => callExtensionTool("media_control", params),
+});
+
+server.addTool({
+  name: "media_get_captions",
+  description:
+    "Caption/subtitle cues of one track (by track or lang, else the showing one; disabled tracks are loaded). On YouTube, the full transcript. Cheapest way to know what a video says: try before frames.",
+  parameters: z.object({
+    ...MEDIA_TARGET,
+    track: z.number().int().min(0).optional(),
+    lang: z.string().optional().describe("Language prefix, e.g. en"),
+    fromSec: z.number().optional(),
+    toSec: z.number().optional(),
+    maxCues: z.number().int().min(1).max(2000).optional().describe("Default 400 (text capped at 24k chars)"),
+  }),
+  execute: async (params) => callExtensionTool("media_get_captions", params),
+});
+
+server.addTool({
+  name: "media_capture_frame",
+  description:
+    "One downscaled frame of a video (default: the primary video) as an image, at the current time or atSec; play state is restored. Cross-origin video without CORS falls back to a screenshot of the player.",
+  parameters: z.object({
+    ...MEDIA_TARGET,
+    atSec: z.number().optional().describe("Seek here first"),
+    ...MEDIA_ENCODING,
+  }),
+  execute: async (params) => mediaImagesResult(await callExtensionTool("media_capture_frame", params)),
+});
+
+server.addTool({
+  name: "media_sample_frames",
+  description:
+    "Keyframes of a video as images, for vision analysis. Seeks without playing, drops blank and near-duplicate frames, restores play state. mode \"scene\" keeps the biggest visual changes, \"even\" spaces frames evenly; narrow fromSec/toSec rather than raising count. Live streams sample over time.",
+  parameters: z.object({
+    ...MEDIA_TARGET,
+    count: z.number().int().min(1).max(20).optional().describe("Frames wanted (default 6)"),
+    mode: z.enum(["even", "scene"]).optional().describe("Default even"),
+    fromSec: z.number().optional(),
+    toSec: z.number().optional(),
+    intervalMs: z.number().int().min(200).max(10000).optional().describe("Live streams: gap between frames (default 1000)"),
+    ...MEDIA_ENCODING,
+  }),
+  execute: async (params) => mediaImagesResult(await callExtensionTool("media_sample_frames", params)),
+});
+
+server.addTool({
+  name: "image_list",
+  description: "List <img> elements (including open shadow roots) with src, alt, natural size and bounding box.",
+  parameters: z.object({
+    limit: z.number().int().min(1).max(500).optional().describe("Default 60"),
+  }),
+  execute: async (params) => callExtensionTool("image_list", params),
+});
+
+server.addTool({
+  name: "image_get_data",
+  description:
+    "One page image as an image block, downscaled and re-encoded. Fails on cross-origin images served without CORS headers (use take_screenshot then).",
+  parameters: z.object({
+    index: z.number().int().min(0).optional().describe("Index from image_list (default 0)"),
+    selector: z.string().optional(),
+    maxWidth: MEDIA_ENCODING.maxWidth.describe("Width cap in px (default 1024)"),
+    format: MEDIA_ENCODING.format,
+    quality: MEDIA_ENCODING.quality,
+  }),
+  execute: async (params) => mediaImagesResult(await callExtensionTool("image_get_data", params)),
 });
 
 // 5. Take snapshot (DOM tree)

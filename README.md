@@ -8,7 +8,7 @@ It is two programs that talk over a local WebSocket:
 - `extension/`: a Manifest V3 extension. Executes the tool calls in the
   browser through `chrome.scripting`, `chrome.tabs` and the DevTools protocol.
 
-Current release: **7.1.0** ([changelog](CHANGELOG.md)). License: MIT.
+Current release: **7.2.0** ([changelog](CHANGELOG.md)). License: MIT.
 
 Targeted clients: GitHub Copilot, JetBrains AI Assistant, Claude (Desktop and
 Code), Cursor and Gemini CLI. Anything that speaks MCP over stdio should work.
@@ -141,7 +141,7 @@ Optional transports, both off by default:
 
 ## Tools
 
-142 tools are registered. 117 are listed to clients by default; the 19
+149 tools are registered. 124 are listed to clients by default; the 19
 Playwright-compatible aliases (`browser_click`, `browser_snapshot`, ...) stay
 callable by name but are only listed with `AUTODOM_PLAYWRIGHT_COMPAT=1`, and
 the six Code Mode tools (`run_code`, `code_api`, `script_*`, below) are only
@@ -151,6 +151,7 @@ listed with `AUTODOM_CODE_MODE`.
 |---|---|
 | Observe | `take_snapshot`, `get_dom_state`, `query_elements`, `deep_query`, `extract_text`, `extract_data`, `get_html`, `get_page_info`, `take_screenshot`, `get_bounding_box`, `get_computed_style`, `check_element_state` |
 | Act | `click`, `type_text`, `fill_form`, `select_option`, `hover`, `press_key`, `scroll`, `drag_and_drop`, `double_click`, `right_click`, `middle_click`, `force_click`, `click_at_coordinates`, `key_down`, `key_up`, `click_by_index`, `type_by_index`, `upload_file` |
+| Video and images | `media_list`, `media_get_captions`, `media_sample_frames`, `media_capture_frame`, `media_control`, `image_list`, `image_get_data` |
 | Navigate and wait | `navigate`, `wait_for_text`, `wait_for_element`, `wait_for_navigation`, `wait_for_network_idle`, `handle_dialog` |
 | Tabs and frames | `list_tabs`, `open_new_tab`, `switch_tab`, `close_tab`, `pin_tab`, `unpin_tab`, `get_pinned_tab`, `finish_session`, popups (`list_popups`, `switch_to_popup`, `close_popup`, `wait_for_popup`), `list_iframes`, `iframe_interact`, `list_shadow_roots`, `shadow_interact` |
 | Scripting | `execute_code`, `evaluate_script`, `execute_async_script` (deprecated), `batch_actions` |
@@ -160,6 +161,15 @@ listed with `AUTODOM_CODE_MODE`.
 | Control and audit | `approval_rules`, `audit_query`, `get_tool_tiers`, `confirm_action`, `cancel_action`, `autodom_diagnostics`, `get_session_summary` |
 | Output | `recall`, `token_stats` |
 | Page-provided | `webmcp_list_tools`, `webmcp_call_tool` (tools a page registers through WebMCP) |
+
+To analyse a video, go cheapest first and stop when you have the answer:
+`media_list` finds every video (frames, shadow roots, YouTube/Vimeo iframes)
+and marks the primary one; `media_get_captions` returns what it says (on
+YouTube, the transcript); `media_sample_frames` returns keyframes as images,
+seeking without playing, downscaled to 768 px, with blank and near-duplicate
+frames dropped (`mode: "scene"` keeps the biggest visual changes). Frames are
+never stored. Cross-origin video without CORS falls back to a screenshot of
+the player; DRM-protected video reports that its frames are unreadable.
 
 Every tool has a safety tier, returned by `get_tool_tiers`:
 
@@ -222,7 +232,7 @@ return links.filter((h) => h.includes("/docs/")).slice(0, 10);
   tools. Most of that is the smaller tool list; leaving the tool list out, it
   read 53-79% less than the standard tools used the usual way, and about the
   same as an agent that already uses `execute_code` well.
-- Globals: `autodom.<tool>(params)` for 104 tools, `page.eval(fn, ...args)`
+- Globals: `autodom.<tool>(params)` for 111 tools, `page.eval(fn, ...args)`
   (runs `fn` in the active tab through `execute_code`), `emitImage(ref)`,
   `sleep(ms)`, `console`. No `fetch`, `require`, timers or filesystem.
 - Every inner call is the same tool an MCP client would call: zod-validated,

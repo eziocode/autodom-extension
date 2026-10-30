@@ -72,7 +72,7 @@
     "browser_snapshot",
     "browser_take_screenshot",
     "browser_wait_for",
-    // Media / image reads (additive tier set merged below).
+    // Media / image reads (media-tools.js). media_control is mutating.
     "media_list",
     "media_get_captions",
     "media_capture_frame",

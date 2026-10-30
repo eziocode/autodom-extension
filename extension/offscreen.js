@@ -9,17 +9,19 @@
  *      with `__autodom_recorder: true` to this document.
  *
  * Recorder protocol (request → response):
- *   { type: "AUTODOM_REC_START", streamId, mimeType, videoBitsPerSecond }
+ *   { type: "AUTODOM_REC_START", streamId, mimeType, videoBitsPerSecond, maxDurationSec, maxBytes }
  *     → { ok, mimeType }
  *   { type: "AUTODOM_REC_STOP" }
  *     → { ok, mimeType, sizeBytes, durationMs, objectUrl }
  *   { type: "AUTODOM_REC_STATUS" }
- *     → { ok, recording, sizeBytes, durationMs, mimeType }
+ *     → { ok, recording, sizeBytes, durationMs, mimeType, heldBytes }
+ *   { type: "AUTODOM_REC_RELEASE" }
+ *     → { ok, freedBytes }   (revokes the objectUrl, drops the blob)
  *
  * The objectUrl is created via URL.createObjectURL(blob) inside this
- * document. It is only usable from the same document — for the chat panel
- * to save the file, the panel should invoke chrome.downloads via the SW,
- * passing { type: "DOWNLOAD_LAST_RECORDING" } which we handle below.
+ * document. The chat panel saves it through the SW's
+ * DOWNLOAD_LAST_RECORDING handler (chrome.downloads), which releases the
+ * recording here once the download completes.
  */
 
 (function () {
@@ -31,28 +33,89 @@
   }, 20_000);
 
   // ── Recorder state ────────────────────────────────────────
+  // A finished recording is held only until it is downloaded (the SW sends
+  // AUTODOM_REC_RELEASE), finish_session, the next start, or
+  // RELEASE_AFTER_MS — about 19 MB per minute at the default bitrate.
+  const DEFAULT_MAX_BYTES = 200 * 1024 * 1024;
+  const DEFAULT_MAX_DURATION_MS = 10 * 60 * 1000;
+  const RELEASE_AFTER_MS = 10 * 60 * 1000;
   let recorder = null;
   let chunks = [];
+  let chunkBytes = 0;
   let mimeType = "video/webm";
   let stream = null;
   let startedAt = 0;
+  let stopped = null; // Promise of the stop result for the current recording
+  let stopReason = null;
+  let recorderError = null;
+  let capTimer = null;
+  let releaseTimer = null;
   let lastBlob = null;
   let lastObjectUrl = null;
 
+  function _stopStream() {
+    try { stream && stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+    stream = null;
+    clearTimeout(capTimer);
+    capTimer = null;
+  }
+
   function _reset() {
     try { recorder && recorder.state !== "inactive" && recorder.stop(); } catch (_) {}
-    try { stream && stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+    _stopStream();
     recorder = null;
-    stream = null;
     chunks = [];
+    chunkBytes = 0;
     startedAt = 0;
   }
 
-  async function startRecording({ streamId, mimeType: mt, videoBitsPerSecond }) {
+  function release() {
+    clearTimeout(releaseTimer);
+    releaseTimer = null;
+    const freedBytes = lastBlob ? lastBlob.size : 0;
+    if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
+    lastObjectUrl = null;
+    lastBlob = null;
+    return { ok: true, freedBytes };
+  }
+
+  function autoStop(reason) {
+    if (!recorder || recorder.state === "inactive") return;
+    stopReason = reason;
+    try { recorder.stop(); } catch (_) {}
+  }
+
+  function finalize() {
+    const durationMs = Date.now() - startedAt;
+    try {
+      lastBlob = new Blob(chunks, { type: mimeType });
+      lastObjectUrl = URL.createObjectURL(lastBlob);
+      return {
+        ok: true,
+        mimeType,
+        sizeBytes: lastBlob.size,
+        durationMs,
+        objectUrl: lastObjectUrl,
+        ...(stopReason && { stopReason }),
+        ...(recorderError && { recorderError }),
+      };
+    } catch (err) {
+      return { ok: false, error: String(err && err.message) };
+    } finally {
+      chunks = [];
+      chunkBytes = 0;
+      _stopStream();
+      recorder = null;
+      releaseTimer = setTimeout(release, RELEASE_AFTER_MS);
+    }
+  }
+
+  async function startRecording({ streamId, mimeType: mt, videoBitsPerSecond, maxDurationSec, maxBytes }) {
     if (recorder && recorder.state === "recording") {
       return { ok: false, error: "recorder already running" };
     }
     if (!streamId) return { ok: false, error: "missing streamId" };
+    release();
     try {
       // Chrome's tabCapture stream id is consumed by getUserMedia with a
       // mandatory chromeMediaSource constraint. Video is required.
@@ -75,11 +138,27 @@
         videoBitsPerSecond: videoBitsPerSecond || 2_500_000,
       });
       chunks = [];
-      lastBlob = null;
-      if (lastObjectUrl) { URL.revokeObjectURL(lastObjectUrl); lastObjectUrl = null; }
-      recorder.ondataavailable = (ev) => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+      chunkBytes = 0;
+      stopReason = null;
+      recorderError = null;
+      const byteCap = maxBytes > 0 ? maxBytes : DEFAULT_MAX_BYTES;
+      recorder.ondataavailable = (ev) => {
+        if (!ev.data || !ev.data.size) return;
+        chunks.push(ev.data);
+        chunkBytes += ev.data.size;
+        if (chunkBytes >= byteCap) autoStop("size cap");
+      };
+      recorder.onerror = (ev) => {
+        recorderError = String((ev && ev.error && ev.error.message) || "recorder error");
+        autoStop("error");
+      };
+      stopped = new Promise((resolve) => { recorder.onstop = () => resolve(finalize()); });
       recorder.start(1000); // 1s chunk cadence
       startedAt = Date.now();
+      capTimer = setTimeout(
+        () => autoStop("duration cap"),
+        maxDurationSec > 0 ? maxDurationSec * 1000 : DEFAULT_MAX_DURATION_MS,
+      );
       return { ok: true, mimeType };
     } catch (err) {
       _reset();
@@ -87,48 +166,29 @@
     }
   }
 
-  function stopRecording() {
-    return new Promise((resolve) => {
-      if (!recorder || recorder.state === "inactive") {
-        return resolve({ ok: false, error: "no active recording" });
-      }
-      const duration = Date.now() - startedAt;
-      recorder.onstop = () => {
-        try {
-          lastBlob = new Blob(chunks, { type: mimeType });
-          if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
-          lastObjectUrl = URL.createObjectURL(lastBlob);
-          const sizeBytes = lastBlob.size;
-          try { stream && stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
-          stream = null;
-          recorder = null;
-          resolve({
-            ok: true,
-            mimeType,
-            sizeBytes,
-            durationMs: duration,
-            objectUrl: lastObjectUrl,
-          });
-        } catch (err) {
-          resolve({ ok: false, error: String(err && err.message) });
-        }
-      };
+  async function stopRecording() {
+    if (recorder && recorder.state !== "inactive") {
       try { recorder.stop(); } catch (err) {
-        resolve({ ok: false, error: String(err && err.message) });
+        return { ok: false, error: String(err && err.message) };
       }
-    });
+      return await stopped;
+    }
+    // Stopped by a cap before the caller asked: hand back that result.
+    if (stopped && lastBlob) return await stopped;
+    return { ok: false, error: "no active recording" };
   }
 
   function getStatus() {
-    const sizeBytes = chunks.reduce((s, c) => s + (c.size || 0), 0);
     const recording = !!recorder && recorder.state === "recording";
     return {
       ok: true,
       recording,
-      sizeBytes,
+      sizeBytes: recording ? chunkBytes : 0,
       durationMs: recording ? (Date.now() - startedAt) : 0,
       mimeType: recording ? mimeType : null,
+      heldBytes: lastBlob ? lastBlob.size : 0,
       lastObjectUrl: lastObjectUrl || null,
+      ...(stopReason && { stopReason }),
     };
   }
 
@@ -144,6 +204,8 @@
             return await stopRecording();
           case "AUTODOM_REC_STATUS":
             return getStatus();
+          case "AUTODOM_REC_RELEASE":
+            return release();
           default:
             return { ok: false, error: "unknown recorder message: " + msg.type };
         }

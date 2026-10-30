@@ -22,13 +22,15 @@ function loadMediaTools(ctx = {}) {
   return sandbox.AutoDOMMediaTools;
 }
 
-test("catalog and tiers shape", () => {
+test("catalog shape: every tool has a handler; tiers live only in action-gate", () => {
   const M = loadMediaTools();
   assert.ok(Array.isArray(M.catalog) && M.catalog.length > 0);
-  assert.ok(M.catalog.find((t) => t.name === "media_control"));
-  assert.ok(M.catalog.find((t) => t.name === "tab_recording_start"));
-  assert.ok(M.tiers.safeRead.has("media_list"));
-  assert.ok(M.tiers.destructive.has("tab_recording_start"));
+  const h = M.makeHandlers({ getActiveTab: async () => ({ id: 1 }), executeInTab: async () => ({}), sendToOffscreen: async () => ({}) });
+  for (const t of M.catalog) {
+    assert.equal(typeof h[t.name], "function", `catalog tool without handler: ${t.name}`);
+    assert.equal(t.parameters.type, "object");
+  }
+  assert.equal(M.tiers, undefined, "a second tier list would drift from action-gate.js");
 });
 
 test("makeHandlers returns the expected agent tool surface", () => {

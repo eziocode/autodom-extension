@@ -46,6 +46,26 @@ export const RESULT_TYPES = {
   get_cookies: `{ cookies: Array<{ name: string; value: string; domain: string; path: string; secure: boolean;
     httpOnly: boolean; expirationDate?: number; [k: string]: any }>; [k: string]: any }`,
   execute_code: `{ success: true; /** The script's JSON-serialized return value */ result: any }`,
+  media_list: `{
+    count: number; /** id of the largest visible video, or null */ primary: string | null;
+    media: Array<{ id: string; index: number; tag: "video" | "audio"; src: string | null; srcType: "file" | "mse" | "stream" | "none";
+      duration: number | null; live: boolean; currentTime: number; paused: boolean; readyState: number; width?: number; height?: number;
+      visible: boolean; inViewport: boolean; drm: boolean; seekable: [number, number] | null; textTracks: number;
+      frameId?: number; primary?: true; [k: string]: any }>;
+    embeds?: Array<{ provider: string; src: string; visible: boolean; note: string }>;
+  }`,
+  media_get_captions: `{ ok: true; id: string; source: "track" | "youtube-transcript" | "dom-visible" | "none";
+    tracks: Array<{ index: number; kind: string; label: string; language: string; mode: string }>; track: number;
+    cues: Array<{ start: number; end: number | null; text: string }>; active: string[]; truncated?: true }`,
+  media_sample_frames: `{ ok: true; video: { id: string; duration: number | null; width: number; height: number };
+    /** images[i] is frames[i]; pass imageRef to emitImage() */ images: Array<{ imageRef: string; mimeType: string }>; imageRef: string;
+    frames: Array<{ t: number; requestedT?: number; width: number; height: number; bytes: number; hash?: string; dark?: true }>;
+    bytes?: number; dropped?: { blank: number; duplicate: number }; truncated?: string; source?: "viewport"; [k: string]: any }`,
+  media_capture_frame: `{ ok: true; video: { id: string; duration: number | null; width: number; height: number };
+    images: Array<{ imageRef: string; mimeType: string }>; imageRef: string;
+    frames: Array<{ t: number; width: number; height: number; bytes: number }>; source?: "viewport"; [k: string]: any }`,
+  image_get_data: `{ ok: true; src: string; naturalWidth: number; naturalHeight: number; width: number; height: number;
+    images: Array<{ imageRef: string; mimeType: string }>; imageRef: string }`,
 };
 
 // Areas group the code_api index. Every bound tool should have one; the
@@ -60,6 +80,8 @@ export const AREAS = [
   ["tabs", ["list_tabs", "open_new_tab", "switch_tab", "close_tab", "pin_tab", "unpin_tab", "get_pinned_tab", "finish_session",
     "wait_for_new_tab", "list_popups", "switch_to_popup", "close_popup", "wait_for_popup", "list_iframes", "iframe_interact",
     "list_shadow_roots", "shadow_interact", "list_downloads", "wait_for_download"]],
+  ["media", ["media_list", "media_control", "media_get_captions", "media_capture_frame", "media_sample_frames", "image_list",
+    "image_get_data"]],
   ["script", ["execute_code", "browser_fetch_raw", "webmcp_list_tools", "webmcp_call_tool"]],
   ["debug", ["get_console_logs", "get_network_requests", "har_start", "har_status", "har_stop", "performance_start_trace",
     "performance_stop_trace", "performance_analyze_insight", "emulate", "emulate_media", "set_viewport", "set_geolocation",
