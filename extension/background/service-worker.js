@@ -95,15 +95,39 @@ function _syncBridgeWatchdog() {
       chrome.alarms.clear(BRIDGE_WATCHDOG_ALARM);
       return;
     }
+    // Energy: once the bridge has been unreachable and unused for a long
+    // stretch, wake every 2 min instead of every 30 s.
+    const period = _bridgeLongIdle() ? 2 : 0.5;
     chrome.alarms.get(BRIDGE_WATCHDOG_ALARM, (existing) => {
-      if (!existing) {
-        chrome.alarms.create(BRIDGE_WATCHDOG_ALARM, { periodInMinutes: 0.5 });
+      if (!existing || existing.periodInMinutes !== period) {
+        chrome.alarms.create(BRIDGE_WATCHDOG_ALARM, { periodInMinutes: period });
       }
     });
   } catch (_) {}
 }
 
+// ─── Idle energy profile ─────────────────────────────────────
+// The bridge counts as "long idle" when it has been disconnected and no tool
+// call has arrived for OFFSCREEN_IDLE_CLOSE_MS. Then the offscreen keepalive
+// page is closed (it only exists to keep the worker warm) and the watchdog
+// slows down. A reconnect or tool call restores both immediately.
+const OFFSCREEN_IDLE_CLOSE_MS = 10 * 60 * 1000;
+let _lastBridgeActivityAt = Date.now();
+function _noteBridgeActivity() {
+  // Time-based on purpose: onopen sets isConnected before calling this.
+  const wasIdle = Date.now() - _lastBridgeActivityAt >= OFFSCREEN_IDLE_CLOSE_MS;
+  _lastBridgeActivityAt = Date.now();
+  if (wasIdle) {
+    _syncBridgeWatchdog();
+    void _syncOffscreenKeepalive("bridge_active");
+  }
+}
+function _bridgeLongIdle() {
+  return !isConnected && Date.now() - _lastBridgeActivityAt >= OFFSCREEN_IDLE_CLOSE_MS;
+}
+
 function _bridgeWatchdogTick() {
+  _syncBridgeWatchdog();
   if (!shouldRunMcp || isConnected || _sessionTimedOut) return;
   if (ws && ws.readyState === WebSocket.CONNECTING) return;
   _debugLog("[AutoDOM] Bridge watchdog: not connected — reconnecting");
@@ -362,11 +386,16 @@ async function _closeOffscreenKeepalive(reason = "unknown") {
 
 async function _syncOffscreenKeepalive(reason = "sync") {
   try {
-    if (shouldRunMcp) {
+    if (shouldRunMcp && !_bridgeLongIdle()) {
       await _ensureOffscreenKeepalive(reason);
-    } else {
-      await _closeOffscreenKeepalive(reason);
+      return;
     }
+    // The same document hosts tab recording: never close it mid-recording.
+    if (await _hasOffscreenDocumentOpen()) {
+      const rec = await _sendRawOffscreenRecorderMessage({ type: "AUTODOM_REC_STATUS" });
+      if (rec?.recording) return;
+    }
+    await _closeOffscreenKeepalive(shouldRunMcp ? `${reason}:idle` : reason);
   } catch (_) {}
 }
 
@@ -4260,6 +4289,7 @@ function _laneErrorResult(err) {
 }
 
 async function _onWsConn_TOOL_CALL(message) {
+  _noteBridgeActivity();
   _debugLog(
     "[AutoDOM SW] TOOL_CALL from bridge:",
     message.tool,
@@ -4786,6 +4816,7 @@ function connectWebSocket(port) {
     ws.onopen = () => {
       isConnected = true;
       _connectFailureStreak = 0;
+      _noteBridgeActivity();
       _cancelIsolationDisconnectRelease();
       _startupRestoreOnly = false;
       autoConnectFallbackTried = false;

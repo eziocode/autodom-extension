@@ -99,10 +99,18 @@ export async function ensureBroker({ indexJs, port, waitMs = 6000, spawnFn = spa
     await lockFd.writeFile(JSON.stringify({ pid: process.pid, at: Date.now() }));
   } catch (err) {
     if (err?.code !== "EEXIST") return { ok: false, spawned: false, reason: err?.message };
-    // Someone else is spawning. Break the lock if its holder died or it is
-    // older than the wait window (crashed mid-spawn).
+    // Someone else is spawning. The holder may not have written its pid
+    // yet (empty file), so judge staleness by the file's age; only break a
+    // lock whose recorded holder is dead or that outlived the wait window.
     const held = await readJson(spawnLock);
-    if (!held || !pidAlive(held.pid) || Date.now() - (held.at || 0) > waitMs) {
+    let ageMs = 0;
+    try {
+      ageMs = Date.now() - (await fs.stat(spawnLock)).mtimeMs;
+    } catch {
+      return ensureBroker({ indexJs, port, waitMs, spawnFn }); // released meanwhile
+    }
+    const holderDead = held?.pid && !pidAlive(held.pid);
+    if (holderDead || ageMs > waitMs) {
       await fs.rm(spawnLock, { force: true }).catch(() => {});
       return ensureBroker({ indexJs, port, waitMs, spawnFn });
     }

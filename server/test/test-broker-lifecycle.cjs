@@ -6,8 +6,9 @@
 //   3. SIGKILL one worker → the others keep working, no reconnect needed.
 //   4. A second browser (different instanceId) is refused with
 //      PORT_BUSY_OTHER_BROWSER; the first browser stays connected.
-//   5. Idle workers go dormant (detach) and wake on their next tool call
-//      without their tab group being released (no CLIENT_GONE).
+//   5. Idle workers go dormant (detach) without their tab group being
+//      released (no CLIENT_GONE); the extension's Fix run while one client
+//      is idle and one active stops neither, and both keep working.
 //   6. No workers + no extension → the broker exits by itself.
 //   7. A tool call after that spawns a fresh broker on demand.
 const cp = require("child_process");
@@ -223,9 +224,26 @@ async function main() {
     const peersNow = await bridgeStatus(lock.token);
     if (peersNow && peersNow.proxies.length) return fail(`workers did not go dormant: ${JSON.stringify(peersNow.proxies)}`);
   }
+  ok("idle workers went dormant (no CLIENT_GONE)");
+
+  // 5b ── "Claude idle, Codex active, user presses Fix": ide-c is active,
+  // ide-b stays dormant; the extension's Fix (native-host restart --upgrade)
+  // must not stop either, and ide-b's next call must just work.
+  const rcActive = await call(c);
+  if (rcActive.error) return fail(`active ide-c failed before Fix: ${text(rcActive)}`);
+  const fix = await nativeHost("restart", "--upgrade", "--port", String(PORT));
+  if (!fix.ok) return fail(`Fix failed: ${JSON.stringify(fix)}`);
+  const killedPids = [...(fix.killed || []), ...(fix.restarted || [])].map((k) => k.pid);
+  for (const w of [b, c]) {
+    if (killedPids.includes(w.proc.pid) || !alive(w.proc.pid)) {
+      return fail(`Fix stopped live client ${w.name}: ${JSON.stringify(fix.killed || fix.restarted)}`);
+    }
+  }
+  if (!alive(bp[0])) return fail("Fix stopped the broker that owns the port");
   const rb4 = await call(b);
-  if (rb4.error) return fail(`dormant ide-b did not wake: ${text(rb4)}`);
-  ok("idle workers went dormant (no CLIENT_GONE) and woke on the next call");
+  const rc4 = await call(c);
+  if (rb4.error || rc4.error) return fail(`after Fix: ${text(rb4)} / ${text(rc4)}`);
+  ok("Fix with one client idle and one active stopped nothing; idle client woke and both work");
 
   // 6 ── no workers + no extension → broker exits on its own
   b.proc.kill("SIGKILL");
@@ -247,6 +265,23 @@ async function main() {
   console.log("PASS — broker lifecycle");
   cleanup();
   process.exit(0);
+}
+
+function nativeHost(...args) {
+  return new Promise((resolve, reject) => {
+    cp.execFile(
+      "node",
+      [path.join(SERVER_CWD, "native-host.js"), "--cli", ...args],
+      { encoding: "utf8", timeout: 60000 },
+      (err, stdout) => {
+        try {
+          resolve(JSON.parse(stdout));
+        } catch (e) {
+          reject(err || e);
+        }
+      },
+    );
+  });
 }
 
 function bridgeStatus(token) {

@@ -24,6 +24,10 @@ All notable changes to AutoDOM are documented in this file.
   no clients.
 - Timers slow down after 60 s without calls (pings 15 s → 60 s, parent
   check 3 s → 15 s, lock check 5 s → 30 s).
+- Extension: after 10 min disconnected with no tool calls, the offscreen
+  keepalive page closes (kept open while a tab recording runs) and the
+  reconnect watchdog wakes every 2 min instead of every 30 s. A reconnect
+  or tool call restores both.
 
 ### Fixed
 - **Fix** and the reaper no longer stop a server whose MCP client is still
