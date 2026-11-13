@@ -4,6 +4,29 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 7.6.0
+
+### Fixed
+- Fix now moves a bridge onto newer server files even when its IDE has been
+  idle. A bridge waited for an MCP handshake from a client that had sent
+  nothing yet (typically the successor of an earlier in-place restart), so
+  Fix said "Moving 7.4.0 → 7.5.0" and the bridge stayed on the old version.
+  Only a half-finished handshake now delays the restart.
+- The extension stays on its port when that port's bridge restarts. It used
+  to fall back to the last port it had used, leaving the IDEs on the
+  configured port without a browser. Fix also moves a connection that sits
+  on another port back to the configured one, and its Reconnect step shows
+  the port actually connected.
+- "Stale servers" in the bridge check lists only orphans that Fix stops.
+  Bridges of idle IDE sessions (kept by design; they reattach on their next
+  tool call) are shown separately, so Fix no longer reports "Nothing stale"
+  right after the check listed several.
+- The chat panel no longer tries to load its stylesheet from a script left
+  behind by an extension reload ("Unsafe attempt to load URL
+  chrome-extension://…"), and inlines the CSS if a page refuses the link.
+
+---
+
 ## 7.5.0
 
 ### Changed
