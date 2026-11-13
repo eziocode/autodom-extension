@@ -7,6 +7,13 @@
 // (toolGetDomState, toolListTabs, ...); keep them in step when those change.
 // Objects stay open (`[k: string]: any`) where a handler adds fields by mode.
 
+// Set by the extension on tools that act on the page, after it settles.
+const PAGE_CHANGES_FIELD = `/** What the page did in response; absent when nothing changed. Handle it before the next action. */
+    page_changes?: { overlays?: Array<{ change: "opened" | "closed"; kind: "dialog" | "alertdialog" | "toast" | "popover" | "menu";
+      label?: string; text?: string; modal?: boolean; buttons?: Array<{ ref: string; label: string }> }>;
+      navigation?: { from: string; to: string }; new_tabs?: Array<{ tabId: number; url: string }>;
+      dialog?: { type: string; message: string }; validation?: Array<{ ref: string; label: string; message: string }>;
+      settled?: false }`;
 const SNAPSHOT_FIELD = "/** Present when called with snapshot: \"diff\" | \"full\" */ snapshot?: string";
 
 export const RESULT_TYPES = {
@@ -23,10 +30,10 @@ export const RESULT_TYPES = {
     images?: number; tabId: number; windowId: number; [k: string]: any }`,
   navigate: `{ success: true; url?: string; title?: string; action?: "back" | "forward" | "reload"; status?: string;
     ${SNAPSHOT_FIELD}; [k: string]: any }`,
-  click: `{ success: true; tag?: string; text?: string; ${SNAPSHOT_FIELD}; [k: string]: any }`,
-  type_text: `{ success: true; value?: string; ${SNAPSHOT_FIELD}; [k: string]: any }`,
-  click_by_index: `{ success: true; index: number; tag: string; text: string; cached: boolean }`,
-  type_by_index: `{ success: true; index: number; tag: string; value: string; cached: boolean }`,
+  click: `{ success: true; tag?: string; text?: string; ${PAGE_CHANGES_FIELD}; ${SNAPSHOT_FIELD}; [k: string]: any }`,
+  type_text: `{ success: true; value?: string; ${PAGE_CHANGES_FIELD}; ${SNAPSHOT_FIELD}; [k: string]: any }`,
+  click_by_index: `{ success: true; index: number; tag: string; text: string; cached: boolean; ${PAGE_CHANGES_FIELD} }`,
+  type_by_index: `{ success: true; index: number; tag: string; value: string; cached: boolean; ${PAGE_CHANGES_FIELD} }`,
   take_screenshot: `{ /** Pass to emitImage() to attach the image to the run_code result. */ imageRef: string;
     images: Array<{ imageRef: string; mimeType: string }>; /** Size and scale note */ text?: string }`,
   list_tabs: `{

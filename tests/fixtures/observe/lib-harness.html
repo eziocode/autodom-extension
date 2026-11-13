@@ -1,0 +1,148 @@
+<!doctype html>
+<!--
+  Real-DOM checks for the page library (extension/background/workflow-engine.js):
+  one click per action, shadow-root lookup, and the page_changes diff.
+  Open this file in a browser; the result is in #result and window.__harness.
+-->
+<meta charset="utf-8" />
+<title>AutoDOM page library harness</title>
+<style>
+  .modal { position: fixed; top: 40px; left: 40px; width: 300px; padding: 16px; background: #fff; border: 1px solid #888; }
+  .toast { position: fixed; bottom: 10px; right: 10px; padding: 8px; background: #222; color: #fff; }
+</style>
+<button id="btn">Save record</button>
+<input id="name" name="name" value="old" />
+<input id="email" name="email" aria-describedby="email-err" />
+<span id="email-err"></span>
+<div id="host"></div>
+<div id="existing" class="modal" role="dialog" aria-label="Already open"><button>Keep</button></div>
+<pre id="result">running…</pre>
+<script src="../../../extension/background/workflow-engine.js"></script>
+<script>
+  (async () => {
+    const out = [];
+    const check = (name, ok, detail) => out.push({ name, ok: !!ok, ...(ok ? {} : { detail }) });
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    try {
+      // The parser still appends nodes until the document has loaded.
+      if (document.readyState !== "complete") await new Promise((r) => addEventListener("load", r));
+      const P = AutoDOMWorkflow._page;
+      P._pageWfLib();
+      check("entry points answer once the library is loaded", P._pageWfObserveArm().ok === true);
+      P._pageWfObserveCollect(true);
+
+      // ── one click per action ──
+      const counts = { click: 0, mousedown: 0, mouseup: 0, dblclick: 0 };
+      const btn = document.getElementById("btn");
+      for (const type of Object.keys(counts)) btn.addEventListener(type, () => counts[type]++);
+      let r = P._pageWfRunAction({ selector: "#btn" }, { action: "click" });
+      check("click by selector fires exactly one click", r.ok && counts.click === 1 && counts.mousedown === 1 && counts.mouseup === 1, { r, counts });
+      check("click reports the document as the source", r.via === "document" && r.tag === "BUTTON", r);
+      r = P._pageWfRunAction({ text: "Save record" }, { action: "click" });
+      check("click by text fires exactly one click", r.ok && counts.click === 2, { r, counts });
+      r = P._pageWfRunAction({ selector: "#btn" }, { action: "dblclick" });
+      check("double click fires one dblclick", r.ok && counts.dblclick === 1, { r, counts });
+
+      // ── fill ──
+      r = P._pageWfRunAction({ selector: "#name" }, { action: "fill", value: "new", append: false });
+      check("fill replaces the value", r.ok && r.value === "new" && document.getElementById("name").value === "new", r);
+      r = P._pageWfRunAction({ selector: "#name" }, { action: "fill", value: "er", append: true });
+      check("fill can append", r.value === "newer", r);
+
+      // ── shadow roots ──
+      const outer = document.getElementById("host").attachShadow({ mode: "open" });
+      outer.innerHTML = '<div id="inner-host"></div>';
+      const inner = outer.getElementById("inner-host").attachShadow({ mode: "open" });
+      inner.innerHTML = '<button id="deep">Deep action</button>';
+      let deepClicks = 0;
+      inner.getElementById("deep").addEventListener("click", () => deepClicks++);
+      r = P._pageWfRunAction({ selector: "#deep" }, { action: "click" });
+      check("selector reaches a nested open shadow root", r.ok && r.via === "shadow" && deepClicks === 1, { r, deepClicks });
+      r = P._pageWfRunAction({ selector: "#host >>> #inner-host >>> #deep" }, { action: "click" });
+      check("host >>> inner chain works", r.ok && deepClicks === 2, { r, deepClicks });
+      r = P._pageWfRunAction({ text: "Deep action" }, { action: "click" });
+      check("text search reaches shadow roots", r.ok && r.via === "shadow" && deepClicks === 3, { r, deepClicks });
+      r = P._pageWfRunAction({ selector: "#nope" }, { action: "click" });
+      check("unknown selector is a miss, not an error", r.ok === false && r.miss === true, r);
+      r = P._pageWfRunAction({ selector: "!!bad" }, { action: "click" });
+      check("invalid selector is an error", r.ok === false && !r.miss && /Invalid selector/.test(r.error), r);
+
+      // ── nothing changed ──
+      P._pageWfObserveArm();
+      await sleep(80);
+      r = P._pageWfObserveCollect(false);
+      check("idle time grows while the DOM is quiet", r.ok && r.idleMs >= 60 && r.mutations === 0, r);
+      r = P._pageWfObserveCollect(true);
+      check("no changes when nothing happened", r.ok && Object.keys(r.changes).length === 0, r);
+      check("collect without arm says so", P._pageWfObserveCollect(true).notArmed === true);
+
+      // ── modal after a delayed save ──
+      P._pageWfObserveArm();
+      setTimeout(() => {
+        const d = document.createElement("div");
+        d.id = "confirm";
+        d.className = "modal";
+        d.setAttribute("role", "dialog");
+        d.setAttribute("aria-modal", "true");
+        d.innerHTML = '<h2>Unsaved changes</h2><p>Discard your edits?</p><button id="discard">Discard</button><button>Cancel</button>';
+        document.body.appendChild(d);
+      }, 60);
+      await sleep(40);
+      check("not idle yet before the modal", P._pageWfObserveCollect(false).mutations === 0);
+      await sleep(80);
+      r = P._pageWfObserveCollect(false);
+      check("mutation seen when the modal is added", r.mutations > 0, r);
+      r = P._pageWfObserveCollect(true);
+      const ov = (r.changes.overlays || [])[0] || {};
+      check(
+        "new modal is reported with label, text and buttons",
+        r.changes.overlays?.length === 1 && ov.change === "opened" && ov.kind === "dialog" && ov.modal === true &&
+          ov.label === "Unsaved changes" && /Discard your edits/.test(ov.text) && ov.buttons.length === 2 && ov.buttons[0].label === "Discard",
+        r,
+      );
+      check("the overlay open before arming is not reported", !(r.changes.overlays || []).some((o) => o.label === "Already open"), r);
+      let discarded = 0;
+      document.getElementById("discard").addEventListener("click", () => discarded++);
+      r = P._pageWfActOnRef(ov.buttons[0].ref, { action: "click" });
+      check("an overlay button ref is clickable", r.ok && discarded === 1, { r, discarded });
+
+      // ── closing an overlay ──
+      P._pageWfObserveArm();
+      document.getElementById("confirm").remove();
+      r = P._pageWfObserveCollect(true);
+      check("closed modal is reported", r.changes.overlays?.[0]?.change === "closed" && r.changes.overlays[0].label === "Unsaved changes", r);
+
+      // ── toast that comes and goes ──
+      P._pageWfObserveArm();
+      const toast = document.createElement("div");
+      toast.className = "toast";
+      toast.setAttribute("role", "status");
+      toast.textContent = "Record saved";
+      document.body.appendChild(toast);
+      await sleep(20);
+      toast.remove();
+      await sleep(20);
+      r = P._pageWfObserveCollect(true);
+      check("a toast removed before collect is still reported", r.changes.overlays?.[0]?.kind === "toast" && r.changes.overlays[0].text === "Record saved", r);
+
+      // ── validation error ──
+      P._pageWfObserveArm();
+      document.getElementById("email").setAttribute("aria-invalid", "true");
+      document.getElementById("email-err").textContent = "Enter a valid email";
+      r = P._pageWfObserveCollect(true);
+      check("new invalid field is reported with its message", r.changes.validation?.[0]?.message === "Enter a valid email" && /^@e\d+$/.test(r.changes.validation[0].ref), r);
+
+      // ── same-document URL change ──
+      P._pageWfObserveArm();
+      history.pushState({}, "", "#saved");
+      r = P._pageWfObserveCollect(true);
+      check("pushState is reported as navigation", /#saved$/.test(r.changes.navigation?.to || ""), r);
+    } catch (e) {
+      check("harness ran to the end", false, String(e && e.stack || e));
+    }
+    const failed = out.filter((c) => !c.ok);
+    window.__harness = { total: out.length, failed };
+    document.getElementById("result").textContent =
+      (failed.length ? "FAIL " : "PASS ") + (out.length - failed.length) + "/" + out.length + "\n" + JSON.stringify(failed, null, 2);
+  })();
+</script>

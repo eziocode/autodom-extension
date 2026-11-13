@@ -16,6 +16,7 @@
     "cookies",
     "clipboardWrite",
     "webNavigation",
+    "webRequest",
     "sidePanel",
     "downloads",
     "offscreen",

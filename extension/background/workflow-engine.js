@@ -33,7 +33,7 @@
   // globalThis.__autodomWfLib once per document (idempotent).
   function _pageWfLib() {
     // Keep in sync with WF_LIB_VERSION checks in the entry points below.
-    const VERSION = 5;
+    const VERSION = 6;
     if (globalThis.__autodomWfLib && globalThis.__autodomWfLib.v === VERSION) {
       return { ok: true, cached: true };
     }
@@ -745,7 +745,7 @@
         if (tag === "label" || tag === "option" || (isField(t) && tag !== "select" && !["checkbox", "radio"].includes(String(t.type).toLowerCase()))) return;
         if (tag === "select") return;
         if (tag === "input" && ["checkbox", "radio"].includes(String(t.type).toLowerCase())) return;
-        // Tools often fire a synthetic click and then el.click(): keep one.
+        // One user gesture can reach here twice (label forwarding): keep one.
         const now = Date.now();
         if (lastClick.el === t && now - lastClick.at < 400) return;
         lastClick = { el: t, at: now };
@@ -820,6 +820,246 @@
       return { ok: true, wasRecording: true };
     };
 
+    // ─── Target lookup shared by the action tools ─────────────────────
+    // Order: @eN ref, document, "host >>> inner" chain, open shadow roots,
+    // visible text. The deep searches only run when the document misses.
+    const queryShadow = (sel) => {
+      const visit = (root, depth) => {
+        for (const host of all(root, "*")) {
+          const sr = host.shadowRoot;
+          if (!sr) continue;
+          const hit = sr.querySelector(sel) || (depth < 6 ? visit(sr, depth + 1) : null);
+          if (hit) return hit;
+        }
+        return null;
+      };
+      return visit(document, 0);
+    };
+    const queryText = (text) => {
+      const scan = (root, depth) => {
+        const base = root.body || root;
+        const walker = document.createTreeWalker(base, NodeFilter.SHOW_TEXT);
+        while (walker.nextNode()) {
+          const parent = walker.currentNode.parentElement;
+          if (!parent || /^(SCRIPT|STYLE|NOSCRIPT)$/.test(parent.tagName) || parent.closest(UI_SEL)) continue;
+          if (walker.currentNode.textContent.trim().includes(text)) return parent;
+        }
+        if (depth >= 6) return null;
+        for (const host of all(base, "*")) {
+          const hit = host.shadowRoot && scan(host.shadowRoot, depth + 1);
+          if (hit) return hit;
+        }
+        return null;
+      };
+      return scan(document, 0);
+    };
+    // Throws on an invalid selector; runAction reports it.
+    const find = (target) => {
+      const t = target || {};
+      if (t.ref) {
+        const el = byRef(t.ref);
+        return el ? { el, via: "ref" } : null;
+      }
+      if (t.selector) {
+        const sel = String(t.selector);
+        if (sel.includes(">>>")) {
+          const parts = sel.split(">>>").map((p) => p.trim());
+          let root = document;
+          let el = null;
+          for (let i = 0; i < parts.length; i++) {
+            el = root.querySelector(parts[i]);
+            if (!el) return null;
+            if (i < parts.length - 1) {
+              if (!el.shadowRoot) return null;
+              root = el.shadowRoot;
+            }
+          }
+          return { el, via: "shadow" };
+        }
+        const el = document.querySelector(sel);
+        if (el) return { el, via: "document" };
+        const deep = queryShadow(sel);
+        return deep ? { el: deep, via: "shadow" } : null;
+      }
+      if (t.text) {
+        const el = queryText(String(t.text));
+        return el ? { el, via: el.getRootNode() === document ? "document" : "shadow" } : null;
+      }
+      return null;
+    };
+    // miss:true tells the service worker to try the tab's other frames.
+    const runAction = (target, step) => {
+      let hit;
+      try {
+        hit = find(target);
+      } catch (e) {
+        return { ok: false, error: "Invalid selector: " + ((target && target.selector) || "") };
+      }
+      if (!hit) return { ok: false, miss: true };
+      const el = hit.el;
+      const res = step && step.action ? act(el, step) : { ok: true };
+      return {
+        ...res,
+        via: hit.via,
+        tag: el.tagName,
+        text: norm(el.textContent).slice(0, 100),
+        ...("value" in el && !isSensitive(el) ? { value: String(el.value == null ? "" : el.value) } : {}),
+        ...(hit.via === "shadow" ? { hosts: shadowHosts(el) } : {}),
+      };
+    };
+
+    // ─── Post-action observation ──────────────────────────────────────
+    // observeArm() remembers the overlays, toasts, invalid fields, URL and
+    // title, then counts DOM mutations. observeCollect() says how long the
+    // DOM has been quiet and, when final, what appeared or went away. There
+    // are no timers here: background tabs throttle them, so the service
+    // worker owns the clock.
+    const OVERLAY_SEL =
+      '[role="dialog"],[role="alertdialog"],[aria-modal="true"],dialog[open],.modal,.popup,.popover,.dialog,.dropdown-menu,[data-popup],[data-modal]';
+    const TOAST_SEL =
+      '[role="alert"],[role="status"],[aria-live="assertive"],[aria-live="polite"],.toast,.snackbar,.notification';
+    const ownUi = (el) => !!(el.closest && el.closest(UI_SEL));
+    // Visible page overlays, outermost only, largest first.
+    const overlays = () => {
+      const found = all(document, OVERLAY_SEL).filter(
+        (el) => !ownUi(el) && visible(el) && (norm(el.textContent) || el.querySelector(INTERACTIVE_SEL)),
+      );
+      const area = (el) => {
+        const r = el.getBoundingClientRect();
+        return r.width * r.height;
+      };
+      return found
+        .filter((el) => !found.some((o) => o !== el && o.contains(el)))
+        .sort((a, b) => area(b) - area(a));
+    };
+    const overlayKind = (el) => {
+      const role = el.getAttribute("role");
+      if (role === "alertdialog") return "alertdialog";
+      if (role === "menu" || el.matches(".dropdown-menu")) return "menu";
+      if (el.matches(".popover")) return "popover";
+      return "dialog";
+    };
+    const idsText = (ids) =>
+      norm(ids.split(/\s+/).map((id) => (document.getElementById(id) || {}).textContent || "").join(" "));
+    const overlayLabel = (el) => {
+      const aria = norm(el.getAttribute("aria-label"));
+      if (aria) return aria.slice(0, 120);
+      const ids = el.getAttribute("aria-labelledby");
+      const named = ids ? idsText(ids) : "";
+      if (named) return named.slice(0, 120);
+      const h = el.querySelector("h1,h2,h3,h4,h5,h6,[role=heading]");
+      return h ? norm(h.textContent).slice(0, 120) : "";
+    };
+    const isModal = (el) => {
+      if (el.getAttribute("aria-modal") === "true") return true;
+      try { return el.matches(":modal"); } catch (_) { return false; }
+    };
+    const overlayInfo = (el) => ({
+      kind: overlayKind(el),
+      label: overlayLabel(el),
+      text: norm(el.innerText || el.textContent).slice(0, 300),
+      modal: isModal(el),
+      buttons: all(el, ROLE_SEL.button + "," + ROLE_SEL.link)
+        .filter(visible)
+        .slice(0, 6)
+        .map((b) => ({ ref: "@" + refOf(b), label: (accName(b) || norm(b.textContent)).slice(0, 60) })),
+    });
+    const invalidFields = () => {
+      const set = new Set(all(document, '[aria-invalid="true"]'));
+      for (const el of all(document, ":user-invalid")) set.add(el);
+      return set;
+    };
+    const invalidMessage = (el) => {
+      for (const attr of ["aria-errormessage", "aria-describedby"]) {
+        const ids = el.getAttribute(attr);
+        const t = ids ? idsText(ids) : "";
+        if (t) return t.slice(0, 160);
+      }
+      return String(el.validationMessage || "").slice(0, 160);
+    };
+
+    let obs = null;
+    const observeArm = () => {
+      if (obs) obs.mo.disconnect();
+      const state = {
+        last: performance.now(),
+        mutations: 0,
+        url: location.href,
+        title: document.title,
+        overlays: new Set(overlays()),
+        toasts: new Map(),
+        flashed: new Map(),
+        invalid: invalidFields(),
+      };
+      for (const el of all(document, TOAST_SEL)) {
+        if (visible(el)) state.toasts.set(el, norm(el.textContent).slice(0, 300));
+      }
+      // Structure only: attribute and text churn (animations, clocks) must
+      // not keep the page "busy".
+      state.mo = new MutationObserver((records) => {
+        state.last = performance.now();
+        state.mutations += records.length;
+        // A toast can come and go inside one settle window.
+        for (const rec of records) {
+          for (const n of rec.addedNodes) {
+            if (n.nodeType !== 1 || state.flashed.size >= 5) continue;
+            const t = n.matches(TOAST_SEL) ? n : n.querySelector(TOAST_SEL);
+            const text = t && !ownUi(t) ? norm(t.textContent) : "";
+            if (text) state.flashed.set(t, text.slice(0, 300));
+          }
+        }
+      });
+      state.mo.observe(document.documentElement, { childList: true, subtree: true });
+      obs = state;
+      return { ok: true };
+    };
+    const observeCollect = (final) => {
+      const s = obs;
+      if (!s) return { ok: false, notArmed: true };
+      const idleMs = Math.round(performance.now() - s.last);
+      if (!final) return { ok: true, idleMs, mutations: s.mutations };
+      s.mo.disconnect();
+      obs = null;
+      const changes = {};
+      if (location.href !== s.url) changes.navigation = { from: s.url, to: location.href, title: document.title };
+      else if (document.title !== s.title) changes.title = { from: s.title, to: document.title };
+
+      const list = [];
+      const open = overlays();
+      for (const el of open) {
+        if (!s.overlays.has(el)) list.push({ change: "opened", ...overlayInfo(el) });
+      }
+      const toastTexts = new Set();
+      const addToast = (text) => {
+        if (!text || toastTexts.has(text)) return;
+        toastTexts.add(text);
+        list.push({ change: "opened", kind: "toast", text });
+      };
+      for (const el of all(document, TOAST_SEL)) {
+        if (ownUi(el) || !visible(el) || open.some((o) => o.contains(el))) continue;
+        const text = norm(el.textContent).slice(0, 300);
+        if (s.toasts.get(el) !== text) addToast(text);
+      }
+      for (const text of s.flashed.values()) addToast(text);
+      for (const el of s.overlays) {
+        if (!open.includes(el)) list.push({ change: "closed", kind: overlayKind(el), label: overlayLabel(el) });
+      }
+      if (list.length) changes.overlays = list.slice(0, 3);
+
+      const invalid = [];
+      for (const el of invalidFields()) {
+        if (invalid.length >= 5) break;
+        if (s.invalid.has(el) || !visible(el)) continue;
+        invalid.push({
+          ref: "@" + refOf(el),
+          label: (labelText(el) || accName(el) || el.getAttribute("name") || "").slice(0, 80),
+          message: invalidMessage(el),
+        });
+      }
+      if (invalid.length) changes.validation = invalid;
+      return { ok: true, idleMs, mutations: s.mutations, changes };
+    };
+
     globalThis.__autodomWfLib = {
       v: VERSION,
       norm,
@@ -831,6 +1071,9 @@
       byRef,
       act,
       actOnRef,
+      runAction,
+      observeArm,
+      observeCollect,
       runStep,
       resolveOnly,
       markCandidates,
@@ -847,11 +1090,11 @@
   // Thin entry points. They answer { needLib: true } when the library is
   // missing (new document) or from another build, and the engine injects
   // _pageWfLib and retries once — so the library is injected once per
-  // document instead of before every step. The literal 5 must match
+  // document instead of before every step. The literal 6 must match
   // VERSION in _pageWfLib (each function is serialized on its own).
   function _pageWfStartRecording(nonce, opts) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 5 ? L.startRecording(nonce, opts) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 6 ? L.startRecording(nonce, opts) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfStopRecording() {
     const L = globalThis.__autodomWfLib;
@@ -859,23 +1102,35 @@
   }
   function _pageWfRunStep(step, timeoutMs) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 5 ? L.runStep(step, timeoutMs) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 6 ? L.runStep(step, timeoutMs) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfActOnRef(ref, step) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 5 ? L.actOnRef(ref, step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 6 ? L.actOnRef(ref, step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+  }
+  function _pageWfRunAction(target, step) {
+    const L = globalThis.__autodomWfLib;
+    return L && L.v === 6 ? L.runAction(target, step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+  }
+  function _pageWfObserveArm() {
+    const L = globalThis.__autodomWfLib;
+    return L && L.v === 6 ? L.observeArm() : { ok: false, needLib: true, error: "workflow lib not loaded" };
+  }
+  function _pageWfObserveCollect(final) {
+    const L = globalThis.__autodomWfLib;
+    return L && L.v === 6 ? L.observeCollect(final) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfCandidates(limit) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 5 ? { ok: true, candidates: L.candidates(limit) } : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 6 ? { ok: true, candidates: L.candidates(limit) } : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfResolveOnly(step) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 5 ? L.resolveOnly(step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 6 ? L.resolveOnly(step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfMark(limit, nearBbox) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 5 ? L.markCandidates(limit, nearBbox) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 6 ? L.markCandidates(limit, nearBbox) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfClearMarks() {
     const L = globalThis.__autodomWfLib;
@@ -883,11 +1138,11 @@
   }
   function _pageWfRemoveStorage(origin, local, session) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 5 ? L.removeStorage(origin, local, session) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 6 ? L.removeStorage(origin, local, session) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfDigest() {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 5 ? L.digest() : { needLib: true };
+    return L && L.v === 6 ? L.digest() : { needLib: true };
   }
   // Fast-mode settle: resolve once the DOM has been quiet for idleMs (no
   // mutations), or after capMs at the latest. Self-contained, no library.
@@ -2850,6 +3105,9 @@
       _pageWfStopRecording,
       _pageWfRunStep,
       _pageWfActOnRef,
+      _pageWfRunAction,
+      _pageWfObserveArm,
+      _pageWfObserveCollect,
       _pageWfCandidates,
       _pageWfDigest,
       _pageWfResolveOnly,

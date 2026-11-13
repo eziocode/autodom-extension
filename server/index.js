@@ -7704,6 +7704,13 @@ const SNAPSHOT_AFTER_PARAM = z
   .optional()
   .describe('Append snapshot after action: diff = changes since last snapshot, full = whole');
 
+// Shared by every tool that acts on the page. The extension attaches
+// page_changes to the result after the page settles.
+const OBSERVE_PARAM = z
+  .union([z.boolean(), z.number()])
+  .optional()
+  .describe("page_changes report after the action: false = skip, number = max settle wait in ms (default 2000)");
+
 function _withoutAtkParams(params = {}) {
   const { verbose, snapshot, ...rest } = params || {};
   return rest;
@@ -7825,6 +7832,7 @@ function _listedToolDefinitions(env = process.env) {
 function _serverInstructions(env = process.env) {
   const base =
     "Inspect page state before UI actions. Use explicit identifiers returned by tools across calls; MCP transport sessions are not application state. " +
+    "Results of click, type and other action tools carry page_changes when the page reacted: a dialog or toast that opened (with @eN refs for its buttons), a navigation, a new tab, a native dialog, validation errors. Read it and deal with it before the next action. " +
     "AutoDOM works in its own background tab group and never takes over the tab the user is using: navigate/open_new_tab open tabs in that group, and a user's tab is only touched when you adopt it explicitly with pin_tab {tabId}. Call finish_session when the task is done to close the tabs AutoDOM opened and put any adopted tab back.";
   const codeMode = _codeModeListing(env);
   if (codeMode === "off") return base;
@@ -8649,6 +8657,7 @@ server.addTool({
     "Click an interactive element by its numeric index from get_dom_state. " +
     "More reliable than CSS selectors — indices are stable within a page state.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     index: z.coerce.number().describe("Element index from get_dom_state"),
     dblClick: z
       .boolean()
@@ -8669,6 +8678,7 @@ server.addTool({
     "Type text into an input element by its numeric index from get_dom_state. " +
     "More reliable than CSS selectors — indices are stable within a page state.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     index: z.coerce.number().describe("Element index from get_dom_state"),
     text: z.string().describe("Text to type"),
     clearFirst: z
@@ -9206,6 +9216,7 @@ server.addTool({
   description:
     "Click an element on the page by CSS selector or visible text content.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
     selector: z
       .string()
@@ -9230,6 +9241,7 @@ server.addTool({
   name: "type_text",
   description: "Type text into an input or textarea element (by CSS selector or snapshot ref).",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
     selector: z.string().optional().describe("CSS selector of the input element"),
     text: z.string().describe("Text to type"),
@@ -9472,6 +9484,7 @@ server.addTool({
   name: "fill_form",
   description: "Fill multiple form fields at once. Efficient batch operation.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     fields: z
       .array(
         z.object({
@@ -9493,6 +9506,7 @@ server.addTool({
   description:
     "Hover over an element to trigger hover effects, tooltips, or dropdowns.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
     selector: z.string().optional().describe("CSS selector of the element to hover"),
   }),
@@ -9508,6 +9522,7 @@ server.addTool({
   description:
     'Press a keyboard key or combination (e.g. "Enter", "Control+A", "Shift+Tab").',
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     key: z
       .string()
       .describe('Key or combination, e.g. "Enter", "Control+A", "Escape"'),
@@ -9963,6 +9978,7 @@ server.addTool({
   description:
     "Select an option from a <select> dropdown by value, visible text, or index.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
     selector: z.string().optional().describe("CSS selector of the <select> element"),
     value: z.string().optional().describe("Option value to select"),
@@ -10185,6 +10201,7 @@ server.addTool({
   name: "drag_and_drop",
   description: "Drag an element and drop it onto another element.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     sourceSelector: z.string().describe("CSS selector of the element to drag"),
     targetSelector: z.string().describe("CSS selector of the drop target"),
   }),
@@ -10199,6 +10216,7 @@ server.addTool({
   name: "right_click",
   description: "Right-click (context menu) on an element.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     selector: z.string().describe("CSS selector of the element"),
   }),
   execute: async (params) => {
@@ -11108,6 +11126,7 @@ server.addTool({
   description:
     "Act inside an iframe (regular tools cannot cross iframe boundaries). Actions: click, type, query, extract_text, fill_form, get_dom_state. Target by frameId from list_iframes or iframeSelector.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     frameId: z
       .number()
       .optional()
@@ -11178,6 +11197,7 @@ server.addTool({
   description:
     "Act inside shadow DOM with piercing selectors: 'host >>> inner' (nest: 'outer >>> inner-host >>> target'). Actions: click, type, query, query_all, extract_text, fill_form, get_dom_state. Find hosts with list_shadow_roots.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     piercingSelector: z
       .string()
       .describe(
@@ -11247,6 +11267,7 @@ server.addTool({
     "Double-click an element by CSS selector or visible text. " +
     "Use for inline rename, expanding tree nodes, or any UI that requires dblclick.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     selector: z.string().optional().describe("CSS selector"),
     text: z.string().optional().describe("Match element by visible text (fallback)"),
   }),
@@ -11262,6 +11283,7 @@ server.addTool({
     "Middle-click (button 1) an element by CSS selector. " +
     "Opens links in a new background tab without needing target=_blank.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     selector: z.string().describe("CSS selector"),
   }),
   execute: async (params) => {
@@ -11276,6 +11298,7 @@ server.addTool({
     "Click an element bypassing visibility and interactability checks. " +
     "Use when a normal click fails because the element is hidden or overlapped.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     selector: z.string().describe("CSS selector"),
   }),
   execute: async (params) => {
@@ -11291,6 +11314,7 @@ server.addTool({
     "Use for canvas, map UIs, datepickers, or visual targets with no CSS selector. " +
     "Combine with get_bounding_box to derive coordinates from an element.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     x: z.number().describe("Viewport X coordinate (pixels from left)"),
     y: z.number().describe("Viewport Y coordinate (pixels from top)"),
     button: z
@@ -11317,6 +11341,7 @@ server.addTool({
     "Use to hold modifier keys (Shift, Control, Alt, Meta) before another action, " +
     "then release with key_up.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     key: z.string().describe("Key name e.g. 'Shift', 'Control', 'Alt', 'a'"),
     selector: z
       .string()
@@ -11334,6 +11359,7 @@ server.addTool({
   description:
     "Dispatch a keyup event — releases a key previously held with key_down.",
   parameters: z.object({
+    observe: OBSERVE_PARAM,
     key: z.string().describe("Key name e.g. 'Shift', 'Control', 'Alt', 'a'"),
     selector: z
       .string()

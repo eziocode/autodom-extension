@@ -1450,7 +1450,7 @@ async function executeAgentTool(toolName, params, ctx) {
       toolName,
       params,
       ctx,
-      () => handler(params || {}, ctx),
+      () => _runToolHandler(toolName, handler, params, ctx),
       {
         tabHint: _gateTab?.id,
         acquireTimeoutMs: ctx?.batchDepth > 0 ? BATCH_LANE_ACQUIRE_TIMEOUT_MS : undefined,
@@ -7073,11 +7073,166 @@ async function handleToolCall(tool, params, id, ctx) {
     const handler = TOOL_HANDLERS.get(tool);
     if (!handler) return { error: `Unknown tool: ${tool}` };
     _throwIfCancelled(ctx);
-    return await handler(params, ctx);
+    return await _runToolHandler(tool, handler, params, ctx);
   } catch (err) {
     if (err?.cancelled) return _cancelledResult(err.reason);
     return { error: err.message };
   }
+}
+
+// ─── Post-action observation (page_changes) ──────────────────
+// Every tool that acts on the page reports what the page did in response:
+// a dialog or toast that appeared, a navigation, a new tab, validation
+// errors. Without it a caller cannot tell that an AJAX save opened a
+// confirmation, and carries on with the next step.
+const OBSERVED_TOOLS = new Set([
+  "click", "double_click", "right_click", "middle_click", "force_click",
+  "click_at_coordinates", "click_by_index", "type_text", "type_by_index",
+  "fill_form", "press_key", "key_down", "key_up", "select_option", "hover",
+  "drag_and_drop", "iframe_interact", "shadow_interact",
+]);
+const _READ_INTERACT_ACTIONS = new Set(["query", "extract_text", "get_dom_state", "check_element_state"]);
+const OBSERVE_QUIET_MS = 50; // DOM quiet this long counts as settled
+const OBSERVE_BUSY_MS = 400; // give up on a page that never goes quiet
+const OBSERVE_CAP_MS = 2000; // longest wait for requests the action started
+const OBSERVE_NAV_MS = 5000; // longest wait for a navigation to load
+
+function _isObservedCall(tool, params) {
+  if (!OBSERVED_TOOLS.has(tool) || params?.observe === false) return false;
+  if (tool === "iframe_interact" || tool === "shadow_interact") {
+    return !_READ_INTERACT_ACTIONS.has(params?.action || "query");
+  }
+  return true;
+}
+
+function _runToolHandler(tool, handler, params, ctx) {
+  const run = () => handler(params || {}, ctx);
+  return _isObservedCall(tool, params) ? _observeAction(params, ctx, run) : run();
+}
+
+// Count the XHR/fetch requests a tab starts while an action settles.
+function _watchTabRequests(tabId) {
+  const wr = chrome.webRequest;
+  const open = new Set();
+  let waiters = [];
+  const release = () => {
+    for (const resolve of waiters) resolve();
+    waiters = [];
+  };
+  const onStart = (d) => open.add(d.requestId);
+  const onEnd = (d) => {
+    if (open.delete(d.requestId) && open.size === 0) release();
+  };
+  if (wr?.onBeforeRequest) {
+    const filter = { urls: ["<all_urls>"], tabId, types: ["xmlhttprequest"] };
+    wr.onBeforeRequest.addListener(onStart, filter);
+    wr.onCompleted.addListener(onEnd, filter);
+    wr.onErrorOccurred.addListener(onEnd, filter);
+  }
+  return {
+    inflight: () => open.size,
+    idle: () => (open.size === 0 ? Promise.resolve() : new Promise((resolve) => waiters.push(resolve))),
+    stop() {
+      if (wr?.onBeforeRequest) {
+        wr.onBeforeRequest.removeListener(onStart);
+        wr.onCompleted.removeListener(onEnd);
+        wr.onErrorOccurred.removeListener(onEnd);
+      }
+      release();
+    },
+  };
+}
+
+// Arm the page observer, run the action, wait for the page to settle and
+// attach what changed as result.page_changes. The key is left out when
+// nothing changed. The clock runs here, not in the page: background tabs
+// throttle page timers.
+async function _observeAction(params, ctx, run) {
+  const P = globalThis.AutoDOMWorkflow?._page;
+  let tab = null;
+  try {
+    tab = await getActiveTab(ctx);
+  } catch (_) {}
+  if (!P || !tab) return run();
+
+  const cap = typeof params?.observe === "number"
+    ? Math.max(0, Math.min(10000, params.observe))
+    : OBSERVE_CAP_MS;
+  const watch = _watchTabRequests(tab.id);
+  const created = [];
+  const onCreated = (t) => created.push(t.id);
+  chrome.tabs.onCreated.addListener(onCreated);
+  try {
+    const armed = await _callWfPage(tab.id, P._pageWfObserveArm, []).catch(() => null);
+    const result = await run();
+    if (!armed?.ok) return result;
+    if (!result || result.error || result.confirmRequired) {
+      _callWfPage(tab.id, P._pageWfObserveCollect, [true]).catch(() => {});
+      return result;
+    }
+    const changes = await _settleAndCollect(tab, cap, watch, created);
+    return changes ? { ...result, page_changes: changes } : result;
+  } finally {
+    watch.stop();
+    chrome.tabs.onCreated.removeListener(onCreated);
+  }
+}
+
+async function _settleAndCollect(tab, cap, watch, created) {
+  const P = globalThis.AutoDOMWorkflow._page;
+  const started = Date.now();
+  const elapsed = () => Date.now() - started;
+  let settled = true;
+  let sawRequest = false;
+  await _sleep(OBSERVE_QUIET_MS);
+  for (;;) {
+    const cur = await chrome.tabs.get(tab.id).catch(() => null);
+    if (!cur) return { tab_closed: true, waited_ms: elapsed() };
+    if (cur.status === "loading") {
+      while (elapsed() < OBSERVE_NAV_MS) {
+        await _sleep(100);
+        const t = await chrome.tabs.get(tab.id).catch(() => null);
+        if (!t || t.status !== "loading") break;
+      }
+      break;
+    }
+    if (watch.inflight() > 0 && elapsed() < cap) {
+      sawRequest = true;
+      await Promise.race([watch.idle(), _sleep(cap - elapsed())]);
+      // The page handles the response a moment after the network is done.
+      await _sleep(OBSERVE_QUIET_MS);
+      continue;
+    }
+    const probe = await _callWfPage(tab.id, P._pageWfObserveCollect, [false]).catch(() => null);
+    if (!probe?.ok || probe.idleMs >= OBSERVE_QUIET_MS) break;
+    if (elapsed() >= (sawRequest ? cap : Math.min(cap, OBSERVE_BUSY_MS))) {
+      settled = false;
+      break;
+    }
+    await _sleep(OBSERVE_QUIET_MS - probe.idleMs);
+  }
+
+  const final = await _callWfPage(tab.id, P._pageWfObserveCollect, [true]).catch(() => null);
+  const changes = final?.ok ? final.changes : {};
+  const after = await chrome.tabs.get(tab.id).catch(() => null);
+  if (after && after.url !== tab.url && !changes.navigation) {
+    changes.navigation = {
+      from: tab.url,
+      to: after.url,
+      title: after.title,
+      ...(after.status === "loading" ? { loading: true } : {}),
+    };
+  }
+  const opened = [];
+  for (const id of created) {
+    const t = await chrome.tabs.get(id).catch(() => null);
+    if (t && t.openerTabId === tab.id) opened.push({ tabId: t.id, url: t.pendingUrl || t.url || "", title: t.title || "" });
+  }
+  if (opened.length) changes.new_tabs = opened;
+  const pending = watch.inflight();
+  if (pending > 0) changes.pending_requests = pending;
+  if (!Object.keys(changes).length) return null;
+  return { ...changes, ...(settled && !pending ? {} : { settled: false }), waited_ms: elapsed() };
 }
 
 // ─── Helper: Get active tab ──────────────────────────────────
@@ -7141,10 +7296,10 @@ async function executeInFrames(tabId, func, args = [], frameIds = null, world = 
 }
 
 // Inject and execute a function in the active tab's content script context
-async function executeInTab(tabId, func, args = [], world = "MAIN") {
+async function executeInTab(tabId, func, args = [], world = "MAIN", frameId = 0) {
   try {
     const results = await chrome.scripting.executeScript({
-      target: { tabId },
+      target: frameId ? { tabId, frameIds: [frameId] } : { tabId },
       func,
       args,
       world,
@@ -7384,47 +7539,12 @@ function _waitForNextLoad(tabId, timeoutMs, signal) {
 
 // 2. Click
 async function toolClick(params, ctx) {
+  const step = { action: params?.dblClick ? "dblclick" : "click" };
   const ref = _refParam(params);
-  if (ref) return _actByRef(ref, { action: params?.dblClick ? "dblclick" : "click" }, ctx);
-  const tab = await getActiveTab(ctx);
-  const { selector, text, dblClick } = params;
-  return await executeInTab(
-    tab.id,
-    (selector, text, dblClick) => {
-      let el;
-      if (selector) {
-        el = document.querySelector(selector);
-      } else if (text) {
-        const walker = document.createTreeWalker(
-          document.body,
-          NodeFilter.SHOW_TEXT,
-        );
-        while (walker.nextNode()) {
-          if (walker.currentNode.textContent.trim().includes(text)) {
-            el = walker.currentNode.parentElement;
-            break;
-          }
-        }
-      }
-      if (!el) return { error: `Element not found: ${selector || text}` };
-      el.scrollIntoView({ behavior: "auto", block: "center" });
-      const eventType = dblClick ? "dblclick" : "click";
-      el.dispatchEvent(
-        new MouseEvent(eventType, {
-          bubbles: true,
-          cancelable: true,
-          view: window,
-        }),
-      );
-      el.click();
-      return {
-        success: true,
-        tag: el.tagName,
-        text: el.textContent?.substring(0, 100),
-      };
-    },
-    [selector ?? null, text ?? null, dblClick ?? false],
-  );
+  if (ref) return _actByRef(ref, step, ctx);
+  const res = await _actOnTarget(ctx, { selector: params?.selector ?? null, text: params?.text ?? null }, step);
+  if (res.error) return res;
+  return { success: true, tag: res.tag, text: res.text, ..._foundIn(res) };
 }
 
 // 3. Type text
@@ -7434,39 +7554,13 @@ async function toolTypeText(params, ctx) {
   if (ref) {
     return _actByRef(ref, { action: "fill", value: params?.text ?? "", append: !clearFirst }, ctx);
   }
-  const tab = await getActiveTab(ctx);
-  const { selector, text } = params;
-  return await executeInTab(
-    tab.id,
-    (selector, text, clearFirst) => {
-      const el = document.querySelector(selector);
-      if (!el) return { error: `Element not found: ${selector}` };
-      el.focus();
-      if (clearFirst) {
-        el.value = "";
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-      // Set value and fire events
-      const nativeInputValueSetter =
-        Object.getOwnPropertyDescriptor(
-          window.HTMLInputElement.prototype,
-          "value",
-        )?.set ||
-        Object.getOwnPropertyDescriptor(
-          window.HTMLTextAreaElement.prototype,
-          "value",
-        )?.set;
-      if (nativeInputValueSetter) {
-        nativeInputValueSetter.call(el, (clearFirst ? "" : el.value) + text);
-      } else {
-        el.value = (clearFirst ? "" : el.value) + text;
-      }
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      return { success: true, value: el.value };
-    },
-    [selector, text, clearFirst || false],
+  const res = await _actOnTarget(
+    ctx,
+    { selector: params?.selector },
+    { action: "fill", value: params?.text ?? "", append: !clearFirst },
   );
+  if (res.error) return res;
+  return { success: true, ...(res.value !== undefined ? { value: res.value } : {}), ..._foundIn(res) };
 }
 
 // ─── Compact interactive snapshot + @eN refs ─────────────────
@@ -7488,11 +7582,40 @@ function _refParam(params) {
 // Call a workflow-lib page entry point; inject the library only when the
 // entry answers { needLib } (new document or another build). The library
 // is idempotent per document, so this saves an executeScript per call.
-async function _callWfPage(tabId, fn, args) {
-  const first = await executeInTab(tabId, fn, args, "ISOLATED");
+async function _callWfPage(tabId, fn, args, frameId = 0) {
+  const first = await executeInTab(tabId, fn, args, "ISOLATED", frameId);
   if (!first?.needLib) return first;
-  await executeInTab(tabId, globalThis.AutoDOMWorkflow._page._pageWfLib, [], "ISOLATED");
-  return executeInTab(tabId, fn, args, "ISOLATED");
+  await executeInTab(tabId, globalThis.AutoDOMWorkflow._page._pageWfLib, [], "ISOLATED", frameId);
+  return executeInTab(tabId, fn, args, "ISOLATED", frameId);
+}
+
+// Run a page-library action where the target is first found: the top
+// document (open shadow roots included), then the tab's other frames.
+// The frames are only asked when the top document misses.
+async function _actOnTarget(ctx, target, step) {
+  const P = globalThis.AutoDOMWorkflow?._page;
+  if (!P) return { error: "workflow engine not loaded" };
+  const tab = await getActiveTab(ctx);
+  let res = await _callWfPage(tab.id, P._pageWfRunAction, [target, step]);
+  if (res?.miss) {
+    const frames = (await chrome.webNavigation.getAllFrames({ tabId: tab.id }).catch(() => null)) || [];
+    for (const frame of frames) {
+      if (frame.frameId === 0) continue;
+      const inFrame = await _callWfPage(tab.id, P._pageWfRunAction, [target, step], frame.frameId).catch(() => null);
+      if (inFrame && !inFrame.miss) {
+        res = { ...inFrame, via: "frame", frameId: frame.frameId };
+        break;
+      }
+    }
+  }
+  if (res?.ok) return res;
+  return { error: res?.miss ? `Element not found: ${target.selector || target.text}` : res?.error || "Action failed" };
+}
+
+// Where _actOnTarget found the element, when it was not the top document.
+function _foundIn(res) {
+  if (res.via === "document") return {};
+  return { via: res.via, ...(res.frameId != null ? { frameId: res.frameId } : {}) };
 }
 
 async function _actByRef(ref, step, ctx) {
@@ -13278,7 +13401,9 @@ async function toolGetDomState(params, ctx) {
       ];
       const OVERLAY_CANDIDATE_SELECTORS = [
         '[role="dialog"]',
+        '[role="alertdialog"]',
         '[aria-modal="true"]',
+        "dialog[open]",
         ".modal",
         ".popup",
         ".popover",
@@ -13760,15 +13885,12 @@ async function toolClickByIndex(params, ctx) {
 
       function clickElement(el) {
         el.scrollIntoView({ behavior: "auto", block: "center" });
-        const eventType = dblClick ? "dblclick" : "click";
-        el.dispatchEvent(
-          new MouseEvent(eventType, {
-            bubbles: true,
-            cancelable: true,
-            view: window,
-          }),
-        );
         el.click();
+        if (dblClick) {
+          el.dispatchEvent(
+            new MouseEvent("dblclick", { bubbles: true, cancelable: true, view: window }),
+          );
+        }
         return {
           success: true,
           index,
@@ -14362,13 +14484,6 @@ function _runIframeInteractInPage(action, selector, text, value, fields, clearFi
     if (!el)
       return { error: `Element not found in iframe: ${selector || text}` };
     el.scrollIntoView({ behavior: "auto", block: "center" });
-    el.dispatchEvent(
-      new MouseEvent("click", {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-      }),
-    );
     el.click();
     return {
       success: true,
@@ -14742,14 +14857,6 @@ async function toolShadowInteract(params, ctx) {
 
       if (action === "click") {
         el.scrollIntoView({ behavior: "auto", block: "center" });
-        el.dispatchEvent(
-          new MouseEvent("click", {
-            bubbles: true,
-            cancelable: true,
-            composed: true,
-            view: window,
-          }),
-        );
         el.click();
         return {
           success: true,
@@ -15308,10 +15415,9 @@ async function toolForceClick(params, ctx) {
     (selector) => {
       const el = document.querySelector(selector);
       if (!el) return { error: `Element not found: ${selector}` };
-      el.dispatchEvent(
-        new MouseEvent("click", { bubbles: true, cancelable: true, view: window }),
-      );
+      // SVG and other non-HTML elements have no click() method.
       if (typeof el.click === "function") el.click();
+      else el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
       return { success: true, tag: el.tagName };
     },
     [selector],
