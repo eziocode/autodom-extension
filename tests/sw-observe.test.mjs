@@ -1,6 +1,7 @@
 // Loads the real service worker in a vm sandbox with a stub `chrome` and a
 // scripted page, to check that action tools attach page_changes: what is
-// reported, when the wait ends, and when the observer is skipped. The
+// reported, when the wait ends, when the observer is skipped, and what
+// happens when a native dialog blocks the page. The
 // page-side half is checked in a real DOM by
 // tests/fixtures/observe/lib-harness.html.
 import { test } from "node:test";
@@ -82,6 +83,18 @@ function loadSw(page = {}) {
   chrome.runtime.lastError = undefined;
   chrome.runtime.onMessage = event();
   chrome.webRequest = { onBeforeRequest: event(), onCompleted: event(), onErrorOccurred: event() };
+  const cdp = [];
+  chrome.debugger = {
+    onEvent: event(),
+    onDetach: event(),
+    attach: async () => {},
+    detach: async () => {},
+    sendCommand: async (_target, method, params) => {
+      cdp.push({ method, params });
+      if (method === "Page.handleJavaScriptDialog") chrome.debugger.onEvent.fire({ tabId: 1 }, "Page.javascriptDialogClosed", {});
+      return {};
+    },
+  };
   chrome.tabs = autoStub();
   Object.assign(chrome.tabs, {
     onUpdated: event(),
@@ -116,6 +129,7 @@ function loadSw(page = {}) {
           return [{ result: { ok: true, idleMs: 1000, mutations: 0, changes: structuredClone(page.changes || {}) } }];
         }
         default:
+          if (page.blocked) await new Promise(() => {});
           return [{ result: { ok: true } }];
       }
     },
@@ -162,7 +176,8 @@ function loadSw(page = {}) {
     }
     throw new Error(`no TOOL_RESULT for ${name}`);
   };
-  return { chrome, tabs, calls, tool };
+  const run = (code) => vm.runInContext(code, ctx);
+  return { chrome, tabs, calls, cdp, tool, run };
 }
 
 async function ready(page) {
@@ -294,4 +309,64 @@ test("read-only calls are not observed", async () => {
   await sw.tool("shadow_interact", { hostSelector: "#h", selector: "#x", action: "query" });
   await sw.tool("get_page_info", {});
   assert.equal(sw.calls.some((n) => n.startsWith("_pageWfObserve")), false);
+});
+
+const never = () => new Promise(() => {});
+const openDialog = (chrome, type, message) =>
+  chrome.debugger.onEvent.fire({ tabId: 1 }, "Page.javascriptDialogOpening", { type, message });
+
+test("a native dialog opened by the action returns at once and gates other tools", async () => {
+  const sw = await ready({
+    duringAction: ({ chrome }) => {
+      openDialog(chrome, "confirm", "Delete this lead?");
+      return never(); // the page is blocked: the injected script never returns
+    },
+  });
+  sw.run("_debuggerAttached.add(1)"); // a session another feature already holds
+  const { result, ms } = await sw.tool("click", { selector: "#delete" });
+  assert.ok(ms < 500, `did not wait for the tool timeout (${ms}ms)`);
+  assert.equal(result.success, true);
+  assert.equal(result.interrupted, "dialog");
+  assert.deepEqual(result.page_changes.dialog, { type: "confirm", message: "Delete this lead?" });
+
+  const blocked = await sw.tool("get_page_info", {});
+  assert.equal(blocked.result.error, "DIALOG_OPEN");
+  assert.equal(blocked.result.dialog.message, "Delete this lead?");
+  assert.ok(blocked.ms < 200, `answered without touching the page (${blocked.ms}ms)`);
+
+  const handled = await sw.tool("handle_dialog", { action: "dismiss" });
+  assert.equal(handled.result.success, true, JSON.stringify(handled.result));
+  assert.equal(handled.result.dialog.type, "confirm");
+  assert.equal(sw.cdp.find((c) => c.method === "Page.handleJavaScriptDialog").params.accept, false);
+
+  const after = await sw.tool("get_page_info", {});
+  assert.notEqual(after.result.error, "DIALOG_OPEN");
+});
+
+test("a dialog that opens while the page settles is reported on the same result", async () => {
+  const sw = await ready({
+    duringAction: ({ chrome }) => {
+      chrome.webRequest.onBeforeRequest.fire({ requestId: "save" });
+      setTimeout(() => openDialog(chrome, "alert", "Saved with warnings"), 120);
+    },
+  });
+  sw.run("_debuggerAttached.add(1)");
+  const { result, ms } = await sw.tool("click", { selector: "#save" });
+  assert.ok(ms >= 120 && ms < 800, `returned when the dialog opened (${ms}ms)`);
+  assert.equal(result.success, true);
+  assert.equal(result.page_changes.dialog.message, "Saved with warnings");
+});
+
+test("without a debugger session the default setting leaves the user's tab unwatched", async () => {
+  const sw = await ready();
+  await sw.tool("click", { selector: "#save" });
+  assert.equal(sw.run("_dialogWatchTabs.size"), 0);
+  assert.equal(sw.cdp.length, 0, "no CDP traffic on a tab AutoDOM does not own");
+});
+
+test("an unwatched tab that stops responding is reported as blocked, not timed out", async () => {
+  const sw = await ready({ blocked: true, duringAction: never });
+  const { result, ms } = await sw.tool("click", { selector: "#delete" });
+  assert.equal(result.error, "PAGE_BLOCKED");
+  assert.ok(ms >= 2400 && ms < 4000, `about 2.5 s, not 30 s (${ms}ms)`);
 });

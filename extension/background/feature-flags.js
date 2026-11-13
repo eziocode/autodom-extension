@@ -36,6 +36,10 @@
     webmcp: true,
     perfMode: "fast",
     toolLanes: true,
+    // Native alert/confirm/prompt detection keeps the debugger attached,
+    // which shows Chrome's "started debugging" bar: owned = only tabs
+    // AutoDOM opened, always = every tab it acts on, off = never.
+    dialogWatch: "owned",
     // On-page overlays
     overlaySessionBorder: true,
     overlayTakeoverPill: true,
@@ -51,6 +55,7 @@
     visionHeal: ["auto", "on", "off"],
     defaultRunMode: ["heal", "strict"],
     perfMode: ["fast", "balanced"],
+    dialogWatch: ["owned", "always", "off"],
   };
   const RANGES = {
     parallelConcurrency: [1, 5],

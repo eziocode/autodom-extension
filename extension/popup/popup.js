@@ -1806,6 +1806,7 @@ function initFeaturesTab() {
     featToolbarShowDescribeImages: ["toolbarShowDescribeImages", "bool"],
     featPerfMode: ["perfMode", "select"],
     featToolLanes: ["toolLanes", "bool"],
+    featDialogWatch: ["dialogWatch", "select"],
     featCompactSnapshotsDefault: ["compactSnapshotsDefault", "bool"],
     featWebmcp: ["webmcp", "bool"],
   };

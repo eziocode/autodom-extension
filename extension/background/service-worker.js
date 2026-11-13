@@ -4085,6 +4085,9 @@ const _LANE_FREE_TOOLS = new Set([
   "wait_for_download",
   "performance_analyze_insight",
   "tab_recording_status",
+  // A native dialog blocks the page; the call it interrupted may still
+  // hold the tab's lane.
+  "handle_dialog",
   // User controls from the chat panel must answer at once, even while an
   // agent is busy in the tab.
   "takeover_set",
@@ -7080,6 +7083,123 @@ async function handleToolCall(tool, params, id, ctx) {
   }
 }
 
+// ─── Native JS dialogs ───────────────────────────────────────
+// alert/confirm/prompt block the page's main thread, so every script
+// injection hangs until the dialog is answered. With a debugger session
+// on the tab the dialog is seen at once: the action that opened it
+// returns, and other page tools answer DIALOG_OPEN in place of a timeout.
+const _pendingDialogs = new Map(); // tabId → { type, message, default_prompt? }
+const _dialogWatchTabs = new Set(); // tabs whose debugger session is kept for dialog events
+const _dialogWaiters = new Map(); // tabId → Set<fn> to call when a dialog opens
+const _DIALOG = Symbol("dialog");
+const _BLOCKED = Symbol("blocked");
+const PAGE_BLOCKED_AFTER_MS = 1500;
+const PAGE_BLOCKED_PROBE_MS = 1000;
+const _DIALOG_HINT = 'A native dialog is open and blocks the page. Call handle_dialog {action:"accept"|"dismiss"} first.';
+// Tools that still work, or must work, while a dialog is open.
+const _DIALOG_SAFE_TOOLS = new Set([
+  "handle_dialog", "switch_tab", "open_new_tab", "close_tab", "pin_tab", "unpin_tab",
+  "finish_session", "autodom_diagnostics",
+]);
+
+function _forgetDialogTab(tabId) {
+  _pendingDialogs.delete(tabId);
+  _dialogWatchTabs.delete(tabId);
+  _dialogWaiters.delete(tabId);
+}
+
+if (chrome.debugger?.onEvent) {
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    const tabId = source?.tabId;
+    if (tabId == null) return;
+    if (method === "Page.javascriptDialogOpening") {
+      _pendingDialogs.set(tabId, {
+        type: params?.type || "alert",
+        message: String(params?.message || "").slice(0, 500),
+        ...(params?.defaultPrompt ? { default_prompt: String(params.defaultPrompt).slice(0, 200) } : {}),
+      });
+      for (const wake of [...(_dialogWaiters.get(tabId) || [])]) wake();
+    } else if (method === "Page.javascriptDialogClosed") {
+      _pendingDialogs.delete(tabId);
+    }
+  });
+  chrome.debugger.onDetach.addListener((source) => {
+    if (source?.tabId != null) _forgetDialogTab(source.tabId);
+  });
+  chrome.tabs.onRemoved.addListener(_forgetDialogTab);
+}
+
+// Keep a debugger session on the tab for dialog events, when the
+// dialogWatch setting allows it. A session that is already attached
+// (console capture, HAR) is shared at no extra cost.
+async function _armDialogWatch(tabId) {
+  if (IS_FIREFOX || _dialogWatchTabs.has(tabId)) return;
+  const mode = (await _getFeatures()).dialogWatch || "owned";
+  const shared = _debuggerAttached.has(tabId);
+  if (!shared) {
+    if (mode === "off") return;
+    if (mode !== "always" && !_AutoDOMTabGroup()?.isOwnedByAnyClient?.(tabId)) return;
+  }
+  try {
+    await ensureDebugger(tabId);
+    await chrome.debugger.sendCommand({ tabId }, "Page.enable");
+    _dialogWatchTabs.add(tabId);
+  } catch (_) {
+    // No session (DevTools open on the tab, restricted page): the
+    // blocked-page check below still applies.
+  }
+}
+
+// `promise`, or _DIALOG as soon as a native dialog opens on the tab.
+function _orDialog(tabId, promise) {
+  if (_pendingDialogs.has(tabId)) return Promise.resolve(_DIALOG);
+  return new Promise((resolve, reject) => {
+    const waiters = _dialogWaiters.get(tabId) || new Set();
+    _dialogWaiters.set(tabId, waiters);
+    const wake = () => {
+      waiters.delete(wake);
+      resolve(_DIALOG);
+    };
+    waiters.add(wake);
+    promise.then(
+      (value) => {
+        waiters.delete(wake);
+        resolve(value);
+      },
+      (err) => {
+        waiters.delete(wake);
+        reject(err);
+      },
+    );
+  });
+}
+
+// For tabs without a dialog watch: when `promise` is slow, inject a
+// trivial script. If that hangs too the page is blocked, and the caller
+// gets _BLOCKED after about 2.5 s in place of the tool timeout.
+function _orBlocked(tabId, promise) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(async () => {
+      const alive = await Promise.race([
+        chrome.scripting.executeScript({ target: { tabId }, func: () => 1 }).then(() => true, () => true),
+        _sleep(PAGE_BLOCKED_PROBE_MS).then(() => false),
+      ]);
+      if (!alive && !done) {
+        done = true;
+        resolve(_BLOCKED);
+      }
+    }, PAGE_BLOCKED_AFTER_MS);
+    const finish = (settle, value) => {
+      clearTimeout(timer);
+      if (done) return;
+      done = true;
+      settle(value);
+    };
+    promise.then((value) => finish(resolve, value), (err) => finish(reject, err));
+  });
+}
+
 // ─── Post-action observation (page_changes) ──────────────────
 // Every tool that acts on the page reports what the page did in response:
 // a dialog or toast that appeared, a navigation, a new tab, validation
@@ -7106,6 +7226,10 @@ function _isObservedCall(tool, params) {
 }
 
 function _runToolHandler(tool, handler, params, ctx) {
+  const dialog = ctx?.tabId != null ? _pendingDialogs.get(ctx.tabId) : null;
+  if (dialog && !_DIALOG_SAFE_TOOLS.has(tool) && !_LANE_FREE_TOOLS.has(tool)) {
+    return { error: "DIALOG_OPEN", dialog, hint: _DIALOG_HINT };
+  }
   const run = () => handler(params || {}, ctx);
   return _isObservedCall(tool, params) ? _observeAction(params, ctx, run) : run();
 }
@@ -7163,14 +7287,32 @@ async function _observeAction(params, ctx, run) {
   const onCreated = (t) => created.push(t.id);
   chrome.tabs.onCreated.addListener(onCreated);
   try {
-    const armed = await _callWfPage(tab.id, P._pageWfObserveArm, []).catch(() => null);
-    const result = await run();
+    const [armed] = await Promise.all([
+      _callWfPage(tab.id, P._pageWfObserveArm, []).catch(() => null),
+      _armDialogWatch(tab.id),
+    ]);
+    // The action and the settle wait both inject scripts, which a native
+    // dialog leaves hanging. Stop waiting on them as soon as one opens.
+    const guard = (promise) =>
+      _dialogWatchTabs.has(tab.id) ? _orDialog(tab.id, promise) : _orBlocked(tab.id, promise);
+    const result = await guard(run());
+    if (result === _DIALOG) {
+      return { success: true, interrupted: "dialog", hint: _DIALOG_HINT, page_changes: { dialog: _pendingDialogs.get(tab.id) } };
+    }
+    if (result === _BLOCKED) {
+      return {
+        error: "PAGE_BLOCKED",
+        hint: "The page stopped responding during the action. A native alert/confirm dialog or a long-running script is blocking it; try handle_dialog, or ask the user to dismiss the dialog.",
+      };
+    }
     if (!armed?.ok) return result;
     if (!result || result.error || result.confirmRequired) {
       _callWfPage(tab.id, P._pageWfObserveCollect, [true]).catch(() => {});
       return result;
     }
-    const changes = await _settleAndCollect(tab, cap, watch, created);
+    const changes = await guard(_settleAndCollect(tab, cap, watch, created));
+    if (changes === _DIALOG) return { ...result, hint: _DIALOG_HINT, page_changes: { dialog: _pendingDialogs.get(tab.id) } };
+    if (changes === _BLOCKED) return { ...result, page_changes: { blocked: true, settled: false } };
     return changes ? { ...result, page_changes: changes } : result;
   } finally {
     watch.stop();
@@ -9236,11 +9378,10 @@ async function toolWaitForNavigation(params, ctx) {
 async function toolHandleDialog(params, ctx) {
   const tab = await getActiveTab(ctx);
   const { action, promptText } = params; // action: accept | dismiss
+  const dialog = _pendingDialogs.get(tab.id);
   try {
     await ensureDebugger(tab.id);
     await chrome.debugger.sendCommand({ tabId: tab.id }, "Page.enable");
-
-    // Try to handle any existing dialog
     const handleParams = { accept: action !== "dismiss" };
     if (promptText) handleParams.promptText = promptText;
     await chrome.debugger.sendCommand(
@@ -9248,12 +9389,12 @@ async function toolHandleDialog(params, ctx) {
       "Page.handleJavaScriptDialog",
       handleParams,
     );
-    return { success: true, action };
+    _pendingDialogs.delete(tab.id);
+    return { success: true, action, ...(dialog ? { dialog } : {}) };
   } catch (err) {
     return { error: `Dialog handling failed: ${err.message}` };
   } finally {
-    // One-shot CDP op — drop the debugger attachment so Chrome's
-    // "started debugging" banner doesn't linger over the MCP overlay.
+    // One-shot CDP op: drop the attachment unless something else holds it.
     detachDebuggerSafe(tab.id).catch(() => {});
   }
 }
@@ -12922,6 +13063,7 @@ async function detachDebuggerSafe(tabId, { force = false } = {}) {
   // Console/network capture holds the session open between tool calls;
   // one-shot CDP users must not tear it down underneath it.
   if (!force && globalThis.AutoDOMDebugCapture?.isActive(tabId)) return;
+  if (!force && _dialogWatchTabs.has(tabId)) return;
   try {
     await chrome.debugger.detach({ tabId });
   } catch (_) {

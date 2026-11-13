@@ -10035,7 +10035,7 @@ server.addTool({
 server.addTool({
   name: "handle_dialog",
   description:
-    "Accept or dismiss a browser dialog (alert, confirm, prompt). Uses Chrome DevTools Protocol.",
+    "Accept or dismiss a native alert/confirm/prompt. Call it when a result has page_changes.dialog or a tool answers DIALOG_OPEN; the page is blocked until then.",
   parameters: z.object({
     action: z
       .enum(["accept", "dismiss"])

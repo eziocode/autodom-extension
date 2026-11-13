@@ -879,6 +879,17 @@
                                 <input type="checkbox" id="featToolLanes" class="chat-toggle-input" />
                                 <span class="chat-toggle-switch" aria-hidden="true"><span class="chat-toggle-knob"></span></span>
                             </label>
+                            <label class="chat-toggle-row" for="featDialogWatch">
+                                <span class="chat-toggle-info">
+                                    <span class="chat-toggle-title">Alert and confirm detection</span>
+                                    <span class="chat-toggle-desc">Reports native alert/confirm/prompt dialogs right away. Chrome shows its "started debugging" bar on watched tabs.</span>
+                                </span>
+                                <select id="featDialogWatch" class="config-input feature-control">
+                                    <option value="owned">AutoDOM tabs</option>
+                                    <option value="always">All tabs</option>
+                                    <option value="off">Off</option>
+                                </select>
+                            </label>
                             <label class="chat-toggle-row" for="featCompactSnapshotsDefault">
                                 <span class="chat-toggle-info">
                                     <span class="chat-toggle-title">Compact snapshots by default</span>
