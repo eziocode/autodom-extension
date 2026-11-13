@@ -12,7 +12,7 @@
  *   classify(tool, params?) → one of "safe-read" | "debug-read" |
  *                             "mutating" | "destructive"
  *   resolveDecision(origin, category, settings) → "allow" | "ask" | "deny"
- *   requestDecision({ tabId, origin, pageUrl, targetUrl, toolName, params, batchOrigin }):
+ *   requestDecision({ tabId, notify, origin, pageUrl, targetUrl, toolName, params, batchOrigin }):
  *     1. administrator policy (managed blockedUrlPatterns) on the page or
  *        navigation target → deny, even with the gate switched off
  *     2. gate disabled → allow
@@ -514,6 +514,7 @@
 
   async function requestDecision({
     tabId,
+    notify,
     origin,
     pageUrl,
     targetUrl,
@@ -564,7 +565,7 @@
         await appendAudit({ origin, toolName, category: cat, decision: "allow-transition", transition });
         return { allowed: true, reason: "pre-approved transition" };
       }
-      return _promptAndRecord({ tabId, origin, toolName, params, category: cat, transition });
+      return _promptAndRecord({ tabId, notify, origin, toolName, params, category: cat, transition });
     }
 
     // 3. Steps of an approved batch run on that batch's origin. A step on
@@ -586,13 +587,13 @@
       return { allowed: false, reason: `Blocked by site rule on ${origin}` };
     }
 
-    return _promptAndRecord({ tabId, origin, toolName, params, category: cat });
+    return _promptAndRecord({ tabId, notify, origin, toolName, params, category: cat });
   }
 
   // policy === "ask" → prompt in the tab's chat panel, persist what the
   // user chose, audit, and return the decision.
-  async function _promptAndRecord({ tabId, origin, toolName, params, category: cat, transition }) {
-    if (tabId == null) {
+  async function _promptAndRecord({ tabId, notify, origin, toolName, params, category: cat, transition }) {
+    if (tabId == null && !notify) {
       // No UI available — fail closed.
       await appendAudit({ origin, toolName, category: cat, decision: "deny-no-ui", transition });
       return { allowed: false, reason: "No chat panel available to confirm action" };
@@ -619,7 +620,9 @@
       }, 120_000);
       _pending.set(requestId, { resolve, timer });
       try {
-        chrome.tabs.sendMessage(tabId, request).catch?.(() => {
+        // `notify` delivers to a chat panel that is not in the page (the
+        // side panel); otherwise the panel lives in the tab being acted on.
+        (notify ? notify(request) : chrome.tabs.sendMessage(tabId, request)).catch?.(() => {
           deliverDecision(requestId, {
             allowed: false,
             reason: "Chat panel not reachable in this tab",

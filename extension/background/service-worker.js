@@ -1197,6 +1197,8 @@ function _stopActiveAgentRun(reason) {
 function _broadcastAgentRunState() {
   try {
     const stateMessage = _getAgentRunStateMessage();
+    // Side panels are extension pages; tabs.sendMessage does not reach them.
+    _sendToPanel("sidepanel", stateMessage).catch(() => {});
     chrome.tabs.query({ active: true }, (tabs) => {
       try { void chrome.runtime.lastError; } catch (_) {}
       if (!tabs) return;
@@ -1408,7 +1410,10 @@ async function executeAgentTool(toolName, params, ctx) {
         const blocked = await _batchStepPolicyCheck(toolName, params, ctx, _gateTab);
         if (blocked) return { ok: false, denied: true, ...blocked };
       } else {
+        const surface = ctx?.run?.surface;
         const decision = await Gate.requestDecision({
+          // A side-panel run has no panel in the page: prompt in the panel.
+          ...(typeof surface === "string" ? { notify: (request) => _sendToPanel(surface, request) } : {}),
           tabId: _gateTab?.id,
           origin: gateOrigin,
           pageUrl: _gateTab?.url || "",
@@ -1466,15 +1471,36 @@ async function executeAgentTool(toolName, params, ctx) {
   }
 }
 
-// Stream a "tool was called" event to the active chat panel so it can
-// render an inline chip in the in-flight assistant message.
-function _streamAgentToolEvent(tabId, evt) {
-  if (tabId == null) return;
+// Where a chat panel lives. An in-page panel is reached through its tab
+// (a number). The side panel is an extension page with no tab, reached
+// through runtime messaging: "sidepanel:<windowId>", so that side panels
+// in other windows can ignore the message.
+function _panelSurface(sender, message) {
+  if (sender?.tab?.id != null) return sender.tab.id;
+  return message?.panelWindowId != null ? `sidepanel:${message.panelWindowId}` : "sidepanel";
+}
+
+// Deliver a message to the chat panel on `surface`. Rejects when there is
+// no panel to reach, so callers can fall back.
+function _sendToPanel(surface, message) {
   try {
-    chrome.tabs
-      .sendMessage(tabId, { type: "AGENT_TOOL_EVENT", event: evt })
-      .catch(() => {});
-  } catch (_) {}
+    if (typeof surface === "number") return Promise.resolve(chrome.tabs.sendMessage(surface, message));
+    if (typeof surface === "string") {
+      const windowId = Number(surface.split(":")[1]);
+      return Promise.resolve(
+        chrome.runtime.sendMessage(Number.isFinite(windowId) ? { ...message, panelWindowId: windowId } : message),
+      );
+    }
+  } catch (err) {
+    return Promise.reject(err);
+  }
+  return Promise.reject(new Error("No chat panel to reach"));
+}
+
+// Stream a "tool was called" event to the chat panel so it can render an
+// inline chip in the in-flight assistant message.
+function _streamAgentToolEvent(surface, evt) {
+  _sendToPanel(surface, { type: "AGENT_TOOL_EVENT", event: evt }).catch(() => {});
 }
 
 function _safeJsonParse(s) {
@@ -2179,28 +2205,21 @@ let _planApprovalIdCounter = 0;
 // Called from the agent loop when the model invokes update_plan.
 // Streams a PLAN_APPROVAL_REQUEST event to the chat panel and returns a
 // Promise that resolves to { approved: boolean } when the user responds.
-async function _requestPlanApproval(panelTabId, planArgs) {
+async function _requestPlanApproval(surface, planArgs) {
   const requestId = `plan_${Date.now()}_${++_planApprovalIdCounter}`;
   return new Promise((resolve) => {
     _pendingPlanApprovals.set(requestId, resolve);
-    try {
-      chrome.tabs
-        .sendMessage(panelTabId, {
-          type: "PLAN_APPROVAL_REQUEST",
-          requestId,
-          domains: planArgs.domains || [],
-          approach: planArgs.approach || "",
-          title: planArgs.title || "Agent Plan",
-        })
-        .catch(() => {
-          // Panel unreachable — auto-approve so the run doesn't hang.
-          _pendingPlanApprovals.delete(requestId);
-          resolve({ approved: true, auto: true });
-        });
-    } catch (_) {
+    _sendToPanel(surface, {
+      type: "PLAN_APPROVAL_REQUEST",
+      requestId,
+      domains: planArgs.domains || [],
+      approach: planArgs.approach || "",
+      title: planArgs.title || "Agent Plan",
+    }).catch(() => {
+      // Panel unreachable — auto-approve so the run doesn't hang.
       _pendingPlanApprovals.delete(requestId);
       resolve({ approved: true, auto: true });
-    }
+    });
     // Safety timeout: auto-approve after 60s if user doesn't respond.
     setTimeout(() => {
       if (_pendingPlanApprovals.has(requestId)) {
@@ -2217,6 +2236,7 @@ async function runAgentLoop({
   context,
   conversationHistory,
   initialTabId,
+  panelSurface,
   modelOverride,
   attachments,
   mode,
@@ -2248,6 +2268,9 @@ async function runAgentLoop({
   // Pin the tab where the chat originated so user focus changes don't hijack the run
   const startTab = await _resolveAgentTab(initialTabId);
   const panelTabId = startTab?.id ?? null;
+  // The panel that asked: its own tab, or the side panel. Events and
+  // approval prompts go there, wherever the run's tab is.
+  const surface = panelSurface ?? panelTabId;
   // The run's own call context: every tool it executes targets this tab
   // (re-pinned by switch_tab / open_new_tab), whatever the bridge or the
   // user does meanwhile.
@@ -2268,6 +2291,7 @@ async function runAgentLoop({
     // A single active run handle lets the chat panel send STOP_AGENT_RUN
     // and have both the in-flight provider fetch and the tool loop bail out.
     const runHandle = _startAgentRunHandle(panelTabId);
+    runHandle.surface = surface;
     const signal = runHandle.aborter.signal;
     agentCtx.clientId = `chat:${panelTabId}:${runHandle.runId}`;
     agentCtx.signal = signal;
@@ -2278,7 +2302,7 @@ async function runAgentLoop({
       toolCalls: accumulatedToolCalls,
       aborted: true,
     });
-    _streamAgentToolEvent(panelTabId, {
+    _streamAgentToolEvent(surface, {
       phase: "run-start",
       runId: runHandle.runId,
     });
@@ -2286,7 +2310,7 @@ async function runAgentLoop({
     const endRun = (aborted) => {
       if (_runEnded) return;
       _runEnded = true;
-      _streamAgentToolEvent(panelTabId, {
+      _streamAgentToolEvent(surface, {
         phase: "run-end",
         runId: runHandle.runId,
         aborted: !!aborted,
@@ -2310,7 +2334,7 @@ async function runAgentLoop({
       if (!_deltaBuf) return;
       const chunk = _deltaBuf;
       _deltaBuf = "";
-      _streamAgentToolEvent(panelTabId, {
+      _streamAgentToolEvent(surface, {
         phase: "answer-delta",
         runId: runHandle.runId,
         chunk,
@@ -2331,7 +2355,7 @@ async function runAgentLoop({
         clearTimeout(_deltaTimer);
         _deltaTimer = null;
       }
-      _streamAgentToolEvent(panelTabId, {
+      _streamAgentToolEvent(surface, {
         phase: "answer-reset",
         runId: runHandle.runId,
       });
@@ -2342,7 +2366,7 @@ async function runAgentLoop({
         clearTimeout(_deltaTimer);
         _deltaTimer = null;
       }
-      _streamAgentToolEvent(panelTabId, {
+      _streamAgentToolEvent(surface, {
         phase: "answer-discard",
         runId: runHandle.runId,
       });
@@ -2353,7 +2377,7 @@ async function runAgentLoop({
         _deltaTimer = null;
       }
       _flushDelta();
-      _streamAgentToolEvent(panelTabId, {
+      _streamAgentToolEvent(surface, {
         phase: "answer-final",
         runId: runHandle.runId,
       });
@@ -2465,13 +2489,13 @@ async function runAgentLoop({
           return { done: false };
         }
         const args = step.args && typeof step.args === "object" ? step.args : {};
-        _streamAgentToolEvent(panelTabId, {
+        _streamAgentToolEvent(surface, {
           phase: "start", runId: runHandle.runId, tool: step.tool, args,
         });
         const r = await executeAgentTool(step.tool, args, agentCtx);
         const ok = !!r?.ok && !r?.error;
         accumulatedToolCalls.push({ tool: step.tool, args, ok });
-        _streamAgentToolEvent(panelTabId, {
+        _streamAgentToolEvent(surface, {
           phase: "end", runId: runHandle.runId, tool: step.tool, ok,
           error: r?.error, result: AgentApi.truncateToolResult(step.tool, r),
         });
@@ -2591,7 +2615,7 @@ async function runAgentLoop({
           case "list_tabs":
             return executeAgentTool("list_tabs", {}, agentCtx);
           case "present_plan": {
-            const decision = await _requestPlanApproval(panelTabId, {
+            const decision = await _requestPlanApproval(surface, {
               domains: qcmd.plan.domains || [],
               approach: qcmd.plan.approach || JSON.stringify(qcmd.plan),
               title: qcmd.plan.title || "Agent Plan",
@@ -2698,12 +2722,12 @@ async function runAgentLoop({
         // Execute commands sequentially
         for (const qcmd of qCommands) {
           if (isAborted()) return { done: true, payload: abortedReply() };
-          _streamAgentToolEvent(panelTabId, {
+          _streamAgentToolEvent(surface, {
             phase: "start", runId: runHandle.runId, tool: `quick:${qcmd.cmd}`, args: qcmd,
           });
           const qResult = await _execQuickCommand(qcmd);
           accumulatedToolCalls.push({ tool: `quick:${qcmd.cmd}`, args: qcmd, ok: !!qResult?.ok });
-          _streamAgentToolEvent(panelTabId, {
+          _streamAgentToolEvent(surface, {
             phase: "end", runId: runHandle.runId, tool: `quick:${qcmd.cmd}`,
             ok: !!qResult?.ok, error: qResult?.error,
           });
@@ -2841,15 +2865,15 @@ async function runAgentLoop({
           }
           // update_plan: pause for user approval before continuing
           if (tc.name === "update_plan") {
-            _streamAgentToolEvent(panelTabId, {
+            _streamAgentToolEvent(surface, {
               phase: "start", runId: runHandle.runId, tool: "update_plan", args,
             });
-            const decision = await _requestPlanApproval(panelTabId, args);
+            const decision = await _requestPlanApproval(surface, args);
             const planResultContent = decision.approved
               ? JSON.stringify({ ok: true, approved: true, message: "Plan approved by user. Proceed." })
               : JSON.stringify({ ok: false, approved: false, message: "Plan rejected by user. Stop or revise." });
             accumulatedToolCalls.push({ tool: "update_plan", args, ok: !!decision.approved });
-            _streamAgentToolEvent(panelTabId, {
+            _streamAgentToolEvent(surface, {
               phase: "end", runId: runHandle.runId, tool: "update_plan", ok: !!decision.approved,
             });
             messages.push({
@@ -2878,7 +2902,7 @@ async function runAgentLoop({
               toolCalls: accumulatedToolCalls,
             } };
           }
-          _streamAgentToolEvent(panelTabId, {
+          _streamAgentToolEvent(surface, {
             phase: "start",
             runId: runHandle.runId,
             tool: tc.name,
@@ -2895,7 +2919,7 @@ async function runAgentLoop({
             args,
             ok: !!rawResult?.ok && !rawResult?.error,
           });
-          _streamAgentToolEvent(panelTabId, {
+          _streamAgentToolEvent(surface, {
             phase: "end",
             runId: runHandle.runId,
             tool: tc.name,
@@ -3022,12 +3046,12 @@ async function runAgentLoop({
           }
           // update_plan: pause for user approval before continuing
           if (tc.name === "update_plan") {
-            _streamAgentToolEvent(panelTabId, {
+            _streamAgentToolEvent(surface, {
               phase: "start", runId: runHandle.runId, tool: "update_plan", args,
             });
-            const decision = await _requestPlanApproval(panelTabId, args);
+            const decision = await _requestPlanApproval(surface, args);
             accumulatedToolCalls.push({ tool: "update_plan", args, ok: !!decision.approved });
-            _streamAgentToolEvent(panelTabId, {
+            _streamAgentToolEvent(surface, {
               phase: "end", runId: runHandle.runId, tool: "update_plan", ok: !!decision.approved,
             });
             toolResultBlocks.push({
@@ -3051,7 +3075,7 @@ async function runAgentLoop({
               "`. The page may not be in the expected state.";
             break;
           }
-          _streamAgentToolEvent(panelTabId, {
+          _streamAgentToolEvent(surface, {
             phase: "start",
             runId: runHandle.runId,
             tool: tc.name,
@@ -3067,7 +3091,7 @@ async function runAgentLoop({
             args,
             ok: !!rawResult?.ok && !rawResult?.error,
           });
-          _streamAgentToolEvent(panelTabId, {
+          _streamAgentToolEvent(surface, {
             phase: "end",
             runId: runHandle.runId,
             tool: tc.name,
@@ -5843,7 +5867,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       _debugLog("[AutoDOM SW] Using DIRECT provider path for:", providerType);
 
       // Per-tab run lock — block overlapping agent runs on the same panel
-      const lockKey = sender?.tab?.id || "popup";
+      const lockKey = _panelSurface(sender, message);
       if (_agentRunLocks.has(lockKey)) {
         sendResponse({
           type: "AI_CHAT_RESPONSE",
@@ -5891,6 +5915,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             context: context || {},
             conversationHistory: conversationHistory || [],
             initialTabId: sender?.tab?.id,
+            panelSurface: lockKey,
             modelOverride: effectiveModel,
             attachments: Array.isArray(attachments) ? attachments : [],
             mode: mode || null,
@@ -5962,7 +5987,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     const aiRequestId = ++aiCallIdCounter;
     const bridgeRunId = `bridge_${aiRequestId}`;
-    const panelTabId = sender?.tab?.id ?? null;
+    const panelTabId = _panelSurface(sender, message);
 
     // Sanitize the outbound history: bound size, truncate older user
     // turns, and STRIP attachment binaries from prior turns so we don't

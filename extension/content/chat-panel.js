@@ -39,6 +39,15 @@
   // pushes a host page (there isn't one), and the resize/close UI
   // hands off to Chrome's native side panel chrome.
   const SIDE_PANEL_MODE = !!window.__AUTODOM_SIDE_PANEL_MODE__;
+  // The side panel has no tab; the service worker addresses it by window.
+  let _sidePanelWindowId = null;
+  if (SIDE_PANEL_MODE) {
+    try {
+      chrome.windows.getCurrent((w) => {
+        if (!chrome.runtime.lastError && w) _sidePanelWindowId = w.id;
+      });
+    } catch (_) {}
+  }
 
   const PANEL_ID = "__autodom_chat_panel";
   const STYLE_ID = "__autodom_chat_style";
@@ -5660,6 +5669,7 @@
         runtime.sendMessage(
           {
             type: "CHAT_AI_MESSAGE",
+            ...(_sidePanelWindowId != null ? { panelWindowId: _sidePanelWindowId } : {}),
             text: text,
             context: context,
             conversationHistory: conversationHistory.slice(-20), // Last 20 messages
@@ -8980,6 +8990,8 @@
   _log("Registering onMessage listener...");
   chrome.runtime.onMessage.addListener((message) => {
     if (_contextInvalidated) return;
+    // Addressed to the side panel of another window.
+    if (message.panelWindowId != null && message.panelWindowId !== _sidePanelWindowId) return;
     // ─── Agent loop activity (live tool chips) ──────────────
     if (message.type === "AGENT_TOOL_EVENT" && message.event) {
       try {

@@ -262,6 +262,51 @@ test("toolbar state is broadcast to the side panel and to panel tabs", async () 
   assert.equal(tabSent[0][1].type, "AUTODOM_TOOLBAR_STATE");
 });
 
+test("chat events reach the side panel through runtime messaging, in-page panels through their tab", async () => {
+  const sw = await settle(loadSw());
+  const runtimeSent = [];
+  const tabSent = [];
+  sw.chrome.runtime.sendMessage = (m) => (runtimeSent.push(JSON.parse(JSON.stringify(m))), Promise.resolve());
+  sw.chrome.tabs.sendMessage = (id, m) => (tabSent.push([id, JSON.parse(JSON.stringify(m))]), Promise.resolve());
+
+  assert.equal(sw.run("_panelSurface({ tab: { id: 5 } }, { panelWindowId: 3 })"), 5, "an in-page panel is its tab");
+  assert.equal(sw.run("_panelSurface({}, { panelWindowId: 3 })"), "sidepanel:3");
+  assert.equal(sw.run("_panelSurface({}, {})"), "sidepanel", "window not known yet");
+
+  sw.run('_streamAgentToolEvent("sidepanel:3", { phase: "start", tool: "click" })');
+  sw.run('_streamAgentToolEvent(5, { phase: "start", tool: "click" })');
+  sw.run('_streamAgentToolEvent(null, { phase: "start" })');
+  await new Promise((r) => setTimeout(r, 10));
+  assert.deepEqual(runtimeSent, [
+    { type: "AGENT_TOOL_EVENT", event: { phase: "start", tool: "click" }, panelWindowId: 3 },
+  ]);
+  assert.deepEqual(tabSent, [[5, { type: "AGENT_TOOL_EVENT", event: { phase: "start", tool: "click" } }]]);
+});
+
+test("a bridge chat request from the side panel gets its tool events", async () => {
+  const sw = await settle(loadSw());
+  const runtimeSent = [];
+  sw.chrome.runtime.sendMessage = (m) => (runtimeSent.push(JSON.parse(JSON.stringify(m))), Promise.resolve());
+  sw.run('pendingAiRequests.set(1, { panelTabId: _panelSurface({}, { panelWindowId: 7 }), runId: "bridge_1" })');
+  sw.run('_streamBridgeToolEvent({ phase: "start", tool: "take_screenshot" })');
+  await new Promise((r) => setTimeout(r, 10));
+  const events = runtimeSent.filter((m) => m.type === "AGENT_TOOL_EVENT");
+  assert.deepEqual(events.map((m) => [m.event.phase, m.panelWindowId]), [["run-start", 7], ["start", 7]]);
+  sw.run("pendingAiRequests.clear()");
+});
+
+test("a plan approval for a side-panel run is asked in the side panel", async () => {
+  const sw = await settle(loadSw());
+  const runtimeSent = [];
+  sw.chrome.runtime.sendMessage = (m) => (runtimeSent.push(JSON.parse(JSON.stringify(m))), Promise.resolve());
+  sw.run('globalThis.__plan = _requestPlanApproval("sidepanel:7", { title: "Plan", approach: "do it", domains: ["a.test"] })');
+  await new Promise((r) => setTimeout(r, 10));
+  const req = runtimeSent.find((m) => m.type === "PLAN_APPROVAL_REQUEST");
+  assert.ok(req, "request delivered");
+  assert.equal(req.panelWindowId, 7);
+  assert.equal(sw.run("_pendingPlanApprovals.size"), 1, "waits for the user, not auto-approved");
+});
+
 test("saved workflows from the panel are mirrored to the bridge; bridge saves are not", async () => {
   const sw = await settle(loadSw());
   const wf = { id: "wf_1", name: "A", steps: [{ action: "navigate", url: "https://a.test/" }] };
