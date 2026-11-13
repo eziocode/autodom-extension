@@ -4,6 +4,58 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 7.3.0
+
+### Added
+- Action tools report what the page did: `click`, `type_text`, `fill_form`,
+  `press_key`, `select_option`, `hover`, the index/coordinate/force click
+  tools, `drag_and_drop`, `iframe_interact`, `shadow_interact` and each
+  `batch_actions` step attach `page_changes` after the page settles: dialogs
+  and toasts that opened or closed (with `@eN` refs for their buttons),
+  navigation, new tabs, native dialogs and validation errors. The key is
+  absent when nothing changed. `observe: false` skips it; a number sets the
+  settle cap in ms (default 2000). An action that changes nothing costs about
+  50 ms more.
+- Native `alert`/`confirm`/`prompt` are detected as they open on tabs that
+  have a debugger session: the action returns with `page_changes.dialog`,
+  other page tools answer `DIALOG_OPEN` at once, and `handle_dialog` runs even
+  while another call holds the tab. New setting "Alert and confirm detection"
+  (`dialogWatch`: AutoDOM tabs, all tabs, off); the default keeps Chrome's
+  debugging bar off your own tabs. Elsewhere a blocked page is reported as
+  `PAGE_BLOCKED` after about 2.5 s instead of a 30 s timeout.
+- Sidebar chat on the local Claude CLI drives the browser with AutoDOM's own
+  MCP tools (screenshots included), through a token-protected loopback
+  endpoint, in place of the 30-tool text loop. Codex, Copilot and custom CLIs
+  keep the old loop. `AUTODOM_CLI_MCP_TOOLS=0` opts out.
+- `click`, `type_text`, `fill_form`, `hover`, `press_key` and `select_option`
+  find elements in open shadow roots and in the tab's other frames when the
+  top document has no match; results say where (`via`, `frameId`).
+  `host >>> inner` selectors work. `wait_for_element` sees open shadow roots.
+- `iframe_interact` exposes `select_option`, `hover`, `scroll` and
+  `check_element_state`.
+
+### Changed
+- New permission: `webRequest`, to count the requests an action starts.
+- `scroll` scrolls the pane that actually scrolls (the selector's scrollable
+  ancestor, or the pane under the viewport centre on fixed-document apps),
+  reports which container moved, and defaults to `behavior: "auto"`.
+
+### Fixed
+- Clicks fired twice (a synthetic click event plus `el.click()`) on
+  selector, text, index, iframe, shadow and force clicks.
+- The side panel received only final answers: streaming, tool cards, Stop
+  state, plan approvals and action confirmations now reach it.
+- The chat stopped following a reply after a tool card finished; the quick
+  prompt (Cmd/Ctrl+Shift+L) now streams and scrolls.
+- The in-panel agent's `scroll` ignored its distance (always 500 px).
+- `press_key` on a ref ignored modifiers; `iframeSelector` failed for
+  `srcdoc`, `about:blank` and same-src frames.
+- Twelve tools had no safety tier and were treated as "write".
+
+### Removed
+- Unused code: the server's WebSocket batching, `listWorkflowFiles`, and
+  dead chat-panel and popup helpers.
+
 ## 7.2.0
 
 ### Added
