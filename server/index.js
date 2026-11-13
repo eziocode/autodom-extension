@@ -8412,7 +8412,7 @@ const PLAYWRIGHT_COMPAT_TOOLS = [
   {
     name: "wait_for_download",
     description:
-      "Wait for a new browser download to start and optionally complete, returning filename, URL, and state.",
+      "Wait for a new browser download to start and optionally complete, returning filename, URL and state; a finished download also has its saved path, size in bytes and MIME type.",
     parameters: z.object({
       timeout: z.number().optional().describe("Maximum wait in milliseconds, default 15000"),
       waitForComplete: z.boolean().optional().describe("Wait until complete or interrupted"),
@@ -10267,10 +10267,10 @@ server.addTool({
 server.addTool({
   name: "get_storage",
   description:
-    "Get localStorage or sessionStorage data. Returns all entries or a specific key.",
+    "Read the page origin's localStorage, sessionStorage, IndexedDB or Cache Storage. indexeddb: no database = list databases; database = its stores with counts; store = records (limit/offset) or one key. cache: no database = cache names; database = cached request URLs.",
   parameters: z.object({
     type: z
-      .enum(["local", "session"])
+      .enum(["local", "session", "indexeddb", "cache"])
       .optional()
       .default("local")
       .describe("Storage type"),
@@ -10278,6 +10278,10 @@ server.addTool({
       .string()
       .optional()
       .describe("Specific key to get (returns all if omitted)"),
+    database: z.string().optional().describe("indexeddb: database name; cache: cache name"),
+    store: z.string().optional().describe("indexeddb: object store"),
+    limit: z.number().optional().describe("indexeddb/cache: entries to return (default 20, max 200)"),
+    offset: z.number().optional().describe("indexeddb/cache: entries to skip"),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("get_storage", params);
@@ -10288,10 +10292,11 @@ server.addTool({
 // 28. Set storage
 server.addTool({
   name: "set_storage",
-  description: "Set, remove, or clear localStorage/sessionStorage entries.",
+  description:
+    "Set, remove or clear localStorage/sessionStorage entries. For IndexedDB and Cache Storage, removals only: a key, a whole store (clear), a database (deleteDatabase) or a cache.",
   parameters: z.object({
     type: z
-      .enum(["local", "session"])
+      .enum(["local", "session", "indexeddb", "cache"])
       .optional()
       .default("local")
       .describe("Storage type"),
@@ -10305,7 +10310,10 @@ server.addTool({
       .boolean()
       .optional()
       .default(false)
-      .describe("Clear all storage entries"),
+      .describe("Clear all storage entries (indexeddb: the store)"),
+    database: z.string().optional().describe("indexeddb: database name; cache: cache name (no key = delete the cache)"),
+    store: z.string().optional().describe("indexeddb: object store"),
+    deleteDatabase: z.boolean().optional().describe("indexeddb: delete the whole database"),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("set_storage", params);
@@ -11002,7 +11010,7 @@ server.addTool({
 server.addTool({
   name: "emulate",
   description:
-    "Emulate a device and conditions on the tab: viewport, user agent, color scheme, network throttling (offline, 3G/4G presets or custom), CPU slowdown. Settings stay until emulate {reset:true}.",
+    "Emulate a device and conditions on the tab: viewport, user agent, color scheme, locale, time zone, touch screen, network throttling (offline, 3G/4G presets or custom), CPU slowdown. Settings stay until emulate {reset:true}.",
   parameters: z.object({
     userAgent: z.string().optional().describe("User agent string to emulate"),
     viewport: z
@@ -11018,6 +11026,12 @@ server.addTool({
       .enum(["dark", "light", "auto"])
       .optional()
       .describe("Emulate dark or light mode"),
+    locale: z.string().optional().describe('Intl / navigator.language locale, e.g. "de-DE"'),
+    timezone: z.string().optional().describe('IANA time zone, e.g. "Asia/Kolkata"'),
+    touch: z
+      .union([z.boolean(), z.object({ maxTouchPoints: z.number().optional() })])
+      .optional()
+      .describe("Emulate a touch screen (true, or the number of touch points)"),
     network: z
       .union([
         z.enum(["offline", "slow-3g", "fast-3g", "slow-4g", "fast-4g"]),
@@ -11072,12 +11086,13 @@ server.addTool({
 // 43. Upload File
 server.addTool({
   name: "upload_file",
-  description: 'Upload a local file through an input[type="file"] element.',
+  description: 'Set the files of an input[type="file"], chosen by @eN ref or CSS selector. Paths are absolute paths on the machine running the browser.',
   parameters: z.object({
-    uid: z
-      .string()
-      .describe("The uid or CSS selector of the file input element"),
-    filePath: z.string().describe("The local path of the file to upload"),
+    ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
+    selector: z.string().optional().describe("CSS selector of the file input"),
+    uid: z.string().optional().describe("Legacy: uid or CSS selector"),
+    files: z.array(z.string()).optional().describe("Absolute file paths (several need a multiple input)"),
+    filePath: z.string().optional().describe("One absolute file path"),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("upload_file", params);

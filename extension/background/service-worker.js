@@ -9902,9 +9902,20 @@ async function toolSetCookie(params, ctx) {
 }
 
 // 27. Get localStorage/sessionStorage
+// local / session storage, IndexedDB and Cache Storage of the page's
+// origin. IndexedDB and caches are read in the page, no debugger needed.
 async function toolGetStorage(params, ctx) {
   const tab = await getActiveTab(ctx);
-  const { type, key } = params; // type: local | session
+  const type = params?.type || "local";
+  if (type === "indexeddb" || type === "cache") {
+    return await executeInTab(tab.id, _pageReadDbStorage, [type, {
+      database: params.database ?? null,
+      store: params.store ?? null,
+      key: params.key ?? null,
+      limit: Math.max(1, Math.min(200, Number(params.limit) || 20)),
+      offset: Math.max(0, Number(params.offset) || 0),
+    }]);
+  }
   return await executeInTab(
     tab.id,
     (type, key) => {
@@ -9919,14 +9930,95 @@ async function toolGetStorage(params, ctx) {
       }
       return { entries: all, count: store.length };
     },
-    [type || "local", key || null],
+    [type, params?.key || null],
   );
 }
 
-// 28. Set localStorage/sessionStorage
+// Page side of get_storage for IndexedDB and Cache Storage. Values are
+// cut to 2000 characters of JSON each.
+async function _pageReadDbStorage(type, q) {
+  const show = (v) => {
+    let text;
+    try {
+      text = JSON.stringify(v, (_k, x) => (x instanceof Blob ? `[Blob ${x.type} ${x.size} B]` : x instanceof ArrayBuffer ? `[ArrayBuffer ${x.byteLength} B]` : x));
+    } catch (_) {
+      text = String(v);
+    }
+    if (text === undefined) return null;
+    return text.length > 2000 ? { truncated: true, json: text.slice(0, 2000) } : JSON.parse(text);
+  };
+  const done = (req) => new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  if (type === "cache") {
+    if (!globalThis.caches) return { error: "Cache Storage is not available on this page" };
+    const names = await caches.keys();
+    if (!q.database) return { type, caches: names };
+    if (!names.includes(q.database)) return { error: `No cache "${q.database}"`, caches: names };
+    const requests = await (await caches.open(q.database)).keys();
+    return {
+      type,
+      cache: q.database,
+      count: requests.length,
+      entries: requests.slice(q.offset, q.offset + q.limit).map((r) => ({ method: r.method, url: r.url.slice(0, 300) })),
+    };
+  }
+  if (!indexedDB.databases) return { error: "indexedDB.databases() is not available in this browser" };
+  const dbs = await indexedDB.databases();
+  if (!q.database) return { type, databases: dbs.map((d) => ({ name: d.name, version: d.version })) };
+  if (!dbs.some((d) => d.name === q.database)) return { error: `No IndexedDB database "${q.database}"`, databases: dbs.map((d) => d.name) };
+  // Opening an existing database at its current version never upgrades it.
+  const db = await done(indexedDB.open(q.database));
+  try {
+    const storeNames = [...db.objectStoreNames];
+    if (!q.store) {
+      const tx = db.transaction(storeNames.length ? storeNames : [], "readonly");
+      const stores = [];
+      for (const name of storeNames) {
+        const os = tx.objectStore(name);
+        stores.push({ name, keyPath: os.keyPath, autoIncrement: os.autoIncrement, indexes: [...os.indexNames], count: await done(os.count()) });
+      }
+      return { type, database: q.database, version: db.version, stores };
+    }
+    if (!storeNames.includes(q.store)) return { error: `No object store "${q.store}"`, stores: storeNames };
+    const os = db.transaction(q.store, "readonly").objectStore(q.store);
+    if (q.key != null) return { type, database: q.database, store: q.store, key: q.key, value: show(await done(os.get(q.key))) };
+    const count = await done(os.count());
+    const entries = [];
+    await new Promise((resolve, reject) => {
+      const req = os.openCursor();
+      let skipped = false;
+      req.onerror = () => reject(req.error);
+      req.onsuccess = () => {
+        const cur = req.result;
+        if (!cur || entries.length >= q.limit) return resolve();
+        if (q.offset && !skipped) {
+          skipped = true;
+          return cur.advance(q.offset);
+        }
+        entries.push({ key: show(cur.key), value: show(cur.value) });
+        cur.continue();
+      };
+    });
+    return { type, database: q.database, store: q.store, count, offset: q.offset, entries };
+  } finally {
+    db.close();
+  }
+}
+
 async function toolSetStorage(params, ctx) {
   const tab = await getActiveTab(ctx);
   const { type, key, value, clear } = params;
+  if (type === "indexeddb" || type === "cache") {
+    return await executeInTab(tab.id, _pageWriteDbStorage, [type, {
+      database: params.database ?? null,
+      store: params.store ?? null,
+      key: key ?? null,
+      deleteDatabase: params.deleteDatabase === true,
+      clear: clear === true,
+    }]);
+  }
   return await executeInTab(
     tab.id,
     (type, key, value, clear) => {
@@ -9947,6 +10039,40 @@ async function toolSetStorage(params, ctx) {
     },
     [type || "local", key, value, clear || false],
   );
+}
+
+// Page side of set_storage for IndexedDB and Cache Storage: removals only
+// (a test resets state; it does not forge records).
+async function _pageWriteDbStorage(type, q) {
+  const done = (req) => new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+    req.onblocked = () => reject(new Error("blocked: another tab of this site has the database open"));
+  });
+  if (!q.database) return { error: "database (or cache name) is required" };
+  if (type === "cache") {
+    if (!globalThis.caches) return { error: "Cache Storage is not available on this page" };
+    if (q.key) return { success: (await (await caches.open(q.database)).delete(q.key)), action: "removed", url: q.key };
+    return { success: await caches.delete(q.database), action: "deleted cache", cache: q.database };
+  }
+  if (q.deleteDatabase) {
+    await done(indexedDB.deleteDatabase(q.database));
+    return { success: true, action: "deleted database", database: q.database };
+  }
+  if (!q.store || (q.key == null && !q.clear)) return { error: "Pass store with key or clear:true, or deleteDatabase:true" };
+  const db = await done(indexedDB.open(q.database));
+  try {
+    if (![...db.objectStoreNames].includes(q.store)) return { error: `No object store "${q.store}"` };
+    const os = db.transaction(q.store, "readwrite").objectStore(q.store);
+    if (q.clear) {
+      await done(os.clear());
+      return { success: true, action: "cleared store", store: q.store };
+    }
+    await done(os.delete(q.key));
+    return { success: true, action: "removed", store: q.store, key: q.key };
+  } finally {
+    db.close();
+  }
 }
 
 // 29. Get HTML (innerHTML/outerHTML)
@@ -13806,7 +13932,7 @@ function _networkConditions(network) {
 }
 
 async function toolEmulate(params, ctx) {
-  const { userAgent, viewport, colorScheme, network, cpuThrottle, reset } = params || {};
+  const { userAgent, viewport, colorScheme, network, cpuThrottle, locale, timezone, touch, reset } = params || {};
   const tab = await getActiveTab(ctx);
   const tabId = tab.id;
   await ensureDebugger(tabId);
@@ -13817,6 +13943,9 @@ async function toolEmulate(params, ctx) {
     await send("Emulation.setEmulatedMedia", { features: [] }).catch(() => {});
     await send("Network.emulateNetworkConditions", NO_THROTTLE).catch(() => {});
     await send("Emulation.setCPUThrottlingRate", { rate: 1 }).catch(() => {});
+    await send("Emulation.setLocaleOverride", {}).catch(() => {});
+    await send("Emulation.setTimezoneOverride", { timezoneId: "" }).catch(() => {});
+    await send("Emulation.setTouchEmulationEnabled", { enabled: false }).catch(() => {});
     _releaseDebugger(tabId, "emulation");
     detachDebuggerSafe(tabId).catch(() => {});
     return { success: true, reset: true };
@@ -13851,42 +13980,58 @@ async function toolEmulate(params, ctx) {
     await send("Emulation.setCPUThrottlingRate", { rate });
     applied.push(`cpu x${rate}`);
   }
+  if (locale) {
+    // Intl and navigator.language; Accept-Language follows the UA override.
+    await send("Emulation.setLocaleOverride", { locale: String(locale) });
+    applied.push(`locale ${locale}`);
+  }
+  if (timezone) {
+    await send("Emulation.setTimezoneOverride", { timezoneId: String(timezone) });
+    applied.push(`timezone ${timezone}`);
+  }
+  if (touch != null) {
+    const enabled = touch !== false;
+    const maxTouchPoints = typeof touch === "object" ? Math.max(1, Math.min(16, Number(touch.maxTouchPoints) || 5)) : 5;
+    await send("Emulation.setTouchEmulationEnabled", enabled ? { enabled, maxTouchPoints } : { enabled });
+    applied.push(enabled ? "touch" : "touch off");
+  }
   // Overrides end when the debugger detaches; keep it until reset.
   if (applied.length) _holdDebugger(tabId, "emulation");
   return { success: true, applied, note: "Applied until emulate {reset:true}, the tab closes, or the debugger is detached." };
 }
 
 // 43. Upload File
-async function toolUploadFile({ uid, filePath }, ctx) {
+// Sets the files of an <input type=file> chosen by @eN ref, CSS selector
+// or legacy uid. DOM.setFileInputFiles takes the element's objectId.
+async function toolUploadFile(params, ctx) {
   const tab = await getActiveTab(ctx);
   const tabId = tab.id;
+  const files = Array.isArray(params?.files) && params.files.length ? params.files.map(String) : params?.filePath ? [String(params.filePath)] : [];
+  if (!files.length) return { error: "Pass files (absolute paths) or filePath" };
+  const target = String(params?.ref || params?.uid || params?.selector || "");
+  if (!target) return { error: "Pass ref, selector or uid of the file input" };
+  const ref = /^@?(e\d+)$/.exec(target)?.[1];
   await ensureDebugger(tabId);
   try {
-    const res = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", {
-      expression: `document.querySelector('${uid.replace(/'/g, "\\'")}') || document.querySelector('[__bmcp_uid="${uid.replace(/"/g, '\\"')}"]');`,
+    const find = ref
+      ? `document.querySelector('[data-autodom-ref="${ref}"]')`
+      : `(() => { try { return document.querySelector(${JSON.stringify(target)}); } catch (_) { return null; } })() || document.querySelector('[__bmcp_uid=' + ${JSON.stringify(JSON.stringify(target))} + ']')`;
+    const res = await chrome.debugger.sendCommand({ tabId }, "Runtime.evaluate", { expression: find });
+    if (!res?.result?.objectId) throw new Error(`File input not found: ${target}`);
+    const info = await chrome.debugger.sendCommand({ tabId }, "Runtime.callFunctionOn", {
+      objectId: res.result.objectId,
+      functionDeclaration: "function () { return this.tagName === 'INPUT' && this.type === 'file' ? (this.multiple ? 'multiple' : 'single') : 'no'; }",
+      returnByValue: true,
     });
-
-    if (
-      !res.result ||
-      res.result.type === "undefined" ||
-      res.result.subtype === "null"
-    ) {
-      throw new Error(`File input element not found for selector/uid: ${uid}`);
-    }
-
-    const nodeRes = await chrome.debugger.sendCommand(
-      { tabId },
-      "DOM.requestNode",
-      { objectId: res.result.objectId },
-    );
-    await chrome.debugger.sendCommand({ tabId }, "DOM.setFileInputFiles", {
-      files: [filePath],
-      backendNodeId: nodeRes.nodeId,
-    });
-    return { success: true, note: `File uploaded to element ${uid}` };
+    const kind = info?.result?.value;
+    if (kind === "no") throw new Error(`${target} is not an <input type="file">`);
+    if (kind === "single" && files.length > 1) throw new Error("This input takes one file; it has no multiple attribute");
+    await chrome.debugger.sendCommand({ tabId }, "DOM.setFileInputFiles", { files, objectId: res.result.objectId });
+    return { success: true, files: files.length, target };
+  } catch (err) {
+    return { error: `Upload failed: ${err.message}` };
   } finally {
-    // One-shot CDP op — drop the debugger attachment so Chrome's
-    // "started debugging" banner doesn't linger.
+    // One-shot CDP op: drop the attachment unless something holds it.
     detachDebuggerSafe(tabId).catch(() => {});
   }
 }
@@ -16214,17 +16359,26 @@ async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter, l
     return filename.includes(filenameFilter) || url.includes(filenameFilter);
   };
 
+  // Chrome picks the final file name after onCreated, so a finished
+  // download is looked up again for its path, size and type.
   const formatDownload = (item, state = item.state) => ({
     id: item.id,
     filename: item.filename,
     url: item.url?.substring(0, 200),
     state,
+    ...(item.mime && { mime: item.mime }),
+    ...(item.fileSize > 0 && { bytes: item.fileSize }),
+    ...(item.error && { error: item.error }),
   });
+  const finished = async (item, state) => {
+    const [fresh] = await chrome.downloads.search({ id: item.id }).catch(() => []);
+    return formatDownload(fresh || item, state);
+  };
 
   const waitForExistingToFinish = (item) =>
     new Promise((resolve) => {
       if (!waitForComplete || item.state === "complete" || item.state === "interrupted") {
-        resolve(formatDownload(item));
+        finished(item, item.state).then(resolve);
         return;
       }
       const remaining = Math.max(0, maxWait - (Date.now() - start));
@@ -16245,7 +16399,7 @@ async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter, l
           clearTimeout(completeTimer);
           detachCancel();
           chrome.downloads.onChanged.removeListener(onChanged);
-          resolve(formatDownload(item, delta.state.current));
+          finished(item, delta.state.current).then(resolve);
         }
       }
       chrome.downloads.onChanged.addListener(onChanged);
@@ -16300,7 +16454,7 @@ async function toolWaitForDownload({ timeout, waitForComplete, filenameFilter, l
           clearTimeout(completeTimer);
           detachDoneCancel();
           chrome.downloads.onChanged.removeListener(onChanged);
-          resolve(formatDownload(item, delta.state.current));
+          finished(item, delta.state.current).then(resolve);
         }
       }
       chrome.downloads.onChanged.addListener(onChanged);

@@ -656,3 +656,59 @@ test("ax snapshot shows only an open modal dialog, and filters by role and name"
   assert.equal(only.result.count, 1);
   assert.match(only.result.snapshot, /checkbox "Subscribed"/);
 });
+
+// ─── Browser state ──────────────────────────────────────────────────
+test("emulate sets locale, time zone and touch, and reset clears them", async () => {
+  const sw = await ready();
+  const r = await sw.tool("emulate", { locale: "de-DE", timezone: "Asia/Kolkata", touch: { maxTouchPoints: 2 } });
+  assert.deepEqual(r.result.applied, ["locale de-DE", "timezone Asia/Kolkata", "touch"]);
+  const sent = (m) => JSON.parse(JSON.stringify(sw.cdp.filter((c) => c.method === m).map((c) => c.params)));
+  assert.deepEqual(sent("Emulation.setLocaleOverride"), [{ locale: "de-DE" }]);
+  assert.deepEqual(sent("Emulation.setTimezoneOverride"), [{ timezoneId: "Asia/Kolkata" }]);
+  assert.deepEqual(sent("Emulation.setTouchEmulationEnabled"), [{ enabled: true, maxTouchPoints: 2 }]);
+  await sw.tool("emulate", { reset: true });
+  assert.deepEqual(sent("Emulation.setLocaleOverride").at(-1), {});
+  assert.deepEqual(sent("Emulation.setTimezoneOverride").at(-1), { timezoneId: "" });
+  assert.deepEqual(sent("Emulation.setTouchEmulationEnabled").at(-1), { enabled: false });
+});
+
+test("upload_file hands CDP the element's objectId and checks the input", async () => {
+  let kind = "multiple";
+  const sw = await ready({
+    cdp: {
+      "Runtime.evaluate": ({ expression }) => (/missing/.test(expression) ? { result: { type: "object", subtype: "null" } } : { result: { objectId: "obj-7" } }),
+      "Runtime.callFunctionOn": () => ({ result: { value: kind } }),
+    },
+  });
+  const ok = await sw.tool("upload_file", { ref: "@e4", files: ["/tmp/a.pdf", "/tmp/b.pdf"] });
+  assert.equal(ok.result.success, true, JSON.stringify(ok.result));
+  const set = sw.cdp.find((c) => c.method === "DOM.setFileInputFiles").params;
+  assert.deepEqual(JSON.parse(JSON.stringify(set)), { files: ["/tmp/a.pdf", "/tmp/b.pdf"], objectId: "obj-7" });
+  assert.match(sw.cdp.find((c) => c.method === "Runtime.evaluate").params.expression, /data-autodom-ref="e4"/);
+  assert.ok(!sw.cdp.some((c) => c.method === "DOM.requestNode"), "no node-id round trip");
+
+  kind = "single";
+  const many = await sw.tool("upload_file", { selector: "#cv", files: ["/a", "/b"] });
+  assert.match(many.result.error, /takes one file/);
+  kind = "no";
+  const notFile = await sw.tool("upload_file", { selector: "#name", filePath: "/a" });
+  assert.match(notFile.result.error, /is not an <input type="file">/);
+  const missing = await sw.tool("upload_file", { selector: "#missing", filePath: "/a" });
+  assert.match(missing.result.error, /File input not found/);
+  kind = "single";
+  const quoted = await sw.tool("upload_file", { selector: "input[name='cv']", filePath: "/a" });
+  assert.ok(quoted.result.success, "selectors with quotes are passed as data, not spliced");
+});
+
+test("a finished download reports its saved path, size and type", async () => {
+  const sw = await ready();
+  sw.chrome.downloads = {
+    onCreated: { addListener(fn) { setTimeout(() => fn({ id: 3, filename: "", url: "https://crm.test/export", state: "in_progress" }), 5); }, removeListener() {} },
+    onChanged: { addListener(fn) { setTimeout(() => fn({ id: 3, state: { current: "complete" } }), 15); }, removeListener() {} },
+    search: async ({ id }) => (id === 3 ? [{ id: 3, filename: "/Users/me/Downloads/leads.csv", url: "https://crm.test/export", state: "complete", mime: "text/csv", fileSize: 2048 }] : []),
+  };
+  const r = await sw.tool("wait_for_download", { waitForComplete: true, timeout: 2000 });
+  assert.deepEqual(JSON.parse(JSON.stringify(r.result)), {
+    id: 3, filename: "/Users/me/Downloads/leads.csv", url: "https://crm.test/export", state: "complete", mime: "text/csv", bytes: 2048,
+  });
+});
