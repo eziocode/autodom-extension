@@ -4,6 +4,43 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 7.5.0
+
+### Changed
+- One detached broker per port now owns the extension connection. Each MCP
+  client's stdio process is a worker that attaches to it, so a client
+  quitting no longer drops the port for the others. A worker that finds no
+  broker starts one; a spawn lock makes sure only one starts.
+  `AUTODOM_BROKER=0` restores the old single-process mode.
+- Calls from different clients are queued separately and served in turn.
+  The in-flight cap follows the machine (2–8 by CPU count, halved under
+  load; `AUTODOM_MAX_INFLIGHT` overrides it). Call ids are seeded from the
+  clock, so they never collide after a broker restart.
+- The tab-group idle setting is per client instead of shared.
+- Idle clients (no tool call for 5 min, `AUTODOM_WORKER_IDLE_MS`) detach
+  from the broker and keep their tabs; the next call reattaches. A broker
+  exits after 2 min with no clients and no browser
+  (`AUTODOM_BROKER_ORPHAN_EXIT_MS`), or after the inactivity timeout with
+  no clients.
+- Timers slow down after 60 s without calls (pings 15 s → 60 s, parent
+  check 3 s → 15 s, lock check 5 s → 30 s).
+
+### Fixed
+- **Fix** and the reaper no longer stop a server whose MCP client is still
+  running (an idle Claude session was killed while Codex was active). Only
+  servers whose client has quit, and brokers with nothing attached, are
+  removed; old live-client servers are left until their client restarts.
+- Random "bridge disconnected": a connection is dropped only after 3 missed
+  server pings or 2 missed extension heartbeats, any message counts as a
+  sign of life, and every close is logged with a reason.
+- A second browser on a port already used by another live browser is
+  refused (`PORT_BUSY_OTHER_BROWSER`) and pointed at a free port, instead
+  of taking the bridge over.
+- After 3 failed reconnects the extension asks the native helper to start a
+  broker (`ensure`: start only, never stops anything).
+
+---
+
 ## 7.4.0
 
 ### Added
