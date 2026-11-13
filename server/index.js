@@ -1819,8 +1819,10 @@ function serverFreshness() {
 function bridgeIdleForRestart() {
   if (pendingCalls.size > 0) return false;
   if (Date.now() - lastActivityTime < SELF_RESTART_IDLE_MS) return false;
-  // A legacy stdio handshake must be fully seen so it can be replayed.
-  if (!BRIDGE_ONLY && stdioHandshakeTap && !stdioHandshakeTap.settled) return false;
+  // A legacy stdio handshake must not be cut in half: once `initialize` was
+  // seen, wait for `notifications/initialized` so both can be replayed. A
+  // client that has said nothing yet is fine — it talks to the successor.
+  if (!BRIDGE_ONLY && stdioHandshakeTap?.midHandshake) return false;
   return true;
 }
 

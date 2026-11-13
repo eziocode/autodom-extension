@@ -80,6 +80,19 @@ function fakeChild() {
   return { stdin: new PassThrough(), stdout: new PassThrough() };
 }
 
+test("handshake tap is mid-handshake only between initialize and initialized", () => {
+  const stdin = new PassThrough();
+  const tap = createHandshakeTap(stdin);
+  // A client that has said nothing must not block a restart.
+  assert.equal(tap.midHandshake, false);
+  assert.equal(tap.settled, false);
+  stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n');
+  assert.equal(tap.midHandshake, true);
+  stdin.write('{"jsonrpc":"2.0","method":"notifications/initialized"}\n');
+  assert.equal(tap.midHandshake, false);
+  assert.equal(tap.settled, true);
+});
+
 test("relay replays the handshake, swallows the duplicate initialize reply, then flushes queued input", async () => {
   const child = fakeChild();
   const stdin = new PassThrough();

@@ -4813,9 +4813,13 @@ function connectWebSocket(port) {
   try {
     ws = new WebSocket(`ws://127.0.0.1:${getCurrentPort()}`);
 
+    // Whether THIS socket ever opened. A close after a successful open is a
+    // bridge restart/blip on a port that works, not a bad port choice.
+    let socketOpened = false;
     ws.onopen = () => {
       isConnected = true;
       _connectFailureStreak = 0;
+      socketOpened = true;
       _noteBridgeActivity();
       _cancelIsolationDisconnectRelease();
       _startupRestoreOnly = false;
@@ -4916,8 +4920,14 @@ function connectWebSocket(port) {
             ? lastConnectedPort
             : null;
 
+        // Fall back only when the current port never connected (the user
+        // picked a dead port). A working port whose bridge restarted (an
+        // in-place update, Fix) must be retried as-is — falling back used to
+        // move the extension onto another port's bridge and strand the IDEs
+        // on this one.
         if (
           autoConnectEnabled &&
+          !socketOpened &&
           !isConnected &&
           fallbackPort &&
           fallbackPort !== currentPort &&
@@ -12931,8 +12941,15 @@ async function _runBridgeCheck() {
     if (helperStatus?.ok) {
       const onPort = (helperStatus.bridges || []).filter((b) => b.port === port);
       const primaries = onPort.filter((b) => b.primary);
+      // Only "kill" verdicts are orphans/zombies — what Fix actually stops.
+      // "nudge" entries still have a live MCP client (an idle IDE chat): the
+      // reaper never kills those, so listing them as stale made Fix look
+      // broken ("Nothing stale" right after a check that listed five).
       const stale = (helperStatus.bridges || []).filter(
-        (b) => b.verdict && b.verdict.action !== "keep",
+        (b) => b.verdict && b.verdict.action === "kill",
+      );
+      const idleClients = (helperStatus.bridges || []).filter(
+        (b) => b.verdict && b.verdict.action === "nudge",
       );
       const portInfo = helperStatus.ports?.[port];
       // A missing lock prevents the helper's authenticated status request,
@@ -12973,7 +12990,10 @@ async function _runBridgeCheck() {
         stale.length ? "warn" : "ok",
         stale.length
           ? `${stale.length} orphan/zombie AutoDOM process(es): ${stale.map((b) => `${b.pid} (${b.verdict.reason})`).join(", ")}`
-          : `${(helperStatus.bridges || []).length} AutoDOM process(es), none orphaned or zombie`,
+          : `${(helperStatus.bridges || []).length} AutoDOM process(es), none orphaned or zombie` +
+            (idleClients.length
+              ? `; ${idleClients.length} belong to idle IDE sessions (kept — they reattach on their next tool call): ${idleClients.map((b) => b.pid).join(", ")}`
+              : ""),
         stale.length > 0,
       );
     } else {
@@ -13216,9 +13236,22 @@ async function _runBridgeFix() {
   autoConnectFallbackTried = false;
   wsPort = port;
   _requestedPort = port;
+  const connectedPort = isConnected ? lastConnectedPort : null;
   _setShouldRunMcp(true);
   chrome.storage.local.set({ mcpPort: port, mcpRunning: true });
   stopAutoConnect();
+  if (isConnected && ws && connectedPort !== port) {
+    // Connected, but to another port's bridge (an earlier fallback): Fix
+    // means "use the configured port", so move back to it.
+    try {
+      ws.onclose = null;
+      ws.close();
+    } catch (_) {}
+    ws = null;
+    isConnected = false;
+    stopKeepAlive();
+    step("Switch port", true, `Leaving port ${connectedPort} for the configured port ${port}`);
+  }
   if (ws && ws.readyState !== WebSocket.OPEN) {
     try {
       ws.onclose = null;
@@ -13238,7 +13271,7 @@ async function _runBridgeFix() {
   step(
     "Reconnect",
     isConnected,
-    isConnected ? `Connected on ws://127.0.0.1:${port}` : "Still not connected — see the check below",
+    isConnected ? `Connected on ws://127.0.0.1:${lastConnectedPort}` : "Still not connected — see the check below",
   );
 
   if (isConnected) {

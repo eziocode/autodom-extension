@@ -1163,8 +1163,15 @@
     link.id = STYLE_ID + "_link";
     link.rel = "stylesheet";
     try {
+      // getURL is plain string-building and keeps "working" in a script
+      // orphaned by an extension reload, but the page may no longer load
+      // our resources then — Chrome logs "Unsafe attempt to load URL
+      // chrome-extension://… from frame with URL …". runtime.id is the
+      // reliable liveness check: it is undefined once the context is gone.
+      if (!chrome.runtime?.id) throw new Error("extension context invalidated");
       link.href = chrome.runtime.getURL("content/chat-panel.css");
     } catch (_) {
+      _contextInvalidated = true;
       // Extension context invalidated mid-injection. Fall back to
       // doing nothing — the next reload will recover.
       try { guard.remove(); } catch (_) {}
@@ -1189,10 +1196,24 @@
       });
     };
     link.addEventListener("load", reveal, { once: true });
-    // If the stylesheet 404s for any reason (file missing in a partial
-    // install) reveal anyway so the panel is at least usable in plain
-    // form rather than permanently invisible.
-    link.addEventListener("error", reveal, { once: true });
+    // The <link> can be refused by the page (or fail in a partial install).
+    // Content scripts may still read their own web-accessible files, so
+    // inline the CSS as a <style> instead; reveal either way so the panel is
+    // never left permanently invisible.
+    link.addEventListener("error", () => {
+      if (!chrome.runtime?.id) return reveal();
+      fetch(link.href)
+        .then((r) => (r.ok ? r.text() : Promise.reject(new Error(String(r.status)))))
+        .then((css) => {
+          const style = document.createElement("style");
+          style.id = STYLE_ID + "_inline";
+          style.textContent = css;
+          document.documentElement.appendChild(style);
+          try { link.remove(); } catch (_) {}
+        })
+        .catch(() => {})
+        .finally(reveal);
+    }, { once: true });
     document.documentElement.appendChild(link);
   }
 

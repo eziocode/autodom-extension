@@ -135,6 +135,16 @@ export function createHandshakeTap(stdin, { maxBytes = 256 * 1024 } = {}) {
     get settled() {
       return finished;
     },
+    /**
+     * `initialize` seen but `notifications/initialized` not yet: handing
+     * over now would leave the successor half-initialized. A client that
+     * has sent nothing at all is NOT mid-handshake — its first message
+     * simply goes to the successor — so a silent IDE must never block a
+     * restart (a successor whose client stayed idle used to wait forever).
+     */
+    get midHandshake() {
+      return !finished && captured.length > 0;
+    },
     /** Lines to replay to the successor, in order. */
     get handshake() {
       return captured.some((c) => c.kind === "initialized") ? [...captured] : [];
