@@ -8,7 +8,7 @@ It is two programs that talk over a local WebSocket:
 - `extension/`: a Manifest V3 extension. Executes the tool calls in the
   browser through `chrome.scripting`, `chrome.tabs` and the DevTools protocol.
 
-Current release: **7.3.0** ([changelog](CHANGELOG.md)). License: MIT.
+Current release: **7.4.0** ([changelog](CHANGELOG.md)). License: MIT.
 
 Targeted clients: GitHub Copilot, JetBrains AI Assistant, Claude (Desktop and
 Code), Cursor and Gemini CLI. Anything that speaks MCP over stdio should work.

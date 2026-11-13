@@ -4,6 +4,58 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 7.4.0
+
+### Added
+- HAR recording for API testing:
+  - Each request names the AutoDOM tool call that triggered it
+    (`_autodom`: step, tool, call id). `_triggeredBy` for the user's own
+    clicks is kept.
+  - `har_start {label}` while recording starts the next test case;
+    `har_stop` writes one `.har` per case, and `curl: true` adds a replay
+    script (redacted values become shell variables).
+  - `har_entries`: filterable rows with JSON request/response shapes.
+  - `wait_for_request`: wait for a matching call after an action and
+    return its status, timing, body shape or a `jsonPath` value; near
+    misses on timeout.
+  - Record-time filters (`apiOnly`, URL include/exclude, methods) and
+    extra redaction of header and body-key names.
+- Screenshots: `fullPage`; one element by `ref`, `selector` or `index`;
+  `annotate` draws `@eN` refs on the image and lists them;
+  `saveBaseline` / `diff` return changed regions; every result reports
+  where the image sits on the page.
+- `click_at_coordinates`: `from: "screenshot"` takes image pixels;
+  `trusted: true` sends real input over the DevTools protocol.
+- `take_snapshot {mode: "ax"}`: Chrome's accessibility tree with `@eN`
+  refs, real states, and only the open modal dialog when there is one.
+- `network_rules`: block, mock, delay or rewrite requests; flagged in
+  HAR entries.
+- `emulate`: network throttling presets or custom, CPU slowdown,
+  locale, time zone, touch, and `reset`.
+- `get_storage` / `set_storage`: IndexedDB and Cache Storage (reads;
+  removals only for writes).
+- `performance_stop_trace` writes a `.json` trace and returns LCP, CLS,
+  INP, long tasks, navigation timing and the slowest requests.
+
+### Changed
+- HAR: headers and cookies are the ones sent over the wire; response
+  JSON is redacted too; long bodies are truncated instead of dropped;
+  a recording survives its tab closing; `har_stop` needs an absolute
+  `.har` path and does not overwrite without `overwrite: true`.
+- `wait_for_download` returns the saved path, size and MIME type.
+- `upload_file` takes an `@eN` ref or selector and several files.
+
+### Fixed
+- `upload_file` passed the wrong node id to Chrome.
+- One-shot DevTools tools (`handle_dialog`, `upload_file`, `print_to_pdf`)
+  detached the debugger and silently dropped emulation and a running
+  trace.
+- `performance_stop_trace` kept no trace data.
+- `browser_take_screenshot` ignored `fullPage` and `selector`.
+
+### Removed
+- `performance_analyze_insight` (returned placeholder text).
+
 ## 7.3.0
 
 ### Added
