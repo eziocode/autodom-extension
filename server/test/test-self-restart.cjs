@@ -27,6 +27,7 @@ for (const f of [
   "self-restart.js",
   "update-utils.js",
   "bridge-reaper.js",
+  "broker-spawn.js",
   "native-host.js",
   "automation-store.js",
   "har-export.js",
@@ -47,7 +48,7 @@ writeVersion("9.0.1");
 
 const proc = cp.spawn("node", [path.join(DIR, "index.js"), "--port", String(PORT)], {
   stdio: ["pipe", "pipe", "pipe"],
-  env: { ...process.env, AUTODOM_INACTIVITY_TIMEOUT: "0", AUTODOM_RESTART_IDLE_MS: "200" },
+  env: { ...process.env, AUTODOM_INACTIVITY_TIMEOUT: "0", AUTODOM_RESTART_IDLE_MS: "200", AUTODOM_BROKER: "0" },
 });
 const stderrLines = [];
 proc.stderr.on("data", (d) => stderrLines.push(String(d)));

@@ -35,6 +35,7 @@
 
   let serverDisabled = false;
   let idleMs = DEFAULT_IDLE_MS;
+  const clientIdleMs = new Map(); // clientId -> idleMs override
   let readyPromise = null;
 
   function api() {
@@ -78,7 +79,12 @@
 
   function configure(opts = {}) {
     if (typeof opts.enabled === "boolean") serverDisabled = !opts.enabled;
-    if (Number.isFinite(opts.idleMs) && opts.idleMs >= 0) idleMs = opts.idleMs;
+    if (Number.isFinite(opts.idleMs) && opts.idleMs >= 0) {
+      // Per-client when a clientId is given: one MCP client's idle setting
+      // must not shorten (or stretch) another client's tab-group lifetime.
+      if (opts.clientId) clientIdleMs.set(opts.clientId, opts.idleMs);
+      else idleMs = opts.idleMs;
+    }
   }
 
   // ── persistence ─────────────────────────────────────────────
@@ -434,6 +440,7 @@
     const s = clients.get(clientId);
     if (!s) return { closed: [], restored: [] };
     clients.delete(clientId); // first, so re-entrant onRemoved is a no-op
+    clientIdleMs.delete(clientId);
     const restored = [];
     for (const [tabId, origin] of s.adopted) {
       if (await restoreAdopted(tabId, origin)) restored.push(tabId);
@@ -483,11 +490,12 @@
   // ── idle sweep / listeners ──────────────────────────────────
 
   async function sweepIdle(now = Date.now()) {
-    if (!idleMs) return [];
     const released = [];
     for (const [clientId, s] of [...clients]) {
       if (s.inflight > 0) continue;
-      if (now - s.lastActivity >= idleMs) {
+      const limit = clientIdleMs.has(clientId) ? clientIdleMs.get(clientId) : idleMs;
+      if (!limit) continue;
+      if (now - s.lastActivity >= limit) {
         await release(clientId, "idle");
         released.push(clientId);
       }

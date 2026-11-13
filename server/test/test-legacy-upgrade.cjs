@@ -25,7 +25,7 @@ const DISK_VERSION = JSON.parse(fs.readFileSync(path.join(REAL, "package.json"),
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "autodom-legacy-"));
 const DIR = path.join(ROOT, "autodom", "server");
 fs.mkdirSync(DIR, { recursive: true });
-for (const f of ["index.js", "self-restart.js", "update-utils.js", "bridge-reaper.js", "native-host.js", "automation-store.js", "har-export.js", "viewer-app.js", "package.json"]) {
+for (const f of ["index.js", "self-restart.js", "update-utils.js", "bridge-reaper.js", "broker-spawn.js", "native-host.js", "automation-store.js", "har-export.js", "viewer-app.js", "package.json"]) {
   fs.copyFileSync(path.join(REAL, f), path.join(DIR, f));
 }
 fs.cpSync(path.join(REAL, "atk"), path.join(DIR, "atk"), { recursive: true });
@@ -42,7 +42,8 @@ const procs = [];
 function bridge() {
   const p = cp.spawn("node", [path.join(DIR, "index.js"), "--port", String(PORT)], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, AUTODOM_INACTIVITY_TIMEOUT: "0", AUTODOM_AUTO_RESTART: "0" },
+    // Real pre-5.4 bridges predate broker mode: model them as stdio primaries.
+    env: { ...process.env, AUTODOM_INACTIVITY_TIMEOUT: "0", AUTODOM_AUTO_RESTART: "0", AUTODOM_BROKER: "0" },
   });
   p.stderr.on("data", () => {});
   procs.push(p);
@@ -87,15 +88,16 @@ async function main() {
   const b = bridge();
   await sleep(9000); // the second bridge retries the port a few times before joining as a proxy
 
+  // Both legacy bridges belong to MCP clients that are still running (this
+  // test process is their parent). Stopping them would drop those clients'
+  // tools, so neither status nor --upgrade may target them any more.
   const before = await nativeHost("status", "--port", String(PORT));
-  const legacy = (before.legacyStale || []).filter((x) => x.port === PORT).map((x) => x.pid).sort();
-  const expected = [a.pid, b.pid].sort();
-  if (JSON.stringify(legacy) !== JSON.stringify(expected)) {
-    return fail(`status did not flag both legacy bridges: ${JSON.stringify(before.legacyStale)} (want ${expected})`);
+  const legacy = (before.legacyStale || []).filter((x) => x.port === PORT).map((x) => x.pid);
+  if (legacy.length) {
+    return fail(`status flagged live-client bridges for restart: ${JSON.stringify(before.legacyStale)}`);
   }
   if (before.diskVersion !== DISK_VERSION) return fail(`diskVersion ${before.diskVersion}`);
 
-  // Plain flush must NOT touch working bridges: only --upgrade may.
   const plain = await nativeHost("flush", "--port", String(PORT));
   if ((plain.restarted || []).length || !alive(a.pid) || !alive(b.pid)) {
     return fail("flush without --upgrade disturbed working bridges");
@@ -103,26 +105,14 @@ async function main() {
 
   const res = await nativeHost("restart", "--upgrade", "--port", String(PORT));
   if (!res.ok) return fail("restart --upgrade failed: " + JSON.stringify(res));
-  const restarted = (res.restarted || []).map((x) => x.pid).sort();
-  if (JSON.stringify(restarted) !== JSON.stringify(expected)) {
-    return fail(`restarted ${restarted}, wanted ${expected}: ${JSON.stringify(res)}`);
+  if ((res.restarted || []).length) {
+    return fail(`restart --upgrade killed live-client bridges: ${JSON.stringify(res.restarted)}`);
   }
-  if (!(await gone(a.pid)) || !(await gone(b.pid))) return fail("legacy bridges still alive");
-  const daemonPid = res.started?.pid;
-  if (!res.started?.ready) {
-    return fail("no fresh bridge started: " + JSON.stringify({ started: res.started, note: res.note, error: res.error, port: res.after?.ports?.[PORT], bridges: (res.after?.bridges || []).filter((x) => x.port === PORT) }), daemonPid);
-  }
+  await sleep(500);
+  if (!alive(a.pid) || !alive(b.pid)) return fail("a live-client legacy bridge was stopped");
 
-  const lock = JSON.parse(fs.readFileSync(LOCK, "utf8"));
-  const st = await status(lock.token);
-  if (!st || st.version !== DISK_VERSION) return fail(`fresh bridge reports ${st && st.version}, wanted ${DISK_VERSION}`, daemonPid);
-  if (st.autoRestart !== true) return fail("fresh bridge cannot restart itself", daemonPid);
-
-  const after = await nativeHost("status", "--port", String(PORT));
-  if ((after.legacyStale || []).some((x) => x.port === PORT)) return fail("still flagged legacy after upgrade", daemonPid);
-
-  console.log(`PASS — 2 legacy bridges (v5.3.9) replaced; fresh bridge v${st.version} owns the port`);
-  cleanup(daemonPid);
+  console.log("PASS — live-client legacy bridges (v5.3.9) were left running by status/flush/restart --upgrade");
+  cleanup();
   process.exit(0);
 }
 main().catch((e) => fail(e.stack || e.message));

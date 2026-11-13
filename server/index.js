@@ -53,7 +53,7 @@ import { z } from "zod";
 import { fileURLToPath } from "url";
 import { execFile, spawn, spawnSync } from "child_process";
 import { promises as fs, readFileSync, rmSync, createWriteStream, mkdtempSync, writeFileSync } from "fs";
-import { homedir, tmpdir } from "os";
+import { homedir, tmpdir, cpus as osCpus, loadavg as osLoadavg } from "os";
 import { join, isAbsolute, resolve as resolvePath } from "path";
 import { promisify } from "util";
 import { AsyncLocalStorage } from "async_hooks";
@@ -72,6 +72,7 @@ import {
   deleteScriptFile,
 } from "./automation-store.js";
 import { decideReap } from "./bridge-reaper.js";
+import { ensureBroker } from "./broker-spawn.js";
 import {
   AtkOutput,
   atkStats,
@@ -408,6 +409,9 @@ process.on("SIGTERM", () => {
 // (SIGUSR1 is reserved by Node for the inspector.)
 if (process.platform !== "win32") {
   process.on("SIGUSR2", () => {
+    // A dormant worker is intentionally detached; it is alive and rejoins
+    // on its next tool call. Waking it here would only burn energy.
+    if (typeof workerDormant !== "undefined" && workerDormant) return;
     process.stderr.write(
       `[AutoDOM] SIGUSR2 received — re-running bridge election (role=${bridgeRole})\n`,
     );
@@ -449,10 +453,15 @@ const _launcherPid = Number.parseInt(
   process.env.AUTODOM_LAUNCHER_PID || "",
   10,
 );
+let _heartbeatTick = 0;
 const _heartbeatInterval = setInterval(() => {
   // A detached --bridge-only daemon is reparented to launchd/init by
   // design; it has no parent to outlive.
   if (BRIDGE_ONLY) return;
+  // Energy: while idle, probe the parent every 5th tick (~15s) instead of
+  // every 3s. Orphan detection stays bounded; wakeups drop by 80%.
+  _heartbeatTick++;
+  if (_heartbeatTick % 5 !== 0 && typeof isIdleProfile === "function" && isIdleProfile()) return;
   // Probe the *current* parent (which may have changed legitimately).
   // If we have no parent at all (PID 0) treat as orphan.
   const currentPpid = process.ppid;
@@ -870,7 +879,22 @@ const execFileAsync = promisify(execFile);
 // ─── State ───────────────────────────────────────────────────
 let extensionSocket = null;
 let pendingCalls = new Map(); // id → { resolve, reject, timer }
-let callIdCounter = 0;
+// Seed call ids from the wall clock so ids issued by a restarted broker
+// never collide with ids a previous broker left in flight in the extension
+// (Date.now()*1000 stays well below Number.MAX_SAFE_INTEGER).
+let callIdCounter = Date.now() * 1000;
+// Last real tool call (not keepalive/pong). Drives the idle energy profile
+// and worker dormancy.
+let lastToolCallAt = Date.now();
+function markToolCall() {
+  lastToolCallAt = Date.now();
+}
+const IDLE_PROFILE_AFTER_MS = Number(process.env.AUTODOM_IDLE_PROFILE_MS) || 60_000;
+function isIdleProfile() {
+  return Date.now() - lastToolCallAt >= IDLE_PROFILE_AFTER_MS;
+}
+const PING_MISS_LIMIT = 3;
+const IDLE_PING_EVERY = 4; // idle: ping every 60s instead of 15s
 let webSocketServer = null;
 let shutdownStarted = false;
 let toolCallLog = []; // Track recent tool calls for diagnostics
@@ -1222,20 +1246,36 @@ const proxyPeers = new Map();
 // Exit once neither the extension nor any proxy has been connected for
 // the inactivity window; the extension keepalive and proxy links keep us
 // alive otherwise.
-if (BRIDGE_ONLY && INACTIVITY_TIMEOUT_MS > 0) {
-  let _bridgeOnlyIdleSince = Date.now();
-  setInterval(() => {
-    if (extensionSocket || proxyPeers.size > 0) {
-      _bridgeOnlyIdleSince = Date.now();
-      return;
+// Broker lifetime:
+//   - no workers AND no extension (browser closed/offline) for
+//     BROKER_ORPHAN_EXIT_MS (2 min)              → exit
+//   - no workers (every MCP client quit or went dormant) for
+//     INACTIVITY_TIMEOUT_MS (10 min) even with the extension connected → exit
+// A worker's next tool call, or the extension's `ensure` request, starts a
+// fresh broker on demand, so exiting here only ever saves resources.
+const BROKER_ORPHAN_EXIT_MS =
+  Number(process.env.AUTODOM_BROKER_ORPHAN_EXIT_MS) || 120_000;
+// The orphan rule always applies (a broker with nothing attached is pure
+// waste); AUTODOM_INACTIVITY_TIMEOUT=0 only disables the 10-min rule.
+if (BRIDGE_ONLY) {
+  let _noWorkersSince = Date.now();
+  let _nothingSince = Date.now();
+  const _brokerIdleCheck = () => {
+    const now = Date.now();
+    if (proxyPeers.size > 0) _noWorkersSince = now;
+    if (proxyPeers.size > 0 || extensionSocket) _nothingSince = now;
+    let why = null;
+    if (now - _nothingSince >= BROKER_ORPHAN_EXIT_MS) {
+      why = `no workers and no extension for ${Math.round((now - _nothingSince) / 1000)}s`;
+    } else if (INACTIVITY_TIMEOUT_MS > 0 && now - _noWorkersSince >= INACTIVITY_TIMEOUT_MS) {
+      why = `no workers for ${Math.round((now - _noWorkersSince) / 60000)} min`;
     }
-    if (Date.now() - _bridgeOnlyIdleSince >= INACTIVITY_TIMEOUT_MS) {
-      process.stderr.write(
-        `[AutoDOM] --bridge-only: no extension or proxy for ${INACTIVITY_TIMEOUT_MS / 60000} min — exiting\n`,
-      );
+    if (why && !shutdownStarted) {
+      process.stderr.write(`[AutoDOM] broker: ${why} — exiting\n`);
       void shutdown(0);
     }
-  }, 30000).unref();
+  };
+  setInterval(_brokerIdleCheck, Math.min(30000, Math.max(1000, BROKER_ORPHAN_EXIT_MS / 4))).unref();
 }
 
 // The lock file is the only way a new instance learns the primary's auth
@@ -1244,8 +1284,11 @@ if (BRIDGE_ONLY && INACTIVITY_TIMEOUT_MS > 0) {
 // primary nobody can join, so every later instance degrades. The primary
 // re-asserts the file whenever it is missing or names someone else.
 const LOCK_REASSERT_MS = 5000;
+let _lockReassertTick = 0;
 setInterval(async () => {
   if (bridgeRole !== BRIDGE_ROLE.PRIMARY || shutdownStarted) return;
+  // Energy: idle → check every 30s instead of 5s.
+  if (++_lockReassertTick % 6 !== 0 && isIdleProfile()) return;
   try {
     const lock = await readLockFile();
     if (lock?.pid === process.pid && lock?.token === AUTH_TOKEN) return;
@@ -1286,6 +1329,10 @@ function collectBridgeStatus() {
     proxyConnected: !isPrimaryServer && _isProxyReady(),
     proxies: [...proxyPeers.values()],
     pendingCalls: pendingCalls.size,
+    brokerMode: BRIDGE_ONLY ? "broker" : BROKER_MODE ? "worker" : "legacy",
+    dormant: typeof workerDormant !== "undefined" ? workerDormant : false,
+    lanes: typeof _laneStats === "function" ? _laneStats() : undefined,
+    energyProfile: isIdleProfile() ? "idle" : "active",
     reconnectGraceMs: RECONNECT_GRACE_MS,
     toolTimeoutMs: TOOL_TIMEOUT,
     nodeVersion: process.version,
@@ -1626,10 +1673,29 @@ async function closeBridgeResources({ closeStdio }) {
   // wss.close() only stops accepting NEW connections — existing sockets
   // stay alive and keep the event loop running, creating zombies.
   if (webSocketServer) {
+    // Attached workers are NOT gone: their MCP clients are alive and will
+    // reattach (respawning a broker if needed). Mark their sockets so the
+    // close handlers do not send CLIENT_GONE and tear down their tab groups.
     for (const client of webSocketServer.clients) {
+      if (client !== extensionSocket) client._autodomDormant = true;
+    }
+    for (const client of webSocketServer.clients) {
+      if (client === extensionSocket) continue;
       try {
         client.terminate();
       } catch (_) {}
+    }
+    if (extensionSocket) {
+      const ext = extensionSocket;
+      try {
+        ext.close(1001, "server_shutdown");
+      } catch (_) {}
+      // Do not let a slow close handshake hold the shutdown.
+      setTimeout(() => {
+        try {
+          ext.terminate();
+        } catch (_) {}
+      }, 250).unref();
     }
     await new Promise((resolve) => webSocketServer.close(() => resolve()));
     webSocketServer = null;
@@ -2407,9 +2473,61 @@ async function tryBecomePrimary() {
 // tryRecoverSecondaryAsPrimary call each other with no attempt cap, which
 // could spin forever and — because the startup path awaited it — meant the
 // stdio transport was never attached and the client's `initialize` hung.
+// Broker mode (default): the WebSocket port is owned by a detached
+// `--bridge-only` broker, never by an MCP client's stdio process. Each stdio
+// process is a worker that attaches as a proxy. A client quitting therefore
+// never takes the port (and every other client's tools) down with it.
+// AUTODOM_BROKER=0 restores the legacy "first stdio process is primary".
+const BROKER_MODE = !BRIDGE_ONLY && process.env.AUTODOM_BROKER !== "0";
+
+// ── Worker dormancy ──────────────────────────────────────────
+// An MCP client with no tool calls for WORKER_IDLE_MS detaches from the
+// broker (stdio stays up, so the client never notices). The broker can then
+// exit when every client is dormant, and the next tool call reattaches —
+// spawning a fresh broker if needed — inside the normal bootstrap window.
+let workerDormant = false;
+const WORKER_IDLE_MS = Number(process.env.AUTODOM_WORKER_IDLE_MS) || 300_000;
+function maybeGoDormant() {
+  if (!BROKER_MODE || workerDormant || shutdownStarted) return;
+  if (isPrimaryServer || bridgeRole !== BRIDGE_ROLE.PROXY) return;
+  if (pendingCalls.size > 0) return;
+  if (Date.now() - lastToolCallAt < WORKER_IDLE_MS) return;
+  const ws = proxyClient;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  workerDormant = true;
+  try {
+    ws.send(JSON.stringify({ type: "CLIENT_IDLE", clientId: MY_CLIENT_ID }));
+  } catch (_) {}
+  // Let the CLIENT_IDLE frame flush before closing.
+  setTimeout(() => {
+    try {
+      ws.close(1000, "worker_dormant");
+    } catch (_) {}
+  }, 50).unref?.();
+  diagLog(`worker idle ${Math.round((Date.now() - lastToolCallAt) / 1000)}s — going dormant`);
+}
+if (BROKER_MODE) {
+  setInterval(maybeGoDormant, Math.max(1000, Math.min(60_000, WORKER_IDLE_MS / 5))).unref();
+}
+
+async function tryAcquireBridge() {
+  if (!BROKER_MODE) return tryBecomePrimary();
+  try {
+    const r = await ensureBroker({ indexJs: serverPath, port: WS_PORT });
+    if (r.ok) {
+      if (r.spawned) diagLog(`broker spawned pid=${r.pid} port=${WS_PORT}`);
+      return false; // attach as a worker (proxy)
+    }
+    diagLog(`broker unavailable (${r.reason}); falling back to in-process primary`);
+  } catch (err) {
+    diagLog(`broker spawn failed (${err?.message || err}); falling back to in-process primary`);
+  }
+  return tryBecomePrimary();
+}
+
 async function establishBridgeRole() {
   for (let round = 1; round <= MAX_ELECTION_ROUNDS; round++) {
-    if (await tryBecomePrimary()) return BRIDGE_ROLE.PRIMARY;
+    if (await tryAcquireBridge()) return BRIDGE_ROLE.PRIMARY;
 
     // Provisional: ensureProxyClientConnected()'s readiness helpers read
     // the role, and we are definitively not primary at this point.
@@ -2480,7 +2598,7 @@ function recoverBridge() {
       `[AutoDOM] Bridge link lost; re-running election (attempt ${recoveryAttempts}/${MAX_RECOVERY_ATTEMPTS}).\n`,
     );
     try {
-      if (await tryBecomePrimary()) {
+      if (await tryAcquireBridge()) {
         process.stderr.write(
           "[AutoDOM] Recovered as primary bridge.\n",
         );
@@ -2670,6 +2788,10 @@ async function ensureProxyClientConnected() {
           finish(false);
           return;
         }
+        if (workerDormant) {
+          diagLog("worker dormant: detached from broker (reattaches on next tool call)");
+          return;
+        }
         process.stderr.write(
           `[AutoDOM] Proxy client disconnected from primary server (code=${code}${suffix})\n`,
         );
@@ -2750,30 +2872,62 @@ function setupWssConnection(wss) {
     // Binary pings are ~50 bytes vs ~80+ bytes for JSON keepalive messages,
     // and they're handled at the protocol level without parsing overhead.
     // Inspired by Playwright's transport ping/pong mechanism.
-    let _wsAlive = true;
+    // Any inbound frame (pong or message) proves liveness. A single missed
+    // pong used to terminate the socket, which dropped healthy extensions
+    // whenever the MV3 service worker was briefly throttled. Tolerate
+    // PING_MISS_LIMIT consecutive misses before declaring the peer dead.
+    let _wsMissed = 0;
+    socket._autodomLastSeen = Date.now();
     const _pingInterval = setInterval(() => {
-      if (!_wsAlive) {
-        diagLog("WebSocket ping timeout — terminating stale connection");
+      if (_wsMissed >= PING_MISS_LIMIT) {
+        diagLog(
+          `WebSocket ping timeout (${_wsMissed} missed) — terminating stale connection`,
+        );
+        socket._autodomCloseReason = "ping_timeout";
         socket.terminate();
         return;
       }
-      _wsAlive = false;
+      // Energy: while idle, only ping every IDLE_PING_EVERY ticks unless a
+      // miss is already being counted.
+      if (_wsMissed === 0 && isIdleProfile()) {
+        socket._autodomIdleTick = (socket._autodomIdleTick || 0) + 1;
+        if (socket._autodomIdleTick % IDLE_PING_EVERY !== 0) return;
+      }
+      _wsMissed++;
       try {
         socket.ping();
       } catch (_) {}
-    }, 15000); // 15s ping interval (half the 30s inactivity check)
+    }, 15000);
+    _pingInterval.unref?.();
+    socket._autodomMarkAlive = () => {
+      _wsMissed = 0;
+      socket._autodomLastSeen = Date.now();
+    };
 
     socket.on("error", (error) => {
       diagLog(`WebSocket error: ${error.message}`);
     });
 
     socket.on("pong", () => {
-      _wsAlive = true;
+      socket._autodomMarkAlive();
       touchActivity();
     });
 
-    socket.on("close", () => {
+    socket.on("close", (code, reasonBuf) => {
       clearInterval(_pingInterval);
+      const _role =
+        socket === extensionSocket
+          ? "extension"
+          : proxyPeers.has(socket)
+            ? `client:${proxyPeers.get(socket)?.clientId || "?"}`
+            : "unknown";
+      const _reason =
+        socket._autodomCloseReason ||
+        (reasonBuf && reasonBuf.length ? reasonBuf.toString() : "") ||
+        "peer_closed";
+      diagLog(
+        `[close] socket=${_role} code=${code} reason=${_reason} idleFor=${Date.now() - (socket._autodomLastSeen || 0)}ms`,
+      );
       // A secondary IDE bridge went away: tell the extension so it can
       // close the tabs that session opened and restore the ones it borrowed.
       const gonePeer = proxyPeers.get(socket);
@@ -2784,7 +2938,7 @@ function setupWssConnection(wss) {
           _cancelProxiedCall(socket, secondaryId, "client_gone");
         }
       }
-      if (gonePeer?.clientId) notifyClientGone(gonePeer.clientId);
+      if (gonePeer?.clientId && !socket._autodomDormant) notifyClientGone(gonePeer.clientId);
       proxyPeers.delete(socket);
       if (socket === extensionSocket) {
         extensionSocket = null;
@@ -2794,6 +2948,7 @@ function setupWssConnection(wss) {
     });
 
     socket.on("message", (data) => {
+      socket._autodomMarkAlive();
       try {
         const raw = readWsJsonPayload(data);
         // Support batched messages: if the payload is a JSON array,
@@ -3562,13 +3717,82 @@ async function _routeViaIdeQueue({
   );
 }
 
+// ── Per-client lanes ─────────────────────────────────────────
+// Every attached worker (MCP client / chat) gets its own FIFO lane. When the
+// broker is saturated, lanes are served round-robin so one client firing a
+// burst of calls cannot starve another. The global in-flight cap adapts to
+// the machine: max(2, min(8, cpus)), halved while the 1-min load average
+// exceeds the core count.
+const _lanes = new Map(); // clientId -> Array<(release) => void>
+let _laneCursor = 0;
+let _lanesInflight = 0;
+const _LANE_CAP_OVERRIDE = Number(process.env.AUTODOM_MAX_INFLIGHT) || 0;
+function _laneGlobalCap() {
+  if (_LANE_CAP_OVERRIDE > 0) return _LANE_CAP_OVERRIDE;
+  const n = osCpus()?.length || 2;
+  let cap = Math.max(2, Math.min(8, n));
+  try {
+    if (osLoadavg()[0] > n) cap = Math.max(2, cap >> 1);
+  } catch (_) {}
+  return cap;
+}
+function _scheduleOnLane(clientId, start) {
+  const key = clientId || "proxy_unknown";
+  if (!_lanes.has(key)) _lanes.set(key, []);
+  _lanes.get(key).push(start);
+  _pumpLanes();
+}
+function _pumpLanes() {
+  while (_lanesInflight < _laneGlobalCap()) {
+    const keys = [..._lanes.keys()];
+    if (!keys.length) return;
+    _laneCursor = _laneCursor % keys.length;
+    const key = keys[_laneCursor];
+    _laneCursor++;
+    const q = _lanes.get(key);
+    const start = q.shift();
+    if (!q.length) _lanes.delete(key);
+    if (!start) continue;
+    _lanesInflight++;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      _lanesInflight--;
+      queueMicrotask(_pumpLanes);
+    };
+    try {
+      start(release);
+    } catch (_) {
+      release();
+    }
+  }
+}
+function _laneStats() {
+  const queued = {};
+  for (const [k, q] of _lanes) queued[k] = q.length;
+  return { inflight: _lanesInflight, cap: _laneGlobalCap(), queued };
+}
+
 // ── INTERNAL_PROXY_CALL ──────────────────────────────────────
 // A secondary IDE instance is sending a tool call; forward it to
 // the real Chrome extension and map the result back.
 function _handleInternalProxyCall(socket, message) {
+  _scheduleOnLane(message.clientId, (release) => {
+    // The worker may have gone while this call waited in its lane.
+    if (!socket || socket.readyState !== 1) {
+      release();
+      return;
+    }
+    _runInternalProxyCall(socket, message, release);
+  });
+}
+
+function _runInternalProxyCall(socket, message, release) {
   // Send a TOOL_RESULT back to the secondary, but only if its socket is
   // still open — it may have closed while we were waiting on the extension.
   const sendResult = (result) => {
+    release();
     if (!socket || socket.readyState !== 1) return;
     try {
       socket.send(
@@ -3620,13 +3844,17 @@ function _handleInternalProxyCall(socket, message) {
 
     // We hijack the ID to map it back
     const internalId = ++callIdCounter;
+    markToolCall();
     const timeoutMs =
       Number.isFinite(message.timeoutMs) && message.timeoutMs > 0
         ? message.timeoutMs
         : TOOL_TIMEOUT;
     if (!socket._proxyCalls) socket._proxyCalls = new Map();
     socket._proxyCalls.set(message.id, internalId);
-    const forget = () => socket._proxyCalls?.delete(message.id);
+    const forget = () => {
+      socket._proxyCalls?.delete(message.id);
+      release();
+    };
     pendingCalls.set(internalId, {
       resolve: (res) => {
         forget();
@@ -3645,6 +3873,7 @@ function _handleInternalProxyCall(socket, message) {
         });
       }, timeoutMs + PROXY_RELAY_GRACE_MS),
       proxySocket: socket,
+      release,
     });
 
     sendToExtensionImmediate({
@@ -3700,6 +3929,7 @@ function _cancelProxiedCall(socket, secondaryId, reason) {
   if (pending) {
     clearTimeout(pending.timer);
     pendingCalls.delete(internalId);
+    pending.release?.();
   }
   sendToolCancel(internalId, reason || "proxy_cancelled");
   return true;
@@ -3725,6 +3955,36 @@ function _handleToolResult(_socket, message) {
 function _handleKeepaliveOrPong(socket, message) {
   // Reset inactivity timer on keepalive — the extension is still alive
   touchActivity();
+  const instanceId =
+    typeof message.instanceId === "string" ? message.instanceId.slice(0, 80) : null;
+  // A different browser (or profile) trying to take over a port whose
+  // current browser is still alive: refuse instead of stealing the bridge
+  // from it. Same instance (service-worker restart) or a dead/legacy
+  // current socket still hands over as before.
+  if (
+    extensionSocket &&
+    extensionSocket !== socket &&
+    extensionSocket.readyState === 1 &&
+    instanceId &&
+    extensionSocket._autodomInstanceId &&
+    extensionSocket._autodomInstanceId !== instanceId &&
+    Date.now() - (extensionSocket._autodomLastSeen || 0) < 45_000
+  ) {
+    diagLog(
+      `refusing extension instance ${instanceId}: port ${WS_PORT} already used by ${extensionSocket._autodomInstanceId}`,
+    );
+    try {
+      socket.send(JSON.stringify({ type: "PORT_BUSY_OTHER_BROWSER", port: WS_PORT }));
+    } catch (_) {}
+    socket._autodomCloseReason = "port_busy_other_browser";
+    setTimeout(() => {
+      try {
+        socket.close(4002, "port_busy_other_browser");
+      } catch (_) {}
+    }, 100).unref?.();
+    return;
+  }
+  if (instanceId) socket._autodomInstanceId = instanceId;
   // Only identify as Chrome extension if we receive KEEPALIVE
   if (extensionSocket !== socket) {
     process.stderr.write("[AutoDOM] Chrome extension connected\n");
@@ -4392,6 +4652,15 @@ function _handleProxyHello(socket, message) {
   diagLog(`proxy peer registered pid=${pid} (total ${proxyPeers.size})`);
 }
 
+// ── CLIENT_IDLE ──────────────────────────────────────────────
+// A worker is going dormant (idle MCP client). Its socket is about to close,
+// but the client is alive and will reattach on its next tool call, so its
+// tab group must survive: suppress CLIENT_GONE for this close.
+function _handleClientIdle(socket) {
+  if (socket === extensionSocket) return;
+  socket._autodomDormant = true;
+}
+
 // ── BRIDGE_STATUS ────────────────────────────────────────────
 // Asked by the extension (bridge check) and the native-messaging helper.
 // Reachable only through verifyClient (extension origin or bearer token).
@@ -4466,6 +4735,7 @@ const _WS_MESSAGE_HANDLERS = Object.freeze({
   WORKFLOW_MIRROR: _handleWorkflowMirror,
   RUN_SCRIPT: _handleRunScript,
   PROXY_HELLO: _handleProxyHello,
+  CLIENT_IDLE: _handleClientIdle,
   BRIDGE_STATUS: _handleBridgeStatus,
   SELF_UPDATE: _handleSelfUpdate,
   AI_CHAT_ABORT: _handleAiChatAbort,
@@ -4621,6 +4891,11 @@ function callExtensionTool(tool, params, options = {}) {
     // Route through proxy if we are a secondary instance
     if (!isPrimaryServer) {
       (async () => {
+        if (workerDormant) {
+          workerDormant = false;
+          markToolCall();
+          diagLog(`worker waking for tool=${tool}`);
+        }
         let connected = await ensureProxyClientConnected();
         if (!connected) {
           // Wait briefly for an in-flight recovery (the proxy close handler
@@ -4648,6 +4923,7 @@ function callExtensionTool(tool, params, options = {}) {
           return;
         }
         const id = ++callIdCounter;
+        markToolCall();
         // Tell the primary to stop the call in the extension when we stop
         // waiting for it.
         const cancelOnPrimary = (reason) => {
@@ -4810,6 +5086,7 @@ function callExtensionTool(tool, params, options = {}) {
     }
 
     const id = ++callIdCounter;
+    markToolCall();
     const timer = setTimeout(() => {
       if (!pendingCalls.has(id)) return;
       pendingCalls.delete(id);

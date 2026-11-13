@@ -42,7 +42,7 @@ test("bridge whose launching parent is gone is killed", () => {
   assert.match(v.kill[0].reason, /orphan/);
 });
 
-test("live-parent instance not joined is nudged first, killed on the second pass", () => {
+test("live-parent instance not joined is nudged first, then kept (never killed)", () => {
   const snap = {
     bridges: [bridge(1), bridge(2)],
     locks: { 9876: { pid: 1, alive: true } },
@@ -52,9 +52,11 @@ test("live-parent instance not joined is nudged first, killed on the second pass
   assert.deepEqual(pids(first.nudge), [2]);
   assert.equal(first.kill.length, 0);
 
+  // Its MCP client is alive (idle, or mid-recovery): killing it would drop
+  // that chat's tools. It reattaches on its next tool call instead.
   const second = decideReap({ ...snap, nudged: [2] });
-  assert.deepEqual(pids(second.kill), [2]);
-  assert.match(second.kill[0].reason, /zombie/);
+  assert.equal(second.kill.length, 0);
+  assert.match(second.keep.find((k) => k.pid === 2).reason, /live client/);
 });
 
 test("nudged instance that joined in the meantime is kept", () => {
@@ -175,7 +177,7 @@ test("a lone unjoined bridge is still nudged (relay rule needs a child bridge)",
 
 test("legacy restart picks bridges that run old code and cannot restart themselves", () => {
   const v = decideLegacyRestart({
-    bridges: [bridge(1), bridge(2), bridge(3), bridge(4), bridge(5, { port: 9877 })],
+    bridges: [1, 2, 3, 4].map((p) => bridge(p, { parentAlive: false })).concat(bridge(5, { port: 9877, parentAlive: false })),
     versions: { 1: "5.3.0", 2: "5.2.2", 3: "5.4.0", 4: "5.4.1", 5: "5.3.0" },
     diskVersion: "5.4.1",
   });
@@ -216,7 +218,13 @@ test("legacy restart catches self-restarting primaries that are stuck", () => {
   const v = decideLegacyRestart({
     // 1: relay whose successor (10) is its child; 2: self-restart off;
     // 3: stale but healthy — restarts itself when idle; 4: reports supervising.
-    bridges: [bridge(1), bridge(10, { ppid: 1 }), bridge(2, { port: 9877 }), bridge(3, { port: 9878 }), bridge(4, { port: 9879 })],
+    bridges: [
+      bridge(1, { parentAlive: false }),
+      bridge(10, { ppid: 1 }),
+      bridge(2, { port: 9877, command: "node index.js --bridge-only --port 9877" }),
+      bridge(3, { port: 9878, parentAlive: false }),
+      bridge(4, { port: 9879, parentAlive: false }),
+    ],
     versions: { 1: "5.4.1", 10: "6.0.0", 2: "5.4.1", 3: "5.4.1", 4: "5.4.1" },
     statuses: {
       9876: st(1),
@@ -229,4 +237,17 @@ test("legacy restart catches self-restarting primaries that are stuck", () => {
   assert.deepEqual(pids(v), [1, 2, 4]);
   assert.match(v.find((e) => e.pid === 1).reason, /relay that kept the port/);
   assert.match(v.find((e) => e.pid === 2).reason, /self-restart off/);
+});
+
+test("legacy restart never stops a bridge whose MCP client is still running", () => {
+  const v = decideLegacyRestart({
+    bridges: [
+      bridge(1, { parentAlive: true }),
+      bridge(2, { parentAlive: false }),
+      bridge(3, { parentAlive: true, command: "node index.js --bridge-only" }),
+    ],
+    versions: { 1: "5.3.0", 2: "5.3.0", 3: "5.3.0" },
+    diskVersion: "5.4.1",
+  });
+  assert.deepEqual(pids(v), [2, 3]);
 });

@@ -46,10 +46,13 @@ function squatPort(port) {
   });
 }
 
-test("initialize is answered fast on a free port and elects primary", async () => {
+test("initialize is answered fast on a free port and attaches to a broker", async () => {
   const report = await selftest(["--port", String(FREE_PORT), "--timeout", "20000"]);
   assert.equal(report.ok, true, JSON.stringify(report.checks, null, 2));
-  assert.equal(report.role, "primary");
+  // Broker mode: the stdio process spawns a detached --bridge-only broker
+  // for the port and attaches to it as a worker (proxy). Legacy mode
+  // (AUTODOM_BROKER=0) still elects itself primary.
+  assert.ok(["proxy", "primary"].includes(report.role), `role=${report.role}`);
   assert.ok(
     report.initializeMs < 1000,
     `initialize took ${report.initializeMs}ms, expected <1000ms`,

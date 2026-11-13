@@ -3931,6 +3931,31 @@ async function _onWsConn_INACTIVITY_WARNING(message) {
     return;
 }
 
+// Another browser already owns this port's bridge. Stop retrying it and
+// point the user at a free port, so each browser gets its own broker.
+const _portBusyUntil = new Map(); // port -> epoch ms
+async function _onWsConn_PORT_BUSY_OTHER_BROWSER(message) {
+  const port = Number(message.port) || getCurrentPort();
+  _portBusyUntil.set(port, Date.now() + 5 * 60 * 1000);
+  let suggested = null;
+  for (const p of PORT_PROBE_RANGE) {
+    if (p === port) continue;
+    if (!(await _probeWsPort(p))) {
+      suggested = p;
+      break;
+    }
+  }
+  if (suggested) chrome.storage.local.set({ mcpDetectedPort: suggested });
+  broadcastStatus(
+    false,
+    `Port ${port} is already used by AutoDOM in another browser. ` +
+      (suggested
+        ? `Set this browser to port ${suggested} in the popup (and start your MCP client with --port ${suggested}).`
+        : "Pick a different port in the popup."),
+    "warn",
+  );
+}
+
 async function _onWsConn_SESSION_TIMEOUT(message) {
     _debugWarn("[AutoDOM] Server closed session:", message.message);
     const keepRetrying = autoConnectEnabled;
@@ -4282,7 +4307,7 @@ async function _runBridgeToolCall(message, entry) {
     else _isolationOptOut.delete(clientId);
   }
   if (Number.isFinite(message.isolationIdleMs)) {
-    _AutoDOMTabGroup()?.configure({ idleMs: message.isolationIdleMs });
+    _AutoDOMTabGroup()?.configure({ idleMs: message.isolationIdleMs, clientId });
   }
 
   // Synthetic pin_tab / unpin_tab / get_pinned_tab — handled
@@ -4704,6 +4729,7 @@ const _WS_CONN_MESSAGE_HANDLERS = Object.freeze({
   TOOL_LOGS_CLEARED: _onWsConn_TOOL_LOGS_CLEARED,
   INACTIVITY_WARNING: _onWsConn_INACTIVITY_WARNING,
   SESSION_TIMEOUT: _onWsConn_SESSION_TIMEOUT,
+  PORT_BUSY_OTHER_BROWSER: _onWsConn_PORT_BUSY_OTHER_BROWSER,
   TOOL_CALL: _onWsConn_TOOL_CALL,
   TOOL_CANCEL: _onWsConn_TOOL_CANCEL,
   CLIENT_GONE: _onWsConn_CLIENT_GONE,
@@ -4775,7 +4801,7 @@ function connectWebSocket(port) {
       // Send KEEPALIVE immediately so the bridge recognises us as the
       // Chrome extension right away, instead of waiting 20 s for the
       // first setInterval tick.
-      ws.send(JSON.stringify({ type: "KEEPALIVE" }));
+      ws.send(_keepaliveMsg());
       // Learn the bridge's pid/role/version for the Bridge check. Older
       // servers ignore the unknown type, leaving bridgeInfo null.
       bridgeInfo = null;
@@ -5002,7 +5028,27 @@ const KEEPALIVE_INTERVAL_MS = 20000;
 const RECONNECT_INITIAL_DELAY_MS = 750;
 const KEEPALIVE_TIMEOUT_MS = 10000; // If no pong within this time, disconnect
 
-const _KEEPALIVE_MSG = JSON.stringify({ type: "KEEPALIVE" });
+// Stable per-browser-profile id. A service-worker restart keeps it (same
+// storage); another browser or profile has its own. The broker uses it to
+// refuse a *different* browser that tries to take over a port another live
+// browser is already using, instead of silently stealing the bridge.
+let _autodomInstanceId = null;
+try {
+  chrome.storage.local.get("autodomInstanceId", (r) => {
+    if (r?.autodomInstanceId) {
+      _autodomInstanceId = r.autodomInstanceId;
+    } else {
+      _autodomInstanceId =
+        (globalThis.crypto?.randomUUID?.() || `inst_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+      chrome.storage.local.set({ autodomInstanceId: _autodomInstanceId });
+    }
+  });
+} catch (_) {}
+function _keepaliveMsg() {
+  return JSON.stringify(
+    _autodomInstanceId ? { type: "KEEPALIVE", instanceId: _autodomInstanceId } : { type: "KEEPALIVE" },
+  );
+}
 
 function startKeepAlive() {
   stopKeepAlive();
@@ -5013,13 +5059,15 @@ function startKeepAlive() {
       if (
         _lastPongTime > 0 &&
         Date.now() - _lastPongTime >
-          KEEPALIVE_INTERVAL_MS + KEEPALIVE_TIMEOUT_MS
+          KEEPALIVE_INTERVAL_MS * 2 + KEEPALIVE_TIMEOUT_MS
       ) {
+        // Two missed keepalive rounds: a single slow PONG (throttled
+        // service worker, busy server) used to drop a healthy bridge.
         _debugWarn("[AutoDOM] Server unresponsive, disconnecting...");
-        ws.close();
+        ws.close(4001, "pong_timeout");
         return;
       }
-      ws.send(_KEEPALIVE_MSG);
+      ws.send(_keepaliveMsg());
     }
   }, KEEPALIVE_INTERVAL_MS);
 }
@@ -11556,6 +11604,12 @@ function startAutoConnect(port, opts) {
   const initialDelayMs = Math.max(0, Number(opts?.initialDelayMs) || 0);
   const tryConnect = () => {
     if (!shouldRunMcp || isConnected || _sessionTimedOut) return;
+    // Another browser owns this port: back off for a while instead of
+    // hammering it (it may close later and free the port).
+    if (_portBusyUntil.get(nextPort) > Date.now()) {
+      autoConnectInterval = setTimeout(tryConnect, 60000);
+      return;
+    }
     _autoConnectAttempt++;
     // Only log every 6th attempt to reduce console spam
     if (_autoConnectAttempt === 1 || _autoConnectAttempt % 6 === 0) {
@@ -11564,6 +11618,7 @@ function startAutoConnect(port, opts) {
       );
     }
     connectWebSocket(nextPort);
+    _maybeEnsureBroker(nextPort, _autoConnectAttempt);
     // Exponential backoff: 3s, 6s, 12s, max 30s (or opts.maxDelayMs)
     const nextDelay = Math.min(
       3000 * Math.pow(2, _autoConnectAttempt - 1),
@@ -11576,6 +11631,25 @@ function startAutoConnect(port, opts) {
   } else {
     tryConnect();
   }
+}
+
+// After a few failed reconnects, ask the native helper to start a broker
+// for this port. `ensure` is spawn-only: it never stops or nudges another
+// client's server. Throttled so a browser left open with no MCP client does
+// not keep a broker alive around the clock (an idle broker exits by itself).
+const ENSURE_BROKER_AFTER_ATTEMPTS = 3;
+const ENSURE_BROKER_THROTTLE_MS = 15 * 60 * 1000;
+const _lastEnsureByPort = new Map();
+function _maybeEnsureBroker(port, attempt) {
+  if (attempt !== ENSURE_BROKER_AFTER_ATTEMPTS) return;
+  const last = _lastEnsureByPort.get(port) || 0;
+  if (Date.now() - last < ENSURE_BROKER_THROTTLE_MS) return;
+  _lastEnsureByPort.set(port, Date.now());
+  void _nativeHostRequest("ensure", { port }).then((res) => {
+    if (res?.ok && res.started) {
+      _debugLog(`[AutoDOM] Started broker pid=${res.started.pid} on port ${port}`);
+    }
+  });
 }
 
 function stopAutoConnect() {

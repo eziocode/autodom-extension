@@ -15,8 +15,9 @@
  *   kill  — bridges whose launching parent is gone (PPID 1 or dead parent).
  *   nudge — everything else: a live-parent instance that is neither the
  *           primary nor a joined proxy (e.g. DEGRADED after its recovery
- *           budget ran out). If it is still unjoined after the nudge
- *           (`nudged` contains its pid on the second pass), kill it.
+ *           budget ran out). A live-parent instance is NEVER killed: if it
+ *           is still unjoined after the nudge it is kept, because its MCP
+ *           client is alive and it reattaches on its next tool call.
  */
 
 export const DEFAULT_PORT = 9876;
@@ -141,7 +142,11 @@ export function decideReap({
       continue;
     }
     if (nudgedSet.has(b.pid)) {
-      kill.push({ ...entry, reason: "zombie (not joined to the primary after nudge)" });
+      // Its launching MCP client is still alive: that client may simply be
+      // idle (dormant worker, or recovering after the primary moved). Killing
+      // it would drop a live chat's tools, so a live-parent instance is never
+      // killed — it reattaches by itself on its next tool call.
+      keep.push({ ...entry, reason: "live client (unjoined after nudge; reattaches on demand)" });
       continue;
     }
     nudge.push({ ...entry, reason: "not primary and not a joined proxy" });
@@ -192,6 +197,11 @@ export function decideLegacyRestart({
   }
   const out = [];
   for (const b of bridges) {
+    // A bridge whose MCP client is still running is that client's lifeline:
+    // stopping it drops the chat's tools until the client restarts. Never
+    // force-upgrade those; only detached daemons (--bridge-only brokers) and
+    // orphans may be replaced.
+    if (b.parentAlive === true && !/--bridge-only/.test(b.command || "")) continue;
     const version = versions[b.pid];
     if (!version) continue; // unknown: never guess
     if (cmpVersion(version, diskVersion) >= 0) continue; // already current

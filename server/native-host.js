@@ -489,6 +489,13 @@ async function restart(port = DEFAULT_PORT, options = {}) {
   return { ...flushed, started: { pid, port, ready } };
 }
 
+async function ensure(port = DEFAULT_PORT) {
+  if (await isPortListening(port)) return { started: null, note: "port already served" };
+  const pid = await startBridgeOnly(port);
+  log(`ensure: started --bridge-only pid=${pid} port=${port}`);
+  return { started: { pid, port } };
+}
+
 async function status() {
   const snap = await scan();
   return summarize(snap, decideReap(snap));
@@ -505,6 +512,11 @@ async function handle(req) {
         return { ok: true, version: VERSION, ...(await status()) };
       case "flush":
         return { ok: true, version: VERSION, ...(await flush(port, { upgrade: req?.upgrade === true })) };
+      case "ensure":
+        // Spawn-only: start a broker when nothing serves the port. Never
+        // kills or nudges anything, so it is safe to call automatically
+        // from the extension's reconnect loop.
+        return { ok: true, version: VERSION, ...(await ensure(port || DEFAULT_PORT)) };
       case "restart":
         return {
           ok: true,

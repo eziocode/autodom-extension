@@ -16,7 +16,7 @@ const REAL = path.resolve(__dirname, "..");
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "autodom-fleet-"));
 const DIR = path.join(ROOT, "server");
 fs.mkdirSync(DIR);
-for (const f of ["index.js", "self-restart.js", "update-utils.js", "bridge-reaper.js", "native-host.js", "automation-store.js", "har-export.js", "viewer-app.js", "package.json"]) {
+for (const f of ["index.js", "self-restart.js", "update-utils.js", "bridge-reaper.js", "broker-spawn.js", "native-host.js", "automation-store.js", "har-export.js", "viewer-app.js", "package.json"]) {
   fs.copyFileSync(path.join(REAL, f), path.join(DIR, f));
 }
 fs.cpSync(path.join(REAL, "atk"), path.join(DIR, "atk"), { recursive: true });
@@ -34,7 +34,7 @@ const clients = [];
 function ide(name) {
   const proc = cp.spawn("node", [path.join(DIR, "index.js"), "--port", String(PORT)], {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, AUTODOM_INACTIVITY_TIMEOUT: "0", AUTODOM_RESTART_IDLE_MS: "200" },
+    env: { ...process.env, AUTODOM_INACTIVITY_TIMEOUT: "0", AUTODOM_RESTART_IDLE_MS: "200", AUTODOM_BROKER: "0" },
   });
   const c = { name, proc, waiters: new Map(), nextId: 1, buf: "", err: [] };
   proc.stderr.on("data", (d) => c.err.push(String(d)));
