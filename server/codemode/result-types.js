@@ -35,7 +35,8 @@ export const RESULT_TYPES = {
   click_by_index: `{ success: true; index: number; tag: string; text: string; cached: boolean; ${PAGE_CHANGES_FIELD} }`,
   type_by_index: `{ success: true; index: number; tag: string; value: string; cached: boolean; ${PAGE_CHANGES_FIELD} }`,
   take_screenshot: `{ /** Pass to emitImage() to attach the image to the run_code result. */ imageRef: string;
-    images: Array<{ imageRef: string; mimeType: string }>; /** Size and scale note */ text?: string }`,
+    images: Array<{ imageRef: string; mimeType: string }>;
+    /** Size, scale and page origin; the @eN legend with annotate, the diff with diff/saveBaseline */ text?: string }`,
   list_tabs: `{
     tabs: Array<{ id: number; listIndex: number; index: number; title: string; url: string; active: boolean;
       status: string; windowId: number; groupId?: number; autodomOwned?: boolean; autodomAdopted?: boolean }>;

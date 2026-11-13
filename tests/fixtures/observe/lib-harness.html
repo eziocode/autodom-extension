@@ -154,6 +154,18 @@
       r = P._pageWfObserveCollect(true);
       check("new invalid field is reported with its message", r.changes.validation?.[0]?.message === "Enter a valid email" && /^@e\d+$/.test(r.changes.validation[0].ref), r);
 
+      // ── marks for annotated screenshots ──
+      r = P._pageWfMark(5, null, { byRef: true });
+      const layer = document.getElementById("__autodom_wf_marks");
+      const labels = [...(layer?.querySelectorAll("span") || [])].map((x) => x.textContent);
+      check(
+        "annotate labels boxes with @eN refs that act on the element",
+        r.ok && r.marks.length > 0 && r.marks.length <= 5 && labels.every((l, i) => l === r.marks[i].ref && /^e\d+$/.test(l)),
+        { r, labels },
+      );
+      P._pageWfClearMarks();
+      check("marks are removed after the capture", !document.getElementById("__autodom_wf_marks"));
+
       // ── same-document URL change ──
       P._pageWfObserveArm();
       history.pushState({}, "", "#saved");

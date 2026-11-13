@@ -8488,10 +8488,8 @@ const PLAYWRIGHT_COMPAT_TOOLS = [
     name: "browser_take_screenshot",
     description: "Capture a screenshot of the current page.",
     parameters: z.object({
-      // Accepted for Playwright compatibility; the capture is the viewport
-      // until full-page and element screenshots land.
-      fullPage: z.boolean().optional().describe("Not implemented yet: the viewport is captured"),
-      selector: PLAYWRIGHT_TARGET_PARAM.describe("Not implemented yet: the viewport is captured"),
+      fullPage: z.boolean().optional().describe("Capture the whole scrollable page"),
+      selector: PLAYWRIGHT_TARGET_PARAM,
       format: z.string().optional().describe("Image format, usually png or jpeg"),
     }),
   },
@@ -8620,16 +8618,23 @@ function _imageBlock(dataUrl, fallbackMime = "image/jpeg") {
   return { type: "image", data: dataUrl.slice(m ? m[0].length : 0), mimeType: m ? m[1] : fallbackMime };
 }
 
-// An image content block plus a one-line size/scale note.
+// An image content block plus a text block: size, where the image sits on
+// the page, and the mark legend / diff when asked for.
 function screenshotToolResult(result, params = {}) {
   if (!result?.screenshot) return stringifyToolResult(result);
   const content = [_imageBlock(result.screenshot, `image/${params.format || "jpeg"}`)];
+  const lines = [];
   if (result.width && result.viewport) {
-    content.push({
-      type: "text",
-      text: `${result.width}x${result.height} image; viewport ${result.viewport.width}x${result.viewport.height} CSS px; scale ${result.scale} image px per CSS px`,
-    });
+    const what = result.fullPage ? "full page" : result.clip ? "element" : "viewport";
+    lines.push(
+      `${result.width}x${result.height} image of the ${what}; scale ${result.scale} image px per CSS px; top-left at page (${result.origin?.x}, ${result.origin?.y}). ` +
+        'click_at_coordinates {x, y, from:"screenshot"} takes image pixels directly.',
+    );
   }
+  if (result.truncated) lines.push(`Page is ${result.pageHeight}px tall; the image stops at 12000px.`);
+  if (result.legend?.length) lines.push("Marked elements (click {ref}):", ...result.legend);
+  if (result.diff) lines.push(`diff: ${JSON.stringify(result.diff)}`);
+  if (lines.length) content.push({ type: "text", text: lines.join("\n") });
   return { content };
 }
 
@@ -9343,7 +9348,7 @@ server.addTool({
 server.addTool({
   name: "take_screenshot",
   description:
-    "Screenshot of the viewport, sized to CSS pixels (= click_at_coordinates x/y) and capped at 1568px long side / ~1.2 MP; reply states size and scale (divide coordinates by scale when capped). Prefer take_snapshot for finding elements.",
+    "Screenshot of the viewport, the full page, or one element, sized to CSS pixels and capped at 1568px long side / ~1.2 MP (full page: 4 MP). annotate:true draws each interactive element's @eN ref on the image and lists them, so you can click {ref} what you see. diff/saveBaseline compare with an earlier shot and return changed regions. Prefer take_snapshot for finding elements.",
   parameters: z.object({
     format: z
       .enum(["png", "jpeg", "webp"])
@@ -9362,6 +9367,17 @@ server.addTool({
       .boolean()
       .optional()
       .describe("Return device pixels with no downscaling (large; only for pixel-exact checks)"),
+    fullPage: z.boolean().optional().describe("Whole scrollable page (needs the DevTools protocol; up to 12000 CSS px tall)"),
+    ref: z.string().optional().describe('Only this element, e.g. "@e12" from take_snapshot'),
+    selector: z.string().optional().describe("Only the element matching this CSS selector"),
+    index: z.number().optional().describe("Only this element index from get_dom_state"),
+    annotate: z.boolean().optional().describe("Draw @eN refs on interactive elements in view and list them"),
+    maxMarks: z.number().optional().describe("Most elements to mark with annotate (default 60, max 150)"),
+    saveBaseline: z.string().optional().describe("Keep this shot under a name for a later diff"),
+    diff: z
+      .union([z.boolean(), z.string()])
+      .optional()
+      .describe('Compare with a saved baseline (name), or true for the previous diff/saveBaseline shot; returns changed regions in page CSS px'),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("take_screenshot", params);
@@ -9754,7 +9770,7 @@ server.addTool({
       })
       .optional(),
     includeBodies: z.boolean().optional().describe("Save text response bodies (default true)"),
-    maxBodyBytes: z.number().optional().describe("Longer bodies are truncated to this size (default 262144)"),
+    maxBodyBytes: z.number().optional().describe("Stored response body byte limit (default 262144, capped at 1048576); longer bodies are truncated"),
     includeSensitive: z.boolean().optional().describe("Keep Authorization/Cookie headers, tokens and password fields unredacted (default false)"),
     redact: z
       .object({
@@ -9768,7 +9784,7 @@ server.addTool({
 
 server.addTool({
   name: "har_status",
-  description: "Progress of a HAR recording: entries, in-flight requests, test-case segments, redactions, and the latest requests.",
+  description: "Progress of a HAR recording: entries, in-flight requests, segments, redactions, skipped bodies, memory budget counters, and the latest requests.",
   parameters: z.object({ tabId: HAR_TAB_PARAM }),
   execute: async (params) => stringifyToolResult(await callExtensionTool("har_status", params)),
 });
@@ -11465,9 +11481,9 @@ server.addTool({
 server.addTool({
   name: "click_at_coordinates",
   description:
-    "Click at absolute viewport (x, y) pixel coordinates. " +
-    "Use for canvas, map UIs, datepickers, or visual targets with no CSS selector. " +
-    "Combine with get_bounding_box to derive coordinates from an element.",
+    "Click at (x, y): viewport CSS px, or with from:\"screenshot\" pixels of the last take_screenshot of this tab (scrolls there if needed). " +
+    "Use for canvas, maps, charts and other targets with no element. trusted:true sends real input events over the DevTools protocol (isTrusted, hover, focus); " +
+    "it is the default when the tab already has a debugger session.",
   parameters: z.object({
     observe: OBSERVE_PARAM,
     x: z.number().describe("Viewport X coordinate (pixels from left)"),
@@ -11482,6 +11498,8 @@ server.addTool({
       .optional()
       .default(false)
       .describe("Double-click instead of single"),
+    from: z.enum(["viewport", "screenshot"]).optional().describe("What x/y refer to (default viewport)"),
+    trusted: z.boolean().optional().describe("Real input events over the DevTools protocol (shows Chrome's debugging bar)"),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("click_at_coordinates", params);

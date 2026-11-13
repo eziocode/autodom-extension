@@ -568,7 +568,11 @@
       if (old) old.remove();
       return { ok: true };
     };
-    const markCandidates = (limit, nearBbox) => {
+    // byRef labels each box with its @eN ref (annotated screenshots), so a
+    // model can act on what it sees with click {ref}.
+    const markCandidates = (limit, nearBbox, opts) => {
+      const byRef = !!(opts && opts.byRef);
+      const max = byRef ? Math.max(1, Math.min(150, Number(limit) || 60)) : 60;
       clearMarks();
       if (nearBbox && Number.isFinite(nearBbox.y)) {
         const top = Math.max(0, nearBbox.y - innerHeight / 2);
@@ -584,15 +588,17 @@
         const r = el.getBoundingClientRect();
         if (r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth) continue;
         const n = marks.length + 1;
+        const ref = refOf(el);
         const box = document.createElement("div");
         box.style.cssText = "position:fixed;border:2px solid #e11d48;box-sizing:border-box;left:" + r.left + "px;top:" + r.top + "px;width:" + r.width + "px;height:" + r.height + "px;";
         const tag = document.createElement("span");
-        tag.textContent = String(n);
-        tag.style.cssText = "position:absolute;left:-2px;top:-14px;background:#e11d48;color:#fff;font:700 11px/12px system-ui,sans-serif;padding:0 3px;border-radius:2px;";
+        tag.textContent = byRef ? ref : String(n);
+        // Inside the box when there is no room above it.
+        tag.style.cssText = "position:absolute;left:-2px;top:" + (r.top < 14 ? "0" : "-14px") + ";background:#e11d48;color:#fff;font:700 11px/12px system-ui,sans-serif;padding:0 3px;border-radius:2px;";
         box.appendChild(tag);
         layer.appendChild(box);
-        marks.push({ n, ref: refOf(el), ...describe(el, { light: true }) });
-        if (marks.length >= 60) break;
+        marks.push({ n, ref, ...describe(el, { light: true }) });
+        if (marks.length >= max) break;
       }
       document.documentElement.appendChild(layer);
       return { ok: true, marks, viewport: { w: innerWidth, h: innerHeight } };
@@ -1155,9 +1161,9 @@
     const L = globalThis.__autodomWfLib;
     return L && L.v === 6 ? L.resolveOnly(step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
-  function _pageWfMark(limit, nearBbox) {
+  function _pageWfMark(limit, nearBbox, opts) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? L.markCandidates(limit, nearBbox) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 6 ? L.markCandidates(limit, nearBbox, opts) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfClearMarks() {
     const L = globalThis.__autodomWfLib;

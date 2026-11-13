@@ -7987,10 +7987,16 @@ function _withWindowCapture(windowId, fn) {
 const SCREENSHOT_MAX_EDGE = 1568;
 const SCREENSHOT_MAX_PIXELS = 1_200_000;
 
-function _screenshotTargetSize(vp, params) {
+// Full-page shots get more pixels (a long page at the viewport cap would be
+// unreadable) and stop at FULL_PAGE_MAX_CSS_HEIGHT.
+const FULL_PAGE_MAX_PIXELS = 4_000_000;
+const FULL_PAGE_MAX_EDGE = 8000;
+const FULL_PAGE_MAX_CSS_HEIGHT = 12000;
+
+function _screenshotTargetSize(vp, params, maxPixels = SCREENSHOT_MAX_PIXELS, maxEdge = SCREENSHOT_MAX_EDGE) {
   if (!vp || !(vp.width > 0) || !(vp.height > 0)) return null;
-  let s = Math.min(1, SCREENSHOT_MAX_EDGE / Math.max(vp.width, vp.height));
-  s = Math.min(s, Math.sqrt(SCREENSHOT_MAX_PIXELS / (vp.width * vp.height)));
+  let s = Math.min(1, maxEdge / Math.max(vp.width, vp.height));
+  s = Math.min(s, Math.sqrt(maxPixels / (vp.width * vp.height)));
   const maxWidth = Number(params?.maxWidth);
   if (maxWidth > 0) s = Math.min(s, maxWidth / vp.width);
   return {
@@ -8071,7 +8077,11 @@ async function _resizeDataUrl(dataUrl, target, params, crop) {
 
 // clip (optional): { x, y, width, height, scale } in CSS px for
 // Page.captureScreenshot, so CDP renders the image at the target size.
-async function _captureBackgroundTab(tab, params, clip) {
+// beyondViewport: render outside the viewport (full page), CDP only.
+// Resolves to the data URL; with detail, to { dataUrl, clipped } where
+// clipped is false when the CDP capture failed and the brief-activation
+// fallback photographed the whole viewport.
+async function _captureBackgroundTab(tab, params, clip, { beyondViewport = false, detail = false } = {}) {
   const format = _shotFormat(params);
   const jpeg = format === "jpeg";
   try {
@@ -8085,7 +8095,7 @@ async function _captureBackgroundTab(tab, params, clip) {
           format,
           ...(format !== "png" && { quality: _shotQuality(params) }),
           fromSurface: true,
-          captureBeyondViewport: false,
+          captureBeyondViewport: beyondViewport,
           ...(clip && { clip }),
         },
       ),
@@ -8097,12 +8107,14 @@ async function _captureBackgroundTab(tab, params, clip) {
       }),
     ]).finally(() => clearTimeout(timer));
     if (res?.data) {
-      return `data:image/${format};base64,${res.data}`;
+      const dataUrl = `data:image/${format};base64,${res.data}`;
+      return detail ? { dataUrl, clipped: !!clip } : dataUrl;
     }
   } catch (_) {
     // fall through to the brief-activation capture
   }
-  return _withWindowCapture(tab.windowId, async () => {
+  if (beyondViewport) return null;
+  const viewportShot = _withWindowCapture(tab.windowId, async () => {
     const [previous] = await chrome.tabs.query({
       active: true,
       windowId: tab.windowId,
@@ -8120,6 +8132,7 @@ async function _captureBackgroundTab(tab, params, clip) {
       }
     }
   });
+  return detail ? { dataUrl: await viewportShot, clipped: false } : viewportShot;
 }
 
 async function toolScreenshot(params, ctx) {
@@ -8149,13 +8162,30 @@ async function toolScreenshot(params, ctx) {
   // viewport is null too) and the page's viewport. When hiding changed
   // something it also waits, in the page, for two animation frames (60 ms
   // fallback for throttled background tabs) so the change is painted.
-  async function setHiddenState(hidden) {
+  // spec (when hiding): { fullPage, ref, selector, index } — also measures
+  // the document or the element to clip to, in the same injection.
+  async function setHiddenState(hidden, spec = null) {
     try {
       const res = await chrome.scripting.executeScript({
         target: { tabId: tab.id, allFrames: false },
         world: "MAIN",
-        args: [HIDE_IDS, HIDE_MARK, PUSH_CLASS, PUSH_MARK, hidden],
-        func: async (ids, mark, pushClass, pushMark, on) => {
+        args: [HIDE_IDS, HIDE_MARK, PUSH_CLASS, PUSH_MARK, hidden, spec],
+        func: async (ids, mark, pushClass, pushMark, on, spec) => {
+          // Two animation frames (60 ms fallback for throttled background
+          // tabs): captures snapshot the current paint.
+          const painted = () =>
+            new Promise((resolve) => {
+              let done = false;
+              const finish = () => {
+                if (done) return;
+                done = true;
+                resolve();
+              };
+              try {
+                requestAnimationFrame(() => requestAnimationFrame(finish));
+              } catch (_) {}
+              setTimeout(finish, 60);
+            });
           let changed = 0;
           for (const id of ids) {
             const el = document.getElementById(id);
@@ -8234,25 +8264,50 @@ async function toolScreenshot(params, ctx) {
               }
             }
           }
-          if (on && changed > 0) {
-            // captureVisibleTab snapshots the current paint: let the
-            // reflow + display:none land first.
-            await new Promise((resolve) => {
-              let done = false;
-              const finish = () => {
-                if (done) return;
-                done = true;
-                resolve();
-              };
+          if (on && changed > 0) await painted();
+          let doc = null;
+          let clip = null;
+          if (on && spec?.fullPage) {
+            const se = document.scrollingElement || document.documentElement;
+            doc = { width: Math.max(se.scrollWidth, innerWidth), height: Math.max(se.scrollHeight, innerHeight) };
+          }
+          if (on && (spec?.ref || spec?.selector || spec?.index != null)) {
+            let el = null;
+            if (spec.ref) el = document.querySelector(`[data-autodom-ref="${spec.ref}"]`);
+            else if (spec.index != null) el = (window.__autodomIndexedElements || [])[spec.index] || null;
+            else {
               try {
-                requestAnimationFrame(() => requestAnimationFrame(finish));
-              } catch (_) {}
-              setTimeout(finish, 60);
-            });
+                el = document.querySelector(spec.selector);
+              } catch (_) {
+                return { changed, error: `Invalid selector: ${spec.selector}` };
+              }
+            }
+            if (!el || !el.isConnected) {
+              clip = { missing: true };
+            } else {
+              let r = el.getBoundingClientRect();
+              if (r.top < 0 || r.left < 0 || r.bottom > innerHeight || r.right > innerWidth) {
+                el.scrollIntoView({ block: "center", inline: "center" });
+                await painted();
+                r = el.getBoundingClientRect();
+              }
+              // A little context around the element, kept inside the viewport.
+              const pad = 8;
+              const x = Math.max(0, Math.floor(r.left - pad));
+              const y = Math.max(0, Math.floor(r.top - pad));
+              clip = {
+                x,
+                y,
+                width: Math.max(1, Math.min(innerWidth, Math.ceil(r.right + pad)) - x),
+                height: Math.max(1, Math.min(innerHeight, Math.ceil(r.bottom + pad)) - y),
+              };
+            }
           }
           // The viewport after our UI was hidden: the capture is sized to it.
           return {
             changed,
+            doc,
+            clip,
             viewport: {
               width: window.innerWidth,
               height: window.innerHeight,
@@ -8270,27 +8325,71 @@ async function toolScreenshot(params, ctx) {
     }
   }
 
+  const P = globalThis.AutoDOMWorkflow?._page;
+  const refMatch = /^@?(e\d+)$/.exec(String(params?.ref || "").trim());
+  const spec = {
+    fullPage: params?.fullPage === true,
+    ...(refMatch && { ref: refMatch[1] }),
+    ...(!refMatch && params?.selector && { selector: String(params.selector) }),
+    ...(!refMatch && !params?.selector && params?.index != null && { index: Number(params.index) }),
+  };
+  const clipping = !!(spec.ref || spec.selector || spec.index != null);
+  if (spec.fullPage && clipping) return { error: "Pass fullPage or an element (ref/selector/index), not both." };
+
   let hidden = false;
+  let marked = false;
   try {
+    // Boxes labelled with @eN refs, drawn before the capture and removed after.
+    let legend = null;
+    if (params?.annotate === true && P) {
+      const marks = await _callWfPage(tab.id, P._pageWfMark, [params?.maxMarks ?? 60, null, { byRef: true }]).catch(() => null);
+      marked = !!marks?.ok;
+      if (marked) legend = (marks.marks || []).map(globalThis.AutoDOMWorkflow.compactLine);
+    }
     // Nothing of ours on the page → no paint to wait for, nothing to restore.
-    const state = await setHiddenState(true);
+    const state = await setHiddenState(true, spec);
     hidden = state.changed > 0;
+    if (state.error) return { error: state.error };
     const vp = state.viewport;
-    const target = params?.fullResolution === true ? null : _screenshotTargetSize(vp, params);
+    if (clipping && (!state.clip || state.clip.missing)) {
+      return { error: `Element not found for the screenshot: ${params.ref || params.selector || `index ${params.index}`}` };
+    }
+
+    // What the image covers, in document CSS px.
+    let area = vp && { x: vp.scrollX, y: vp.scrollY, width: vp.width, height: vp.height };
+    let truncated = false;
+    if (spec.fullPage && state.doc) {
+      truncated = state.doc.height > FULL_PAGE_MAX_CSS_HEIGHT;
+      area = { x: 0, y: 0, width: state.doc.width, height: Math.min(state.doc.height, FULL_PAGE_MAX_CSS_HEIGHT) };
+    } else if (clipping && vp) {
+      area = { x: vp.scrollX + state.clip.x, y: vp.scrollY + state.clip.y, width: state.clip.width, height: state.clip.height };
+    }
+    const target =
+      params?.fullResolution === true
+        ? null
+        : spec.fullPage
+          ? _screenshotTargetSize(area, params, FULL_PAGE_MAX_PIXELS, FULL_PAGE_MAX_EDGE)
+          : _screenshotTargetSize(area, params);
+    const cdpClip = area && {
+      ...area,
+      scale: target ? target.width / (area.width * vp.dpr) : 1,
+    };
 
     let dataUrl = null;
-    if (_isolatedClientId(ctx) && !tab.active) {
+    let cdpClipped = false;
+    if (spec.fullPage) {
+      dataUrl = await _captureBackgroundTab(tab, params, cdpClip, { beyondViewport: true });
+      if (!dataUrl) {
+        return { error: "Full-page screenshots need the Chrome DevTools protocol, which could not attach to this tab (DevTools open, or not Chrome/Edge)." };
+      }
+    } else if (_isolatedClientId(ctx) && !tab.active) {
       // The agent's tab sits in the background (we never activate it), so
       // captureVisibleTab would photograph whatever the user is viewing.
-      const clip = target && {
-        x: vp.scrollX,
-        y: vp.scrollY,
-        width: vp.width,
-        height: vp.height,
-        scale: target.width / (vp.width * vp.dpr),
-      };
-      dataUrl = await _captureBackgroundTab(tab, params, clip);
+      const shot = await _captureBackgroundTab(tab, params, target || clipping ? cdpClip : null, { detail: true });
+      dataUrl = shot.dataUrl;
+      cdpClipped = shot.clipped;
     }
+    let cropped = clipping && cdpClipped;
     if (!dataUrl) {
       const format = _shotFormat(params);
       dataUrl = await _withWindowCapture(tab.windowId, () =>
@@ -8302,8 +8401,23 @@ async function toolScreenshot(params, ctx) {
       );
     }
     let size = _imageSize(dataUrl);
+    if (clipping && !cropped && size && vp) {
+      // A viewport capture: cut the element out (device px), then size it.
+      const k = size.width / vp.width;
+      const crop = {
+        x: Math.round(state.clip.x * k),
+        y: Math.round(state.clip.y * k),
+        width: Math.max(1, Math.round(state.clip.width * k)),
+        height: Math.max(1, Math.round(state.clip.height * k)),
+      };
+      const out = await _resizeDataUrl(dataUrl, target || { width: crop.width, height: crop.height }, params, crop);
+      if (!out) return { error: "Could not crop the screenshot to the element in this browser." };
+      dataUrl = out;
+      size = _imageSize(dataUrl) || size;
+      cropped = true;
+    }
     const wantType = `image/${_shotFormat(params)}`;
-    const needsResize = target && size && size.width > target.width + 1;
+    const needsResize = !cropped && target && size && size.width > target.width + 1;
     if (needsResize || !dataUrl.startsWith(`data:${wantType};`)) {
       const resized = await _resizeDataUrl(dataUrl, needsResize ? target : size, params);
       if (resized) {
@@ -8311,22 +8425,156 @@ async function toolScreenshot(params, ctx) {
         size = _imageSize(dataUrl) || size;
       }
     }
+
+    // Image px per CSS px, and where the image's top-left is on the page:
+    // page CSS x = origin.x + image x / scale.
+    const scale = size && area ? Math.round((size.width / area.width) * 1000) / 1000 : null;
+    if (scale && area) _lastShotGeometry.set(tab.id, { originX: area.x, originY: area.y, scale });
+
+    let diff = null;
+    if ((params?.diff || params?.saveBaseline) && area) {
+      const grid = await _lumaGrid(dataUrl);
+      if (grid) {
+        const shot = { ...grid, area };
+        if (params?.diff) diff = _compareToBaseline(tab.id, params.diff === true ? "last" : String(params.diff), shot);
+        _saveBaseline(tab.id, "last", shot);
+        if (params?.saveBaseline) _saveBaseline(tab.id, String(params.saveBaseline), shot);
+      } else if (params?.diff) {
+        diff = { error: "Image comparison is not available in this browser." };
+      }
+    }
+
     return {
       success: true,
       screenshot: dataUrl,
       ...(size && { width: size.width, height: size.height }),
       ...(vp && {
         viewport: { width: vp.width, height: vp.height, devicePixelRatio: vp.dpr },
-        // Image pixels per CSS pixel: divide image coordinates by this to get
-        // the x/y that click_at_coordinates takes.
-        ...(size && { scale: Math.round((size.width / vp.width) * 1000) / 1000 }),
+        // Divide image coordinates by scale (and add origin) to get page
+        // CSS px; click_at_coordinates {from:"screenshot"} does it for you.
+        ...(scale && { scale }),
+        origin: { x: Math.round(area.x), y: Math.round(area.y) },
       }),
+      ...(spec.fullPage && { fullPage: true, ...(truncated && { truncated: true, pageHeight: state.doc.height }) }),
+      ...(clipping && { clip: { x: Math.round(area.x), y: Math.round(area.y), width: area.width, height: area.height } }),
+      ...(legend && { legend }),
+      ...(diff && { diff }),
     };
   } catch (err) {
     return { error: `Screenshot failed: ${err.message}` };
   } finally {
     if (hidden) await setHiddenState(false);
+    if (marked) await _callWfPage(tab.id, P._pageWfClearMarks, []).catch(() => {});
   }
+}
+
+// ─── Screenshot geometry and visual diff ────────────────────
+const _lastShotGeometry = new Map(); // tabId → { originX, originY, scale }
+const _shotBaselines = new Map(); // `${tabId}|${name}` → { luma, cols, rows, area }
+const SHOT_GRID_COLS = 64;
+const SHOT_DIFF_THRESHOLD = 18; // mean luma change (0-255) that marks a cell changed
+const SHOT_MAX_BASELINES = 20;
+chrome.tabs?.onRemoved?.addListener?.((tabId) => {
+  _lastShotGeometry.delete(tabId);
+  for (const key of [..._shotBaselines.keys()]) if (key.startsWith(`${tabId}|`)) _shotBaselines.delete(key);
+});
+
+// The image as a small grid of luma values (the browser averages each
+// cell while scaling down).
+async function _lumaGrid(dataUrl) {
+  if (typeof OffscreenCanvas !== "function" || typeof createImageBitmap !== "function") return null;
+  try {
+    const size = _imageSize(dataUrl);
+    if (!size) return null;
+    const cols = SHOT_GRID_COLS;
+    const rows = Math.max(1, Math.min(512, Math.round((cols * size.height) / size.width)));
+    const blob = await (await fetch(dataUrl)).blob();
+    const bitmap = await createImageBitmap(blob, { resizeWidth: cols, resizeHeight: rows, resizeQuality: "medium" });
+    const canvas = new OffscreenCanvas(cols, rows);
+    const g = canvas.getContext("2d");
+    g.drawImage(bitmap, 0, 0);
+    bitmap.close?.();
+    const px = g.getImageData(0, 0, cols, rows).data;
+    const luma = new Uint8Array(cols * rows);
+    for (let i = 0; i < luma.length; i++) luma[i] = (px[i * 4] * 77 + px[i * 4 + 1] * 150 + px[i * 4 + 2] * 29) >> 8;
+    return { luma, cols, rows };
+  } catch (_) {
+    return null;
+  }
+}
+
+// Changed cells of two same-size grids, merged into connected regions
+// (largest first). Pure, so it is unit-tested.
+function _gridDiff(a, b, cols, rows, threshold = SHOT_DIFF_THRESHOLD) {
+  const changed = new Uint8Array(cols * rows);
+  let count = 0;
+  for (let i = 0; i < changed.length; i++) {
+    if (Math.abs(a[i] - b[i]) >= threshold) {
+      changed[i] = 1;
+      count += 1;
+    }
+  }
+  const regions = [];
+  const seen = new Uint8Array(changed.length);
+  for (let start = 0; start < changed.length; start++) {
+    if (!changed[start] || seen[start]) continue;
+    let c0 = cols, r0 = rows, c1 = -1, r1 = -1, cells = 0;
+    const stack = [start];
+    seen[start] = 1;
+    while (stack.length) {
+      const i = stack.pop();
+      const c = i % cols;
+      const r = (i - c) / cols;
+      cells += 1;
+      c0 = Math.min(c0, c); c1 = Math.max(c1, c);
+      r0 = Math.min(r0, r); r1 = Math.max(r1, r);
+      for (const [dc, dr] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nc = c + dc;
+        const nr = r + dr;
+        if (nc < 0 || nr < 0 || nc >= cols || nr >= rows) continue;
+        const j = nr * cols + nc;
+        if (changed[j] && !seen[j]) {
+          seen[j] = 1;
+          stack.push(j);
+        }
+      }
+    }
+    regions.push({ c0, r0, c1, r1, cells });
+  }
+  regions.sort((x, y) => y.cells - x.cells);
+  return { changedCells: count, ratio: count / changed.length, regions };
+}
+
+function _saveBaseline(tabId, name, shot) {
+  const key = `${tabId}|${name}`;
+  _shotBaselines.delete(key);
+  _shotBaselines.set(key, shot);
+  while (_shotBaselines.size > SHOT_MAX_BASELINES) _shotBaselines.delete(_shotBaselines.keys().next().value);
+}
+
+function _compareToBaseline(tabId, name, shot) {
+  const base = _shotBaselines.get(`${tabId}|${name}`);
+  if (!base) return { against: name, error: `No baseline "${name}". Take a screenshot with saveBaseline:"${name}" (or diff/saveBaseline once for "last") first.` };
+  const sameArea = Math.abs(base.area.width - shot.area.width) < 2 && Math.abs(base.area.height - shot.area.height) < 2;
+  if (base.cols !== shot.cols || base.rows !== shot.rows || !sameArea) {
+    return { against: name, comparable: false, changed: true, reason: "the screenshots cover different areas or sizes" };
+  }
+  const d = _gridDiff(base.luma, shot.luma, shot.cols, shot.rows);
+  const cw = shot.area.width / shot.cols;
+  const ch = shot.area.height / shot.rows;
+  return {
+    against: name,
+    changed: d.changedCells > 0,
+    changedRatio: Math.round(d.ratio * 1000) / 1000,
+    // Page CSS px.
+    regions: d.regions.slice(0, 12).map((r) => ({
+      x: Math.round(shot.area.x + r.c0 * cw),
+      y: Math.round(shot.area.y + r.r0 * ch),
+      width: Math.round((r.c1 - r.c0 + 1) * cw),
+      height: Math.round((r.r1 - r.r0 + 1) * ch),
+    })),
+    ...(base.area.x !== shot.area.x || base.area.y !== shot.area.y ? { note: "the page was scrolled between the two screenshots" } : {}),
+  };
 }
 
 // A video frame the page cannot read (cross-origin, no CORS): screenshot
@@ -15650,37 +15898,70 @@ async function toolForceClick(params, ctx) {
 }
 
 // 52. Click at absolute viewport coordinates
+// x/y are viewport CSS px, or with from:"screenshot" pixels of the last
+// take_screenshot of this tab (any scale, crop or full page). trusted uses
+// CDP input events (isTrusted, real hover/focus), and is the default when a
+// debugger session is already attached to the tab.
 async function toolClickAtCoordinates(params, ctx) {
   const tab = await getActiveTab(ctx);
-  const { x, y, button = "left", double = false } = params;
-  return await executeInTab(
+  const { button = "left", double = false } = params;
+  let docPoint = null;
+  if (params?.from === "screenshot") {
+    const geo = _lastShotGeometry.get(tab.id);
+    if (!geo) return { error: 'No screenshot of this tab to map from. Call take_screenshot first, or pass viewport x/y without from:"screenshot".' };
+    docPoint = { x: geo.originX + Number(params.x) / geo.scale, y: geo.originY + Number(params.y) / geo.scale };
+  }
+  const trusted = params?.trusted ?? (!IS_FIREFOX && _debuggerAttached.has(tab.id));
+  // One injection: map the point into the viewport (scrolling to it when
+  // needed), and dispatch synthetic events unless CDP will.
+  const hit = await executeInTab(
     tab.id,
-    (x, y, button, double) => {
-      const btnNum = button === "right" ? 2 : button === "middle" ? 1 : 0;
-      const el = document.elementFromPoint(x, y);
-      const opts = {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-        clientX: x,
-        clientY: y,
-        button: btnNum,
-      };
-      if (btnNum === 2) {
-        (el || document.body).dispatchEvent(new MouseEvent("contextmenu", opts));
-      } else if (btnNum === 1) {
-        (el || document.body).dispatchEvent(new MouseEvent("auxclick", opts));
-      } else if (double) {
-        (el || document.body).dispatchEvent(new MouseEvent("dblclick", opts));
-      } else {
-        (el || document.body).dispatchEvent(new MouseEvent("mousedown", opts));
-        (el || document.body).dispatchEvent(new MouseEvent("mouseup", opts));
-        (el || document.body).dispatchEvent(new MouseEvent("click", opts));
+    (x, y, docPoint, button, double, dispatch) => {
+      if (docPoint) {
+        let vx = docPoint.x - scrollX;
+        let vy = docPoint.y - scrollY;
+        if (vx < 0 || vy < 0 || vx >= innerWidth || vy >= innerHeight) {
+          scrollTo(Math.max(0, docPoint.x - innerWidth / 2), Math.max(0, docPoint.y - innerHeight / 2));
+          vx = docPoint.x - scrollX;
+          vy = docPoint.y - scrollY;
+        }
+        x = vx;
+        y = vy;
       }
-      return { success: true, tag: el?.tagName, id: el?.id || null };
+      const el = document.elementFromPoint(x, y);
+      if (dispatch) {
+        const btnNum = button === "right" ? 2 : button === "middle" ? 1 : 0;
+        const opts = { bubbles: true, cancelable: true, composed: true, view: window, clientX: x, clientY: y, button: btnNum };
+        const target = el || document.body;
+        if (btnNum === 2) target.dispatchEvent(new MouseEvent("contextmenu", opts));
+        else if (btnNum === 1) target.dispatchEvent(new MouseEvent("auxclick", opts));
+        else {
+          for (const type of ["mousedown", "mouseup", "click"]) target.dispatchEvent(new MouseEvent(type, opts));
+          if (double) target.dispatchEvent(new MouseEvent("dblclick", opts));
+        }
+      }
+      return { x: Math.round(x), y: Math.round(y), tag: el?.tagName, id: el?.id || null };
     },
-    [x, y, button, double],
+    [Number(params.x), Number(params.y), docPoint, button, double, !trusted],
   );
+  if (!hit) return { error: "Could not reach the page" };
+  if (trusted) {
+    try {
+      await ensureDebugger(tab.id);
+      const send = (type, extra) =>
+        chrome.debugger.sendCommand({ tabId: tab.id }, "Input.dispatchMouseEvent", { type, x: hit.x, y: hit.y, ...extra });
+      await send("mouseMoved", { button: "none" });
+      for (let n = 1; n <= (double ? 2 : 1); n++) {
+        await send("mousePressed", { button, clickCount: n });
+        await send("mouseReleased", { button, clickCount: n });
+      }
+    } catch (err) {
+      return { error: `Trusted click failed: ${err.message}. Retry with trusted:false for synthetic events.` };
+    } finally {
+      detachDebuggerSafe(tab.id).catch(() => {});
+    }
+  }
+  return { success: true, ...hit, trusted: !!trusted };
 }
 
 // 53. Key down — hold a key (useful for Shift/Ctrl modifier combos)

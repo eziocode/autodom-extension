@@ -26,6 +26,11 @@
   const MAX_POST_DATA = 65536;
   const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
   const DEFAULT_TOTAL_BODY_BYTES = 20 * 1024 * 1024;
+  const MAX_BODY_BYTES = 1024 * 1024;
+  const MAX_TOTAL_BODY_BYTES = 64 * 1024 * 1024;
+  const MAX_SESSIONS = 8;
+  const MAX_PENDING_BODIES = 8;
+  const MAX_PENDING_EXTRA = 128;
   // An encoded (compressed) body this many times over the limit is not
   // fetched at all; smaller ones are fetched and truncated.
   const FETCH_OVER_LIMIT_FACTOR = 4;
@@ -47,6 +52,11 @@
   const TEXT_MIME = /^(text\/|application\/(json|javascript|ecmascript|xml|xhtml\+xml|x-www-form-urlencoded|graphql|ld\+json|manifest\+json)|[^;]*\+(json|xml))/i;
 
   const _sessions = new Map(); // tabId → session
+  // Payload budgets, not estimates of total JS heap. Include reservations
+  // until CDP settles, even if har_stop has already timed out.
+  let _bodyBytes = 0;
+  let _reservedBodyBytes = 0;
+  let _pendingBodies = 0;
   let _deps = null;
 
   function init(deps) {
@@ -91,11 +101,14 @@
 
   function _options(opts) {
     const f = opts.filter || {};
+    const requested = Number(opts.maxBodyBytes);
     const lower = (list) => new Set((Array.isArray(list) ? list : []).map((x) => String(x).toLowerCase()));
     return {
       includeBodies: opts.includeBodies !== false,
       includeSensitive: opts.includeSensitive === true,
-      maxBodyBytes: Number(opts.maxBodyBytes) > 0 ? Number(opts.maxBodyBytes) : DEFAULT_MAX_BODY_BYTES,
+      maxBodyBytes: Number.isFinite(requested) && requested > 0
+        ? Math.max(1, Math.min(MAX_BODY_BYTES, Math.floor(requested)))
+        : DEFAULT_MAX_BODY_BYTES,
       filter: {
         apiOnly: f.apiOnly === true || opts.apiOnly === true,
         include: (f.urlInclude || []).map(_matcher),
@@ -108,6 +121,7 @@
   }
 
   function _segment(s, label) {
+    if (s.segments.length >= MAX_ENTRIES) throw new Error("HAR segment limit reached; stop this recording first.");
     const seg = { index: s.segments.length, label: label == null ? "" : String(label).slice(0, 200), startedMs: Date.now() };
     s.segments.push(seg);
     return seg;
@@ -123,6 +137,7 @@
       const seg = _segment(running, opts.label);
       return { segment: { index: seg.index, label: seg.label }, closedSegment: closed };
     }
+    if (_sessions.size >= MAX_SESSIONS) throw new Error("HAR session limit reached; stop an existing recording first (closed tabs are retained).");
     const s = {
       startedAt: Date.now(),
       opts: _options(opts),
@@ -139,11 +154,15 @@
       skipped: 0,
       redactions: 0,
       bodyBytes: 0,
+      reservedBodyBytes: 0,
+      bodySkipped: 0,
+      metadataDropped: 0,
       pendingBodies: new Set(),
       segments: [],
       steps: [],
       waiters: new Set(),
       closed: false,
+      stopped: false,
     };
     _segment(s, opts.label);
     _sessions.set(tabId, s);
@@ -157,7 +176,8 @@
       const f = tree?.frameTree?.frame;
       if (f?.url && /^https?:/.test(f.url)) _openPage(s, f.url, Date.now(), null);
     } catch (err) {
-      _sessions.delete(tabId);
+      // Network events can arrive while Page setup is still pending.
+      if (_sessions.get(tabId) === s) await stop(tabId, { waitForBodiesMs: 0 });
       throw err;
     }
     return { started: true, segment: { index: 0, label: s.segments[0].label } };
@@ -169,6 +189,10 @@
   function noteAction(tabId, { callId, tool, target } = {}) {
     const s = _sessions.get(tabId);
     if (!s) return null;
+    if (s.steps.length >= MAX_ENTRIES) {
+      s.metadataDropped += 1;
+      return null;
+    }
     const step = {
       step: s.steps.length + 1,
       segment: s.segments.length - 1,
@@ -199,6 +223,10 @@
   }
 
   function _openPage(s, url, wallMs, ts) {
+    if (s.pages.length >= MAX_ENTRIES) {
+      s.metadataDropped += 1;
+      return s.currentPage;
+    }
     const page = {
       id: `page_${s.pages.length + 1}`,
       title: url,
@@ -343,10 +371,18 @@
     const startedMs = params.wallTime ? params.wallTime * 1000 : Date.now();
     if (params.type === "Document" && params.frameId && params.frameId === s.mainFrameId) {
       _openPage(s, req.url, startedMs, params.timestamp);
-      s.pageByLoader.set(params.loaderId, s.currentPage);
+      if (s.pageByLoader.size < MAX_ENTRIES || s.pageByLoader.has(params.loaderId)) {
+        s.pageByLoader.set(params.loaderId, s.currentPage);
+      }
     }
     if (!_kept(s, params)) {
       s.skipped += 1;
+      return null;
+    }
+    // Reserve the entry slot at request start. Otherwise live/byRequest
+    // and body fetches keep growing after the completed-entry cap is hit.
+    if (s.entries.length + s.live.size >= MAX_ENTRIES) {
+      s.dropped += 1;
       return null;
     }
     const page = s.pageByLoader.get(params.loaderId) || s.currentPage;
@@ -434,6 +470,16 @@
       _applyExtra(s, e, { [kind]: value });
       return;
     }
+    if (!e && s.entries.length + s.live.size >= MAX_ENTRIES) {
+      s.metadataDropped += 1;
+      return;
+    }
+    // Unknown/filtered requests may never get a matching event. Keep a
+    // bounded early-event window without dropping late headers for entries.
+    if (!s.extra.has(requestId) && s.extra.size >= MAX_PENDING_EXTRA) {
+      s.extra.delete(s.extra.keys().next().value);
+      s.metadataDropped += 1;
+    }
     const pending = s.extra.get(requestId) || {};
     pending[kind] = value;
     s.extra.set(requestId, pending);
@@ -470,39 +516,96 @@
       return;
     }
     s.entries.push(entry);
+    s.extra.delete(requestId);
     for (const w of [...s.waiters]) w(entry);
+  }
+
+  // Scan only the retained prefix; never allocate an encoded copy of an
+  // arbitrarily large CDP body. Avoid splitting Unicode or base64 quanta.
+  function _copyPrefix(text, end) {
+    if (end === text.length) return text;
+    // V8 slices can retain the entire source string. Copy only the bounded
+    // prefix so a small retained body doesn't keep a huge CDP body alive.
+    return new TextDecoder("utf-8", { ignoreBOM: true }).decode(new TextEncoder().encode(text.slice(0, end)));
+  }
+
+  function _bodyPrefix(text, limit, base64) {
+    if (base64) {
+      const end = Math.min(text.length, Math.floor(limit / 4) * 4);
+      return { text: _copyPrefix(text, end), bytes: end, truncated: end < text.length };
+    }
+    let end = 0;
+    let bytes = 0;
+    while (end < text.length) {
+      const cp = text.codePointAt(end);
+      const width = cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
+      if (bytes + width > limit) break;
+      bytes += width;
+      end += cp > 0xffff ? 2 : 1;
+    }
+    return { text: _copyPrefix(text, end), bytes, truncated: end < text.length };
   }
 
   function _fetchBody(s, tabId, requestId, entry) {
     const mime = entry.response?.content?.mimeType || "";
     const size = entry.response?.content?.size ?? 0;
     if (!s.opts.includeBodies || !TEXT_MIME.test(mime)) return;
-    if (size > s.opts.maxBodyBytes * FETCH_OVER_LIMIT_FACTOR || s.bodyBytes >= DEFAULT_TOTAL_BODY_BYTES) {
-      entry.response.content.comment = "Body not saved (over the size limit).";
+    const skip = (comment) => {
+      s.bodySkipped += 1;
+      entry.response.content.comment = comment;
+    };
+    if (size > s.opts.maxBodyBytes * FETCH_OVER_LIMIT_FACTOR) {
+      skip("Body not saved (over the size limit).");
       return;
     }
-    const p = _deps
-      .sendCommand(tabId, "Network.getResponseBody", { requestId })
+    if (_pendingBodies >= MAX_PENDING_BODIES) {
+      skip("Body not saved (concurrent body fetch limit).");
+      return;
+    }
+    const reserved = Math.min(
+      s.opts.maxBodyBytes,
+      DEFAULT_TOTAL_BODY_BYTES - s.bodyBytes - s.reservedBodyBytes,
+      MAX_TOTAL_BODY_BYTES - _bodyBytes - _reservedBodyBytes,
+    );
+    if (reserved <= 0) {
+      skip("Body not saved (over the size limit: body budget exhausted).");
+      return;
+    }
+    s.reservedBodyBytes += reserved;
+    _reservedBodyBytes += reserved;
+    _pendingBodies += 1;
+    let held = reserved;
+    const releaseReservation = () => {
+      s.reservedBodyBytes -= held;
+      _reservedBodyBytes -= held;
+      held = 0;
+    };
+    const p = Promise.resolve()
+      .then(() => _deps.sendCommand(tabId, "Network.getResponseBody", { requestId }))
       .then((res) => {
-        if (!res) return;
+        if (s.stopped || !res) return;
         let text = res.body || "";
         if (res.base64Encoded) {
           entry.response.content.encoding = "base64";
         } else {
           text = _redactBodyText(s, mime, text);
         }
-        if (text.length > s.opts.maxBodyBytes) {
-          text = text.slice(0, s.opts.maxBodyBytes);
-          entry.response.content.comment = `Body truncated to ${s.opts.maxBodyBytes} characters.`;
+        const saved = _bodyPrefix(text, reserved, res.base64Encoded);
+        if (saved.truncated) {
+          entry.response.content.comment = `Body truncated to ${saved.bytes} UTF-8 bytes (stored encoding).`;
           entry._autodom.truncated = true;
         }
-        s.bodyBytes += text.length;
-        entry.response.content.text = text;
+        releaseReservation();
+        s.bodyBytes += saved.bytes;
+        _bodyBytes += saved.bytes;
+        entry.response.content.text = saved.text;
       })
       .catch(() => {
-        entry.response.content.comment = "Body no longer available from the browser.";
+        if (!s.stopped) skip("Body no longer available from the browser.");
       })
       .finally(() => {
+        releaseReservation();
+        _pendingBodies -= 1;
         s.pendingBodies.delete(p);
         delete entry._body;
       });
@@ -512,7 +615,7 @@
 
   function _onEvent(tabId, method, params) {
     const s = _sessions.get(tabId);
-    if (!s) return;
+    if (!s || s.closed) return;
     switch (method) {
       case "Network.requestWillBeSent": {
         const prev = s.live.get(params.requestId);
@@ -523,13 +626,17 @@
           _finish(s, params.requestId, prev);
         }
         const e = _newEntry(s, params);
-        if (!e) break;
+        if (!e) {
+          s.extra.delete(params.requestId);
+          break;
+        }
         s.live.set(params.requestId, e);
         s.byRequest.set(params.requestId, e);
         const pending = s.extra.get(params.requestId);
         if (pending?.request) {
           _applyExtra(s, e, { request: pending.request });
           delete pending.request;
+          if (!pending.response) s.extra.delete(params.requestId);
         }
         break;
       }
@@ -602,6 +709,18 @@
       dropped: s.dropped,
       ...(s.skipped && { filteredOut: s.skipped }),
       redactions: s.redactions,
+      bodiesSkipped: s.bodySkipped,
+      metadataDropped: s.metadataDropped,
+      memory: {
+        bodyBytes: s.bodyBytes,
+        reservedBodyBytes: s.reservedBodyBytes,
+        pendingBodies: s.pendingBodies.size,
+        trackedRequests: s.byRequest.size,
+        pendingExtraInfo: s.extra.size,
+        globalBodyBytes: _bodyBytes,
+        globalReservedBodyBytes: _reservedBodyBytes,
+        globalPendingBodies: _pendingBodies,
+      },
       durationMs: Date.now() - s.startedAt,
       ...(s.closed && { tabClosed: true }),
     };
@@ -841,6 +960,22 @@
       ]);
       clearTimeout(timer);
     }
+    // Late CDP completions must not mutate the returned HAR or reacquire
+    // body budget after stop. Reservations remain until each fetch settles.
+    s.stopped = true;
+    _bodyBytes -= s.bodyBytes;
+    for (const e of s.live.values()) {
+      if (e._body) {
+        e.response.content.comment = "Body not saved (recording stopped before fetch completed).";
+        s.bodySkipped += 1;
+      }
+    }
+    for (const e of s.entries) {
+      if (e._body) {
+        e.response.content.comment = "Body not saved (recording stopped before fetch completed).";
+        s.bodySkipped += 1;
+      }
+    }
     // Requests still open at stop are kept, marked incomplete.
     for (const [, e] of s.live) {
       if (!e.response) e.response = _response(s, { status: 0, statusText: "" }, -1);
@@ -863,6 +998,10 @@
       ...(endedMs != null && { durationMs: endedMs - startedMs }),
     }));
     const entries = s.entries.map(({ _ts, _startMs, _timing, _body, ...e }) => e);
+    s.live.clear();
+    s.byRequest.clear();
+    s.extra.clear();
+    s.pageByLoader.clear();
     const har = {
       log: {
         version: "1.2",
@@ -883,7 +1022,7 @@
       const k = e._error ? "failed" : String(e.response?.status ?? "none");
       byStatus[k] = (byStatus[k] || 0) + 1;
     }
-    return {
+    const result = {
       har,
       summary: {
         entries: entries.length,
@@ -898,9 +1037,19 @@
         truncatedBodies: entries.filter((e) => e._autodom.truncated).length,
         durationMs: Date.now() - s.startedAt,
         bodiesSavedBytes: s.bodyBytes,
+        bodiesSkipped: s.bodySkipped,
+        metadataDropped: s.metadataDropped,
         actions: userActions.map((a) => ({ index: a.index, action: a.action, target: a.target, requests: a.requests })),
       },
     };
+    // Pending CDP promises can outlive stop. Their session closure must
+    // not retain every completed request/body after its budget is released.
+    s.entries.length = 0;
+    s.pages.length = 0;
+    s.steps.length = 0;
+    s.segments.length = 0;
+    s.currentPage = null;
+    return result;
   }
 
   globalThis.AutoDOMHar = {

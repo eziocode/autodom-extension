@@ -9,7 +9,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const bg = (f) => readFileSync(resolve(here, "../extension/background", f), "utf8");
 
 // debug-capture.js + har-recorder.js in one sandbox, with a scripted CDP.
-function load({ bodies = {} } = {}) {
+function load({ bodies = {}, failMethod } = {}) {
   const listeners = { event: [], detach: [], removed: [], updated: [] };
   const ev = (k) => ({ addListener: (fn) => listeners[k].push(fn) });
   const sent = [];
@@ -20,6 +20,8 @@ function load({ bodies = {} } = {}) {
     },
     URL,
     URLSearchParams,
+    TextEncoder,
+    TextDecoder,
     setTimeout,
     clearTimeout,
   };
@@ -29,6 +31,10 @@ function load({ bodies = {} } = {}) {
   vm.runInContext(bg("har-recorder.js"), ctx);
   const send = async (tabId, method, params) => {
     sent.push({ tabId, method, params });
+    if (method === failMethod) {
+      failMethod = undefined;
+      throw new Error("CDP setup failed");
+    }
     if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "MAIN", url: "https://shop.test/" } } };
     if (method === "Network.getResponseBody") {
       const b = bodies[params.requestId];
@@ -41,7 +47,7 @@ function load({ bodies = {} } = {}) {
   cap.init({ ensureDebugger: async () => {}, sendCommand: send, detach: async () => {} });
   const har = ctx.AutoDOMHar;
   har.init({ capture: cap, sendCommand: send });
-  const emit = (method, params) => listeners.event.forEach((fn) => fn({ tabId: 1 }, method, params));
+  const emit = (method, params, tabId = 1) => listeners.event.forEach((fn) => fn({ tabId }, method, params));
   const removeTab = (id) => listeners.removed.forEach((fn) => fn(id));
   return { cap, har, emit, sent, removeTab };
 }
@@ -250,10 +256,240 @@ const req = (id, url, extra = {}) => ({
   requestId: id, type: "XHR", timestamp: T0, wallTime: Date.now() / 1000,
   request: { url, method: "GET", headers: {} }, ...extra,
 });
-const finish = (env, id, status = 200, mimeType = "application/json") => {
-  env.emit("Network.responseReceived", { requestId: id, response: { status, mimeType, headers: {} } });
-  env.emit("Network.loadingFinished", { requestId: id, timestamp: T0 + 0.1, encodedDataLength: 10 });
+const finish = (env, id, status = 200, mimeType = "application/json", tab = 1) => {
+  env.emit("Network.responseReceived", { requestId: id, response: { status, mimeType, headers: {} } }, tab);
+  env.emit("Network.loadingFinished", { requestId: id, timestamp: T0 + 0.1, encodedDataLength: 10 }, tab);
 };
+
+test("request admission bounds retained metadata and skips bodies beyond the entry cap", async () => {
+  const env = await started({ bodies: { overflow: { body: "unused" } } });
+  for (let i = 0; i < 5000; i++) {
+    env.emit("Network.requestWillBeSent", req(`r${i}`, "https://shop.test/api/x"));
+    finish(env, `r${i}`, 200, "image/png");
+  }
+  env.emit("Network.requestWillBeSent", req("overflow", "https://shop.test/api/overflow"));
+  finish(env, "overflow");
+  env.emit("Network.responseReceivedExtraInfo", { requestId: "r0", headers: { "X-Late": "kept" } });
+  const session = env.har._sessions.get(1);
+  assert.equal(session.byRequest.size, 5000);
+  assert.equal(session.live.size, 0);
+  assert.equal(env.sent.filter((s) => s.method === "Network.getResponseBody").length, 0);
+  const { har, summary } = await env.har.stop(1);
+  assert.equal(summary.dropped, 1);
+  assert.equal(har.log.entries[0].response.headers[0].name, "X-Late", "late wire headers still reach retained entries");
+});
+
+test("in-flight requests share the entry admission cap", async () => {
+  const env = await started();
+  for (let i = 0; i < 5010; i++) env.emit("Network.requestWillBeSent", req(`r${i}`, "https://shop.test/api/x"));
+  assert.equal(env.har.status(1).inFlight, 5000);
+  const { summary } = await env.har.stop(1);
+  assert.equal(summary.entries, 5000);
+  assert.equal(summary.dropped, 10);
+});
+
+test("unmatched ExtraInfo is bounded and matched request-only slots are released", async () => {
+  const env = await started();
+  for (let i = 0; i < 300; i++) {
+    env.emit("Network.requestWillBeSentExtraInfo", { requestId: `orphan${i}`, headers: { Host: "shop.test" } });
+  }
+  assert.equal(env.har._sessions.get(1).extra.size, 128);
+  env.emit("Network.requestWillBeSent", req("orphan299", "https://shop.test/api/x"));
+  assert.equal(env.har._sessions.get(1).extra.has("orphan299"), false);
+  const { har } = await env.har.stop(1);
+  assert.equal(har.log.entries[0].request.headers[0].name, "Host");
+});
+
+test("session limit preserves closed-tab recordings and stop frees capacity", async () => {
+  const env = await started();
+  for (let tab = 2; tab <= 8; tab++) await env.har.start(tab);
+  env.removeTab(1);
+  await assert.rejects(env.har.start(9), /session limit/i);
+  assert.equal((await env.har.stop(1)).summary.entries, 0);
+  assert.equal((await env.har.start(9)).started, true);
+});
+
+test("concurrent body fetches share a global cap and report skipped bodies", async () => {
+  let resolveBody;
+  const body = new Promise((resolve) => { resolveBody = resolve; });
+  const bodies = Object.fromEntries(Array.from({ length: 16 }, (_, i) => [`r${i}`, body]));
+  const env = await started({ bodies });
+  await env.cap.start(2, "https://shop.test/");
+  await env.har.start(2);
+  for (let i = 0; i < 16; i++) {
+    const tab = i < 4 ? 1 : 2;
+    env.emit("Network.requestWillBeSent", req(`r${i}`, "https://shop.test/api/x"), tab);
+    finish(env, `r${i}`, 200, "application/json", tab);
+  }
+  await new Promise(setImmediate);
+  assert.equal(env.sent.filter((s) => s.method === "Network.getResponseBody").length, 8);
+  resolveBody({ body: "ok", base64Encoded: false });
+  const first = await env.har.stop(1);
+  const second = await env.har.stop(2);
+  const entries = [...first.har.log.entries, ...second.har.log.entries];
+  assert.equal(entries.filter((e) => e.response.content.text === "ok").length, 8);
+  assert.match(entries[8].response.content.comment, /concurrent/i);
+});
+
+test("body truncation respects UTF-8 bytes and preserves complete characters", async () => {
+  const env = load({ bodies: { unicode: { body: "😀éé", base64Encoded: false } } });
+  await env.cap.start(1, "https://shop.test/");
+  await env.har.start(1, { maxBodyBytes: 7 });
+  env.emit("Network.requestWillBeSent", req("unicode", "https://shop.test/api/x"));
+  finish(env, "unicode", 200, "text/plain");
+  const { har, summary } = await env.har.stop(1);
+  assert.equal(har.log.entries[0].response.content.text, "😀é");
+  assert.equal(summary.bodiesSavedBytes, 6);
+});
+
+test("base64 truncation keeps complete encoding quanta", async () => {
+  const env = load({ bodies: { binary: { body: "YWJjZGVm", base64Encoded: true } } });
+  await env.cap.start(1, "https://shop.test/");
+  await env.har.start(1, { maxBodyBytes: 7 });
+  env.emit("Network.requestWillBeSent", req("binary", "https://shop.test/api/x"));
+  finish(env, "binary");
+  const { har, summary } = await env.har.stop(1);
+  assert.equal(har.log.entries[0].response.content.text, "YWJj");
+  assert.equal(summary.bodiesSavedBytes, 4);
+});
+
+test("truncated text keeps a leading UTF-8 BOM", async () => {
+  const env = load({ bodies: { bom: { body: "\uFEFFé", base64Encoded: false } } });
+  await env.cap.start(1, "https://shop.test/");
+  await env.har.start(1, { maxBodyBytes: 4 });
+  env.emit("Network.requestWillBeSent", req("bom", "https://shop.test/api/x"));
+  finish(env, "bom", 200, "text/plain");
+  const { har, summary } = await env.har.stop(1);
+  assert.equal(har.log.entries[0].response.content.text, "\uFEFF");
+  assert.equal(summary.bodiesSavedBytes, 3);
+});
+
+test("per-body limit is clamped even when a caller requests a huge capture", async () => {
+  const env = load({ bodies: { big: { body: "x".repeat(2 * 1024 * 1024) } } });
+  await env.cap.start(1, "https://shop.test/");
+  await env.har.start(1, { maxBodyBytes: 100 * 1024 * 1024 });
+  env.emit("Network.requestWillBeSent", req("big", "https://shop.test/api/x"));
+  finish(env, "big", 200, "text/plain");
+  const { summary } = await env.har.stop(1);
+  assert.equal(summary.bodiesSavedBytes, 1024 * 1024);
+});
+
+// Actual captured bodies fill the budgets; no fabricated internal counters.
+async function captureMiB(env, tab, id) {
+  env.emit("Network.requestWillBeSent", req(id, "https://shop.test/api/x"), tab);
+  env.emit("Network.responseReceived", { requestId: id, response: { status: 200, mimeType: "text/plain", headers: {} } }, tab);
+  env.emit("Network.loadingFinished", { requestId: id, timestamp: T0 + 0.1, encodedDataLength: 0 }, tab);
+  await new Promise(setImmediate);
+}
+
+test("session body budget reserves space before concurrent fetches complete", async () => {
+  const bodies = {};
+  const env = load({ bodies });
+  await env.cap.start(1, "https://shop.test/");
+  await env.har.start(1, { maxBodyBytes: 1024 * 1024 });
+  for (let i = 0; i < 19; i++) {
+    bodies[`fill${i}`] = { body: "x".repeat(1024 * 1024) };
+    await captureMiB(env, 1, `fill${i}`);
+  }
+  let resolveBody;
+  const pending = new Promise((resolve) => { resolveBody = resolve; });
+  for (let i = 0; i < 4; i++) {
+    bodies[`race${i}`] = pending;
+    env.emit("Network.requestWillBeSent", req(`race${i}`, "https://shop.test/api/x"));
+    finish(env, `race${i}`, 200, "text/plain");
+  }
+  resolveBody({ body: "x".repeat(1024 * 1024) });
+  const { summary } = await env.har.stop(1);
+  assert.equal(summary.bodiesSavedBytes, 20 * 1024 * 1024);
+});
+
+test("global body budget is shared across sessions and released by stop", async () => {
+  const bodies = {};
+  const env = load({ bodies });
+  for (let tab = 1; tab <= 4; tab++) {
+    await env.cap.start(tab, "https://shop.test/");
+    await env.har.start(tab, { maxBodyBytes: 1024 * 1024 });
+    for (let i = 0; i < 20; i++) {
+      const id = `${tab}-${i}`;
+      bodies[id] = { body: "x".repeat(1024 * 1024) };
+      await captureMiB(env, tab, id);
+    }
+  }
+  assert.equal(env.har.status(4).memory.bodyBytes, 4 * 1024 * 1024);
+  assert.equal(env.har.status(4).memory.globalBodyBytes, 64 * 1024 * 1024);
+  await env.har.stop(1);
+  bodies.reuse = { body: "x".repeat(1024 * 1024) };
+  await captureMiB(env, 4, "reuse");
+  assert.equal(env.har.status(4).memory.bodyBytes, 5 * 1024 * 1024);
+});
+
+test("stop timeout prevents late body mutations and releases reservations after settlement", async () => {
+  let resolveBody;
+  const pending = new Promise((resolve) => { resolveBody = resolve; });
+  const env = await started({ bodies: { slow: pending, next: { body: "ok" } } });
+  env.emit("Network.requestWillBeSent", req("slow", "https://shop.test/api/x"));
+  finish(env, "slow");
+  const out = await env.har.stop(1, { waitForBodiesMs: 0 });
+  resolveBody({ body: "late" });
+  await new Promise(setImmediate);
+  assert.equal(out.har.log.entries[0].response.content.text, undefined);
+  assert.equal(out.summary.bodiesSavedBytes, 0);
+  assert.equal(out.summary.bodiesSkipped, 1);
+  await env.har.start(1);
+  assert.equal(env.har.status(1).memory.globalReservedBodyBytes, 0);
+  env.emit("Network.requestWillBeSent", req("next", "https://shop.test/api/x"));
+  finish(env, "next");
+  assert.equal((await env.har.stop(1)).summary.bodiesSavedBytes, 2);
+});
+
+test("failed recording setup releases bodies already captured during setup", async () => {
+  const env = load({ bodies: { early: { body: "early" } }, failMethod: "Page.getFrameTree" });
+  await env.cap.start(1, "https://shop.test/");
+  const starting = env.har.start(1);
+  env.emit("Network.requestWillBeSent", req("early", "https://shop.test/api/x"));
+  finish(env, "early", 200, "text/plain");
+  await assert.rejects(starting, /CDP setup failed/);
+  await new Promise(setImmediate);
+  await env.har.start(2);
+  assert.equal(env.har.status(2).memory.globalBodyBytes, 0);
+  assert.equal(env.har.status(2).memory.globalReservedBodyBytes, 0);
+});
+
+test("failed body fetches release global capacity for another session", async () => {
+  const env = await started();
+  for (let i = 0; i < 8; i++) {
+    env.emit("Network.requestWillBeSent", req(`gone${i}`, "https://shop.test/api/x"));
+    finish(env, `gone${i}`);
+  }
+  await new Promise(setImmediate);
+  await env.har.start(2);
+  const memory = env.har.status(2).memory;
+  assert.equal(memory.globalReservedBodyBytes, 0);
+  assert.equal(memory.globalPendingBodies, 0);
+  assert.equal(env.har.status(1).bodiesSkipped, 8);
+});
+
+test("page, loader, step and segment metadata stays bounded in long recordings", async () => {
+  const env = load();
+  await env.cap.start(1, "https://shop.test/");
+  await env.har.start(1, { apiOnly: true });
+  for (let i = 0; i < 5010; i++) {
+    env.emit("Network.requestWillBeSent", req(`doc${i}`, "https://shop.test/", {
+      type: "Document", frameId: "MAIN", loaderId: `loader${i}`,
+    }));
+    env.har.noteAction(1, { tool: "click" });
+  }
+  for (let i = 1; i < 5000; i++) await env.har.start(1, { label: `case${i}` });
+  await assert.rejects(env.har.start(1, { label: "overflow" }), /segment limit/i);
+  const session = env.har._sessions.get(1);
+  assert.equal(session.pages.length, 5000);
+  assert.equal(session.pageByLoader.size, 5000);
+  assert.equal(session.steps.length, 5000);
+  assert.equal(env.har.noteAction(1, { tool: "click" }), null);
+  const { summary } = await env.har.stop(1);
+  assert.ok(summary.metadataDropped > 0);
+  assert.equal(summary.entries, 0, "filtered document requests are not retained");
+});
 
 test("wire headers and cookies from ExtraInfo replace the page's, in either order", async () => {
   const env = await started();

@@ -420,3 +420,72 @@ test("a HAR test case: tool calls are linked to their requests and asserted on",
   assert.deepEqual(JSON.parse(JSON.stringify(log._autodom.segments.map((s) => s.label))), ["edit lead", "second case"]);
   assert.equal((await sw.run(`toolHarEntries({}, __ctx)`)).error.startsWith("No HAR recording"), true);
 });
+
+// ─── Vision: screenshot geometry, diff, coordinate clicks ───────────
+test("grid diff merges changed cells into regions, largest first", async () => {
+  const sw = await ready();
+  const out = sw.run(`(() => {
+    const cols = 8, rows = 4, a = new Uint8Array(32), b = new Uint8Array(32);
+    for (const i of [9, 10, 17, 18, 26]) b[i] = 200;   // a 2x2 block plus a cell below it
+    b[7] = 200;                                          // one lone cell
+    b[0] = 10;                                           // under the threshold
+    return _gridDiff(a, b, cols, rows);
+  })()`);
+  assert.equal(out.changedCells, 6);
+  assert.deepEqual(JSON.parse(JSON.stringify(out.regions)), [
+    { c0: 1, r0: 1, c1: 2, r1: 3, cells: 5 },
+    { c0: 7, r0: 0, c1: 7, r1: 0, cells: 1 },
+  ]);
+});
+
+test("baselines compare same-size shots and map regions to page CSS px", async () => {
+  const sw = await ready();
+  const res = sw.run(`(() => {
+    const area = { x: 0, y: 400, width: 640, height: 320 };
+    const base = { luma: new Uint8Array(64 * 32), cols: 64, rows: 32, area };
+    const now = { luma: new Uint8Array(64 * 32), cols: 64, rows: 32, area };
+    now.luma[5 * 64 + 10] = 255;
+    _saveBaseline(1, "before-save", base);
+    return {
+      hit: _compareToBaseline(1, "before-save", now),
+      none: _compareToBaseline(1, "nope", now),
+      other: _compareToBaseline(1, "before-save", { ...now, area: { ...area, width: 300 } }),
+    };
+  })()`);
+  const hit = JSON.parse(JSON.stringify(res.hit));
+  assert.equal(hit.changed, true);
+  assert.deepEqual(hit.regions, [{ x: 100, y: 450, width: 10, height: 10 }]);
+  assert.match(res.none.error, /No baseline "nope"/);
+  assert.equal(res.other.comparable, false);
+});
+
+test("click_at_coordinates maps screenshot pixels to the page and can send trusted input", async () => {
+  const sw = await ready();
+  const seen = [];
+  sw.chrome.scripting.executeScript = async ({ args }) => {
+    seen.push(args);
+    return [{ result: { x: 50, y: 60, tag: "CANVAS", id: "map" } }];
+  };
+  const none = await sw.tool("click_at_coordinates", { x: 10, y: 10, from: "screenshot", observe: false });
+  assert.match(none.result.error, /No screenshot of this tab/);
+
+  sw.run("_lastShotGeometry.set(1, { originX: 0, originY: 1200, scale: 0.5 })");
+  const synthetic = await sw.tool("click_at_coordinates", { x: 100, y: 40, from: "screenshot", observe: false });
+  assert.equal(synthetic.result.success, true, JSON.stringify(synthetic.result));
+  assert.equal(synthetic.result.trusted, false);
+  const [, , docPoint, , , dispatch] = seen.at(-1);
+  assert.deepEqual(JSON.parse(JSON.stringify(docPoint)), { x: 200, y: 1280 }, "origin + image px / scale");
+  assert.equal(dispatch, true, "the page dispatches synthetic events");
+
+  const trusted = await sw.tool("click_at_coordinates", { x: 5, y: 5, trusted: true, double: true, observe: false });
+  assert.equal(trusted.result.trusted, true, JSON.stringify(trusted.result));
+  assert.equal(seen.at(-1)[5], false, "no synthetic events when CDP clicks");
+  const mouse = sw.cdp.filter((c) => c.method === "Input.dispatchMouseEvent").map((c) => [c.params.type, c.params.x, c.params.y, c.params.clickCount ?? 0]);
+  assert.deepEqual(JSON.parse(JSON.stringify(mouse)), [
+    ["mouseMoved", 50, 60, 0],
+    ["mousePressed", 50, 60, 1],
+    ["mouseReleased", 50, 60, 1],
+    ["mousePressed", 50, 60, 2],
+    ["mouseReleased", 50, 60, 2],
+  ]);
+});
