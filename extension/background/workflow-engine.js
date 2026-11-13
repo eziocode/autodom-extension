@@ -936,6 +936,23 @@
     };
     const runActions = (list) => list.map(([target, step]) => runAction(target, step));
 
+    // Accessibility snapshot: the service worker tagged elements with
+    // data-autodom-ax="<token>" over CDP. Give each an @eN ref (so click,
+    // type_text, ... accept it) and drop the tag.
+    const adoptAx = () => {
+      const refs = {};
+      const visit = (root, depth) => {
+        for (const el of all(root, "[data-autodom-ax]")) {
+          refs[el.getAttribute("data-autodom-ax")] = refOf(el);
+          el.removeAttribute("data-autodom-ax");
+        }
+        if (depth >= 6) return;
+        for (const host of all(root, "*")) if (host.shadowRoot) visit(host.shadowRoot, depth + 1);
+      };
+      visit(document, 0);
+      return { ok: true, refs };
+    };
+
     // ─── Post-action observation ──────────────────────────────────────
     // observeArm() remembers the overlays, toasts, invalid fields, URL and
     // title, then counts DOM mutations. observeCollect() says how long the
@@ -1101,6 +1118,7 @@
       actOnRef,
       runAction,
       runActions,
+      adoptAx,
       observeArm,
       observeCollect,
       runStep,
@@ -1144,6 +1162,10 @@
   function _pageWfRunActions(list) {
     const L = globalThis.__autodomWfLib;
     return L && L.v === 6 ? L.runActions(list) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+  }
+  function _pageWfAdoptAx() {
+    const L = globalThis.__autodomWfLib;
+    return L && L.v === 6 ? L.adoptAx() : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfObserveArm() {
     const L = globalThis.__autodomWfLib;
@@ -1458,7 +1480,8 @@
       extra.push(c.inputType);
     }
     if (c.testid) extra.push(`testid=${c.testid}`);
-    return `@${c.ref} ${role}${name ? ` "${String(name).slice(0, 80)}"` : ""}${extra.length ? ` [${extra.join(" ")}]` : ""}`;
+    if (Array.isArray(c.states)) extra.push(...c.states);
+    return `${c.ref ? `@${c.ref} ` : ""}${role}${name ? ` "${String(name).slice(0, 80)}"` : ""}${extra.length ? ` [${extra.join(" ")}]` : ""}`;
   }
 
   function diffDigest(before, after) {
@@ -3140,6 +3163,7 @@
       _pageWfActOnRef,
       _pageWfRunAction,
       _pageWfRunActions,
+      _pageWfAdoptAx,
       _pageWfObserveArm,
       _pageWfObserveCollect,
       _pageWfCandidates,

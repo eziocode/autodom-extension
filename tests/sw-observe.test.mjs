@@ -592,3 +592,67 @@ test("performance_stop_trace reads the trace stream and returns a summary", asyn
   assert.ok(sw.cdp.some((c) => c.method === "IO.close"));
   assert.equal(sw.run("_debuggerHolds.has(1)"), false, "the trace hold is released");
 });
+
+// ─── Accessibility snapshot ─────────────────────────────────────────
+const ax = (nodeId, role, name, extra = {}) => ({ nodeId, role: { value: role }, ...(name != null && { name: { value: name } }), ...extra });
+const prop = (name, value) => ({ name, value: { value } });
+const AX_PAGE = [
+  ax("1", "RootWebArea", "Leads", { childIds: ["2", "9"] }),
+  ax("2", "generic", "", { parentId: "1", childIds: ["3", "4", "5", "6"] }),
+  ax("3", "heading", "Edit lead", { parentId: "2", properties: [prop("level", 2)] }),
+  ax("4", "textbox", "Email", { parentId: "2", backendDOMNodeId: 40, value: { value: "a@b" }, properties: [prop("invalid", "true"), prop("required", true)] }),
+  ax("5", "checkbox", "Subscribed", { parentId: "2", backendDOMNodeId: 50, properties: [prop("checked", "true")] }),
+  ax("6", "button", "Hidden", { parentId: "2", ignored: true, backendDOMNodeId: 60 }),
+  ax("9", "button", "Save", { parentId: "1", backendDOMNodeId: 90, properties: [prop("disabled", true)] }),
+];
+const AX_MODAL = [
+  ...AX_PAGE.map((n) => (n.nodeId === "1" ? { ...n, childIds: [...n.childIds, "20"] } : n)),
+  ax("20", "dialog", "Discard changes?", { parentId: "1", childIds: ["21", "22"], properties: [prop("modal", true)] }),
+  ax("21", "button", "Discard", { parentId: "20", backendDOMNodeId: 210 }),
+  ax("22", "button", "Keep editing", { parentId: "20", backendDOMNodeId: 220, properties: [prop("focused", true)] }),
+];
+
+function axPage(nodes) {
+  return {
+    cdp: {
+      "Accessibility.getFullAXTree": () => ({ nodes }),
+      "DOM.pushNodesByBackendIdsToFrontend": ({ backendNodeIds }) => ({ nodeIds: backendNodeIds.map((id) => id + 1000) }),
+    },
+  };
+}
+
+test("ax snapshot: roles, names, states, refs; ignored and generic nodes pruned", async () => {
+  const sw = await ready(axPage(AX_PAGE));
+  sw.chrome.scripting.executeScript = async ({ func }) => {
+    if (func.name === "_pageWfAdoptAx") return [{ result: { ok: true, refs: { 0: "e1", 1: "e2", 2: "e3" } } }];
+    return [{ result: { ok: true } }];
+  };
+  const { result } = await sw.tool("take_snapshot", { mode: "ax" });
+  assert.equal(result.mode, "ax", JSON.stringify(result));
+  const lines = result.snapshot.split("\n");
+  assert.deepEqual(lines.slice(1, 5), [
+    'heading "Edit lead" [level=2]',
+    '@e1 textbox "Email" [invalid required value="a@b"]',
+    '@e2 checkbox "Subscribed" [checked]',
+    '@e3 button "Save" [disabled]',
+  ]);
+  assert.ok(!result.snapshot.includes("Hidden"), "ignored node left out");
+  const tags = sw.cdp.filter((c) => c.method === "DOM.setAttributeValue").map((c) => [c.params.nodeId, c.params.value]);
+  assert.deepEqual(JSON.parse(JSON.stringify(tags)), [[1040, "0"], [1050, "1"], [1090, "2"]]);
+});
+
+test("ax snapshot shows only an open modal dialog, and filters by role and name", async () => {
+  const sw = await ready(axPage(AX_MODAL));
+  sw.chrome.scripting.executeScript = async () => [{ result: { ok: true, refs: { 0: "e7", 1: "e8" } } }];
+  const { result } = await sw.tool("take_snapshot", { mode: "ax" });
+  assert.match(result.snapshot, /A modal dialog is open: "Discard changes\?"/);
+  assert.match(result.snapshot, /\n  @e7 button "Discard"\n  @e8 button "Keep editing" \[focused\]/);
+  assert.ok(!result.snapshot.includes("Email"), "page behind the modal is hidden");
+  assert.equal(result.modal.label, "Discard changes?");
+
+  const sw2 = await ready(axPage(AX_PAGE));
+  sw2.chrome.scripting.executeScript = async () => [{ result: { ok: true, refs: {} } }];
+  const only = await sw2.tool("take_snapshot", { mode: "ax", role: "checkbox" });
+  assert.equal(only.result.count, 1);
+  assert.match(only.result.snapshot, /checkbox "Subscribed"/);
+});

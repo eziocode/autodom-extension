@@ -166,6 +166,19 @@
       P._pageWfClearMarks();
       check("marks are removed after the capture", !document.getElementById("__autodom_wf_marks"));
 
+      // ── accessibility snapshot refs ──
+      document.getElementById("btn").setAttribute("data-autodom-ax", "0");
+      inner.getElementById("deep").setAttribute("data-autodom-ax", "1");
+      r = P._pageWfAdoptAx();
+      const r0 = r.refs[0], r1 = r.refs[1];
+      check(
+        "ax tags become @eN refs, also inside shadow roots, and the tags are removed",
+        r.ok && /^e\d+$/.test(r0) && /^e\d+$/.test(r1) && !document.querySelector("[data-autodom-ax]") && !inner.querySelector("[data-autodom-ax]"),
+        r,
+      );
+      const before = deepClicks;
+      check("an ax ref is clickable", P._pageWfActOnRef(r1, { action: "click" }).ok && deepClicks === before + 1, { r1, deepClicks });
+
       // ── same-document URL change ──
       P._pageWfObserveArm();
       history.pushState({}, "", "#saved");

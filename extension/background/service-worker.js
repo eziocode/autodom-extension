@@ -7866,6 +7866,156 @@ async function _interactiveSnapshot(params, ctx) {
   };
 }
 
+// ─── Accessibility snapshot (take_snapshot {mode:"ax"}) ──────
+// Chrome's own accessibility tree: computed names, real states (expanded,
+// checked, disabled, invalid, ...), aria-hidden and inert honoured, and
+// elements in closed shadow roots. Costs a debugger attach, so it is not
+// the default.
+const AX_INTERACTIVE_ROLES = new Set([
+  "button", "link", "textbox", "searchbox", "checkbox", "radio", "combobox", "listbox", "option",
+  "menuitem", "menuitemcheckbox", "menuitemradio", "tab", "switch", "slider", "spinbutton",
+  "treeitem", "textarea", "PopUpButton", "ToggleButton", "MenuListPopup",
+]);
+const AX_STRUCTURE_ROLES = new Set(["heading", "dialog", "alertdialog", "alert", "status", "main", "navigation", "form", "region", "tablist", "menu", "grid", "table", "row", "list"]);
+const AX_SKIP_ROLES = new Set(["generic", "none", "presentation", "InlineTextBox", "LineBreak", "RootWebArea", "WebArea"]);
+const AX_STATE_PROPS = ["disabled", "expanded", "checked", "pressed", "selected", "invalid", "required", "readonly", "focused", "modal", "level"];
+
+function _axProp(node, name) {
+  const p = (node.properties || []).find((x) => x.name === name);
+  return p ? p.value?.value : undefined;
+}
+
+function _axStates(node) {
+  const out = [];
+  for (const name of AX_STATE_PROPS) {
+    const v = _axProp(node, name);
+    if (v === undefined || v === false || v === "false") continue;
+    out.push(v === true || v === "true" ? name : `${name}=${v}`);
+  }
+  return out;
+}
+
+// AX nodes → lines with indentation. Pure: the CDP part fills refs later
+// through `refFor(backendDOMNodeId)`. Returns { lines, bind, scope, total }.
+function _axLines(nodes, { interactiveOnly = true, role = null, name = null, limit = 300 } = {}) {
+  const byId = new Map(nodes.map((n) => [n.nodeId, n]));
+  const isRoot = (n) => !n.parentId || !byId.has(n.parentId);
+  const roleOf = (n) => n.role?.value || "";
+  const nameOf = (n) => String(n.name?.value || "").replace(/\s+/g, " ").trim();
+  const interactive = (n) => AX_INTERACTIVE_ROLES.has(roleOf(n)) || (_axProp(n, "focusable") === true && !!nameOf(n) && !AX_SKIP_ROLES.has(roleOf(n)));
+
+  // A modal dialog that is open hides the rest of the page from users.
+  const modal = nodes.find((n) => !n.ignored && /dialog/.test(roleOf(n)) && _axProp(n, "modal") === true);
+  const roots = modal ? [modal] : nodes.filter(isRoot);
+  const wantRole = role ? String(role).toLowerCase() : null;
+  const wantName = name ? String(name).toLowerCase() : null;
+
+  const lines = [];
+  const bind = []; // { line, backendDOMNodeId }
+  let total = 0;
+  const walk = (n, depth) => {
+    if (!n) return;
+    const r = roleOf(n);
+    const label = nameOf(n);
+    let shown = false;
+    if (!n.ignored && !AX_SKIP_ROLES.has(r)) {
+      const isInteractive = interactive(n);
+      const keep =
+        (wantRole ? r.toLowerCase() === wantRole : true) &&
+        (wantName ? label.toLowerCase().includes(wantName) : true) &&
+        (isInteractive || (!interactiveOnly && (AX_STRUCTURE_ROLES.has(r) || (r === "StaticText" && label))) || (interactiveOnly && !wantRole && AX_STRUCTURE_ROLES.has(r) && /dialog|alert|heading/.test(r)));
+      if (keep && r !== "StaticText") {
+        total += 1;
+        if (lines.length < limit) {
+          const value = _axProp(n, "valuetext") ?? n.value?.value;
+          const line = {
+            depth,
+            role: r,
+            ...(label && { accessibleName: label.slice(0, 120) }),
+            states: [..._axStates(n), ...(value !== undefined && value !== "" && !label.includes(String(value)) ? [`value=${JSON.stringify(String(value).slice(0, 60))}`] : [])],
+          };
+          lines.push(line);
+          if (isInteractive && n.backendDOMNodeId) bind.push({ line, backendDOMNodeId: n.backendDOMNodeId });
+          shown = true;
+        }
+      } else if (keep && r === "StaticText" && !interactiveOnly && lines.length < limit) {
+        // Text right under a structural line only, to keep it short.
+        lines.push({ depth, text: label.slice(0, 200) });
+      }
+    }
+    for (const id of n.childIds || []) walk(byId.get(id), shown ? depth + 1 : depth);
+  };
+  for (const root of roots) walk(root, 0);
+  return { lines, bind, total, scope: modal ? { modal: true, label: nameOf(modal) } : null };
+}
+
+function _axRender(line, compactLine) {
+  const pad = "  ".repeat(Math.min(line.depth, 12));
+  if (line.text != null) return `${pad}"${line.text}"`;
+  return pad + compactLine(line);
+}
+
+async function _axSnapshot(params, ctx) {
+  if (IS_FIREFOX) return { error: 'mode "ax" needs the Chrome DevTools protocol; use mode "interactive".' };
+  const W = globalThis.AutoDOMWorkflow;
+  if (!W) return { error: "workflow engine not loaded" };
+  const tab = await getActiveTab(ctx);
+  const tabId = tab.id;
+  const limit = Math.max(10, Math.min(1000, Number(params?.limit) || 300));
+  const maxChars = Math.max(1000, Math.min(60000, Number(params?.maxChars) || 12000));
+  const send = (method, p) => chrome.debugger.sendCommand({ tabId }, method, p || {});
+  await ensureDebugger(tabId);
+  try {
+    const { nodes = [] } = await send("Accessibility.getFullAXTree", {});
+    const { lines, bind, total, scope } = _axLines(nodes, {
+      interactiveOnly: params?.interactiveOnly !== false,
+      role: params?.role,
+      name: params?.name,
+      limit,
+    });
+
+    // Refs: tag each element over CDP, then let the page library adopt the
+    // tags as @eN refs in one call (it walks open shadow roots).
+    if (bind.length) {
+      await send("DOM.getDocument", { depth: 0 });
+      const { nodeIds = [] } = await send("DOM.pushNodesByBackendIdsToFrontend", { backendNodeIds: bind.map((b) => b.backendDOMNodeId) });
+      await Promise.all(
+        nodeIds.map((nodeId, i) => (nodeId ? send("DOM.setAttributeValue", { nodeId, name: "data-autodom-ax", value: String(i) }).catch(() => {}) : null)),
+      );
+      const adopted = await _callWfPage(tabId, W._page._pageWfAdoptAx, []).catch(() => null);
+      for (const [token, ref] of Object.entries(adopted?.refs || {})) {
+        const b = bind[Number(token)];
+        if (b) b.line.ref = ref;
+      }
+    }
+
+    const header = [`Page: ${tab.title || ""} — ${tab.url || ""} (accessibility tree)`];
+    if (scope) header.push(`A modal dialog is open${scope.label ? `: "${scope.label}"` : ""}; only its contents are shown.`);
+    let body = "";
+    let shown = 0;
+    for (const line of lines) {
+      const text = _axRender(line, W.compactLine);
+      if (body.length + text.length + 1 > maxChars) break;
+      body += text + "\n";
+      shown += 1;
+    }
+    const capped = shown < lines.length || total > lines.length;
+    const footer = `(${shown} of ${total} nodes${capped ? `; capped by ${shown < lines.length ? "maxChars" : "limit"}` : ""}. Elements in iframes are not included; use iframe_interact. Pass ref:"@eN" to click, type_text, hover or select_option.)`;
+    return {
+      mode: "ax",
+      url: tab.url,
+      title: tab.title,
+      count: shown,
+      ...(scope && { modal: scope }),
+      snapshot: [...header, body.trimEnd(), footer].filter(Boolean).join("\n"),
+    };
+  } catch (err) {
+    return { error: `Accessibility snapshot failed: ${err.message}. mode "interactive" works without the debugger.` };
+  } finally {
+    detachDebuggerSafe(tabId).catch(() => {});
+  }
+}
+
 // ─── WebMCP bridge ───────────────────────────────────────────
 // Pages can register their own agent tools with
 // document.modelContext.registerTool() (Chrome origin trial 149–156;
@@ -8608,6 +8758,7 @@ async function toolSnapshot(params, ctx) {
     return _interactiveSnapshot({ ...(params || {}), mode: "interactive" }, ctx);
   }
   if (params?.mode === "interactive") return _interactiveSnapshot(params, ctx);
+  if (params?.mode === "ax") return _axSnapshot(params, ctx);
   const tab = await getActiveTab(ctx);
   const autoScroll = params?.autoScroll || false;
   const maxScrolls = Number.isFinite(params?.maxScrolls) ? params.maxScrolls : 12;

@@ -9513,14 +9513,18 @@ server.addTool({
 server.addTool({
   name: "take_snapshot",
   description:
-    "Page snapshot. Default interactive: one line per actionable element (@e12 button \"Save\"); pass ref to click/type_text/hover/select_option/press_key. mode:\"diff\" = only elements added/changed/removed since your last snapshot of this page. mode:\"tree\" = legacy DOM tree (large). autoScroll:true renders lazy content first (virtualized lists: use get_dom_state autoScroll).",
+    "Page snapshot. Default interactive: one line per actionable element (@e12 button \"Save\"); pass ref to click/type_text/hover/select_option/press_key. mode:\"ax\" = Chrome's accessibility tree with the same refs: computed names, states (expanded, checked, disabled, invalid), only the open modal dialog when there is one, closed shadow roots included; better for custom widgets, but attaches the debugger. mode:\"diff\" = only elements added/changed/removed since your last snapshot of this page. mode:\"tree\" = legacy DOM tree (large). autoScroll:true renders lazy content first (virtualized lists: use get_dom_state autoScroll).",
   parameters: z.object({
     mode: z
-      .enum(["interactive", "diff", "tree"])
+      .enum(["interactive", "ax", "diff", "tree"])
       .optional()
       .default("interactive")
-      .describe("interactive (default) | diff (changes since last snapshot) | tree (legacy full DOM tree)"),
-    limit: z.coerce.number().optional().describe("interactive mode: max elements (default 300)"),
+      .describe("interactive (default) | ax (accessibility tree) | diff (changes since last snapshot) | tree (legacy full DOM tree)"),
+    limit: z.coerce.number().optional().describe("interactive/ax mode: max elements (default 300)"),
+    interactiveOnly: z.boolean().optional().describe("ax mode: false also lists headings, landmarks and text (default true)"),
+    role: z.string().optional().describe('ax mode: only this role, e.g. "button"'),
+    name: z.string().optional().describe("ax mode: only names containing this text"),
+    maxChars: z.number().optional().describe("ax mode: output budget in characters (default 12000)"),
     includeHidden: z.boolean().optional().describe("interactive mode: include hidden form fields"),
     maxDepth: z
       .number()
@@ -9554,6 +9558,8 @@ server.addTool({
     const mode = params.mode || "interactive";
     const forward = { ..._withoutAtkParams(params), mode: mode === "diff" ? "interactive" : mode };
     const result = await callExtensionTool("take_snapshot", forward);
+    // ax lines are not comparable with interactive baselines: no diff.
+    if (mode === "ax" && typeof result?.snapshot === "string") return compactResult("take_snapshot", result.snapshot, params);
     if (mode !== "tree" && typeof result?.snapshot === "string") {
       return compactResult("take_snapshot", _snapshotView(result, mode), params);
     }
