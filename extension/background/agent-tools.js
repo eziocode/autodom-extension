@@ -458,13 +458,13 @@
     {
       name: "scroll",
       description:
-        "Scroll the page or an element. direction = up/down/top/bottom or pixels.",
+        "Scroll the page, or the scrollable pane that holds `selector`. The result says which container moved and whether it moved.",
       parameters: {
         type: "object",
         properties: {
-          direction: { type: "string" },
-          selector: { type: "string" },
-          pixels: { type: "integer" },
+          direction: { type: "string", enum: ["up", "down", "left", "right", "top", "bottom", "into_view"] },
+          amount: { type: "integer", description: "Pixels, default 500" },
+          selector: { type: "string", description: "Element to scroll, or to bring into view with into_view" },
         },
       },
     },

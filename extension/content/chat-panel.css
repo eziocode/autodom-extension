@@ -832,7 +832,9 @@
       flex-direction: column !important;
       align-items: flex-start !important;
       gap: 12px !important;
-      scroll-behavior: smooth;
+      /* No scroll-behavior:smooth here: following a streaming reply sets
+         scrollTop every frame, and an animated scroll reads as "the user
+         scrolled away", which stops the follow. */
       min-width: 0;
       min-height: 0;
       /* Prevent host-page CSS (Zoho CRM, Gmail, etc.) from leaking

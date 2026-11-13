@@ -9948,7 +9948,7 @@ server.addTool({
 server.addTool({
   name: "scroll",
   description:
-    "Scroll the page or an element. Directions: up, down, left, right, top, bottom, into_view.",
+    "Scroll the page, or the scrollable pane that holds `selector`. When the document itself does not scroll, the pane under the middle of the viewport is used. Directions: up, down, left, right, top, bottom, into_view.",
   parameters: z.object({
     direction: z
       .enum(["up", "down", "left", "right", "top", "bottom", "into_view"])
@@ -9963,8 +9963,8 @@ server.addTool({
     behavior: z
       .enum(["smooth", "instant", "auto"])
       .optional()
-      .default("smooth")
-      .describe("Scroll behavior"),
+      .default("auto")
+      .describe("Scroll behavior; smooth animates, so the result cannot say whether it moved"),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("scroll", params);

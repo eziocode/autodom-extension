@@ -4984,6 +4984,10 @@
     return entry;
   }
 
+  // Set while the inline overlay waits for a reply; deltas are mirrored
+  // into it.
+  let _inlineStreamNode = null;
+
   function _appendStreamingDelta(runId, chunk) {
     if (!runId || typeof chunk !== "string" || !chunk) return;
     const entry = _ensureStreamingBubble(runId);
@@ -5005,6 +5009,16 @@
     // O(n) — critical for long replies.
     entry.textNode.appendChild(document.createTextNode(safe));
     if (list) _scheduleScrollToBottom(list, "stickIfNearBottom", { wasNearBottom });
+    // The quick-prompt overlay shows the same stream while it waits.
+    if (_inlineStreamNode) {
+      const inlineNearBottom = _isNearBottom(inlineResponse);
+      if (_inlineStreamNode.dataset.pending) {
+        delete _inlineStreamNode.dataset.pending;
+        _inlineStreamNode.textContent = "";
+      }
+      _inlineStreamNode.appendChild(document.createTextNode(safe));
+      _scheduleScrollToBottom(inlineResponse, "stickIfNearBottom", { wasNearBottom: inlineNearBottom });
+    }
   }
 
   function _resetStreamingBubble(runId) {
@@ -5186,6 +5200,9 @@
           ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : ms + "ms";
       }
       const body = card.querySelector(".ai-tool-card-body");
+      // Sampled before the result is appended: a long result grows the
+      // list and would read as "not near the bottom".
+      const wasNearBottom = _isNearBottom(messagesContainer);
       if (body) {
         // Append result block
         const lbl = document.createElement("div");
@@ -5209,7 +5226,6 @@
           if (head) head.setAttribute("aria-expanded", "true");
         }
       }
-      const wasNearBottom = _isNearBottom(messagesContainer);
       _scheduleScrollToBottom(
         messagesContainer,
         "stickIfNearBottom",
@@ -8851,7 +8867,8 @@
     inlineHints.style.display = "none";
     inlineResponse.classList.add("visible");
     inlineResponseContent.innerHTML =
-      '<span class="ai-sparkle">\u2728</span> AI thinking...';
+      '<span class="ai-sparkle">\u2728</span> <span data-pending="1">AI thinking...</span>';
+    _inlineStreamNode = inlineResponseContent.lastElementChild;
 
     // Mirror into the panel BEFORE sending so the panel can show the
     // user's question even if the AI call fails or is cancelled. The
@@ -8875,6 +8892,8 @@
         md.className = "md";
         renderMarkdownInto(md, responseText);
         inlineResponseContent.appendChild(md);
+        // The finished answer is read from its start.
+        inlineResponse.scrollTop = 0;
         try { addMessage("assistant", responseText); } catch (_) {}
         _pushHistory({ role: "assistant", content: responseText });
       } else {
@@ -8920,6 +8939,7 @@
       inlineResponseContent.textContent = msg;
       try { addMessage("system", msg); } catch (_) {}
     } finally {
+      _inlineStreamNode = null;
       isProcessing = false;
       inlineSendBtn.disabled = false;
       inlineInput.value = "";

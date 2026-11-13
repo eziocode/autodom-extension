@@ -9138,49 +9138,59 @@ async function toolCloseTab(params, ctx) {
 // 20. Scroll
 async function toolScroll(params, ctx) {
   const tab = await getActiveTab(ctx);
-  const { direction, amount, selector, behavior } = params;
+  const { direction, selector, behavior } = params;
   return await executeInTab(
     tab.id,
     (direction, amount, selector, behavior) => {
-      const target = selector ? document.querySelector(selector) : window;
-      if (selector && !target)
-        return { error: `Element not found: ${selector}` };
-      const scrollBehavior = behavior || "auto";
+      const root = document.scrollingElement || document.documentElement;
+      const scrollable = (el) => {
+        if (el === document.body || el === root) return false;
+        const cs = getComputedStyle(el);
+        const can = (overflow, size, client) => /auto|scroll|overlay/.test(overflow) && size > client + 1;
+        return can(cs.overflowY, el.scrollHeight, el.clientHeight) || can(cs.overflowX, el.scrollWidth, el.clientWidth);
+      };
+      const scrollerOf = (el) => {
+        while (el && !scrollable(el)) el = el.parentElement;
+        return el || null;
+      };
 
-      if (selector && direction === "into_view") {
-        target.scrollIntoView({ behavior: scrollBehavior, block: "center" });
-        return { success: true, action: "scrollIntoView" };
+      let target = root;
+      if (selector) {
+        const el = document.querySelector(selector);
+        if (!el) return { error: `Element not found: ${selector}` };
+        if (direction === "into_view") {
+          el.scrollIntoView({ behavior, block: "center" });
+          return { success: true, action: "scrollIntoView" };
+        }
+        // The element itself, or the pane it sits in.
+        target = scrollerOf(el) || root;
+      } else if (root.scrollHeight <= root.clientHeight + 1 && root.scrollWidth <= root.clientWidth + 1) {
+        // App layouts keep the document fixed and scroll an inner pane:
+        // use the one under the middle of the viewport.
+        target = scrollerOf(document.elementFromPoint(innerWidth / 2, innerHeight / 2)) || root;
       }
 
-      const px = amount || 500;
-      const opts = { behavior: scrollBehavior };
-      if (direction === "up") opts.top = -px;
-      else if (direction === "down") opts.top = px;
-      else if (direction === "left") opts.left = -px;
-      else if (direction === "right") opts.left = px;
-      else if (direction === "top") {
-        (selector ? target : window).scrollTo({
-          top: 0,
-          behavior: scrollBehavior,
+      const before = { top: target.scrollTop, left: target.scrollLeft };
+      if (direction === "top") target.scrollTo({ top: 0, behavior });
+      else if (direction === "bottom") target.scrollTo({ top: target.scrollHeight, behavior });
+      else {
+        target.scrollBy({
+          behavior,
+          top: direction === "up" ? -amount : direction === "down" ? amount : 0,
+          left: direction === "left" ? -amount : direction === "right" ? amount : 0,
         });
-        return { success: true };
-      } else if (direction === "bottom") {
-        const el = selector ? target : document.documentElement;
-        (selector ? target : window).scrollTo({
-          top: el.scrollHeight,
-          behavior: scrollBehavior,
-        });
-        return { success: true };
       }
-
-      (selector ? target : window).scrollBy(opts);
       return {
         success: true,
-        scrollY: window.scrollY,
-        scrollX: window.scrollX,
+        container: target === root ? "page" : target.tagName.toLowerCase() + (target.id ? "#" + target.id : ""),
+        scrollTop: Math.round(target.scrollTop),
+        scrollLeft: Math.round(target.scrollLeft),
+        // A smooth scroll has not moved yet when this returns.
+        ...(behavior === "smooth" ? {} : { moved: target.scrollTop !== before.top || target.scrollLeft !== before.left }),
       };
     },
-    [direction ?? "down", amount ?? 500, selector ?? null, behavior ?? "auto"],
+    // "pixels" is the name the in-panel agent's schema used before 7.3.
+    [direction ?? "down", params.amount ?? params.pixels ?? 500, selector ?? null, behavior ?? "auto"],
   );
 }
 
