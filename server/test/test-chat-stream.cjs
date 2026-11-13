@@ -8,6 +8,9 @@
 //   3. Browser tool calls made for a chat request use the bridge's chat
 //      client id (<clientId>:chat), not the IDE agent's, so the agent's
 //      pins are never overwritten; MCP tool calls keep the agent's id.
+//   4. The Claude CLI is attached to AutoDOM's own tools through a
+//      token-protected loopback MCP endpoint, as its only MCP server and
+//      with its built-in tools off; other CLIs get no MCP servers.
 //
 // Providers are local fake HTTP servers.
 //
@@ -230,9 +233,10 @@ async function main() {
     JSON.stringify({ agent: agentCall?.clientId, chat: chatCalls[0]?.clientId }),
   );
 
-  // ── 5. spawned CLIs do not boot their MCP servers ─────────
-  // Fake claude/codex binaries record their argv; the codex one also
-  // answers `mcp list --json`.
+  // ── 5. what MCP servers the spawned CLIs get ──────────────
+  // Fake claude/codex binaries record their argv. The claude one calls a
+  // tool on the MCP server it was given, with and without its token; the
+  // codex one answers `mcp list --json`.
   const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "autodom-fake-cli-"));
   const argvLog = path.join(binDir, "argv.jsonl");
   const fakeCli = (name, extra) => {
@@ -247,29 +251,65 @@ async function main() {
     fs.chmodSync(file, 0o755);
     return file;
   };
-  const claudeBin = fakeCli("claude", `process.stdin.resume(); process.stdin.on("end", () => console.log(JSON.stringify({ result: "claude ok" })));\n`);
+  const claudeBin = fakeCli(
+    "claude",
+    `const fs = require("fs");\n` +
+      `const cfg = JSON.parse(fs.readFileSync(args[args.indexOf("--mcp-config") + 1], "utf8")).mcpServers;\n` +
+      `const srv = cfg.autodom;\n` +
+      `const call = (headers) => fetch(srv.url, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream", "mcp-protocol-version": "2026-07-28", "mcp-method": "tools/call", "mcp-name": "get_page_info", ...headers }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "get_page_info", arguments: {}, _meta: { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": { name: "fake-claude", version: "1" }, "io.modelcontextprotocol/clientCapabilities": {} } } }) });\n` +
+      `process.stdin.resume(); process.stdin.on("end", async () => {\n` +
+      `  const denied = await call({});\n` +
+      `  const ok = await call(srv.headers);\n` +
+      `  const text = await ok.text();\n` +
+      `  fs.appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify({ name: "claude-mcp", servers: Object.keys(cfg), mode: fs.statSync(args[args.indexOf("--mcp-config") + 1]).mode & 0o777, denied: denied.status, ok: ok.status, body: ok.status === 200 ? undefined : text.slice(0, 300), sawPage: /fake\\.test/.test(text) }) + "\\n");\n` +
+      `  console.log(JSON.stringify({ result: "claude ok" }));\n` +
+      `});\n`,
+  );
   const codexBin = fakeCli(
     "codex",
     `if (args[0] === "mcp") { console.log(JSON.stringify([{ name: "autodom", enabled: true }, { name: "weird.name", enabled: true }, { name: "off", enabled: false }])); process.exit(0); }\n` +
       `console.log("codex ok");\n`,
   );
+  const beforeCli = frames.length;
   chat("c5", "Explain how rainbows form", "cli", { provider: "cli", cliBinary: claudeBin, cliKind: "claude" });
   const f5 = await waitFor(() => finalFor("c5"), 8000);
+  const cliToolCalls = frames.slice(beforeCli).filter((f) => f.type === "TOOL_CALL");
   chat("c6", "Explain how tides work", "cli", { provider: "cli", cliBinary: codexBin, cliKind: "codex" });
   const f6 = await waitFor(() => finalFor("c6"), 8000);
   const runs = fs.existsSync(argvLog)
     ? fs.readFileSync(argvLog, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l))
     : [];
   const claudeRun = runs.find((r) => r.name === "claude");
+  const claudeMcp = runs.find((r) => r.name === "claude-mcp");
+  const cfgPath = claudeRun ? claudeRun.args[claudeRun.args.indexOf("--mcp-config") + 1] : "";
   const codexRun = runs.find((r) => r.name === "codex" && r.args[0] === "exec");
   check("claude CLI reply delivered", f5 && /claude ok/.test(f5.response || ""), JSON.stringify(f5));
   check(
-    "claude is spawned with an empty, strict MCP config",
+    "claude gets AutoDOM as its only MCP server and no built-in tools",
     claudeRun &&
       claudeRun.args.includes("--strict-mcp-config") &&
-      claudeRun.args[claudeRun.args.indexOf("--mcp-config") + 1] === '{"mcpServers":{}}',
-    JSON.stringify(claudeRun),
+      claudeRun.args[claudeRun.args.indexOf("--tools") + 1] === "" &&
+      claudeRun.args[claudeRun.args.indexOf("--allowedTools") + 1] === "mcp__autodom" &&
+      claudeMcp &&
+      JSON.stringify(claudeMcp.servers) === '["autodom"]',
+    JSON.stringify({ claudeRun, claudeMcp }),
   );
+  check(
+    "the endpoint token is in a private file, not on the command line",
+    claudeMcp && claudeMcp.mode === 0o600 && claudeRun && !claudeRun.args.join(" ").includes("Bearer"),
+    JSON.stringify({ mode: claudeMcp?.mode, args: claudeRun?.args }),
+  );
+  check(
+    "the endpoint refuses calls without the token and serves calls with it",
+    claudeMcp && claudeMcp.denied === 401 && claudeMcp.ok === 200 && claudeMcp.sawPage,
+    JSON.stringify(claudeMcp),
+  );
+  check(
+    "tool calls from the CLI run as the chat, not as the IDE agent",
+    cliToolCalls.length === 1 && cliToolCalls[0].tool === "get_page_info" && /:chat$/.test(cliToolCalls[0].clientId),
+    JSON.stringify(cliToolCalls.map((c) => [c.tool, c.clientId])),
+  );
+  check("the token file is removed when the CLI exits", cfgPath && !fs.existsSync(cfgPath), cfgPath);
   check("codex CLI reply delivered", f6 && /codex ok/.test(f6.response || ""), JSON.stringify(f6));
   check(
     "codex disables each enabled, addressable MCP server",
@@ -286,7 +326,7 @@ async function main() {
   } catch (_) {}
   cleanup();
   const failed = results.filter((r) => !r.ok).length;
-  console.log(failed ? `\nFAIL — ${failed} check(s) failed` : "\nPASS — chat replies stream and chat tool calls use their own client id");
+  console.log(failed ? `\nFAIL — ${failed} check(s) failed` : "\nPASS — chat replies stream, chat tool calls use their own client id, and the Claude CLI gets AutoDOM's tools");
   await new Promise((r) => setTimeout(r, 300));
   process.exit(failed ? 1 : 0);
 }

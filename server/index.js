@@ -52,7 +52,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { z } from "zod";
 import { fileURLToPath } from "url";
 import { execFile, spawn, spawnSync } from "child_process";
-import { promises as fs, readFileSync, rmSync, createWriteStream } from "fs";
+import { promises as fs, readFileSync, rmSync, createWriteStream, mkdtempSync, writeFileSync } from "fs";
 import { homedir, tmpdir } from "os";
 import { join, isAbsolute, resolve as resolvePath } from "path";
 import { promisify } from "util";
@@ -6909,6 +6909,20 @@ async function routeDirectProviderChat({
   }
 
   if (provider === "cli") {
+    // Claude CLI: it drives the browser itself with AutoDOM's MCP tools.
+    // Other CLIs keep the text-JSON agent loop below until they can be
+    // attached the same way.
+    if (_cliMcpToolsEnabled(providerConfig)) {
+      return callCliProvider({
+        text,
+        context,
+        conversationHistory,
+        providerConfig,
+        requestId,
+        onTextDelta,
+        mcpTools: true,
+      });
+    }
     const richPageAnalysis = isRichPageAnalysisIntent(text);
     if (
       !richPageAnalysis &&
@@ -7392,6 +7406,81 @@ async function _codexEnabledMcpServers(binary) {
   return names;
 }
 
+// ─── AutoDOM tools for the chat's own CLI ────────────────────
+// A chat request answered by the local Claude CLI gets the same tools as
+// any MCP client: the CLI is pointed at a loopback MCP endpoint of this
+// process, as its only MCP server and with its built-in tools off. Calls
+// arriving there run as the chat (client id <id>:chat, the user's tab),
+// exactly like the tool calls this server makes for a chat request.
+// Set AUTODOM_CLI_MCP_TOOLS=0 to keep the CLI text-only.
+const _chatMcpTokens = new Set(); // bearer tokens of chat requests in flight
+let _chatMcpPort = null;
+
+function _cliMcpToolsEnabled(providerConfig) {
+  if (process.env.AUTODOM_CLI_MCP_TOOLS === "0") return false;
+  if ((providerConfig?.cliKind || "claude").trim().toLowerCase() !== "claude") return false;
+  // The user's own MCP flags win.
+  return !/(^|\s)--(strict-)?mcp-config(\s|=|$)/.test(providerConfig?.cliExtraArgs || "");
+}
+
+async function _ensureChatMcpEndpoint() {
+  if (_chatMcpPort) return _chatMcpPort;
+  const { createServer } = await import("http");
+  const validateHost = localhostHostValidation();
+  const onerror = (err) => process.stderr.write(`[AutoDOM] chat MCP endpoint error: ${err.message}\n`);
+  const handle = toNodeHandler(createMcpHandler(createAutoDomMcpServer, { onerror }), { onerror });
+  const httpServer = createServer((req, res) => {
+    if (!validateHost(req, res)) return;
+    const token = /^Bearer (\S+)$/.exec(req.headers.authorization || "")?.[1];
+    if (!token || !_chatMcpTokens.has(token)) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
+    if ((req.url || "").split("?")[0] !== "/mcp") {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Not found" }));
+      return;
+    }
+    userTabRequestContext.run({ userTab: true }, () => handle(req, res));
+  });
+  await new Promise((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(0, "127.0.0.1", resolve);
+  });
+  httpServer.unref();
+  _chatMcpPort = httpServer.address().port;
+  return _chatMcpPort;
+}
+
+// CLI arguments that attach the endpoint for one chat request, and a
+// release() that revokes its token. The token goes in a 0600 file, not on
+// the command line, so it is not visible in the process list.
+async function _attachChatMcp() {
+  const port = await _ensureChatMcpEndpoint();
+  const token = randomBytes(32).toString("hex");
+  _chatMcpTokens.add(token);
+  const dir = mkdtempSync(join(tmpdir(), "autodom-chat-"));
+  const file = join(dir, "mcp.json");
+  writeFileSync(
+    file,
+    JSON.stringify({
+      mcpServers: {
+        autodom: { type: "http", url: `http://127.0.0.1:${port}/mcp`, headers: { Authorization: `Bearer ${token}` } },
+      },
+    }),
+    { mode: 0o600 },
+  );
+  return {
+    // Each of these flags takes a list; the next flag ends it.
+    args: ["--mcp-config", file, "--strict-mcp-config", "--tools", "", "--allowedTools", "mcp__autodom"],
+    release() {
+      _chatMcpTokens.delete(token);
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
 async function _cliMcpIsolationArgs(kind, binary, userArgsJoined) {
   if (!_cliIsolateMcpEnabled()) return [];
   if (kind === "claude") {
@@ -7407,7 +7496,7 @@ async function _cliMcpIsolationArgs(kind, binary, userArgsJoined) {
   return [];
 }
 
-async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta }) {
+async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta, mcpTools = false }) {
   if (_isAborted(requestId)) throw new AiAbortError(requestId);
   const binary = (providerConfig.cliBinary || "claude").trim();
   const kind = (providerConfig.cliKind || "claude").trim().toLowerCase();
@@ -7450,8 +7539,12 @@ async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta }) 
   const wantCodexJson = kind === "codex" && !userPickedJsonCodex;
   const codexJsonArgs = wantCodexJson ? ["--json"] : [];
 
-  const mcpIsolationArgs = await _cliMcpIsolationArgs(kind, binary, userArgsJoined);
-  if (_isAborted(requestId)) throw new AiAbortError(requestId);
+  const chatMcp = mcpTools && _cliMcpToolsEnabled(providerConfig) ? await _attachChatMcp() : null;
+  const mcpIsolationArgs = chatMcp ? chatMcp.args : await _cliMcpIsolationArgs(kind, binary, userArgsJoined);
+  if (_isAborted(requestId)) {
+    chatMcp?.release();
+    throw new AiAbortError(requestId);
+  }
 
   let args;
   let writePromptToStdin = true;
@@ -7495,10 +7588,12 @@ async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta }) 
       }
       if (_isAborted(requestId)) {
         _killCliProviderProcess(requestId, "aborted before prompt write");
+        chatMcp?.release();
         reject(new AiAbortError(requestId));
         return;
       }
     } catch (spawnErr) {
+      chatMcp?.release();
       reject(
         new Error(
           `CLI provider: failed to spawn '${binary}': ${spawnErr.message}. Ensure the binary is installed and on PATH.`,
@@ -7518,6 +7613,7 @@ async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta }) 
         if (timer) clearTimeout(timer);
       } catch (_) {}
       if (requestId != null) activeCliProviderProcesses.delete(requestId);
+      chatMcp?.release();
       fn(value);
     };
 
@@ -7641,6 +7737,7 @@ async function callCliProvider({
   providerConfig,
   requestId,
   onTextDelta,
+  mcpTools = false,
 }) {
   if (_isAborted(requestId)) throw new AiAbortError(requestId);
   const binary = (providerConfig.cliBinary || "claude").trim();
@@ -7655,8 +7752,14 @@ async function callCliProvider({
   // Compose the prompt: system context + conversation + new user turn
   const systemPreamble = buildProviderSystemPrompt(context, { responseStyle: providerConfig?.responseStyle });
   const historyText = conversationToProviderText(conversationHistory);
+  const toolNote = mcpTools
+    ? "You have the AutoDOM browser tools (mcp__autodom__*) and they act on the user's current tab. " +
+      "Use them to read the page and to do what is asked; take_screenshot shows you the page. " +
+      "After each action read page_changes in the result and deal with any dialog it reports before going on.\n\n"
+    : "";
   const composedPrompt =
     `${systemPreamble}\n\n` +
+    toolNote +
     (historyText ? `Conversation so far:\n${historyText}\n\n` : "") +
     `User: ${text}\n\nRespond as the AutoDOM browser assistant.`;
 
@@ -7665,6 +7768,7 @@ async function callCliProvider({
     providerConfig,
     requestId,
     onTextDelta,
+    mcpTools,
   });
   return {
     response: cliResult.response || "(CLI returned no output)",
