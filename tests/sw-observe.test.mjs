@@ -84,14 +84,18 @@ function loadSw(page = {}) {
   chrome.runtime.onMessage = event();
   chrome.webRequest = { onBeforeRequest: event(), onCompleted: event(), onErrorOccurred: event() };
   const cdp = [];
+  const detached = [];
   chrome.debugger = {
     onEvent: event(),
     onDetach: event(),
     attach: async () => {},
-    detach: async () => {},
+    detach: async () => {
+      detached.push(Date.now());
+    },
     sendCommand: async (_target, method, params) => {
       cdp.push({ method, params });
       if (method === "Page.handleJavaScriptDialog") chrome.debugger.onEvent.fire({ tabId: 1 }, "Page.javascriptDialogClosed", {});
+      if (page.cdp?.[method]) return page.cdp[method](params, chrome);
       return {};
     },
   };
@@ -153,6 +157,8 @@ function loadSw(page = {}) {
     navigator: { userAgent: "node" },
     WebSocket: FakeWebSocket,
     Blob,
+    btoa,
+    atob,
   };
   ctx.globalThis = ctx;
   ctx.self = ctx;
@@ -177,7 +183,7 @@ function loadSw(page = {}) {
     throw new Error(`no TOOL_RESULT for ${name}`);
   };
   const run = (code) => vm.runInContext(code, ctx);
-  return { chrome, tabs, calls, cdp, tool, run };
+  return { chrome, tabs, calls, cdp, detached, tool, run };
 }
 
 async function ready(page) {
@@ -488,4 +494,101 @@ test("click_at_coordinates maps screenshot pixels to the page and can send trust
     ["mousePressed", 50, 60, 2],
     ["mouseReleased", 50, 60, 2],
   ]);
+});
+
+// ─── Network control ────────────────────────────────────────────────
+const paused = (chrome, requestId, url, extra = {}) =>
+  chrome.debugger.onEvent.fire({ tabId: 1 }, "Fetch.requestPaused", {
+    requestId, networkId: `n${requestId}`, resourceType: "XHR",
+    request: { url, method: "GET", headers: { Origin: "https://crm.test", "X-Old": "1" } }, ...extra,
+  });
+const answers = (sw) => sw.cdp.filter((c) => /^Fetch\.(continue|fail|fulfill)/.test(c.method)).map((c) => [c.method, c.params.requestId]);
+
+test("network_rules answers every paused request: block, mock, modify, pass through", async () => {
+  const sw = await ready();
+  const added = await sw.tool("network_rules", {
+    action: "add",
+    rules: [
+      { urlPattern: "*/api/leads*", method: "GET", do: "mock", status: 503, json: { error: "down" } },
+      { urlPattern: "/ads\\.js$/", do: "block" },
+      { id: "auth", urlPattern: "/api/", do: "modify", setRequestHeaders: { Authorization: "Bearer test" }, removeRequestHeaders: ["X-Old"] },
+    ],
+  });
+  assert.equal(added.result.ok, true, JSON.stringify(added.result));
+  const enable = sw.cdp.find((c) => c.method === "Fetch.enable");
+  assert.deepEqual(JSON.parse(JSON.stringify(enable.params.patterns)), [{ urlPattern: "*", requestStage: "Request" }], "a /regex/ rule pauses everything");
+
+  paused(sw.chrome, "1", "https://crm.test/api/leads?page=2");
+  paused(sw.chrome, "2", "https://cdn.test/ads.js");
+  paused(sw.chrome, "3", "https://crm.test/api/notes");
+  paused(sw.chrome, "4", "https://crm.test/logo.png");
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(answers(sw), [
+    ["Fetch.fulfillRequest", "1"],
+    ["Fetch.failRequest", "2"],
+    ["Fetch.continueRequest", "3"],
+    ["Fetch.continueRequest", "4"],
+  ]);
+  const mock = sw.cdp.find((c) => c.method === "Fetch.fulfillRequest").params;
+  assert.equal(mock.responseCode, 503);
+  assert.equal(Buffer.from(mock.body, "base64").toString(), '{"error":"down"}');
+  assert.ok(mock.responseHeaders.some((h) => h.name === "Access-Control-Allow-Origin" && h.value === "https://crm.test"));
+  const modified = sw.cdp.filter((c) => c.method === "Fetch.continueRequest").find((c) => c.params.requestId === "3").params.headers;
+  assert.deepEqual(JSON.parse(JSON.stringify(modified)), [{ name: "Origin", value: "https://crm.test" }, { name: "Authorization", value: "Bearer test" }]);
+
+  const listed = await sw.tool("network_rules", {});
+  assert.deepEqual(listed.result.rules.map((r) => [r.id, r.hits]), [["r1", 1], ["r2", 1], ["auth", 1]]);
+  assert.equal("_body" in listed.result.rules[0], false, "mock bodies are not echoed back");
+
+  const cleared = await sw.tool("network_rules", { action: "clear" });
+  assert.deepEqual(cleared.result.rules, []);
+  assert.ok(sw.cdp.some((c) => c.method === "Fetch.disable"));
+});
+
+test("network_rules: times limits a rule and bad rules are refused", async () => {
+  const sw = await ready({ cdp: { "Fetch.fulfillRequest": () => new Promise(() => {}) } });
+  const bad = await sw.tool("network_rules", { action: "add", rules: [{ urlPattern: "/x", do: "explode" }] });
+  assert.match(bad.result.error, /must be block, mock, delay or modify/);
+  await sw.tool("network_rules", { action: "add", rules: [{ urlPattern: "/once", do: "mock", times: 1 }] });
+  paused(sw.chrome, "a", "https://crm.test/once");
+  paused(sw.chrome, "b", "https://crm.test/once");
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(answers(sw), [["Fetch.fulfillRequest", "a"], ["Fetch.continueRequest", "b"]], "second request passes: times reached");
+});
+
+test("one-shot CDP tools no longer drop held emulation; reset releases it", async () => {
+  const sw = await ready();
+  const em = await sw.tool("emulate", { network: "slow-3g", cpuThrottle: 4, observe: false });
+  assert.deepEqual(em.result.applied, ["network", "cpu x4"]);
+  const cond = sw.cdp.find((c) => c.method === "Network.emulateNetworkConditions").params;
+  assert.equal(cond.latency, 2000);
+  assert.equal(sw.cdp.find((c) => c.method === "Emulation.setCPUThrottlingRate").params.rate, 4);
+  sw.run("_debuggerAttached.add(1)");
+  await sw.run("detachDebuggerSafe(1)");
+  assert.equal(sw.detached.length, 0, "held: a one-shot tool does not detach");
+  const reset = await sw.tool("emulate", { reset: true });
+  assert.equal(reset.result.reset, true);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sw.detached.length, 1, "released and detached");
+  const bad = await sw.tool("emulate", { network: "5g" });
+  assert.match(bad.result.error, /Unknown network preset/);
+});
+
+test("performance_stop_trace reads the trace stream and returns a summary", async () => {
+  const chunks = [{ data: '{"traceEvents":[', eof: false }, { data: btoa("1,2]}"), base64Encoded: true, eof: true }];
+  const sw = await ready({
+    cdp: {
+      "Tracing.end": (_p, chrome) => {
+        setTimeout(() => chrome.debugger.onEvent.fire({ tabId: 1 }, "Tracing.tracingComplete", { stream: "s1" }), 5);
+        return {};
+      },
+      "IO.read": () => chunks.shift(),
+    },
+  });
+  await sw.tool("performance_start_trace", {});
+  const stopped = await sw.tool("performance_stop_trace", {});
+  assert.equal(stopped.result.success, true, JSON.stringify(stopped.result));
+  assert.equal(stopped.result.trace, '{"traceEvents":[1,2]}');
+  assert.ok(sw.cdp.some((c) => c.method === "IO.close"));
+  assert.equal(sw.run("_debuggerHolds.has(1)"), false, "the trace hold is released");
 });

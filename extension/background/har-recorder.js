@@ -160,6 +160,7 @@
       pendingBodies: new Set(),
       segments: [],
       steps: [],
+      intercepts: new Map(), // requestId → rule that answered it before its entry existed
       waiters: new Set(),
       closed: false,
       stopped: false,
@@ -205,6 +206,15 @@
     };
     s.steps.push(step);
     return step.step;
+  }
+
+  // A network_rules rule answered this request (CDP networkId = requestId).
+  function noteIntercept(tabId, requestId, info) {
+    const s = _sessions.get(tabId);
+    if (!s) return;
+    const e = s.byRequest.get(requestId);
+    if (e) e._autodom.intercept = info;
+    else s.intercepts.set(requestId, info);
   }
 
   function endAction(tabId, stepNo) {
@@ -632,6 +642,10 @@
         }
         s.live.set(params.requestId, e);
         s.byRequest.set(params.requestId, e);
+        if (s.intercepts.has(params.requestId)) {
+          e._autodom.intercept = s.intercepts.get(params.requestId);
+          s.intercepts.delete(params.requestId);
+        }
         const pending = s.extra.get(params.requestId);
         if (pending?.request) {
           _applyExtra(s, e, { request: pending.request });
@@ -1060,6 +1074,7 @@
     isActive,
     recordingTabs,
     noteAction,
+    noteIntercept,
     endAction,
     query,
     row,

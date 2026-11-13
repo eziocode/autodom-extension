@@ -64,3 +64,15 @@ test("curl script quotes values and never carries redacted secrets", () => {
   assert.match(text, /# ── segment 1: Add to cart/);
   assert.doesNotMatch(text, /logo\.png/);
 });
+
+test("writeArtifact: default folder, extension check, no silent overwrite", async () => {
+  const { writeArtifact } = await import("../server/har-export.js");
+  const dir = mkdtempSync(join(tmpdir(), "artifact-"));
+  const file = join(dir, "t.json");
+  assert.equal(await writeArtifact("traces", "{}", { path: file, ext: ".json" }), file);
+  await assert.rejects(writeArtifact("traces", "{}", { path: file, ext: ".json" }), /exists/);
+  await writeArtifact("traces", "[]", { path: file, ext: ".json", overwrite: true });
+  assert.equal(readFileSync(file, "utf8"), "[]");
+  await assert.rejects(writeArtifact("traces", "{}", { path: join(dir, "t.txt"), ext: ".json" }), /must end in \.json/);
+  await assert.rejects(writeArtifact("traces", "{}", { path: "t.json", ext: ".json" }), /absolute/);
+});

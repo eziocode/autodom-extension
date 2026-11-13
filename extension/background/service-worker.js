@@ -1803,6 +1803,8 @@ async function _handleUnpinTabTool(clientId) {
 // AutoDOM created, ungroups/restores tabs it adopted, drops the pin.
 async function _handleFinishSessionTool(clientId) {
   if (!clientId) return { error: "finish_session requires a clientId" };
+  const pinnedTab = _clientPins.get(clientId)?.tabId;
+  if (pinnedTab != null) await _clearNetworkRules(pinnedTab);
   _clientPins.delete(clientId);
   // Free a finished tab recording still held in memory; a running one is
   // left alone (the chat panel's record toggle may own it).
@@ -4107,7 +4109,6 @@ const _LANE_FREE_TOOLS = new Set([
   "stop_recording",
   "list_downloads",
   "wait_for_download",
-  "performance_analyze_insight",
   "tab_recording_status",
   // A native dialog blocks the page; the call it interrupted may still
   // hold the tab's lane.
@@ -6566,10 +6567,10 @@ const TOOL_HANDLERS = new Map([
   ["get_recording", toolGetRecording],
   ["get_session_summary", toolGetSessionSummary],
   ["emulate", toolEmulate],
+  ["network_rules", toolNetworkRules],
   ["upload_file", toolUploadFile],
   ["performance_start_trace", toolPerformanceStartTrace],
   ["performance_stop_trace", toolPerformanceStopTrace],
-  ["performance_analyze_insight", toolPerformanceAnalyzeInsight],
   // ─── Token-Efficient Tools ─────────────────────────────────
   ["execute_code", toolExecuteCode],
   ["get_dom_state", toolGetDomState],
@@ -7173,6 +7174,7 @@ async function _armDialogWatch(tabId) {
     await ensureDebugger(tabId);
     await chrome.debugger.sendCommand({ tabId }, "Page.enable");
     _dialogWatchTabs.add(tabId);
+    _holdDebugger(tabId, "dialog");
   } catch (_) {
     // No session (DevTools open on the tab, restricted page): the
     // blocked-page check below still applies.
@@ -13359,6 +13361,26 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // Track which tabs have an active debugger session to avoid double-attach
 const _debuggerAttached = new Set();
 
+// Features that need the session to stay attached: overrides, interception
+// rules, a running trace and dialog watching all end on detach. One-shot
+// CDP tools (upload, PDF, dialog answer) detach only when nothing holds it.
+const _debuggerHolds = new Map(); // tabId → Set<owner>
+function _holdDebugger(tabId, owner) {
+  if (!_debuggerHolds.has(tabId)) _debuggerHolds.set(tabId, new Set());
+  _debuggerHolds.get(tabId).add(owner);
+}
+function _releaseDebugger(tabId, owner) {
+  const set = _debuggerHolds.get(tabId);
+  if (!set) return;
+  set.delete(owner);
+  if (!set.size) _debuggerHolds.delete(tabId);
+}
+if (chrome.debugger?.onDetach) {
+  chrome.debugger.onDetach.addListener((source) => {
+    if (source?.tabId != null) _debuggerHolds.delete(source.tabId);
+  });
+}
+
 // Detach the debugger from a tab if we are the ones holding it. Best
 // effort — never throws. Called after one-shot CDP operations
 // (execute_code CSP fallback, file upload) so Chrome's permanent
@@ -13370,7 +13392,7 @@ async function detachDebuggerSafe(tabId, { force = false } = {}) {
   // Console/network capture holds the session open between tool calls;
   // one-shot CDP users must not tear it down underneath it.
   if (!force && globalThis.AutoDOMDebugCapture?.isActive(tabId)) return;
-  if (!force && _dialogWatchTabs.has(tabId)) return;
+  if (!force && _debuggerHolds.get(tabId)?.size) return;
   try {
     await chrome.debugger.detach({ tabId });
   } catch (_) {
@@ -13421,36 +13443,266 @@ async function ensureDebugger(tabId) {
 }
 
 // 42. Emulate device / features
-async function toolEmulate({ userAgent, viewport, colorScheme }, ctx) {
+// ─── network_rules: block, mock, delay or rewrite requests ───
+// CDP Fetch pauses only requests matching a rule's pattern, and every
+// paused request is answered: by the rule, or continued untouched. A
+// watchdog continues any request a rule has not answered in 10 s, so a
+// broken rule cannot hang the page.
+const NETWORK_RULES_MAX = 50;
+const NETWORK_RULE_BODY_MAX = 1024 * 1024;
+const NETWORK_RULE_WATCHDOG_MS = 10000;
+const _networkRules = new Map(); // tabId → { rules: [], seq }
+let _networkRuleListener = null;
+
+function _ruleUrlMatcher(pattern) {
+  const p = String(pattern || "*");
+  const re = /^\/(.+)\/([a-z]*)$/.exec(p);
+  if (re) {
+    try {
+      const rx = new RegExp(re[1], re[2]);
+      return (url) => rx.test(url);
+    } catch (_) {}
+  }
+  const rx = new RegExp(p.split("*").map((x) => x.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*"));
+  return (url) => rx.test(url);
+}
+
+// Fetch.enable patterns: a glob goes to the browser as is; a /regex/
+// pauses everything and is matched here.
+function _fetchPatterns(rules) {
+  const any = rules.some((r) => /^\/.+\/[a-z]*$/.test(r.urlPattern));
+  const patterns = any ? [{ urlPattern: "*" }] : rules.map((r) => ({ urlPattern: r.urlPattern.includes("*") ? r.urlPattern : `*${r.urlPattern}*` }));
+  return patterns.map((x) => ({ ...x, requestStage: "Request" }));
+}
+
+function _ruleFor(tabId, request, resourceType) {
+  const state = _networkRules.get(tabId);
+  if (!state) return null;
+  for (const r of state.rules) {
+    if (r.method && r.method !== request.method) continue;
+    if (r.resourceType && r.resourceType !== resourceType) continue;
+    if (!r._match(request.url)) continue;
+    if (r.times != null && r.hits >= r.times) continue;
+    return r;
+  }
+  return null;
+}
+
+// UTF-8 text → base64.
+function _b64(text) {
+  const bytes = new TextEncoder().encode(text);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+async function _answerPaused(tabId, p) {
+  const send = (method, params) => chrome.debugger.sendCommand({ tabId }, method, { requestId: p.requestId, ...params });
+  const rule = _ruleFor(tabId, p.request, p.resourceType);
+  if (!rule) return send("Fetch.continueRequest");
+  rule.hits += 1;
+  rule.lastUrl = p.request.url.slice(0, 300);
+  globalThis.AutoDOMHar?.noteIntercept?.(tabId, p.networkId, { rule: rule.id, do: rule.do });
+  if (rule.do === "block") return send("Fetch.failRequest", { errorReason: "BlockedByClient" });
+  if (rule.do === "delay") {
+    await _sleep(rule.delayMs);
+    return send("Fetch.continueRequest");
+  }
+  if (rule.do === "modify") {
+    const drop = new Set((rule.removeRequestHeaders || []).map((h) => h.toLowerCase()));
+    const set = rule.setRequestHeaders || {};
+    const setLower = new Set(Object.keys(set).map((h) => h.toLowerCase()));
+    const headers = Object.entries(p.request.headers || {})
+      .filter(([k]) => !drop.has(k.toLowerCase()) && !setLower.has(k.toLowerCase()))
+      .map(([name, value]) => ({ name, value: String(value) }));
+    for (const [name, value] of Object.entries(set)) headers.push({ name, value: String(value) });
+    return send("Fetch.continueRequest", { headers });
+  }
+  // mock
+  const headers = Object.entries(rule.headers || {}).map(([name, value]) => ({ name, value: String(value) }));
+  const has = (n) => headers.some((h) => h.name.toLowerCase() === n);
+  if (!has("content-type")) headers.push({ name: "Content-Type", value: rule.json !== undefined ? "application/json" : "text/plain" });
+  // A mocked cross-origin API call still needs CORS headers to be readable.
+  const origin = p.request.headers?.Origin || p.request.headers?.origin;
+  if (origin && !has("access-control-allow-origin")) {
+    headers.push({ name: "Access-Control-Allow-Origin", value: origin }, { name: "Access-Control-Allow-Credentials", value: "true" });
+  }
+  return send("Fetch.fulfillRequest", { responseCode: rule.status, responseHeaders: headers, body: rule._body });
+}
+
+function _ensureNetworkRuleListener() {
+  if (_networkRuleListener || !chrome.debugger?.onEvent) return;
+  _networkRuleListener = (source, method, p) => {
+    if (method !== "Fetch.requestPaused" || !_networkRules.has(source?.tabId)) return;
+    const tabId = source.tabId;
+    let answered = false;
+    const watchdog = setTimeout(() => {
+      if (!answered) chrome.debugger.sendCommand({ tabId }, "Fetch.continueRequest", { requestId: p.requestId }).catch(() => {});
+    }, NETWORK_RULE_WATCHDOG_MS);
+    _answerPaused(tabId, p)
+      .catch(() => chrome.debugger.sendCommand({ tabId }, "Fetch.continueRequest", { requestId: p.requestId }).catch(() => {}))
+      .finally(() => {
+        answered = true;
+        clearTimeout(watchdog);
+      });
+  };
+  chrome.debugger.onEvent.addListener(_networkRuleListener);
+  chrome.debugger.onDetach.addListener((source) => _networkRules.delete(source?.tabId));
+  chrome.tabs.onRemoved.addListener((tabId) => _networkRules.delete(tabId));
+}
+
+function _normalizeRule(raw, seq) {
+  const act = String(raw?.do || "");
+  if (!["block", "mock", "delay", "modify"].includes(act)) throw new Error(`rule.do must be block, mock, delay or modify (got "${raw?.do}")`);
+  if (!raw.urlPattern) throw new Error("rule.urlPattern is required");
+  const rule = {
+    id: raw.id ? String(raw.id) : `r${seq}`,
+    urlPattern: String(raw.urlPattern),
+    ...(raw.method && { method: String(raw.method).toUpperCase() }),
+    ...(raw.resourceType && { resourceType: String(raw.resourceType) }),
+    ...(raw.times != null && { times: Math.max(1, Number(raw.times)) }),
+    do: act,
+    hits: 0,
+  };
+  if (act === "mock") {
+    const text = raw.json !== undefined ? JSON.stringify(raw.json) : raw.body != null ? String(raw.body) : "";
+    if (text.length > NETWORK_RULE_BODY_MAX) throw new Error(`mock body over ${NETWORK_RULE_BODY_MAX} characters`);
+    rule.status = Number(raw.status) || 200;
+    rule.headers = raw.headers || {};
+    if (raw.json !== undefined) rule.json = true;
+    rule._body = _b64(text);
+  }
+  if (act === "delay") rule.delayMs = Math.max(0, Math.min(NETWORK_RULE_WATCHDOG_MS - 500, Number(raw.delayMs) || 1000));
+  if (act === "modify") {
+    rule.setRequestHeaders = raw.setRequestHeaders || {};
+    rule.removeRequestHeaders = raw.removeRequestHeaders || [];
+  }
+  Object.defineProperty(rule, "_match", { value: _ruleUrlMatcher(rule.urlPattern), enumerable: false });
+  return rule;
+}
+
+const _publicRule = ({ _body, ...r }) => r;
+
+async function toolNetworkRules(params, ctx) {
+  if (IS_FIREFOX) return { error: "network_rules needs the Chrome DevTools protocol (Chrome/Edge/Chromium)." };
+  const tab = await getActiveTab(ctx);
+  const tabId = tab.id;
+  const action = params?.action || "list";
+  const state = _networkRules.get(tabId) || { rules: [], seq: 0 };
+  if (action === "list") return { ok: true, tabId, rules: state.rules.map(_publicRule) };
+
+  let next = state.rules;
+  if (action === "clear") next = [];
+  else if (action === "remove") {
+    const ids = new Set((params?.ids || []).map(String));
+    next = state.rules.filter((r) => !ids.has(r.id));
+  } else if (action === "add") {
+    const added = (params?.rules || []).map((r) => _normalizeRule(r, ++state.seq));
+    const ids = new Set(added.map((r) => r.id));
+    next = [...state.rules.filter((r) => !ids.has(r.id)), ...added];
+    if (next.length > NETWORK_RULES_MAX) return { error: `At most ${NETWORK_RULES_MAX} rules per tab.` };
+  } else {
+    return { error: `Unknown action "${action}" (add, remove, list, clear)` };
+  }
+
+  const send = (method, p) => chrome.debugger.sendCommand({ tabId }, method, p || {});
+  if (!next.length) {
+    _networkRules.delete(tabId);
+    await send("Fetch.disable").catch(() => {});
+    _releaseDebugger(tabId, "network_rules");
+    detachDebuggerSafe(tabId).catch(() => {});
+    return { ok: true, tabId, rules: [] };
+  }
+  await ensureDebugger(tabId);
+  _ensureNetworkRuleListener();
+  _networkRules.set(tabId, { rules: next, seq: state.seq });
+  await send("Fetch.enable", { patterns: _fetchPatterns(next) });
+  _holdDebugger(tabId, "network_rules");
+  return { ok: true, tabId, rules: next.map(_publicRule), note: "Rules apply to requests from now on, until removed, cleared, finish_session, or the tab closes." };
+}
+
+// finish_session: drop the rules of the tabs this client worked on.
+async function _clearNetworkRules(tabId) {
+  if (!_networkRules.has(tabId)) return;
+  _networkRules.delete(tabId);
+  await chrome.debugger.sendCommand({ tabId }, "Fetch.disable").catch(() => {});
+  _releaseDebugger(tabId, "network_rules");
+}
+
+// Network presets, roughly DevTools' throttling profiles (bytes/s, ms).
+const NETWORK_PRESETS = {
+  offline: { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 },
+  "slow-3g": { offline: false, latency: 2000, downloadThroughput: 50000, uploadThroughput: 50000 },
+  "fast-3g": { offline: false, latency: 563, downloadThroughput: 180000, uploadThroughput: 84375 },
+  "slow-4g": { offline: false, latency: 150, downloadThroughput: 1012500, uploadThroughput: 168750 },
+  "fast-4g": { offline: false, latency: 60, downloadThroughput: 4500000, uploadThroughput: 1125000 },
+};
+const NO_THROTTLE = { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 };
+
+function _networkConditions(network) {
+  if (typeof network === "string") {
+    const preset = NETWORK_PRESETS[network];
+    if (!preset) throw new Error(`Unknown network preset "${network}" (${Object.keys(NETWORK_PRESETS).join(", ")})`);
+    return preset;
+  }
+  const kbps = (v) => (Number(v) > 0 ? Math.round((Number(v) * 1000) / 8) : -1);
+  return {
+    offline: network.offline === true,
+    latency: Math.max(0, Number(network.latencyMs) || 0),
+    downloadThroughput: kbps(network.downloadKbps),
+    uploadThroughput: kbps(network.uploadKbps),
+  };
+}
+
+async function toolEmulate(params, ctx) {
+  const { userAgent, viewport, colorScheme, network, cpuThrottle, reset } = params || {};
   const tab = await getActiveTab(ctx);
   const tabId = tab.id;
   await ensureDebugger(tabId);
+  const send = (method, p) => chrome.debugger.sendCommand({ tabId }, method, p || {});
+  if (reset) {
+    await send("Emulation.setUserAgentOverride", { userAgent: "" }).catch(() => {});
+    await send("Emulation.clearDeviceMetricsOverride").catch(() => {});
+    await send("Emulation.setEmulatedMedia", { features: [] }).catch(() => {});
+    await send("Network.emulateNetworkConditions", NO_THROTTLE).catch(() => {});
+    await send("Emulation.setCPUThrottlingRate", { rate: 1 }).catch(() => {});
+    _releaseDebugger(tabId, "emulation");
+    detachDebuggerSafe(tabId).catch(() => {});
+    return { success: true, reset: true };
+  }
+  const applied = [];
   if (userAgent) {
-    await chrome.debugger.sendCommand(
-      { tabId },
-      "Emulation.setUserAgentOverride",
-      { userAgent },
-    );
+    await send("Emulation.setUserAgentOverride", { userAgent });
+    applied.push("userAgent");
   }
   if (viewport) {
-    await chrome.debugger.sendCommand(
-      { tabId },
-      "Emulation.setDeviceMetricsOverride",
-      {
-        width: viewport.width,
-        height: viewport.height,
-        deviceScaleFactor: viewport.deviceScaleFactor || 1,
-        mobile: viewport.isMobile || false,
-      },
-    );
+    await send("Emulation.setDeviceMetricsOverride", {
+      width: viewport.width,
+      height: viewport.height,
+      deviceScaleFactor: viewport.deviceScaleFactor || 1,
+      mobile: viewport.isMobile || false,
+    });
+    applied.push("viewport");
   }
   if (colorScheme) {
     const preferred = colorScheme === "auto" ? "no-preference" : colorScheme;
-    await chrome.debugger.sendCommand({ tabId }, "Emulation.setEmulatedMedia", {
-      features: [{ name: "prefers-color-scheme", value: preferred }],
-    });
+    await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: preferred }] });
+    applied.push("colorScheme");
   }
-  return { success: true, note: "Emulation settings applied." };
+  if (network) {
+    const conditions = _networkConditions(network);
+    await send("Network.enable");
+    await send("Network.emulateNetworkConditions", conditions);
+    applied.push("network");
+  }
+  if (cpuThrottle != null) {
+    const rate = Math.max(1, Math.min(20, Number(cpuThrottle) || 1));
+    await send("Emulation.setCPUThrottlingRate", { rate });
+    applied.push(`cpu x${rate}`);
+  }
+  // Overrides end when the debugger detaches; keep it until reset.
+  if (applied.length) _holdDebugger(tabId, "emulation");
+  return { success: true, applied, note: "Applied until emulate {reset:true}, the tab closes, or the debugger is detached." };
 }
 
 // 43. Upload File
@@ -13489,55 +13741,114 @@ async function toolUploadFile({ uid, filePath }, ctx) {
 }
 
 // 44. Start Trace
+// The trace travels to the bridge over one WebSocket message (32 MB).
+const TRACE_MAX_BYTES = 28 * 1024 * 1024;
+
 async function toolPerformanceStartTrace({ reload }, ctx) {
   const tab = await getActiveTab(ctx);
   const tabId = tab.id;
   await ensureDebugger(tabId);
   await chrome.debugger.sendCommand({ tabId }, "Tracing.start", {
     categories:
-      "-*,devtools.timeline,v8.execute,disabled-by-default-devtools.timeline",
+      "-*,devtools.timeline,v8.execute,disabled-by-default-devtools.timeline,loading,blink.user_timing",
     transferMode: "ReturnAsStream",
   });
+  _holdDebugger(tabId, "trace");
   if (reload) {
     await chrome.tabs.reload(tabId);
   }
-  return { success: true, note: "Performance trace started." };
+  return { success: true, note: "Performance trace started. Do the steps, then performance_stop_trace." };
 }
 
-// 45. Stop Trace
-async function toolPerformanceStopTrace({ filePath }, ctx) {
-  const tab = await getActiveTab(ctx);
-  const tabId = tab.id;
-  await ensureDebugger(tabId);
-  return new Promise((resolve, reject) => {
-    let eventCount = 0;
-    const tracingListener = (source, method, params) => {
-      if (source.tabId === tabId && method === "Tracing.dataCollected") {
-        eventCount += params.value.length;
-      }
-      if (source.tabId === tabId && method === "Tracing.tracingComplete") {
-        chrome.debugger.onEvent.removeListener(tracingListener);
-        resolve({
-          success: true,
-          traceEventsCaptured: eventCount,
-          note: "Trace stopped. Data stream completed.",
-        });
-      }
+// Web vitals the page itself measured, read with buffered observers.
+function _pagePerfSummary() {
+  return new Promise((resolve) => {
+    const out = { lcpMs: null, cls: 0, inpMs: null, longTasks: { count: 0, totalMs: 0, top: [] } };
+    const observe = (type, fn) => {
+      try {
+        new PerformanceObserver((list) => list.getEntries().forEach(fn)).observe({ type, buffered: true, ...(type === "event" && { durationThreshold: 16 }) });
+      } catch (_) {}
     };
-    chrome.debugger.onEvent.addListener(tracingListener);
-    chrome.debugger.sendCommand({ tabId }, "Tracing.end").catch(reject);
+    observe("largest-contentful-paint", (e) => (out.lcpMs = Math.round(e.startTime)));
+    observe("layout-shift", (e) => {
+      if (!e.hadRecentInput) out.cls += e.value;
+    });
+    observe("event", (e) => {
+      if (e.interactionId) out.inpMs = Math.max(out.inpMs || 0, Math.round(e.duration));
+    });
+    const tasks = [];
+    observe("longtask", (e) => tasks.push(e));
+    // Buffered entries are delivered in a task after observe().
+    setTimeout(() => {
+      out.cls = Math.round(out.cls * 1000) / 1000;
+      out.longTasks.count = tasks.length;
+      out.longTasks.totalMs = Math.round(tasks.reduce((n, t) => n + t.duration, 0));
+      out.longTasks.top = tasks
+        .sort((a, b) => b.duration - a.duration)
+        .slice(0, 5)
+        .map((t) => ({ startMs: Math.round(t.startTime), durationMs: Math.round(t.duration) }));
+      const nav = performance.getEntriesByType("navigation")[0];
+      if (nav) out.navigation = { domContentLoadedMs: Math.round(nav.domContentLoadedEventEnd), loadMs: Math.round(nav.loadEventEnd), ttfbMs: Math.round(nav.responseStart) };
+      out.slowestRequests = performance
+        .getEntriesByType("resource")
+        .sort((a, b) => b.duration - a.duration)
+        .slice(0, 5)
+        .map((r) => ({ url: r.name.slice(0, 200), type: r.initiatorType, durationMs: Math.round(r.duration), bytes: r.transferSize }));
+      resolve(out);
+    }, 100);
   });
 }
 
-// 46. Analyze Performance Insight
-async function toolPerformanceAnalyzeInsight({ insightName, insightSetId }, ctx) {
-  return {
-    insightName,
-    insightSetId,
-    status:
-      "Performance insight analysis requires deep DevTools Lighthouse integration. Returning placeholder metadata.",
-    note: "For full analysis, load the generated trace file directly into the Chrome DevTools Performance panel.",
-  };
+async function toolPerformanceStopTrace(params, ctx) {
+  const tab = await getActiveTab(ctx);
+  const tabId = tab.id;
+  await ensureDebugger(tabId);
+  const send = (method, p) => chrome.debugger.sendCommand({ tabId }, method, p || {});
+  try {
+    const stream = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        chrome.debugger.onEvent.removeListener(onEvent);
+        reject(new Error("the browser did not finish the trace in 20 s"));
+      }, 20000);
+      const onEvent = (source, method, p) => {
+        if (source.tabId !== tabId || method !== "Tracing.tracingComplete") return;
+        clearTimeout(timer);
+        chrome.debugger.onEvent.removeListener(onEvent);
+        resolve(p?.stream || null);
+      };
+      chrome.debugger.onEvent.addListener(onEvent);
+      send("Tracing.end").catch((err) => {
+        clearTimeout(timer);
+        chrome.debugger.onEvent.removeListener(onEvent);
+        reject(err);
+      });
+    });
+    if (!stream) return { error: "The browser returned no trace data." };
+    let trace = "";
+    let tooLarge = false;
+    const utf8 = new TextDecoder();
+    for (;;) {
+      const chunk = await send("IO.read", { handle: stream, size: 1 << 20 });
+      trace += chunk.base64Encoded
+        ? utf8.decode(Uint8Array.from(atob(chunk.data || ""), (c) => c.charCodeAt(0)), { stream: !chunk.eof })
+        : chunk.data || "";
+      if (chunk.eof) break;
+      if (trace.length > TRACE_MAX_BYTES) {
+        tooLarge = true;
+        break;
+      }
+    }
+    await send("IO.close", { handle: stream }).catch(() => {});
+    const summary = await executeInTab(tabId, _pagePerfSummary, []).catch(() => null);
+    if (tooLarge) {
+      return { success: true, summary, error: `The trace is over ${TRACE_MAX_BYTES >> 20} MB and was not kept; record a shorter span.` };
+    }
+    return { success: true, summary, trace, bytes: trace.length };
+  } catch (err) {
+    return { error: `Stopping the trace failed: ${err.message}` };
+  } finally {
+    _releaseDebugger(tabId, "trace");
+  }
 }
 
 // ─── Token-Efficient Tool Implementations ────────────────────

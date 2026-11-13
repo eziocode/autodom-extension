@@ -1,5 +1,6 @@
-// Writes a recorded HAR to disk for har_stop: one file, or one file per
-// test-case segment, plus an optional curl script for the API calls.
+// Writes recorded artifacts to disk: HARs for har_stop (one file, or one
+// per test-case segment, plus an optional curl script) and other large
+// tool outputs such as performance traces.
 import { promises as fs } from "fs";
 import { homedir } from "os";
 import { basename, dirname, extname, isAbsolute, join } from "path";
@@ -82,6 +83,24 @@ export function toCurl(har) {
     count += 1;
   }
   return { text: lines.join("\n"), count };
+}
+
+// One artifact file: an absolute path ending in `ext`, or
+// ~/Downloads/autodom-<kind>/<time><ext>. Never replaces a file unless
+// overwrite. Returns the path written.
+export async function writeArtifact(kind, text, { path, ext, overwrite = false } = {}) {
+  let file;
+  if (path) {
+    if (!isAbsolute(path)) throw new Error(`path must be absolute: ${path}`);
+    if (extname(path).toLowerCase() !== ext) throw new Error(`path must end in ${ext}: ${path}`);
+    file = path;
+  } else {
+    file = join(homedir(), "Downloads", `autodom-${kind}`, `${new Date().toISOString().replace(/[:.]/g, "-")}${ext}`);
+  }
+  if (!overwrite && (await exists(file))) throw new Error(`${file} exists; pass overwrite:true to replace it`);
+  await fs.mkdir(dirname(file), { recursive: true });
+  await fs.writeFile(file, text, "utf8");
+  return file;
 }
 
 // Where the files go: an absolute .har path (one file), an absolute

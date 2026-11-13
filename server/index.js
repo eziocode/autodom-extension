@@ -85,7 +85,7 @@ import {
 import { CODE_MODE_TOOL_NAMES, CODE_ONLY_LISTED, createCodeMode } from "./codemode/index.js";
 import { checkScriptSyntax } from "./codemode/sandbox.js";
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
-import { writeHarFiles } from "./har-export.js";
+import { writeArtifact, writeHarFiles } from "./har-export.js";
 
 // Local Playwright/Node automation backends were intentionally removed: AutoDOM
 // is a Playwright alternative, not a wrapper, and any server-spawned automation
@@ -1015,7 +1015,6 @@ const TOOL_TIERS = new Map([
   ["wait_for_navigation", "read"],
   ["wait_for_new_tab", "read"],
   ["wait_for_network_idle", "read"],
-  ["performance_analyze_insight", "read"],
   ["get_pending_chat_requests", "read"],
   ["browser_snapshot", "read"],
   ["browser_console_messages", "read"],
@@ -1072,6 +1071,7 @@ const TOOL_TIERS = new Map([
   ["upload_file", "write"],
   ["performance_start_trace", "write"],
   ["performance_stop_trace", "write"],
+  ["network_rules", "write"],
   ["browser_click", "write"],
   ["browser_type", "write"],
   ["browser_hover", "write"],
@@ -1137,6 +1137,7 @@ function getToolTier(toolName, params = {}) {
       ? "read"
       : "destructive";
   }
+  if (toolName === "network_rules") return (params?.action || "list") === "list" ? "read" : "write";
   if (toolName === "iframe_interact" || toolName === "shadow_interact") {
     return INTERACT_READ_ACTIONS.has(String(params?.action || "query")) ? "read" : "write";
   }
@@ -10995,7 +10996,7 @@ server.addTool({
 server.addTool({
   name: "emulate",
   description:
-    "Emulates various features on the selected page (like viewport size, user agent).",
+    "Emulate a device and conditions on the tab: viewport, user agent, color scheme, network throttling (offline, 3G/4G presets or custom), CPU slowdown. Settings stay until emulate {reset:true}.",
   parameters: z.object({
     userAgent: z.string().optional().describe("User agent string to emulate"),
     viewport: z
@@ -11011,11 +11012,55 @@ server.addTool({
       .enum(["dark", "light", "auto"])
       .optional()
       .describe("Emulate dark or light mode"),
+    network: z
+      .union([
+        z.enum(["offline", "slow-3g", "fast-3g", "slow-4g", "fast-4g"]),
+        z.object({
+          offline: z.boolean().optional(),
+          latencyMs: z.number().optional(),
+          downloadKbps: z.number().optional(),
+          uploadKbps: z.number().optional(),
+        }),
+      ])
+      .optional()
+      .describe("Throttle the tab's network: a preset or custom latency and bandwidth"),
+    cpuThrottle: z.number().optional().describe("Slow the CPU down this many times (1-20)"),
+    reset: z.boolean().optional().describe("Clear every emulation and throttling setting"),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("emulate", params);
     return stringifyToolResult(result);
   },
+});
+
+server.addTool({
+  name: "network_rules",
+  description:
+    "Block, mock, delay or rewrite the tab's requests for testing: error states, slow APIs, stubbed responses, extra headers. Rules match urlPattern (substring, \"*\" glob or /regex/) and optional method/resourceType, first match wins, and last until removed, cleared or finish_session. Requests a rule answers are flagged in HAR recordings.",
+  parameters: z.object({
+    action: z.enum(["add", "remove", "list", "clear"]).optional().describe("Default list"),
+    rules: z
+      .array(
+        z.object({
+          id: z.string().optional().describe("Replaces a rule with the same id"),
+          urlPattern: z.string(),
+          method: z.string().optional(),
+          resourceType: z.string().optional().describe("XHR, Fetch, Document, Script, Image, ..."),
+          times: z.number().optional().describe("Apply to this many requests, then stop"),
+          do: z.enum(["block", "mock", "delay", "modify"]),
+          status: z.number().optional().describe("mock: response status (default 200)"),
+          headers: z.record(z.string(), z.string()).optional().describe("mock: response headers"),
+          json: z.any().optional().describe("mock: JSON response body"),
+          body: z.string().optional().describe("mock: text response body"),
+          delayMs: z.number().optional().describe("delay: hold the request this long (max 9500)"),
+          setRequestHeaders: z.record(z.string(), z.string()).optional().describe("modify: headers to add or replace"),
+          removeRequestHeaders: z.array(z.string()).optional().describe("modify: headers to drop"),
+        }),
+      )
+      .optional(),
+    ids: z.array(z.string()).optional().describe("remove: rule ids"),
+  }),
+  execute: async (params) => stringifyToolResult(await callExtensionTool("network_rules", params)),
 });
 
 // 43. Upload File
@@ -11055,39 +11100,24 @@ server.addTool({
 server.addTool({
   name: "performance_stop_trace",
   description:
-    "Stops the active performance trace recording and returns the raw trace data.",
+    "Stop the performance trace, write it as a .json file DevTools' Performance panel can open (default ~/Downloads/autodom-traces/), and return a summary: LCP, CLS, INP, long tasks, navigation timing and the slowest requests.",
   parameters: z.object({
     filePath: z
       .string()
       .optional()
-      .describe("Optional absolute path to save the trace data to"),
+      .describe("Absolute .json path to write the trace to"),
+    overwrite: z.boolean().optional().describe("Replace an existing file at filePath"),
   }),
   execute: async (params) => {
-    const result = await callExtensionTool("performance_stop_trace", params);
-    return stringifyToolResult(result);
-  },
-});
-
-// 46. Analyze Performance Insight
-server.addTool({
-  name: "performance_analyze_insight",
-  description: "Analyzes specific performance insights from a captured trace.",
-  parameters: z.object({
-    insightName: z
-      .string()
-      .describe(
-        'The name of the Insight you want more information on (e.g., "LCPBreakdown")',
-      ),
-    insightSetId: z
-      .string()
-      .describe("The id for the specific insight set from the trace"),
-  }),
-  execute: async (params) => {
-    const result = await callExtensionTool(
-      "performance_analyze_insight",
-      params,
-    );
-    return stringifyToolResult(result);
+    const result = await callExtensionTool("performance_stop_trace", {});
+    if (typeof result?.trace !== "string") return stringifyToolResult(result);
+    const { trace, ...rest } = result;
+    try {
+      const file = await writeArtifact("traces", trace, { path: params.filePath, ext: ".json", overwrite: params.overwrite === true });
+      return stringifyToolResult({ ...rest, path: file, bytes: Buffer.byteLength(trace) });
+    } catch (err) {
+      return stringifyToolResult({ ...rest, error: `Trace recorded, but could not be written: ${err.message}` });
+    }
   },
 });
 

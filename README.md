@@ -155,7 +155,7 @@ listed with `AUTODOM_CODE_MODE`.
 | Navigate and wait | `navigate`, `wait_for_text`, `wait_for_element`, `wait_for_navigation`, `wait_for_network_idle`, `handle_dialog` |
 | Tabs and frames | `list_tabs`, `open_new_tab`, `switch_tab`, `close_tab`, `pin_tab`, `unpin_tab`, `get_pinned_tab`, `finish_session`, popups (`list_popups`, `switch_to_popup`, `close_popup`, `wait_for_popup`), `list_iframes`, `iframe_interact`, `list_shadow_roots`, `shadow_interact` |
 | Scripting | `execute_code`, `evaluate_script`, `execute_async_script` (deprecated), `batch_actions` |
-| Debugging | `get_console_logs`, `get_network_requests`, `har_start`, `har_status`, `har_entries`, `wait_for_request`, `har_stop`, `performance_start_trace`, `performance_stop_trace`, `emulate`, `emulate_media`, `set_viewport`, `set_geolocation`, `print_to_pdf` |
+| Debugging | `get_console_logs`, `get_network_requests`, `har_start`, `har_status`, `har_entries`, `wait_for_request`, `har_stop`, `performance_start_trace`, `performance_stop_trace`, `network_rules`, `emulate`, `emulate_media`, `set_viewport`, `set_geolocation`, `print_to_pdf` |
 | Storage | `get_cookies`, `set_cookie`, `delete_cookie`, `clear_cookies`, `get_storage`, `set_storage`, `set_attribute` |
 | Workflows | `workflow_record_start`, `workflow_record_stop`, `workflow_save`, `workflow_list`, `workflow_get`, `workflow_run`, `workflow_run_many`, `workflow_export`, `run_list`, `run_get`, `run_cancel`, `run_undo`, `schedule_create`, `schedule_list`, `schedule_update`, `schedule_delete` |
 | Control and audit | `approval_rules`, `audit_query`, `get_tool_tiers`, `confirm_action`, `cancel_action`, `autodom_diagnostics`, `get_session_summary` |
@@ -307,6 +307,22 @@ Other controls:
   from the agent.
 
 Source: [`server/atk/`](server/atk), tests in `tests/atk.test.mjs`.
+
+HAR recording retains at most 8 sessions, including closed tabs. Stop an existing
+recording before starting a ninth; closed-tab recordings remain available to
+`har_stop`. Each recording admits at most 5,000 requests (completed and in flight
+combined), 5,000 pages, steps and segments each, and 128 unmatched early header
+events. Late wire headers still update retained requests.
+
+Response bodies default to 256 KiB each, with `maxBodyBytes` capped at 1 MiB.
+Stored body payloads are limited to 20 MiB per session and 64 MiB across sessions;
+pending fetches reserve budget before dispatch. At most 8 body fetches run at
+once across all sessions; excess bodies are skipped with a comment. UTF-8 text
+is truncated at character boundaries, base64 at complete encoding groups.
+`har_status` includes `memory`, `bodiesSkipped` and `metadataDropped` counters;
+`har_stop` reports skipped bodies and dropped metadata in its summary. These are
+payload limits, not a total heap ceiling: headers, request bodies and temporary
+CDP responses also consume memory.
 
 ## Tab isolation
 

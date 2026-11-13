@@ -92,7 +92,7 @@ export const AREAS = [
     "image_get_data"]],
   ["script", ["execute_code", "browser_fetch_raw", "webmcp_list_tools", "webmcp_call_tool"]],
   ["debug", ["get_console_logs", "get_network_requests", "har_start", "har_status", "har_entries", "har_stop", "performance_start_trace",
-    "performance_stop_trace", "performance_analyze_insight", "emulate", "emulate_media", "set_viewport", "set_geolocation",
+    "performance_stop_trace", "network_rules", "emulate", "emulate_media", "set_viewport", "set_geolocation",
     "print_to_pdf"]],
   ["storage", ["get_cookies", "set_cookie", "delete_cookie", "clear_cookies", "get_storage", "set_storage"]],
   ["workflow", ["workflow_record_start", "workflow_record_stop", "workflow_save", "workflow_list", "workflow_get", "workflow_run",
