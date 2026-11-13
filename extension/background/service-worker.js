@@ -6534,6 +6534,8 @@ const TOOL_HANDLERS = new Map([
   ["har_start", toolHarStart],
   ["har_status", toolHarStatus],
   ["har_stop", toolHarStop],
+  ["har_entries", toolHarEntries],
+  ["wait_for_request", toolWaitForRequest],
   ["list_tabs", toolListTabs],
   ["switch_tab", toolSwitchTab],
   ["wait_for_new_tab", toolWaitForNewTab],
@@ -7125,6 +7127,8 @@ const _DIALOG_HINT = 'A native dialog is open and blocks the page. Call handle_d
 const _DIALOG_SAFE_TOOLS = new Set([
   "handle_dialog", "switch_tab", "open_new_tab", "close_tab", "pin_tab", "unpin_tab",
   "finish_session", "autodom_diagnostics",
+  // HAR tools read the recording, not the page.
+  "har_status", "har_stop", "har_entries", "wait_for_request",
 ]);
 
 function _forgetDialogTab(tabId) {
@@ -7256,7 +7260,27 @@ function _runToolHandler(tool, handler, params, ctx) {
     return { error: "DIALOG_OPEN", dialog, hint: _DIALOG_HINT };
   }
   const run = () => handler(params || {}, ctx);
-  return _isObservedCall(tool, params) ? _observeAction(params, ctx, run) : run();
+  const res = _isObservedCall(tool, params) ? _observeAction(params, ctx, run) : run();
+  return _HAR_ACTION_TOOLS.has(tool) ? _withHarStep(tool, params, ctx, res) : res;
+}
+
+// Tools whose requests a HAR recording credits to them (entry._autodom.step).
+const _HAR_ACTION_TOOLS = new Set([
+  ...OBSERVED_TOOLS, "navigate", "upload_file", "evaluate_script", "execute_code",
+  "execute_async_script", "webmcp_call_tool", "browser_fetch_raw", "workflow_run",
+]);
+
+async function _withHarStep(tool, params, ctx, pending) {
+  const har = globalThis.AutoDOMHar;
+  const tabId = ctx?.tabId;
+  if (!har || tabId == null || !har.isActive(tabId)) return pending;
+  const target = params?.ref || params?.selector || params?.url || params?.text || (params?.index != null ? `#${params.index}` : undefined);
+  const step = har.noteAction(tabId, { callId: ctx.callId, tool, target });
+  try {
+    return await pending;
+  } finally {
+    har.endAction(tabId, step);
+  }
 }
 
 // Count the XHR/fetch requests a tab starts while an action settles.
@@ -8762,11 +8786,28 @@ function _harRecorder() {
   return har;
 }
 
+// The tab whose recording a HAR tool reads: params.tabId, the call's tab
+// when it records, or the only recording there is (a test may close its
+// tab before har_stop).
+async function _harTabId(har, params, ctx) {
+  if (params?.tabId != null) return Number(params.tabId);
+  const tab = await getActiveTab(ctx).catch(() => null);
+  if (tab && har.isActive(tab.id)) return tab.id;
+  const tabs = har.recordingTabs();
+  if (tabs.length === 1) return tabs[0];
+  return tab?.id ?? null;
+}
+
+const _NO_HAR = "No HAR recording on this tab. Call har_start first (once per test run; har_start {label} starts each test case).";
+
 async function toolHarStart(params, ctx) {
   const har = _harRecorder();
   if (!har) return { error: "HAR recording needs the Chrome DevTools protocol (Chrome/Edge/Chromium)." };
   const tab = await getActiveTab(ctx);
-  if (har.isActive(tab.id)) return { ok: true, alreadyRecording: true, tabId: tab.id, ...har.status(tab.id) };
+  if (har.isActive(tab.id)) {
+    if (params?.label == null) return { ok: true, alreadyRecording: true, tabId: tab.id, ...har.status(tab.id) };
+    return { ok: true, recording: true, tabId: tab.id, ...(await har.start(tab.id, params)) };
+  }
   const capture = await _startDebugCapture(tab);
   if (capture.fallback) return { error: `Could not attach to the tab: ${capture.fallback}` };
   await har.start(tab.id, params || {});
@@ -8801,14 +8842,14 @@ async function toolHarStart(params, ctx) {
 
 async function toolHarStatus(params, ctx) {
   const har = _harRecorder();
-  const tab = await getActiveTab(ctx);
-  const st = har?.status(tab.id);
-  if (!st) return { ok: true, recording: false, tabId: tab.id };
-  const steps = _harTabs.get(tab.id)?.ownsRecorder ? workflowEngine?.recordingSteps?.() || [] : [];
+  const tabId = har ? await _harTabId(har, params, ctx) : null;
+  const st = tabId != null ? har.status(tabId) : null;
+  if (!st) return { ok: true, recording: false, tabId };
+  const steps = _harTabs.get(tabId)?.ownsRecorder ? workflowEngine?.recordingSteps?.() || [] : [];
   return {
     ok: true,
     recording: true,
-    tabId: tab.id,
+    tabId,
     ...st,
     userActions: steps.length,
     recentActions: steps.slice(-5).map((s) => ({ action: s.action, text: s.locator?.accessibleName || s.locator?.text || s.locator?.label, url: s.url })),
@@ -8817,8 +8858,9 @@ async function toolHarStatus(params, ctx) {
 
 async function toolHarStop(params, ctx) {
   const har = _harRecorder();
-  const tab = await getActiveTab(ctx);
-  if (!har?.isActive(tab.id)) return { error: "No HAR recording on this tab. Call har_start first." };
+  const tabId = har ? await _harTabId(har, params, ctx) : null;
+  if (tabId == null || !har.recordingTabs().includes(tabId)) return { error: _NO_HAR };
+  const tab = (await chrome.tabs.get(tabId).catch(() => null)) || { id: tabId, url: har.status(tabId)?.recent?.[0]?.url || "" };
   const meta = _harTabs.get(tab.id) || {};
   _harTabs.delete(tab.id);
   let actions = [];
@@ -8834,7 +8876,7 @@ async function toolHarStop(params, ctx) {
     creator: { name: "AutoDOM", version: manifest.version || "" },
     ...(browserMatch && { browser: { name: browserMatch[1] === "Edg" ? "Edge" : browserMatch[1], version: browserMatch[2] } }),
   });
-  if (meta.captureStarted) await globalThis.AutoDOMDebugCapture?.stop(tab.id);
+  if (meta.captureStarted) await globalThis.AutoDOMDebugCapture?.stop(tab.id).catch(() => {});
   let host = "page";
   try { host = new URL(tab.url).hostname || host; } catch (_) {}
   return {
@@ -8845,6 +8887,49 @@ async function toolHarStop(params, ctx) {
     ...(meta.ownsRecorder && {
       workflowDraft: "The user actions are also kept as a workflow draft: workflow_save keeps it as a replayable workflow.",
     }),
+  };
+}
+
+// API assertions over the running recording.
+async function toolHarEntries(params, ctx) {
+  const har = _harRecorder();
+  const tabId = har ? await _harTabId(har, params, ctx) : null;
+  const res = tabId != null ? har.query(tabId, params || {}) : null;
+  if (!res) return { error: _NO_HAR };
+  return { ok: true, tabId, total: res.total, shown: res.rows.length, rows: res.rows };
+}
+
+async function toolWaitForRequest(params, ctx) {
+  const har = _harRecorder();
+  const tabId = har ? await _harTabId(har, params, ctx) : null;
+  if (tabId == null || !har.recordingTabs().includes(tabId)) return { error: _NO_HAR };
+  const q = {
+    urlPattern: params?.urlPattern,
+    method: params?.method,
+    status: params?.status,
+    resourceType: params?.resourceType,
+    sinceMs: har.sinceMs(tabId, params?.since || "last_action"),
+  };
+  const timeoutMs = Math.max(0, Math.min(120000, Number(params?.timeout) || 15000));
+  const started = Date.now();
+  const res = await har.waitFor(tabId, q, { count: Math.max(1, Number(params?.count) || 1), timeoutMs, signal: ctx?.signal });
+  if (res?.cancelled) return _cancelledResult("wait_for_request cancelled");
+  const body = params?.body || "shape";
+  const opts = {
+    shape: body !== "none",
+    detail: body === "excerpt",
+    maxBodyChars: Math.max(100, Math.min(20000, Number(params?.maxBodyChars) || 2000)),
+    jsonPath: params?.jsonPath,
+  };
+  const rows = [];
+  for (const e of res?.entries || []) rows.push(har.row(await har.bodyOf(e), opts));
+  if (res?.matched) return { ok: true, matched: true, elapsedMs: Date.now() - started, ...(rows.length === 1 ? { request: rows[0] } : { requests: rows }) };
+  return {
+    ok: true,
+    matched: false,
+    error: `No ${params?.method || ""} request matching "${params?.urlPattern || "*"}"${params?.status ? ` with status ${params.status}` : ""} within ${timeoutMs} ms${res?.stopped ? " (the recording was stopped)" : ""}`,
+    ...(rows.length && { partial: rows }),
+    nearMisses: har.nearMisses(tabId, q),
   };
 }
 

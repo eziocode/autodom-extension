@@ -622,7 +622,7 @@ async function makeBundle(root, version, { lock = "lock-a", serverFiles = true }
   await writeFile(join(top, "server/package.json"), JSON.stringify({ version }));
   await writeFile(join(top, "server/package-lock.json"), lock);
   if (serverFiles) {
-    for (const f of ["index.js", "self-restart.js", "update-utils.js", "automation-store.js", "viewer-app.js"]) {
+    for (const f of ["index.js", "self-restart.js", "update-utils.js", "automation-store.js", "har-export.js", "viewer-app.js"]) {
       await writeFile(join(top, "server", f), "// " + version);
     }
     await mkdir(join(top, "server/atk"), { recursive: true });

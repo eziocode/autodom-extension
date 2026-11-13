@@ -24,7 +24,7 @@ function writeExtension(dir, version) {
 }
 function writeServer(dir, version, lock) {
   mkdirSync(dir, { recursive: true });
-  for (const f of ["index.js", "self-restart.js", "automation-store.js", "viewer-app.js"]) writeFileSync(join(dir, f), `// ${version}`);
+  for (const f of ["index.js", "self-restart.js", "automation-store.js", "har-export.js", "viewer-app.js"]) writeFileSync(join(dir, f), `// ${version}`);
   mkdirSync(join(dir, "atk"), { recursive: true });
   writeFileSync(join(dir, "atk/index.js"), `// ${version}`);
   mkdirSync(join(dir, "codemode"), { recursive: true });

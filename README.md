@@ -141,7 +141,7 @@ Optional transports, both off by default:
 
 ## Tools
 
-149 tools are registered. 124 are listed to clients by default; the 19
+151 tools are registered. 126 are listed to clients by default; the 19
 Playwright-compatible aliases (`browser_click`, `browser_snapshot`, ...) stay
 callable by name but are only listed with `AUTODOM_PLAYWRIGHT_COMPAT=1`, and
 the six Code Mode tools (`run_code`, `code_api`, `script_*`, below) are only
@@ -155,7 +155,7 @@ listed with `AUTODOM_CODE_MODE`.
 | Navigate and wait | `navigate`, `wait_for_text`, `wait_for_element`, `wait_for_navigation`, `wait_for_network_idle`, `handle_dialog` |
 | Tabs and frames | `list_tabs`, `open_new_tab`, `switch_tab`, `close_tab`, `pin_tab`, `unpin_tab`, `get_pinned_tab`, `finish_session`, popups (`list_popups`, `switch_to_popup`, `close_popup`, `wait_for_popup`), `list_iframes`, `iframe_interact`, `list_shadow_roots`, `shadow_interact` |
 | Scripting | `execute_code`, `evaluate_script`, `execute_async_script` (deprecated), `batch_actions` |
-| Debugging | `get_console_logs`, `get_network_requests`, `har_start`, `har_status`, `har_stop`, `performance_start_trace`, `performance_stop_trace`, `emulate`, `emulate_media`, `set_viewport`, `set_geolocation`, `print_to_pdf` |
+| Debugging | `get_console_logs`, `get_network_requests`, `har_start`, `har_status`, `har_entries`, `wait_for_request`, `har_stop`, `performance_start_trace`, `performance_stop_trace`, `emulate`, `emulate_media`, `set_viewport`, `set_geolocation`, `print_to_pdf` |
 | Storage | `get_cookies`, `set_cookie`, `delete_cookie`, `clear_cookies`, `get_storage`, `set_storage`, `set_attribute` |
 | Workflows | `workflow_record_start`, `workflow_record_stop`, `workflow_save`, `workflow_list`, `workflow_get`, `workflow_run`, `workflow_run_many`, `workflow_export`, `run_list`, `run_get`, `run_cancel`, `run_undo`, `schedule_create`, `schedule_list`, `schedule_update`, `schedule_delete` |
 | Control and audit | `approval_rules`, `audit_query`, `get_tool_tiers`, `confirm_action`, `cancel_action`, `autodom_diagnostics`, `get_session_summary` |
@@ -232,7 +232,7 @@ return links.filter((h) => h.includes("/docs/")).slice(0, 10);
   tools. Most of that is the smaller tool list; leaving the tool list out, it
   read 53-79% less than the standard tools used the usual way, and about the
   same as an agent that already uses `execute_code` well.
-- Globals: `autodom.<tool>(params)` for 111 tools, `page.eval(fn, ...args)`
+- Globals: `autodom.<tool>(params)` for 113 tools, `page.eval(fn, ...args)`
   (runs `fn` in the active tab through `execute_code`), `emitImage(ref)`,
   `sleep(ms)`, `console`. No `fetch`, `require`, timers or filesystem.
 - Every inner call is the same tool an MCP client would call: zod-validated,
@@ -422,7 +422,7 @@ server/
   index.js       MCP server, WebSocket bridge, tool registry
   atk/           output compaction, recall store, snapshot diff, stats, rules
   self-restart.js, update-utils.js, bridge-reaper.js, native-host.js
-  automation-store.js, viewer-app.js
+  automation-store.js, har-export.js, viewer-app.js
   test/          bridge integration tests (reconnect, proxy, self-update, ...)
 enterprise/      managed-policy templates (macOS plist, Windows registry, Linux JSON)
 scripts/         build, pack, version bump, update manifests, mcp-selftest

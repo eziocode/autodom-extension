@@ -29,6 +29,7 @@ for (const f of [
   "bridge-reaper.js",
   "native-host.js",
   "automation-store.js",
+  "har-export.js",
   "viewer-app.js",
   "package.json",
 ]) {

@@ -103,6 +103,8 @@
     "har_start",
     "har_status",
     "har_stop",
+    "har_entries",
+    "wait_for_request",
   ]);
 
   // Tools whose `url` param moves the page (or a new tab) to another site.

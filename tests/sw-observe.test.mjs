@@ -370,3 +370,53 @@ test("an unwatched tab that stops responding is reported as blocked, not timed o
   assert.equal(result.error, "PAGE_BLOCKED");
   assert.ok(ms >= 2400 && ms < 4000, `about 2.5 s, not 30 s (${ms}ms)`);
 });
+
+// ─── HAR for API tests, through the real handlers ───────────────────
+const W = () => Date.now() / 1000;
+const xhr = (chrome, id, url, method = "GET", status = 200, body) => {
+  const fire = (m, p) => chrome.debugger.onEvent.fire({ tabId: 1 }, m, p);
+  fire("Network.requestWillBeSent", {
+    requestId: id, type: "XHR", timestamp: 1, wallTime: W(),
+    request: { url, method, headers: { "Content-Type": "application/json" }, ...(body && { postData: body }) },
+  });
+  fire("Network.responseReceived", { requestId: id, response: { status, mimeType: "application/json", headers: {} } });
+  fire("Network.loadingFinished", { requestId: id, timestamp: 1.1, encodedDataLength: 20 });
+};
+
+test("a HAR test case: tool calls are linked to their requests and asserted on", async () => {
+  let saveCalls = 0;
+  const sw = await ready({
+    duringAction: ({ chrome }) => {
+      saveCalls += 1;
+      xhr(chrome, `save${saveCalls}`, "https://crm.test/api/leads/7", "PUT", 200, '{"name":"Ada"}');
+    },
+  });
+  sw.run(`globalThis.__ctx = _makeCallContext({ tabId: 1, callId: "c42" })`);
+  const started = await sw.run(`toolHarStart({ label: "edit lead", actions: false, apiOnly: true }, __ctx)`);
+  assert.equal(started.recording, true, JSON.stringify(started));
+
+  const click = await sw.run(`_runToolHandler("click", TOOL_HANDLERS.get("click"), { selector: "#save", observe: false }, __ctx)`);
+  assert.equal(click.success, true, JSON.stringify(click));
+
+  const hit = await sw.run(`toolWaitForRequest({ urlPattern: "/api/leads/*", method: "PUT", status: "2xx", timeout: 500 }, __ctx)`);
+  assert.equal(hit.matched, true, JSON.stringify(hit));
+  assert.equal(hit.request.status, 200);
+  assert.equal(hit.request.tool, "click", "credited to the click");
+  assert.deepEqual(JSON.parse(JSON.stringify(hit.request.requestShape)), { name: "string" });
+
+  const miss = await sw.run(`toolWaitForRequest({ urlPattern: "/api/leads/*", method: "DELETE", timeout: 50 }, __ctx)`);
+  assert.equal(miss.matched, false);
+  assert.equal(miss.nearMisses[0].method, "PUT");
+
+  const next = await sw.run(`toolHarStart({ label: "second case" }, __ctx)`);
+  assert.equal(next.closedSegment.entries, 1);
+
+  const rows = await sw.run(`toolHarEntries({ segment: 0 }, __ctx)`);
+  assert.equal(rows.total, 1);
+
+  const stopped = await sw.run(`toolHarStop({}, __ctx)`);
+  const log = stopped.har.log;
+  assert.equal(log.entries[0]._autodom.callId, "c42");
+  assert.deepEqual(JSON.parse(JSON.stringify(log._autodom.segments.map((s) => s.label))), ["edit lead", "second case"]);
+  assert.equal((await sw.run(`toolHarEntries({}, __ctx)`)).error.startsWith("No HAR recording"), true);
+});

@@ -85,6 +85,7 @@ import {
 import { CODE_MODE_TOOL_NAMES, CODE_ONLY_LISTED, createCodeMode } from "./codemode/index.js";
 import { checkScriptSyntax } from "./codemode/sandbox.js";
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
+import { writeHarFiles } from "./har-export.js";
 
 // Local Playwright/Node automation backends were intentionally removed: AutoDOM
 // is a Playwright alternative, not a wrapper, and any server-spawned automation
@@ -995,6 +996,8 @@ const TOOL_TIERS = new Map([
   ["har_start", "write"],
   ["har_status", "read"],
   ["har_stop", "read"],
+  ["har_entries", "read"],
+  ["wait_for_request", "read"],
   ["list_tabs", "read"],
   ["list_downloads", "read"],
   ["wait_for_download", "read"],
@@ -9729,53 +9732,119 @@ server.addTool({
   },
 });
 
-// HAR recording: network traffic + the user's own clicks in the tab.
+// HAR recording: network traffic, the AutoDOM tool call behind each
+// request, and the user's own clicks in the tab. Export helpers are in
+// har-export.js.
+const HAR_TAB_PARAM = z.number().optional().describe("Tab of the recording (default: the active one, or the only recording)");
+
 server.addTool({
   name: "har_start",
   description:
-    "Record a HAR of the active tab over CDP plus the user's own clicks, typing and navigations. Use when the user performs a flow by hand: har_start, ask user to act in the AutoDOM tab, har_stop. Entries: method, URL, headers, text bodies, status, timings, triggering action. Credentials, cookies and sensitive params redacted unless includeSensitive. Asks the user once per site.",
+    "Record a HAR of the active tab over CDP, for API testing or a flow the user performs by hand. Each entry says which AutoDOM tool call (or user action) triggered it. Call again with a new label to start the next test case in the same recording. Credentials, cookies and sensitive body keys are redacted unless includeSensitive. Asks the user once per site.",
   parameters: z.object({
     url: z.string().optional().describe("Open this URL first (its load is recorded)"),
+    label: z.string().optional().describe("Test-case name; while recording, starts the next segment"),
     actions: z.boolean().optional().describe("Also record the user's clicks/typing/navigations (default true)"),
+    apiOnly: z.boolean().optional().describe("Keep only XHR, fetch and EventSource requests"),
+    filter: z
+      .object({
+        urlInclude: z.array(z.string()).optional().describe('Keep only URLs matching one of these (substring, "*" glob or /regex/)'),
+        urlExclude: z.array(z.string()).optional().describe("Drop URLs matching one of these"),
+        methods: z.array(z.string()).optional().describe('Keep only these methods, e.g. ["POST","PUT"]'),
+      })
+      .optional(),
     includeBodies: z.boolean().optional().describe("Save text response bodies (default true)"),
-    maxBodyBytes: z.number().optional().describe("Largest response body to save, in bytes (default 262144)"),
+    maxBodyBytes: z.number().optional().describe("Longer bodies are truncated to this size (default 262144)"),
     includeSensitive: z.boolean().optional().describe("Keep Authorization/Cookie headers, tokens and password fields unredacted (default false)"),
+    redact: z
+      .object({
+        headers: z.array(z.string()).optional().describe("More header names to redact"),
+        bodyKeys: z.array(z.string()).optional().describe("More JSON / form keys to redact in request and response bodies"),
+      })
+      .optional(),
   }),
   execute: async (params) => stringifyToolResult(await callExtensionTool("har_start", params)),
 });
 
 server.addTool({
   name: "har_status",
-  description: "Progress of the HAR recording on the active tab: entries so far, in-flight requests, pages, user actions recorded and the most recent requests/actions.",
-  parameters: z.object({}),
-  execute: async () => stringifyToolResult(await callExtensionTool("har_status", {})),
+  description: "Progress of a HAR recording: entries, in-flight requests, test-case segments, redactions, and the latest requests.",
+  parameters: z.object({ tabId: HAR_TAB_PARAM }),
+  execute: async (params) => stringifyToolResult(await callExtensionTool("har_status", params)),
+});
+
+server.addTool({
+  name: "har_entries",
+  description:
+    "Query the recorded requests without exporting: one compact row each (method, URL, status, duration, sizes, JSON shape of request and response, triggering tool call). seq returns one request with headers and bodies.",
+  parameters: z.object({
+    tabId: HAR_TAB_PARAM,
+    urlPattern: z.string().optional().describe('Substring, "*" glob or /regex/'),
+    method: z.string().optional(),
+    status: z.union([z.number(), z.string()]).optional().describe('200, "2xx", "4xx", "5xx" or "failed"'),
+    resourceType: z.string().optional().describe("XHR, Fetch, Document, Script, ..."),
+    segment: z.number().optional().describe("Test-case segment index"),
+    seq: z.number().optional().describe("One request in detail"),
+    shape: z.boolean().optional().describe("Include JSON shapes (default true)"),
+    maxBodyChars: z.number().optional().describe("Body excerpt length with seq (default 2000)"),
+    limit: z.number().optional().describe("Most recent rows to return (default 30, max 200)"),
+  }),
+  execute: async (params) => stringifyToolResult(await callExtensionTool("har_entries", params)),
+});
+
+server.addTool({
+  name: "wait_for_request",
+  description:
+    "API assertion step: wait until a request matching urlPattern/method/status has finished, then return its status, timing and body shape, excerpt or a jsonPath value. Looks back to the start of the last action first, so call it right after the click or submit. Needs a running har_start. On timeout returns near misses.",
+  parameters: z.object({
+    urlPattern: z.string().describe('Substring, "*" glob or /regex/'),
+    method: z.string().optional(),
+    status: z.union([z.number(), z.string()]).optional().describe('200, "2xx", "4xx", "5xx" or "failed"'),
+    resourceType: z.string().optional(),
+    since: z.enum(["last_action", "segment", "now"]).optional().describe("Earliest request start to accept (default last_action)"),
+    count: z.number().optional().describe("Wait for this many matches (default 1)"),
+    timeout: z.number().optional().describe("ms (default 15000, at most the tool timeout minus 4 s)"),
+    body: z.enum(["none", "shape", "excerpt"]).optional().describe("What of the bodies to return (default shape)"),
+    jsonPath: z.string().optional().describe('Value to pick from the JSON response, e.g. "data.items[0].id"'),
+    maxBodyChars: z.number().optional(),
+    tabId: HAR_TAB_PARAM,
+  }),
+  execute: async (params) => {
+    // Must end before the bridge's own tool timeout.
+    const cap = Math.max(1000, TOOL_TIMEOUT - 4000);
+    const timeout = Math.min(cap, Number(params.timeout) || 15000);
+    return stringifyToolResult(await callExtensionTool("wait_for_request", { ...params, timeout }));
+  },
 });
 
 server.addTool({
   name: "har_stop",
   description:
-    "Stop HAR recording on the active tab and write the .har (default ~/Downloads/autodom-har/<host>-<time>.har). Returns path plus summary: counts by status, pages, requests per user action. inline:true also returns the HAR JSON (large).",
+    "Stop the HAR recording and write it to disk (default ~/Downloads/autodom-har/). With several test-case segments, one .har per segment (split:\"none\" keeps one file). curl:true also writes a shell script that replays the API calls. Returns paths and a summary per segment.",
   parameters: z.object({
-    path: z.string().optional().describe("Absolute .har path to write instead of the default"),
-    inline: z.boolean().optional().describe("Also return the HAR JSON in the result"),
+    tabId: HAR_TAB_PARAM,
+    path: z.string().optional().describe("Absolute .har path (one file) or directory (split) to write to"),
+    split: z.enum(["segment", "none"]).optional().describe("One file per test case (default when there are several)"),
+    curl: z.boolean().optional().describe("Also write <name>.curl.sh with the XHR/fetch calls (redacted values stay placeholders)"),
+    overwrite: z.boolean().optional().describe("Replace existing files at path"),
+    inline: z.boolean().optional().describe("Also return the HAR JSON in the result (large)"),
   }),
   execute: async (params) => {
-    const result = await callExtensionTool("har_stop", {});
+    const result = await callExtensionTool("har_stop", { tabId: params.tabId });
     if (!result?.har) return stringifyToolResult(result);
     const { har, ...rest } = result;
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const file =
-      params.path && isAbsolute(params.path)
-        ? params.path
-        : join(homedir(), "Downloads", "autodom-har", `${String(rest.host || "page").replace(/[^a-z0-9.-]/gi, "_")}-${stamp}.har`);
-    const text = JSON.stringify(har, null, 2);
     try {
-      await fs.mkdir(resolvePath(file, ".."), { recursive: true });
-      await fs.writeFile(file, text, "utf8");
+      const written = await writeHarFiles(har, {
+        host: rest.host,
+        path: params.path,
+        split: params.split,
+        curl: params.curl === true,
+        overwrite: params.overwrite === true,
+      });
+      return stringifyToolResult({ ...rest, ...written, ...(params.inline && { har }) });
     } catch (err) {
-      return stringifyToolResult({ ...rest, error: `Recorded, but could not write ${file}: ${err.message}`, ...(params.inline && { har }) });
+      return stringifyToolResult({ ...rest, error: `Recorded, but could not write the HAR: ${err.message}`, ...(params.inline && { har }) });
     }
-    return stringifyToolResult({ ...rest, path: file, bytes: Buffer.byteLength(text), ...(params.inline && { har }) });
   },
 });
 

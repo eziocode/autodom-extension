@@ -46,6 +46,9 @@ function load({ bodies = {} } = {}) {
   return { cap, har, emit, sent, removeTab };
 }
 
+// Values built in the vm sandbox have other prototypes.
+const deq = (actual, expected, ...msg) => assert.deepEqual(JSON.parse(JSON.stringify(actual)), expected, ...msg);
+
 const T0 = 1000; // monotonic seconds
 const W0 = 1_700_000_000; // wall seconds
 
@@ -231,9 +234,160 @@ test("body fetch failures and oversize bodies are noted, not fatal", async () =>
   assert.match(big.response.content.comment, /size limit/);
 });
 
-test("closing the tab drops its HAR session", async () => {
+test("closing the tab keeps the recording for har_stop", async () => {
   const env = await started();
+  env.emit("Network.requestWillBeSent", { requestId: "a", type: "XHR", timestamp: T0, wallTime: W0, request: { url: "https://shop.test/api/x", method: "GET", headers: {} } });
+  env.emit("Network.loadingFinished", { requestId: "a", timestamp: T0 + 0.1, encodedDataLength: 1 });
   env.removeTab(1);
-  assert.equal(env.har.isActive(1), false);
-  assert.equal(await env.har.stop(1), null);
+  assert.equal(env.har.isActive(1), false, "no longer recording");
+  deq([...env.har.recordingTabs()], [1]);
+  assert.equal(env.har.status(1).tabClosed, true);
+  const { har } = await env.har.stop(1);
+  assert.equal(har.log.entries.length, 1);
+});
+
+const req = (id, url, extra = {}) => ({
+  requestId: id, type: "XHR", timestamp: T0, wallTime: Date.now() / 1000,
+  request: { url, method: "GET", headers: {} }, ...extra,
+});
+const finish = (env, id, status = 200, mimeType = "application/json") => {
+  env.emit("Network.responseReceived", { requestId: id, response: { status, mimeType, headers: {} } });
+  env.emit("Network.loadingFinished", { requestId: id, timestamp: T0 + 0.1, encodedDataLength: 10 });
+};
+
+test("wire headers and cookies from ExtraInfo replace the page's, in either order", async () => {
+  const env = await started();
+  // ExtraInfo before the request…
+  env.emit("Network.requestWillBeSentExtraInfo", {
+    requestId: "a",
+    headers: { Cookie: "sid=1; theme=dark", Host: "shop.test" },
+    associatedCookies: [{ blockedReasons: [], cookie: { name: "sid", value: "1" } }, { blockedReasons: ["SameSiteStrict"], cookie: { name: "x", value: "2" } }],
+  });
+  env.emit("Network.requestWillBeSent", req("a", "https://shop.test/api/me"));
+  env.emit("Network.responseReceived", { requestId: "a", response: { status: 200, mimeType: "application/json", headers: { "Content-Type": "application/json" } } });
+  // …and the response one after it.
+  env.emit("Network.responseReceivedExtraInfo", {
+    requestId: "a",
+    headers: { "Set-Cookie": "sid=2; Path=/; HttpOnly\nlang=en; Secure", "Content-Type": "application/json" },
+  });
+  env.emit("Network.loadingFinished", { requestId: "a", timestamp: T0 + 0.1, encodedDataLength: 10 });
+  const { har, summary } = await env.har.stop(1);
+  const e = har.log.entries[0];
+  assert.ok(e.request.headers.some((h) => h.name === "Host"), "wire request headers");
+  deq(e.request.cookies.map((c) => [c.name, c.value]), [["sid", "REDACTED"]], "blocked cookies are not sent");
+  const set = e.response.headers.filter((h) => h.name === "Set-Cookie");
+  assert.equal(set.length, 2, "repeated headers are split");
+  deq(e.response.cookies.map((c) => [c.name, c.value, !!c.httpOnly, !!c.secure]), [["sid", "REDACTED", true, false], ["lang", "REDACTED", false, true]]);
+  assert.ok(summary.redactions >= 3, "Cookie and both Set-Cookie headers");
+});
+
+test("record-time filters keep only the API calls asked for", async () => {
+  const env = load();
+  await env.cap.start(1, "https://shop.test/");
+  await env.har.start(1, { filter: { apiOnly: true, urlExclude: ["*/telemetry*"], methods: ["GET", "POST"] } });
+  env.emit("Network.requestWillBeSent", req("1", "https://shop.test/api/a"));
+  env.emit("Network.requestWillBeSent", req("2", "https://shop.test/logo.png", { type: "Image" }));
+  env.emit("Network.requestWillBeSent", req("3", "https://shop.test/telemetry/v1"));
+  env.emit("Network.requestWillBeSent", req("4", "https://shop.test/api/b", { request: { url: "https://shop.test/api/b", method: "DELETE", headers: {} } }));
+  for (const id of ["1", "2", "3", "4"]) finish(env, id);
+  const { har, summary } = await env.har.stop(1);
+  deq(har.log.entries.map((e) => e.request.url), ["https://shop.test/api/a"]);
+  assert.equal(summary.filteredOut, 3);
+});
+
+test("response JSON and extra keys are redacted; long bodies are truncated, not dropped", async () => {
+  const env = load({
+    bodies: {
+      a: { body: JSON.stringify({ accessToken: "t", user: { name: "Ada", ssnLast4: "1234" } }), base64Encoded: false },
+      big: { body: "x".repeat(300), base64Encoded: false },
+    },
+  });
+  await env.cap.start(1, "https://shop.test/");
+  await env.har.start(1, { maxBodyBytes: 100, redact: { bodyKeys: ["ssnLast4"], headers: ["X-Tenant"] } });
+  env.emit("Network.requestWillBeSent", req("a", "https://shop.test/api/login", { request: { url: "https://shop.test/api/login", method: "GET", headers: { "X-Tenant": "acme" } } }));
+  finish(env, "a");
+  env.emit("Network.requestWillBeSent", req("big", "https://shop.test/api/big"));
+  finish(env, "big", 200, "text/plain");
+  const { har, summary } = await env.har.stop(1);
+  const [a, big] = har.log.entries;
+  deq(JSON.parse(a.response.content.text), { accessToken: "REDACTED", user: { name: "Ada", ssnLast4: "REDACTED" } });
+  assert.equal(a.request.headers[0].value, "REDACTED");
+  assert.equal(big.response.content.text.length, 100);
+  assert.equal(big._autodom.truncated, true);
+  assert.match(big.response.content.comment, /truncated/);
+  assert.equal(summary.truncatedBodies, 1);
+});
+
+test("segments split one recording into test cases", async () => {
+  const env = load();
+  await env.cap.start(1, "https://shop.test/");
+  const first = await env.har.start(1, { label: "login" });
+  assert.equal(first.segment.label, "login");
+  env.emit("Network.requestWillBeSent", req("1", "https://shop.test/api/login"));
+  finish(env, "1", 401);
+  const next = await env.har.start(1, { label: "checkout" });
+  deq(next.closedSegment, { index: 0, label: "login", entries: 1, failed: 1 });
+  assert.equal(next.segment.index, 1);
+  env.emit("Network.requestWillBeSent", req("2", "https://shop.test/api/cart"));
+  finish(env, "2");
+  assert.equal((await env.har.start(1, {})).alreadyRunning, true, "no label: still one recording");
+  const { har } = await env.har.stop(1);
+  deq(har.log.entries.map((e) => e._autodom.segment), [0, 1]);
+  deq(har.log._autodom.segments.map((s) => [s.label, s.entries]), [["login", 1], ["checkout", 1]]);
+});
+
+test("entries name the AutoDOM tool call that triggered them", async () => {
+  const env = await started();
+  env.emit("Network.requestWillBeSent", req("before", "https://shop.test/api/boot"));
+  const step = env.har.noteAction(1, { callId: "c9", tool: "click", target: "#save" });
+  env.emit("Network.requestWillBeSent", req("during", "https://shop.test/api/save"));
+  env.har.endAction(1, step);
+  env.emit("Network.requestWillBeSent", req("after", "https://shop.test/api/refresh", { wallTime: (Date.now() + 500) / 1000 }));
+  for (const id of ["before", "during", "after"]) finish(env, id);
+  const { har } = await env.har.stop(1);
+  const [before, during, after] = har.log.entries;
+  assert.equal(before._autodom.step, undefined);
+  deq(
+    { step: during._autodom.step, tool: during._autodom.tool, callId: during._autodom.callId, phase: during._autodom.phase },
+    { step: 1, tool: "click", callId: "c9", phase: "during" },
+  );
+  assert.equal(after._autodom.phase, "after");
+  deq(har.log._autodom.steps.map((s) => [s.tool, s.target, s.requests]), [["click", "#save", 2]]);
+});
+
+test("query and waitFor answer API assertions", async () => {
+  const env = load({ bodies: { s: { body: '{"data":{"id":42,"items":[{"name":"a"}]}}', base64Encoded: false } } });
+  await env.cap.start(1, "https://shop.test/");
+  await env.har.start(1, {});
+  env.emit("Network.requestWillBeSent", req("old", "https://shop.test/api/orders", { wallTime: (Date.now() - 1000) / 1000 }));
+  finish(env, "old", 500);
+  const since = env.har.sinceMs(1, "now");
+  const pending = env.har.waitFor(1, { urlPattern: "/api/orders", method: "POST", status: "2xx", sinceMs: since }, { timeoutMs: 2000 });
+  env.emit("Network.requestWillBeSent", req("s", "https://shop.test/api/orders", {
+    wallTime: (since + 5) / 1000,
+    request: { url: "https://shop.test/api/orders", method: "POST", headers: { "Content-Type": "application/json" }, postData: '{"qty":2}' },
+  }));
+  finish(env, "s", 201);
+  const hit = await pending;
+  assert.equal(hit.matched, true);
+  await env.har.bodyOf(hit.entries[0]);
+  const r = env.har.row(hit.entries[0], { jsonPath: "data.items[0].name" });
+  assert.equal(r.status, 201);
+  deq(r.requestShape, { qty: "number" });
+  deq(r.responseShape, { data: { id: "number", items: [{ name: "string" }] } });
+  assert.equal(r.picked, "a");
+
+  const q = env.har.query(1, { status: "5xx" });
+  assert.equal(q.total, 1);
+  assert.equal(q.rows[0].status, 500);
+  const one = env.har.query(1, { seq: r.seq });
+  assert.equal(one.rows[0].requestBody, '{"qty":2}');
+
+  const miss = await env.har.waitFor(1, { urlPattern: "/api/orders", method: "DELETE", sinceMs: since }, { timeoutMs: 30 });
+  assert.equal(miss.matched, false);
+  deq(env.har.nearMisses(1, { urlPattern: "/api/orders", sinceMs: since }).map((x) => x.method), ["POST"]);
+
+  const waiting = env.har.waitFor(1, { urlPattern: "/never" }, { timeoutMs: 5000 });
+  await env.har.stop(1);
+  assert.equal((await waiting).stopped, true, "a stop ends pending waits");
 });
