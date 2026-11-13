@@ -713,23 +713,6 @@ function deriveModeFromSource(source) {
   return "api"; // openai / anthropic / ollama / openai-compatible
 }
 
-function resolveSourceForMode(mode, presetKey) {
-  if (mode === "ide") return "ide";
-  if (mode === "cli") return "cli";
-  // api mode — derive from preset, fall back to existing select / openai
-  const preset = PROVIDER_PRESETS[presetKey];
-  if (preset && preset.source) return preset.source;
-  const existing = DOM.providerSelect?.value;
-  if (existing && existing !== "ide" && existing !== "cli") return existing;
-  return "openai";
-}
-
-// Single source of truth: read the effective protocol source from the
-// hidden providerSelect, which Mode + Preset always keep in sync.
-function getEffectiveProviderSource() {
-  return DOM.providerSelect?.value || providerSettings.source || "ide";
-}
-
 let activityLogs = [];
 let activityFilter = "all";
 let popupToastTimer = null;

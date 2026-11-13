@@ -115,15 +115,6 @@ export async function readRoutineFile(path) {
   return fs.readFile(file, "utf8");
 }
 
-export async function listWorkflowFiles(home = autodomHome()) {
-  const dir = join(home, "workflows");
-  try {
-    return (await fs.readdir(dir)).filter((f) => f.endsWith(".json")).map((f) => join(dir, f));
-  } catch {
-    return [];
-  }
-}
-
 // Writes an export. Without `path` it goes to ~/.autodom/exports/<filename>.
 // An explicit path must end in an export extension, and the parent folder
 // must already exist (we never create arbitrary directory trees).

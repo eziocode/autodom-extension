@@ -962,6 +962,11 @@ const TOOL_TIERS = new Map([
   // Read-only / inspection tools
   ["get_dom_state", "read"],
   ["get_page_info", "read"],
+  ["get_tool_tiers", "read"],
+  ["deep_query", "read"],
+  ["list_iframes", "read"],
+  ["list_shadow_roots", "read"],
+  ["list_popups", "read"],
   ["code_api", "read"],
   ["script_list", "read"],
   ["script_get", "read"],
@@ -1032,6 +1037,15 @@ const TOOL_TIERS = new Map([
 
   // Write tools — modify page state but are generally reversible
   ["click", "write"],
+  ["iframe_interact", "write"],
+  ["shadow_interact", "write"],
+  ["switch_to_popup", "write"],
+  ["wait_for_popup", "read"],
+  ["close_popup", "write"],
+  // Answering a held action is not itself the action; the held call
+  // keeps its own tier.
+  ["confirm_action", "write"],
+  ["cancel_action", "read"],
   ["click_by_index", "write"],
   ["type_text", "write"],
   ["type_by_index", "write"],
@@ -1110,6 +1124,8 @@ const TOOL_TIERS = new Map([
   ["webmcp_call_tool", "destructive"],
 ]);
 
+const INTERACT_READ_ACTIONS = new Set(["query", "query_all", "extract_text", "get_dom_state", "check_element_state"]);
+
 function getToolTier(toolName, params = {}) {
   // Parameter-aware tiering for composite compatibility tools.
   if (toolName === "fetch_page_source" || toolName === "browser_fetch_raw") {
@@ -1117,6 +1133,9 @@ function getToolTier(toolName, params = {}) {
     return (method === "GET" || method === "HEAD") && params?.body === undefined
       ? "read"
       : "destructive";
+  }
+  if (toolName === "iframe_interact" || toolName === "shadow_interact") {
+    return INTERACT_READ_ACTIONS.has(String(params?.action || "query")) ? "read" : "write";
   }
   if (toolName === "browser_tabs") {
     const action = String(params?.action || "list").toLowerCase();
@@ -1162,49 +1181,9 @@ const LEGACY_CLI_MODEL_DEFAULTS = new Set([
   "o4-mini",
 ]);
 
-// ─── WebSocket Message Batching ──────────────────────────────
-// When multiple tool calls arrive in rapid succession (e.g. batch_actions
-// dispatching sequentially, or parallel IDE requests), we micro-batch
-// outgoing messages into a single WebSocket frame to reduce per-message
-// overhead (frame headers, syscalls, TCP segments).  Inspired by
-// Playwright's channel multiplexing approach.
-const WS_BATCH_INTERVAL_MS = 5; // ~5ms micro-batch window (reduced timer churn)
-let _wsBatchQueue = [];
-let _wsBatchTimer = null;
-
-function flushWsBatch() {
-  _wsBatchTimer = null;
-  if (_wsBatchQueue.length === 0) return;
-  if (!extensionSocket || extensionSocket.readyState !== 1) {
-    _wsBatchQueue.length = 0;
-    return;
-  }
-  if (_wsBatchQueue.length === 1) {
-    // Single message — send directly, no array wrapper overhead
-    extensionSocket.send(_wsBatchQueue[0]);
-  } else {
-    // Multiple messages — batch into a JSON array for single-frame send
-    extensionSocket.send("[" + _wsBatchQueue.join(",") + "]");
-  }
-  _wsBatchQueue.length = 0;
-}
-
-function sendToExtension(messageObj) {
-  const json = JSON.stringify(messageObj);
-  _wsBatchQueue.push(json);
-  if (!_wsBatchTimer) {
-    _wsBatchTimer = setTimeout(flushWsBatch, WS_BATCH_INTERVAL_MS);
-  }
-}
-
+// Send one frame to the extension, if it is connected.
 function sendToExtensionImmediate(messageObj) {
-  // For latency-critical messages (single tool calls when no batch is pending)
-  if (_wsBatchQueue.length > 0) {
-    _wsBatchQueue.push(JSON.stringify(messageObj));
-    clearTimeout(_wsBatchTimer);
-    _wsBatchTimer = null;
-    flushWsBatch();
-  } else if (extensionSocket && extensionSocket.readyState === 1) {
+  if (extensionSocket && extensionSocket.readyState === 1) {
     extensionSocket.send(JSON.stringify(messageObj));
   }
 }
@@ -2400,7 +2379,6 @@ async function tryBecomePrimary() {
 
 🌐 WebSocket listening on: ws://127.0.0.1:${WS_PORT}
 ⏱️  Inactivity timeout: ${inactivityMins}
-📦 Message batching: ${WS_BATCH_INTERVAL_MS}ms window
 `);
       setupWssConnection(wss);
       return true;
@@ -4854,9 +4832,6 @@ function callExtensionTool(tool, params, options = {}) {
     });
 
     try {
-      // Use immediate send for individual tool calls (low latency path).
-      // Batched sends are used when multiple calls queue within the
-      // micro-batch window (e.g. inside batch_actions processing).
       sendToExtensionImmediate({
         type: "TOOL_CALL",
         clientId: frameClientId(),
@@ -8510,8 +8485,10 @@ const PLAYWRIGHT_COMPAT_TOOLS = [
     name: "browser_take_screenshot",
     description: "Capture a screenshot of the current page.",
     parameters: z.object({
-      fullPage: z.boolean().optional().describe("Capture the full page when supported"),
-      selector: PLAYWRIGHT_TARGET_PARAM,
+      // Accepted for Playwright compatibility; the capture is the viewport
+      // until full-page and element screenshots land.
+      fullPage: z.boolean().optional().describe("Not implemented yet: the viewport is captured"),
+      selector: PLAYWRIGHT_TARGET_PARAM.describe("Not implemented yet: the viewport is captured"),
       format: z.string().optional().describe("Image format, usually png or jpeg"),
     }),
   },

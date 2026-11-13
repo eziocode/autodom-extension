@@ -53,6 +53,20 @@ test("public MCP registration is unique and structurally complete", async () => 
   }
 });
 
+test("every registered tool has an explicit safety tier", async () => {
+  const server = await source("server/index.js");
+  const start = server.indexOf("const TOOL_TIERS = new Map([");
+  const end = server.indexOf("]);", start);
+  assert.notEqual(start, -1);
+  const tiered = new Set(
+    [...server.slice(start, end).matchAll(/\["([a-z0-9_]+)",\s*"(read|write|destructive)"\]/g)].map((m) => m[1]),
+  );
+  // An unlisted tool falls back to "write": a read-only tool is then held
+  // by write guardrails, and it is missing from get_tool_tiers.
+  const untiered = namesFromAddToolCalls(server).filter((name) => !tiered.has(name));
+  assert.deepEqual(untiered, []);
+});
+
 test("tool-count copy cannot drift from public inventory", async () => {
   const files = await Promise.all([
     source("README.md"),

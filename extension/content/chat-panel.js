@@ -2966,7 +2966,7 @@
       btn.className = "autodom-model-item" + (m.id === current ? " is-active" : "");
       btn.setAttribute("role", "option");
       btn.setAttribute("aria-selected", m.id === current ? "true" : "false");
-      btn.innerHTML = `${_escapeHtml(m.label)}<span class="mi-desc">${_escapeHtml(m.description || m.id)}</span>`;
+      btn.innerHTML = `${escapeHtml(m.label)}<span class="mi-desc">${escapeHtml(m.description || m.id)}</span>`;
       btn.addEventListener("click", () => {
         _setModelOverride(m.id);
         _modelPickerClose();
@@ -2974,13 +2974,6 @@
       });
       _modelPickerMenu.appendChild(btn);
     });
-  }
-
-  function _escapeHtml(s) {
-    return String(s ?? "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
   }
 
   const _ACCOUNT_CONTEXT_ID_RE =
@@ -4900,11 +4893,9 @@
 
   // ── Token-streaming bubble state (Phase A/C) ──────────────────────
   // _streamingBubbles holds the per-runId transient assistant bubble
-  // and accumulated text. _streamedRunIds remembers runs whose final
-  // reply we've already painted via streaming so the late-arriving
-  // AI_CHAT_RESPONSE can skip a duplicate addMessage.
+  // and accumulated text. The final AI_CHAT_RESPONSE removes it and
+  // renders the reply as markdown.
   const _streamingBubbles = new Map(); // runId → {bubble, textNode, text}
-  const _streamedRunIds = new Set();
 
   function _ensureMessageList() {
     return document.getElementById("__autodom_messages");
@@ -5039,27 +5030,14 @@
 
   function _finalizeStreamingBubble(runId) {
     if (!runId) return;
-    // Mark this run as already-streamed so the final AI_CHAT_RESPONSE
-    // skips a duplicate addMessage. Leave the transient bubble in place
-    // until the final markdown render replaces it (sendAiMessage), which
-    // calls _resetStreamingBubble for us once it has the rich version.
-    _streamedRunIds.add(runId);
+    // Leave the transient bubble in place until the final markdown
+    // render replaces it (sendAiMessage calls _resetStreamingBubble).
     const entry = _streamingBubbles.get(runId);
     if (entry?.bubble) {
       entry.bubble.classList.add("done");
       const cursor = entry.bubble.querySelector(".stream-cursor");
       if (cursor) cursor.remove();
     }
-  }
-
-  function _consumeStreamedRunId(runId) {
-    if (!runId) return false;
-    const had = _streamedRunIds.has(runId);
-    if (had) {
-      _streamedRunIds.delete(runId);
-      _resetStreamingBubble(runId);
-    }
-    return had;
   }
 
   function appendAgentToolChip(evt) {
@@ -6562,28 +6540,6 @@
     return result;
   }
 
-  function buildLocalSummary() {
-    return buildLocalSummaryFromInfo({
-      title: (document.title || "(untitled)").trim(),
-      headings: Array.from(document.querySelectorAll("h1, h2, h3"))
-        .map((h) => (h.textContent || "").trim().replace(/\s+/g, " "))
-        .filter((t) => t && t.length > 2 && t.length < 140)
-        .slice(0, 12),
-      paragraphs: Array.from(document.querySelectorAll("p"))
-        .map((p) => (p.textContent || "").trim().replace(/\s+/g, " "))
-        .filter((t) => t.length > 60)
-        .slice(0, 4),
-      counts: {
-        links: document.querySelectorAll("a[href]").length,
-        buttons: document.querySelectorAll('button, [role="button"]').length,
-        inputs: document.querySelectorAll("input, textarea, select").length,
-        forms: document.querySelectorAll("form").length,
-      },
-      text: extractMainPageText(),
-      local: true,
-    });
-  }
-
   function buildLocalSummaryFromInfo(info) {
     const title =
       _scrubContextIdentifiers((info && info.title) || "(untitled)") ||
@@ -7240,7 +7196,6 @@
       for (const rid of Array.from(_streamingBubbles.keys())) {
         _resetStreamingBubble(rid);
       }
-      _streamedRunIds.clear();
     } catch (_) {}
 
     addMessage("ai-response", responseText, {
@@ -8979,7 +8934,7 @@
   });
 
   function escapeHtml(text) {
-    return text
+    return String(text ?? "")
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")
