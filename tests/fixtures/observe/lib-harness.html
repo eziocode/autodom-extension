@@ -14,6 +14,7 @@
 <input id="name" name="name" value="old" />
 <input id="email" name="email" aria-describedby="email-err" />
 <span id="email-err"></span>
+<select id="stage"><option value="">Pick</option><option value="new">New</option><option value="won">Closed won</option></select>
 <div id="host"></div>
 <div id="existing" class="modal" role="dialog" aria-label="Already open"><button>Keep</button></div>
 <pre id="result">running…</pre>
@@ -48,6 +49,27 @@
       check("fill replaces the value", r.ok && r.value === "new" && document.getElementById("name").value === "new", r);
       r = P._pageWfRunAction({ selector: "#name" }, { action: "fill", value: "er", append: true });
       check("fill can append", r.value === "newer", r);
+
+      // ── form, select, keys ──
+      r = P._pageWfRunActions([
+        [{ selector: "#name" }, { action: "fill", value: "Ada" }],
+        [{ selector: "#missing" }, { action: "fill", value: "x" }],
+      ]);
+      check("a form is filled in one call and misses are marked", r[0].ok && r[0].value === "Ada" && r[1].miss === true, r);
+      r = P._pageWfRunAction({ selector: "#stage" }, { action: "select", value: "", optionText: "Closed won" });
+      check("select by option text", r.ok && r.value === "won" && r.selectedText === "Closed won", r);
+      r = P._pageWfRunAction({ selector: "#stage" }, { action: "select", value: "", index: 1 });
+      check("select by index", r.ok && r.value === "new", r);
+      const keys = [];
+      document.getElementById("name").addEventListener("keydown", (e) => keys.push([e.key, e.code, e.ctrlKey, e.shiftKey]));
+      P._pageWfRunAction({ selector: "#name" }, { action: "press", key: "Control+Shift+a" });
+      document.getElementById("name").focus();
+      r = P._pageWfRunAction({ active: true }, { action: "press", key: "Escape" });
+      check(
+        "key combinations carry modifiers and no selector means the focused element",
+        r.ok && JSON.stringify(keys) === JSON.stringify([["a", "KeyA", true, true], ["Escape", "Escape", false, false]]),
+        { r, keys },
+      );
 
       // ── shadow roots ──
       const outer = document.getElementById("host").attachShadow({ mode: "open" });

@@ -8443,99 +8443,45 @@ async function toolEvaluateScript(params, ctx) {
 
 // 7. Fill form
 async function toolFillForm(params, ctx) {
+  const P = globalThis.AutoDOMWorkflow?._page;
+  if (!P) return { error: "workflow engine not loaded" };
   const tab = await getActiveTab(ctx);
-  const { fields } = params; // [{selector, value}]
-  return await executeInTab(
-    tab.id,
-    (fields) => {
-      const results = [];
-      for (const field of fields) {
-        const el = document.querySelector(field.selector);
-        if (!el) {
-          results.push({ selector: field.selector, error: "Not found" });
-          continue;
-        }
-        el.focus();
-        if (el.tagName === "SELECT") {
-          el.value = field.value;
-          el.dispatchEvent(new Event("change", { bubbles: true }));
-        } else {
-          el.value = field.value;
-          el.dispatchEvent(new Event("input", { bubbles: true }));
-          el.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-        results.push({ selector: field.selector, success: true });
-      }
-      return { success: true, results };
-    },
-    [fields],
-  );
+  const steps = (params?.fields || []).map((f) => [{ selector: f.selector }, { action: "fill", value: f.value }]);
+  // One round trip for the whole form; only fields the top document does
+  // not have go looking in other frames.
+  const top = await _callWfPage(tab.id, P._pageWfRunActions, [steps]);
+  const results = [];
+  for (let i = 0; i < steps.length; i++) {
+    const [target, step] = steps[i];
+    const res = top?.[i]?.miss ? await _actOnTarget(ctx, target, step) : top?.[i];
+    results.push(
+      res?.ok
+        ? { selector: target.selector, success: true, ..._foundIn(res) }
+        : { selector: target.selector, error: /^Element not found/.test(res?.error || "") ? "Not found" : res?.error || "Not found" },
+    );
+  }
+  return { success: true, results };
 }
 
 // 8. Hover
 async function toolHover(params, ctx) {
   const ref = _refParam(params);
   if (ref) return _actByRef(ref, { action: "hover" }, ctx);
-  const tab = await getActiveTab(ctx);
-  const { selector } = params;
-  return await executeInTab(
-    tab.id,
-    (selector) => {
-      const el = document.querySelector(selector);
-      if (!el) return { error: `Element not found: ${selector}` };
-      el.scrollIntoView({ behavior: "auto", block: "center" });
-      el.dispatchEvent(
-        new MouseEvent("mouseenter", { bubbles: true, cancelable: true }),
-      );
-      el.dispatchEvent(
-        new MouseEvent("mouseover", { bubbles: true, cancelable: true }),
-      );
-      return { success: true, tag: el.tagName };
-    },
-    [selector],
-  );
+  const res = await _actOnTarget(ctx, { selector: params?.selector }, { action: "hover" });
+  if (res.error) return res;
+  return { success: true, tag: res.tag, ..._foundIn(res) };
 }
 
 // 9. Press key
 async function toolPressKey(params, ctx) {
+  const key = params?.key || "Enter";
   const ref = _refParam(params);
-  if (ref) return _actByRef(ref, { action: "press", key: params?.key || "Enter" }, ctx);
-  const tab = await getActiveTab(ctx);
-  const { key, selector } = params;
-  return await executeInTab(
-    tab.id,
-    (key, selector) => {
-      const target = selector
-        ? document.querySelector(selector)
-        : document.activeElement || document.body;
-      if (!target) return { error: "No target element" };
-
-      // Parse key combo (e.g. "Control+A")
-      const parts = key.split("+");
-      const mainKey = parts.pop();
-      const modifiers = {
-        ctrlKey: parts.includes("Control") || parts.includes("Ctrl"),
-        shiftKey: parts.includes("Shift"),
-        altKey: parts.includes("Alt"),
-        metaKey: parts.includes("Meta") || parts.includes("Cmd"),
-      };
-
-      const keyEventProps = {
-        key: mainKey,
-        code: `Key${mainKey.toUpperCase()}`,
-        bubbles: true,
-        cancelable: true,
-        ...modifiers,
-      };
-
-      target.dispatchEvent(new KeyboardEvent("keydown", keyEventProps));
-      target.dispatchEvent(new KeyboardEvent("keypress", keyEventProps));
-      target.dispatchEvent(new KeyboardEvent("keyup", keyEventProps));
-
-      return { success: true, key };
-    },
-    [key, selector || null],
-  );
+  if (ref) return _actByRef(ref, { action: "press", key }, ctx);
+  // No selector: the focused element, as a keyboard would.
+  const target = params?.selector ? { selector: params.selector } : { active: true };
+  const res = await _actOnTarget(ctx, target, { action: "press", key });
+  if (res.error) return res;
+  return { success: true, key, ..._foundIn(res) };
 }
 
 // 10. Get page info
@@ -9240,43 +9186,23 @@ async function toolScroll(params, ctx) {
 
 // 21. Select option from <select>
 async function toolSelectOption(params, ctx) {
+  const step = {
+    action: "select",
+    value: params?.value ?? "",
+    optionText: params?.text || "",
+    ...(params?.index != null ? { index: Number(params.index) } : {}),
+  };
   const ref = _refParam(params);
-  if (ref) {
-    return _actByRef(ref, { action: "select", value: params?.value ?? "", optionText: params?.text || "" }, ctx);
-  }
-  const tab = await getActiveTab(ctx);
-  const { selector, value, text, index } = params;
-  return await executeInTab(
-    tab.id,
-    (selector, value, text, index) => {
-      const el = document.querySelector(selector);
-      if (!el) return { error: `Element not found: ${selector}` };
-      if (el.tagName !== "SELECT")
-        return { error: "Element is not a <select>" };
-
-      let found = false;
-      for (const opt of el.options) {
-        if (
-          (value !== undefined && opt.value === value) ||
-          (text !== undefined && opt.text === text) ||
-          (index !== undefined && opt.index === index)
-        ) {
-          el.value = opt.value;
-          found = true;
-          break;
-        }
-      }
-      if (!found) return { error: "Option not found" };
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      el.dispatchEvent(new Event("input", { bubbles: true }));
-      return {
-        success: true,
-        selectedValue: el.value,
-        selectedText: el.options[el.selectedIndex].text,
-      };
-    },
-    [selector, value ?? null, text ?? null, index ?? null],
-  );
+  if (ref) return _actByRef(ref, step, ctx);
+  const res = await _actOnTarget(ctx, { selector: params?.selector }, step);
+  if (res.error) return res;
+  return {
+    success: true,
+    selectedValue: res.value,
+    selectedText: res.selectedText,
+    ...(res.note ? { note: res.note } : {}),
+    ..._foundIn(res),
+  };
 }
 
 // 22. Wait for element (CSS selector)
@@ -9289,8 +9215,19 @@ async function toolWaitForElement(params, ctx) {
   const res = await _waitInPage(
     tab.id,
     (selector, desiredState, sliceMs) => {
-      const reached = () => {
-        const el = document.querySelector(selector);
+      // Open shadow roots are searched too, but only from the timed poll:
+      // walking every element on each mutation would be too slow.
+      const inShadow = (root, depth) => {
+        for (const host of root.querySelectorAll("*")) {
+          const sr = host.shadowRoot;
+          if (!sr) continue;
+          const hit = sr.querySelector(selector) || (depth < 6 ? inShadow(sr, depth + 1) : null);
+          if (hit) return hit;
+        }
+        return null;
+      };
+      const reached = (deep) => {
+        const el = document.querySelector(selector) || (deep ? inShadow(document, 0) : null);
         if (desiredState === "attached") return !!el;
         if (desiredState === "detached") return !el;
         if (desiredState === "visible") {
@@ -9311,7 +9248,7 @@ async function toolWaitForElement(params, ctx) {
         }
         return !!el;
       };
-      if (reached()) return true;
+      if (reached(true)) return true;
       return new Promise((resolve) => {
         let done = false;
         const finish = (v) => {
@@ -9333,8 +9270,10 @@ async function toolWaitForElement(params, ctx) {
         });
         // Visibility can change without a mutation (stylesheet media
         // queries, animations); a cheap in-page poll covers that.
-        const poll = setInterval(check, 200);
-        const endTimer = setTimeout(() => finish(reached()), sliceMs);
+        const poll = setInterval(() => {
+          if (reached(true)) finish(true);
+        }, 200);
+        const endTimer = setTimeout(() => finish(reached(true)), sliceMs);
       });
     },
     [selector, desiredState],
@@ -14837,24 +14776,48 @@ async function toolIframeInteract(params, ctx) {
 
   let targetFrameId = frameId;
 
-  // If iframeSelector is provided instead of frameId, resolve it
+  // iframeSelector → frameId. Matching by src covers cross-origin frames;
+  // srcdoc, about:blank and same-src frames are found by tagging the
+  // frame's window, which the page can reach because they are same-origin.
   if (targetFrameId === undefined && params.iframeSelector) {
-    const frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id });
-    const iframeSrc = await executeInTab(
+    const probe = `f${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const found = await executeInTab(
       tab.id,
-      (sel) => {
+      (sel, probe) => {
         const iframe = document.querySelector(sel);
-        return iframe ? iframe.src : null;
+        if (!iframe) return null;
+        let tagged = false;
+        try {
+          iframe.contentWindow.__autodomFrameProbe = probe;
+          tagged = true;
+        } catch (_) {}
+        return { src: iframe.src || "", tagged };
       },
-      [params.iframeSelector],
+      [params.iframeSelector, probe],
     );
-    if (!iframeSrc)
+    if (!found)
       return {
         error: `iframe not found with selector: ${params.iframeSelector}`,
       };
-    const match = frames.find((f) => f.url === iframeSrc && f.frameId !== 0);
+    let match = null;
+    if (found.tagged) {
+      const hits = await executeInFrames(
+        tab.id,
+        (probe) => {
+          const hit = window.__autodomFrameProbe === probe;
+          if (hit) delete window.__autodomFrameProbe;
+          return hit;
+        },
+        [probe],
+      );
+      match = hits.find((h) => h.result && h.frameId !== 0);
+    }
+    if (!match && found.src) {
+      const frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id });
+      match = frames.find((f) => f.url === found.src && f.frameId !== 0);
+    }
     if (!match)
-      return { error: `Could not resolve frameId for iframe: ${iframeSrc}` };
+      return { error: `Could not resolve a frame for iframe: ${params.iframeSelector}` };
     targetFrameId = match.frameId;
   }
 

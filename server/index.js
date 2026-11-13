@@ -11124,7 +11124,7 @@ server.addTool({
 server.addTool({
   name: "iframe_interact",
   description:
-    "Act inside an iframe (regular tools cannot cross iframe boundaries). Actions: click, type, query, extract_text, fill_form, get_dom_state. Target by frameId from list_iframes or iframeSelector.",
+    "Act inside one iframe, chosen by frameId from list_iframes or by iframeSelector. click, type_text and the other action tools already look in frames when the top document has no match; use this to target a specific frame or to read it.",
   parameters: z.object({
     observe: OBSERVE_PARAM,
     frameId: z
@@ -11138,7 +11138,10 @@ server.addTool({
         "CSS selector for the iframe element in the parent page (alternative to frameId)",
       ),
     action: z
-      .enum(["click", "type", "query", "extract_text", "fill_form", "get_dom_state"])
+      .enum([
+        "click", "type", "query", "extract_text", "fill_form", "get_dom_state",
+        "select_option", "hover", "scroll", "check_element_state",
+      ])
       .describe("Action to perform inside the iframe"),
     selector: z
       .string()
@@ -11166,6 +11169,8 @@ server.addTool({
       .optional()
       .default(false)
       .describe("Clear the field before typing"),
+    direction: z.enum(["up", "down", "left", "right"]).optional().describe("Scroll direction (scroll action)"),
+    pixels: z.number().optional().describe("Scroll distance in px (scroll action, default 500)"),
   }),
   execute: async (params) => {
     const result = await callExtensionTool("iframe_interact", params);

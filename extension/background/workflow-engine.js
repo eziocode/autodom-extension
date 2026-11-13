@@ -456,10 +456,11 @@
         const want = step.value == null ? "" : String(step.value);
         const wantText = norm(step.optionText || "");
         const opt =
+          (step.index != null && opts[step.index]) ||
           (want !== "" && opts.find((o) => o.value === want)) ||
           (wantText && opts.find((o) => norm(o.text) === wantText)) ||
           (want !== "" && opts.find((o) => norm(o.text) === norm(want))) ||
-          (want === "" && !wantText && opts.find((o) => o.value === ""));
+          (want === "" && !wantText && step.index == null && opts.find((o) => o.value === ""));
         if (!opt) return { ok: false, error: "option not found: " + (step.optionText || want) };
         setNativeValue(el, opt.value);
         fire(el, "input");
@@ -473,8 +474,22 @@
         return { ok: true };
       }
       if (action === "press") {
-        const key = step.key || "Enter";
-        const init = { key, code: key, bubbles: true, cancelable: true, composed: true };
+        // "Control+Shift+A" style combinations; a lone "+" is the key itself.
+        const parts = String(step.key || "Enter").split("+");
+        const key = parts.pop() || "+";
+        const has = (re) => parts.some((p) => re.test(p));
+        const code = /^[a-z]$/i.test(key) ? "Key" + key.toUpperCase() : /^\d$/.test(key) ? "Digit" + key : key;
+        const init = {
+          key,
+          code,
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+          ctrlKey: has(/^(control|ctrl)$/i),
+          shiftKey: has(/^shift$/i),
+          altKey: has(/^alt$/i),
+          metaKey: has(/^(meta|cmd|command)$/i),
+        };
         try { el.focus({ preventScroll: true }); } catch (_) {}
         const down = new KeyboardEvent("keydown", init);
         const notCancelled = el.dispatchEvent(down);
@@ -860,6 +875,11 @@
         const el = byRef(t.ref);
         return el ? { el, via: "ref" } : null;
       }
+      if (t.active) {
+        let el = document.activeElement || document.body;
+        while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+        return el ? { el, via: "document" } : null;
+      }
       if (t.selector) {
         const sel = String(t.selector);
         if (sel.includes(">>>")) {
@@ -904,9 +924,11 @@
         tag: el.tagName,
         text: norm(el.textContent).slice(0, 100),
         ...("value" in el && !isSensitive(el) ? { value: String(el.value == null ? "" : el.value) } : {}),
+        ...(el.tagName === "SELECT" && el.selectedIndex >= 0 ? { selectedText: el.options[el.selectedIndex].text } : {}),
         ...(hit.via === "shadow" ? { hosts: shadowHosts(el) } : {}),
       };
     };
+    const runActions = (list) => list.map(([target, step]) => runAction(target, step));
 
     // ─── Post-action observation ──────────────────────────────────────
     // observeArm() remembers the overlays, toasts, invalid fields, URL and
@@ -1072,6 +1094,7 @@
       act,
       actOnRef,
       runAction,
+      runActions,
       observeArm,
       observeCollect,
       runStep,
@@ -1111,6 +1134,10 @@
   function _pageWfRunAction(target, step) {
     const L = globalThis.__autodomWfLib;
     return L && L.v === 6 ? L.runAction(target, step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+  }
+  function _pageWfRunActions(list) {
+    const L = globalThis.__autodomWfLib;
+    return L && L.v === 6 ? L.runActions(list) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfObserveArm() {
     const L = globalThis.__autodomWfLib;
@@ -3106,6 +3133,7 @@
       _pageWfRunStep,
       _pageWfActOnRef,
       _pageWfRunAction,
+      _pageWfRunActions,
       _pageWfObserveArm,
       _pageWfObserveCollect,
       _pageWfCandidates,
