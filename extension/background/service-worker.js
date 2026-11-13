@@ -4038,6 +4038,55 @@ const _inflightBridgeCalls = new Map(); // id -> entry
 const _recentCancelledCalls = []; // last few cancellations, for diagnostics
 const RECENT_CANCELLED_MAX = 20;
 
+// ─── Per-hop timing ──────────────────────────────────────────
+// Each TOOL_RESULT carries a `timing` frame field (outside `result`, so tool
+// output is unchanged): time spent queued in admission/tab lanes, time
+// executing, and how old this service worker is. performance.now() in a
+// worker counts from worker start, so swAgeMs exposes cold wakes. Totals
+// for executeScript and debugger attach are kept for __diagnostics.
+const _swBootWall = Date.now();
+// Monotonic ms since worker start; Date.now() fallback for hosts without
+// performance (test sandboxes).
+function _swNow() {
+  return typeof performance !== "undefined" && performance.now
+    ? performance.now()
+    : Date.now() - _swBootWall;
+}
+let _bridgeCallsSinceBoot = 0;
+const _swCostTotals = {
+  inject: { count: 0, totalMs: 0, maxMs: 0 },
+  debuggerAttach: { count: 0, totalMs: 0, maxMs: 0 },
+};
+function _noteSwCost(kind, ms) {
+  const t = _swCostTotals[kind];
+  if (!t || !Number.isFinite(ms)) return;
+  t.count++;
+  t.totalMs += ms;
+  if (ms > t.maxMs) t.maxMs = ms;
+}
+function _swCostSnapshot() {
+  const out = {};
+  for (const [k, t] of Object.entries(_swCostTotals)) {
+    out[k] = {
+      count: t.count,
+      avgMs: t.count ? Math.round((t.totalMs / t.count) * 10) / 10 : 0,
+      maxMs: Math.round(t.maxMs * 10) / 10,
+    };
+  }
+  return out;
+}
+function _bridgeCallTiming(entry) {
+  const r1 = (n) => Math.round(n * 10) / 10;
+  const doneAt = _swNow();
+  const ranAt = entry.runningAt ?? entry.receivedAt;
+  return {
+    queueMs: r1(Math.max(0, ranAt - entry.receivedAt)),
+    execMs: r1(Math.max(0, doneAt - ranAt)),
+    swAgeMs: Math.round(entry.receivedAt),
+    firstCallSinceBoot: entry.callSeq === 1,
+  };
+}
+
 function _registerBridgeCall(message) {
   const timeoutMs =
     Number.isFinite(message.timeoutMs) && message.timeoutMs > 0
@@ -4052,6 +4101,9 @@ function _registerBridgeCall(message) {
     ctx: null,
     state: "queued", // queued → waiting (for a lane) → running → done | cancelled
     startedAt,
+    receivedAt: _swNow(),
+    runningAt: null,
+    callSeq: ++_bridgeCallsSinceBoot,
     deadline: startedAt + timeoutMs,
     timer: null,
   };
@@ -4396,6 +4448,7 @@ async function _runBridgeToolCall(message, entry) {
       type: "TOOL_RESULT",
       id: message.id,
       result,
+      timing: _bridgeCallTiming(entry),
     }),
   );
   // Notify popup
@@ -4534,6 +4587,7 @@ async function _runBridgeTool(message, entry, clientId, toolName, params) {
       result = await _withCallContext(ctx, () =>
         _runInToolLanes(toolName, params, ctx, () => {
           if (entry.state !== "cancelled") entry.state = "running";
+          entry.runningAt = _swNow();
           return handleToolCallWithRecording(toolName, params, message.id, callMeta, ctx);
         }),
       );
@@ -4642,6 +4696,11 @@ async function _bridgeDiagnostics(clientId) {
   const Tab = _AutoDOMTabGroup();
   const now = Date.now();
   return {
+    timing: {
+      swAgeMs: Math.round(_swNow()),
+      callsSinceBoot: _bridgeCallsSinceBoot,
+      costs: _swCostSnapshot(),
+    },
     pins,
     tabIsolation: {
       supported: !!Tab?.supported(),
@@ -7579,6 +7638,7 @@ async function executeInFrames(tabId, func, args = [], frameIds = null, world = 
 
 // Inject and execute a function in the active tab's content script context
 async function executeInTab(tabId, func, args = [], world = "MAIN", frameId = 0) {
+  const injectStart = _swNow();
   try {
     const results = await chrome.scripting.executeScript({
       target: frameId ? { tabId, frameIds: [frameId] } : { tabId },
@@ -7586,6 +7646,7 @@ async function executeInTab(tabId, func, args = [], world = "MAIN", frameId = 0)
       args,
       world,
     });
+    _noteSwCost("inject", _swNow() - injectStart);
     if (results && results[0]) {
       if (results[0].error) {
         throw new Error(results[0].error.message || "Script execution error");
@@ -13838,7 +13899,9 @@ async function ensureDebugger(tabId) {
   }
   if (_debuggerAttached.has(tabId)) return;
   try {
+    const attachStart = _swNow();
     await chrome.debugger.attach({ tabId }, "1.3");
+    _noteSwCost("debuggerAttach", _swNow() - attachStart);
     try {
       trackDebuggerAttachment(tabId);
     } catch (trackErr) {

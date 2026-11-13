@@ -87,6 +87,7 @@ import { CODE_MODE_TOOL_NAMES, CODE_ONLY_LISTED, createCodeMode } from "./codemo
 import { checkScriptSyntax } from "./codemode/sandbox.js";
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 import { writeArtifact, writeHarFiles } from "./har-export.js";
+import { buildTimingRecord, createTimingStats } from "./timing-stats.js";
 
 // Local Playwright/Node automation backends were intentionally removed: AutoDOM
 // is a Playwright alternative, not a wrapper, and any server-spawned automation
@@ -898,6 +899,8 @@ const IDLE_PING_EVERY = 4; // idle: ping every 60s instead of 15s
 let webSocketServer = null;
 let shutdownStarted = false;
 let toolCallLog = []; // Track recent tool calls for diagnostics
+// Per-hop latency of bridge tool calls (see server/timing-stats.js).
+const timingStats = createTimingStats();
 let _toolLogIndex = 0;
 const _TOOL_LOG_MAX = 50;
 let lastActivityTime = Date.now(); // Tracks last tool call or keepalive
@@ -2834,7 +2837,7 @@ async function ensureProxyClientConnected() {
             if (pending) {
               clearTimeout(pending.timer);
               pendingCalls.delete(message.id);
-              pending.resolve(message.result);
+              pending.resolve(message.result, message.timing);
             }
           } else if (message?.type === "BRIDGE_CHECK_STALE") {
             // The primary just applied an update: run our own stale check
@@ -3793,12 +3796,20 @@ function _handleInternalProxyCall(socket, message) {
 function _runInternalProxyCall(socket, message, release) {
   // Send a TOOL_RESULT back to the secondary, but only if its socket is
   // still open — it may have closed while we were waiting on the extension.
-  const sendResult = (result) => {
+  let relaySentAt = null;
+  const sendResult = (result, extTiming) => {
     release();
     if (!socket || socket.readyState !== 1) return;
+    const timing =
+      relaySentAt != null
+        ? {
+            ext: extTiming || null,
+            roundTripMs: Math.round((performance.now() - relaySentAt) * 10) / 10,
+          }
+        : undefined;
     try {
       socket.send(
-        JSON.stringify({ type: "TOOL_RESULT", id: message.id, result }),
+        JSON.stringify({ type: "TOOL_RESULT", id: message.id, result, ...(timing ? { timing } : {}) }),
       );
     } catch (_) {}
   };
@@ -3858,9 +3869,9 @@ function _runInternalProxyCall(socket, message, release) {
       release();
     };
     pendingCalls.set(internalId, {
-      resolve: (res) => {
+      resolve: (res, extTiming) => {
         forget();
-        sendResult(res);
+        sendResult(res, extTiming);
       },
       reject: () => {},
       // Backstop only: the secondary times out first and sends
@@ -3878,6 +3889,7 @@ function _runInternalProxyCall(socket, message, release) {
       release,
     });
 
+    relaySentAt = performance.now();
     sendToExtensionImmediate({
       type: "TOOL_CALL",
       clientId: message.clientId || "proxy_unknown",
@@ -3949,7 +3961,7 @@ function _handleToolResult(_socket, message) {
   if (pending) {
     clearTimeout(pending.timer);
     pendingCalls.delete(message.id);
-    pending.resolve(message.result);
+    pending.resolve(message.result, message.timing);
   }
 }
 
@@ -4807,12 +4819,27 @@ function callExtensionTool(tool, params, options = {}) {
   // Reset inactivity timer on every tool call
   touchActivity();
   const callStart = Date.now();
+  // Per-hop timing marks (performance.now()); sentAt is set when the frame
+  // leaves for the extension, or for the primary when proxied.
+  const marks = { startAt: performance.now(), sentAt: null, proxied: false };
   diagLog(
     `toolCall START tool=${tool} isPrimary=${isPrimaryServer} extSocket=${extensionSocket ? "connected(state=" + extensionSocket.readyState + ")" : "null"} pendingCalls=${pendingCalls.size}`,
   );
   return new Promise((resolve, reject) => {
-    const wrappedResolve = (rawResult) => {
+    const wrappedResolve = (rawResult, hopTiming) => {
       let result = rawResult;
+      let timingRec = null;
+      if (marks.sentAt != null) {
+        timingRec = buildTimingRecord({
+          tool,
+          startAt: marks.startAt,
+          sentAt: marks.sentAt,
+          endAt: performance.now(),
+          ext: marks.proxied ? null : hopTiming,
+          relay: marks.proxied ? hopTiming : null,
+        });
+        timingStats.record(timingRec);
+      }
       // The extension's approval rules said "ask" for this tool on this
       // site: hold it exactly like confirm mode does.
       if (result?.approvalRequired && !confirmedExecution) {
@@ -4831,7 +4858,12 @@ function callExtensionTool(tool, params, options = {}) {
       const hasError =
         result && typeof result === "object" && "error" in result;
       diagLog(
-        `toolCall END tool=${tool} elapsed=${elapsed}ms hasError=${hasError}`,
+        `toolCall END tool=${tool} elapsed=${elapsed}ms hasError=${hasError}` +
+          (timingRec
+            ? ` rtt=${timingRec.roundTripMs}ms swQueue=${timingRec.swQueueMs ?? "?"}ms swExec=${timingRec.swExecMs ?? "?"}ms transport=${timingRec.transportMs ?? "?"}ms` +
+              (timingRec.relayMs != null ? ` relay=${timingRec.relayMs}ms` : "") +
+              (timingRec.coldWake ? " coldWake" : "")
+            : ""),
       );
       if (hasError) _logToolError(tool, result.error, params);
       const logEntry = {
@@ -4953,13 +4985,15 @@ function callExtensionTool(tool, params, options = {}) {
         });
 
         pendingCalls.set(id, {
-          resolve: (res) => {
+          resolve: (res, hopTiming) => {
             detachAbort();
-            wrappedResolve(res);
+            wrappedResolve(res, hopTiming);
           },
           reject,
           timer,
         });
+        marks.sentAt = performance.now();
+        marks.proxied = true;
         try {
           proxyClient.send(
             JSON.stringify({
@@ -5106,14 +5140,15 @@ function callExtensionTool(tool, params, options = {}) {
     });
 
     pendingCalls.set(id, {
-      resolve: (res) => {
+      resolve: (res, hopTiming) => {
         detachAbort();
-        wrappedResolve(res);
+        wrappedResolve(res, hopTiming);
       },
       reject,
       timer,
     });
 
+    marks.sentAt = performance.now();
     try {
       sendToExtensionImmediate({
         type: "TOOL_CALL",
@@ -10269,6 +10304,7 @@ server.addTool({
       bridge: collectBridgeStatus(),
       recentToolErrors: _toolErrorBuf.slice(-10),
       recentToolCalls: toolCallLog.slice(-10),
+      timing: timingStats.summary({ top: 10, recent: 5 }),
       atk: { ...atkStats.summary({ top: 5 }), recall: recallStore.stats() },
       extension: null,
     };
