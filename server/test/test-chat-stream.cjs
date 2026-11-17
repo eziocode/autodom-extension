@@ -110,6 +110,14 @@ function cleanup() {
       s.close();
     } catch (_) {}
   }
+  // In broker mode the WS port is owned by a detached --bridge-only broker
+  // the stdio process spawned; it outlives the worker, so stop it by the pid
+  // in its lock file.
+  try {
+    const lock = JSON.parse(fs.readFileSync(LOCK, "utf8"));
+    if (lock.pid && lock.pid !== process.pid) process.kill(lock.pid, "SIGKILL");
+  } catch (_) {}
+  fs.rmSync(LOCK, { force: true });
 }
 
 const results = [];
@@ -210,7 +218,10 @@ async function main() {
     chatCalls.length > 0 && chatCalls.every((c) => c.clientId === `${lock.clientId || ""}:chat` || /^mcp_[a-f0-9]{16}:chat$/.test(c.clientId)),
     JSON.stringify(chatCalls.map((c) => c.clientId)),
   );
-  // An MCP (IDE agent) call keeps the bridge's own id.
+  // An MCP (IDE agent) call keeps its own plain id, and the chat never
+  // shares it. In broker mode (the default) this stdio process is a worker
+  // with its own id while the broker that owns the extension socket serves
+  // chat requests, so the chat id is `<brokerId>:chat`, not `<agentId>:chat`.
   const mark = frames.length;
   p.stdin.write(JSON.stringify({
     jsonrpc: "2.0",
@@ -228,8 +239,12 @@ async function main() {
   }) + "\n");
   const agentCall = await waitFor(() => frames.slice(mark).find((f) => f.type === "TOOL_CALL"), 5000);
   check(
-    "IDE agent tool calls keep the bridge client id",
-    agentCall && /^mcp_[a-f0-9]{16}$/.test(agentCall.clientId) && chatCalls[0] && chatCalls[0].clientId === `${agentCall.clientId}:chat`,
+    "IDE agent tool calls keep their own client id, distinct from the chat's",
+    agentCall &&
+      /^mcp_[a-f0-9]{16}$/.test(agentCall.clientId) &&
+      chatCalls[0] &&
+      /^mcp_[a-f0-9]{16}:chat$/.test(chatCalls[0].clientId) &&
+      chatCalls[0].clientId !== agentCall.clientId,
     JSON.stringify({ agent: agentCall?.clientId, chat: chatCalls[0]?.clientId }),
   );
 
