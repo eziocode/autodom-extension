@@ -42,6 +42,14 @@ const DOM = {
   providerCliKind: $("#providerCliKind"),
   providerCliBinary: $("#providerCliBinary"),
   providerCliExtraArgs: $("#providerCliExtraArgs"),
+  providerCliModelGroup: $("#providerCliModelGroup"),
+  providerCliModelSelect: $("#providerCliModelSelect"),
+  providerCliModelCustom: $("#providerCliModelCustom"),
+  cliModelStatus: $("#cliModelStatus"),
+  cliRefreshModelsBtn: $("#cliRefreshModelsBtn"),
+  cliRescanBtn: $("#cliRescanBtn"),
+  cliSummary: $("#cliSummary"),
+  cliAdvanced: $("#cliAdvanced"),
   providerEnabledToggle: $("#providerEnabledToggle"),
   providerPreset: $("#providerPreset"),
   providerMode: $("#providerMode"),
@@ -605,6 +613,7 @@ let providerSettings = {
   cliBinary: "",
   cliKind: "claude",
   cliExtraArgs: "",
+  cliModel: "",
   enabled: false,
   preset: "custom",
 };
@@ -687,6 +696,14 @@ const CLI_KIND_INFO = {
     authHint:
       "Run `copilot` once interactively and follow the GitHub device-login prompt to authenticate.",
   },
+  gemini: {
+    label: "Gemini CLI",
+    binary: "gemini",
+    npmPackage: "@google/gemini-cli",
+    install: "npm install -g @google/gemini-cli",
+    docsUrl: "https://github.com/google-gemini/gemini-cli",
+    authHint: "Run `gemini` once to sign in with Google, or set GEMINI_API_KEY.",
+  },
   custom: {
     label: "Custom CLI",
     binary: "",
@@ -697,6 +714,326 @@ const CLI_KIND_INFO = {
 
 function getCliKindInfo(kind) {
   return CLI_KIND_INFO[kind] || CLI_KIND_INFO.claude;
+}
+
+// ─── Local CLI connection: detect / summary / models / test ──
+// Mirrors the pre-push-checker AI Provider page: the bridge scans every
+// known CLI (resolved path, version, sign-in state), the CLI dropdown and
+// a summary line show the result, and the Model dropdown is filled from
+// what the selected CLI reports (built-in list as fallback). Generation
+// counters drop stale replies after the user switched CLI.
+const CLI_MODEL_CUSTOM = "__custom__";
+let cliScanState = { byKind: {}, loaded: false, loading: false, error: "", bridgeOffline: false };
+let cliScanGen = 0;
+let cliModelState = { kind: "", models: [], source: "", note: "" };
+let cliModelGen = 0;
+
+function _selectedCliKind() {
+  return DOM.providerCliKind?.value || providerSettings.cliKind || "claude";
+}
+
+function _cliBinaryOverride(kind) {
+  const bin = (DOM.providerCliBinary?.value || "").trim();
+  const def = getCliKindInfo(kind).binary || "";
+  return bin && bin !== def ? bin : "";
+}
+
+function _readCliModelFromUI() {
+  const sel = DOM.providerCliModelSelect;
+  if (!sel) return providerSettings.cliModel || "";
+  if (sel.value === CLI_MODEL_CUSTOM) return (DOM.providerCliModelCustom?.value || "").trim();
+  return sel.value || "";
+}
+
+async function scanClis({ force = false } = {}) {
+  if (!DOM.providerCliKind) return;
+  const gen = ++cliScanGen;
+  cliScanState = { ...cliScanState, loading: true, error: "" };
+  if (DOM.cliRescanBtn) DOM.cliRescanBtn.disabled = true;
+  renderCliSummary();
+  const kind = _selectedCliKind();
+  const override = _cliBinaryOverride(kind);
+  const overrides = override && kind !== "custom" ? { [kind]: override } : {};
+  let resp;
+  try {
+    resp = await sendRuntimeMessage({ type: "SCAN_CLIS", overrides, force });
+  } catch (err) {
+    resp = { ok: false, error: err?.message || String(err) };
+  }
+  if (gen !== cliScanGen) return;
+  if (DOM.cliRescanBtn) DOM.cliRescanBtn.disabled = false;
+  if (resp?.ok && Array.isArray(resp.clis)) {
+    const byKind = {};
+    for (const c of resp.clis) if (c?.kind) byKind[c.kind] = c;
+    cliScanState = { byKind, loaded: true, loading: false, error: "", bridgeOffline: false };
+  } else {
+    cliScanState = {
+      ...cliScanState,
+      loading: false,
+      error: resp?.error || "CLI detection failed",
+      bridgeOffline: !!resp?.bridgeOffline || /not connected/i.test(resp?.error || ""),
+    };
+  }
+  renderCliKindOptions();
+  renderCliSummary();
+  renderCliPrompt();
+  if (cliScanState.loaded && cliModelState.kind !== _selectedCliKind()) loadCliModels(false);
+}
+
+// Option labels: "Codex CLI · 0.169.0 ✓" / "Gemini CLI (not installed)".
+function renderCliKindOptions() {
+  const sel = DOM.providerCliKind;
+  if (!sel) return;
+  for (const opt of sel.options) {
+    const info = getCliKindInfo(opt.value);
+    if (opt.value === "custom") continue;
+    const r = cliScanState.byKind[opt.value];
+    if (!r) {
+      opt.textContent = info.label;
+      continue;
+    }
+    if (!r.found) {
+      opt.textContent = `${info.label}  (not installed)`;
+      continue;
+    }
+    const ver = String(r.version || "").match(/\d+(?:\.\d+)+/)?.[0] || "";
+    const mark = r.auth?.state === "ok" ? " ✓" : r.auth?.state === "missing" ? " · sign in needed" : "";
+    opt.textContent = `${info.label}${ver ? ` · ${ver}` : ""}${mark}`;
+  }
+}
+
+function renderCliSummary() {
+  const el = DOM.cliSummary;
+  if (!el) return;
+  el.textContent = "";
+  const kind = _selectedCliKind();
+  const dot = () => {
+    const d = document.createElement("span");
+    d.className = "cli-dot";
+    return d;
+  };
+  const add = (text, cls) => {
+    const span = document.createElement("span");
+    if (cls) span.className = cls;
+    span.textContent = text;
+    el.appendChild(span);
+    return span;
+  };
+  if (kind === "custom") {
+    el.dataset.state = "unknown";
+    el.appendChild(dot());
+    add("Custom command — set the binary under Advanced. The prompt is sent on stdin.");
+    return;
+  }
+  if (cliScanState.loading && !cliScanState.byKind[kind]) {
+    el.dataset.state = "unknown";
+    el.appendChild(dot());
+    add("Detecting installed CLIs…");
+    return;
+  }
+  if (cliScanState.error && !cliScanState.byKind[kind]) {
+    el.dataset.state = "error";
+    el.appendChild(dot());
+    add(
+      cliScanState.bridgeOffline
+        ? "Bridge not connected — connect it to detect CLIs (they run on the bridge host)."
+        : `Detection failed: ${cliScanState.error}`,
+    );
+    return;
+  }
+  const r = cliScanState.byKind[kind];
+  if (!r) {
+    el.removeAttribute("data-state");
+    return;
+  }
+  if (!r.found) {
+    el.dataset.state = "missing";
+    el.appendChild(dot());
+    add(`${getCliKindInfo(kind).label} not found. Install it below, or set its path under Advanced.`);
+    return;
+  }
+  const authState = r.auth?.state || "unknown";
+  el.dataset.state = authState === "ok" ? "ok" : authState === "missing" ? "missing" : "unknown";
+  el.appendChild(dot());
+  add(r.path || "", "cli-path");
+  if (r.version) add(` · ${String(r.version).slice(0, 60)}`);
+  if (r.auth?.text) add(` · ${r.auth.text}`, `cli-auth-${authState}`);
+  if (r.warning) add(` · ${r.warning}`, "cli-auth-unknown");
+}
+
+function renderCliModelOptions() {
+  const sel = DOM.providerCliModelSelect;
+  if (!sel) return;
+  const current = providerSettings.cliModel || "";
+  const models = cliModelState.kind === _selectedCliKind() ? cliModelState.models : [];
+  sel.textContent = "";
+  const addOpt = (value, label) => {
+    const o = document.createElement("option");
+    o.value = value;
+    o.textContent = label;
+    sel.appendChild(o);
+  };
+  addOpt("", "CLI default");
+  for (const m of models) addOpt(m, m);
+  const isCustom = !!current && !models.includes(current);
+  if (isCustom && models.length) addOpt(current, `${current} (custom)`);
+  else if (isCustom) addOpt(current, current);
+  addOpt(CLI_MODEL_CUSTOM, "Custom…");
+  sel.value = current;
+  if (DOM.providerCliModelCustom) {
+    DOM.providerCliModelCustom.style.display = "none";
+    DOM.providerCliModelCustom.value = current;
+  }
+  if (DOM.cliModelStatus) {
+    const kind = _selectedCliKind();
+    if (kind === "custom") {
+      DOM.cliModelStatus.textContent = "Custom CLIs: pick Custom… and type the model id, or pass it in Extra args.";
+    } else if (cliModelState.kind !== kind) {
+      DOM.cliModelStatus.textContent = "";
+    } else if (cliModelState.loading) {
+      DOM.cliModelStatus.textContent = "Loading models…";
+    } else if (cliModelState.error) {
+      DOM.cliModelStatus.textContent = cliModelState.error;
+    } else {
+      const n = models.length;
+      DOM.cliModelStatus.textContent = n
+        ? `${n} model${n === 1 ? "" : "s"} · ${cliModelState.source === "live" ? "reported by the CLI" : "built-in list"}${cliModelState.note ? ` · ${cliModelState.note}` : ""}`
+        : "No models reported — pick Custom… to type one.";
+    }
+  }
+}
+
+async function loadCliModels(force) {
+  const kind = _selectedCliKind();
+  if (kind === "custom") {
+    cliModelState = { kind, models: [], source: "", note: "" };
+    renderCliModelOptions();
+    return;
+  }
+  const gen = ++cliModelGen;
+  cliModelState = { ...cliModelState, kind, loading: true, error: "" };
+  if (DOM.cliRefreshModelsBtn) DOM.cliRefreshModelsBtn.disabled = true;
+  renderCliModelOptions();
+  let resp;
+  try {
+    resp = await sendRuntimeMessage({
+      type: "LIST_CLI_MODELS",
+      kind,
+      binary: _cliBinaryOverride(kind),
+      force: !!force,
+    });
+  } catch (err) {
+    resp = { ok: false, error: err?.message || String(err) };
+  }
+  if (gen !== cliModelGen || kind !== _selectedCliKind()) return;
+  if (DOM.cliRefreshModelsBtn) DOM.cliRefreshModelsBtn.disabled = false;
+  cliModelState = resp?.ok
+    ? { kind, models: Array.isArray(resp.models) ? resp.models : [], source: resp.source || "", note: resp.note || "", loading: false }
+    : {
+        kind,
+        models: [],
+        source: "",
+        loading: false,
+        error: /not connected/i.test(resp?.error || "")
+          ? "Connect the bridge to list models."
+          : `Could not list models: ${resp?.error || "unknown error"}`,
+      };
+  renderCliModelOptions();
+}
+
+// Kick off detection the first time the CLI section is shown (and again
+// once the bridge connects after an offline attempt).
+function ensureCliDetection() {
+  const mode = providerSettings.mode || deriveModeFromSource(providerSettings.source || "ide");
+  if (mode !== "cli") return;
+  if (cliScanState.loading) return;
+  if (!cliScanState.loaded || cliScanState.bridgeOffline) {
+    if (cliScanState.bridgeOffline && !isConnected) return;
+    scanClis();
+  }
+}
+
+// "Check CLI": re-detect the selected CLI and report it in the status line.
+async function checkCliBinary() {
+  const kind = _selectedCliKind();
+  const info = getCliKindInfo(kind);
+  if (kind === "custom" && !(DOM.providerCliBinary?.value || "").trim()) {
+    DOM.providerStatus.textContent = "Set the custom CLI binary under Advanced first.";
+    if (DOM.cliAdvanced) DOM.cliAdvanced.open = true;
+    return;
+  }
+  if (DOM.checkCliBtn) DOM.checkCliBtn.disabled = true;
+  DOM.providerStatus.textContent = `Checking ${info.label}…`;
+  try {
+    if (kind === "custom") {
+      const binary = DOM.providerCliBinary.value.trim();
+      const r = await sendRuntimeMessage({ type: "CHECK_CLI_BINARY", binary, kind, force: true });
+      DOM.providerStatus.textContent = r?.ok
+        ? `✓ ${binary} ready · ${String(r.path || "")} · ${String(r.version || "").split(/\r?\n/)[0].slice(0, 60)}`
+        : `✕ ${String(r?.error || "CLI check failed").slice(0, 300)}`;
+      addLog(r?.ok ? `CLI ready: ${r.path || binary}` : `CLI check failed: ${r?.error}`, r?.ok ? "success" : "error");
+      return;
+    }
+    await scanClis({ force: true });
+    const r = cliScanState.byKind[kind];
+    if (!r) {
+      DOM.providerStatus.textContent = `✕ ${cliScanState.error || "CLI check failed"}`;
+      addLog(`CLI check failed: ${cliScanState.error}`, "error");
+    } else if (!r.found) {
+      DOM.providerStatus.textContent = `✕ ${info.label} not found — install it below or set its path under Advanced.`;
+      addLog(`CLI not found: ${info.binary} · searched ${r.searchPath || "(unknown)"}`, "error");
+    } else if (r.auth?.state === "missing") {
+      DOM.providerStatus.textContent = `⚠ ${info.label} found but not signed in — ${r.auth.text}`;
+      addLog(`CLI ${r.path}: ${r.auth.text}`, "warn");
+    } else {
+      DOM.providerStatus.textContent = `✓ ${info.label} ready · ${String(r.version || "").slice(0, 60)}`;
+      addLog(`CLI ready: ${r.path} (${String(r.version || "").slice(0, 60)})`, "success");
+    }
+  } catch (err) {
+    DOM.providerStatus.textContent = `✕ ${err.message || err}`;
+    addLog(`CLI check error: ${err.message || err}`, "error");
+  } finally {
+    if (DOM.checkCliBtn) DOM.checkCliBtn.disabled = false;
+  }
+}
+
+// End-to-end test: the bridge runs the CLI with a one-word prompt.
+async function testCliConnection() {
+  const kind = _selectedCliKind();
+  const info = getCliKindInfo(kind);
+  const config = {
+    cliKind: kind,
+    cliBinary: (DOM.providerCliBinary?.value || "").trim() || info.binary || "",
+    cliExtraArgs: (DOM.providerCliExtraArgs?.value || "").trim(),
+    cliModel: _readCliModelFromUI(),
+  };
+  if (!config.cliBinary) {
+    updateProviderUI("Set the custom CLI binary under Advanced first.");
+    if (DOM.cliAdvanced) DOM.cliAdvanced.open = true;
+    return;
+  }
+  DOM.testProviderBtn.disabled = true;
+  DOM.providerStatus.removeAttribute("title");
+  DOM.providerStatus.textContent = `Testing ${info.label}${config.cliModel ? ` · ${config.cliModel}` : ""}… (runs the CLI once)`;
+  try {
+    const r = await sendRuntimeMessage({ type: "TEST_CLI", config });
+    const secs = r?.elapsedMs ? ` · ${(r.elapsedMs / 1000).toFixed(1)}s` : "";
+    if (r?.ok) {
+      const reply = String(r.reply || "").replace(/\s+/g, " ").slice(0, 40);
+      DOM.providerStatus.textContent = `✓ Connected${r.model ? ` · ${r.model}` : ""} · reply: ${reply || "(empty)"}${secs}`;
+      addLog(`CLI test OK (${info.label}${r.model ? `, ${r.model}` : ""})${secs}`, "success");
+    } else {
+      const full = String(r?.error || "CLI test failed");
+      const first = full.split(/\r?\n/).find((l) => l.trim()) || full;
+      DOM.providerStatus.textContent = `✕ ${first.slice(0, 200)}${secs}`;
+      DOM.providerStatus.title = full;
+      addLog(`CLI test failed: ${full.slice(0, 500)}`, "error");
+    }
+  } catch (err) {
+    DOM.providerStatus.textContent = `✕ ${err.message || err}`;
+  } finally {
+    DOM.testProviderBtn.disabled = false;
+  }
 }
 
 // ─── Mode <-> source mapping ──────────────────────────────────
@@ -859,6 +1196,7 @@ const _secretAreaName =
     "aiProviderCliBinary",
     "aiProviderCliKind",
     "aiProviderCliExtraArgs",
+    "aiProviderCliModel",
     "aiProviderEnabled",
     "aiProviderPreset",
     "aiProviderMode",
@@ -893,6 +1231,7 @@ const _secretAreaName =
     cliBinary: stored.aiProviderCliBinary || "",
     cliKind: stored.aiProviderCliKind || "claude",
     cliExtraArgs: stored.aiProviderCliExtraArgs || "",
+    cliModel: stored.aiProviderCliModel || "",
     enabled: stored.aiProviderEnabled === true,
     preset: stored.aiProviderPreset || "custom",
     mode: stored.aiProviderMode || deriveModeFromSource(stored.aiProviderSource || "ide"),
@@ -925,6 +1264,7 @@ const _secretAreaName =
     DOM.providerCliKind.value = providerSettings.cliKind || "claude";
   if (DOM.providerCliExtraArgs)
     DOM.providerCliExtraArgs.value = providerSettings.cliExtraArgs;
+  renderCliModelOptions();
   if (DOM.providerEnabledToggle)
     DOM.providerEnabledToggle.checked = !!providerSettings.enabled;
   if (DOM.providerPreset)
@@ -1430,8 +1770,14 @@ const _secretAreaName =
       if (DOM.providerCliBinary && (!current || knownDefaults.includes(current))) {
         DOM.providerCliBinary.value = info.binary || "";
       }
+      // Model ids are per CLI — a codex model is invalid for claude.
+      providerSettings.cliModel = "";
+      cliModelState = { kind: "", models: [], source: "", note: "" };
+      renderCliModelOptions();
       updateProviderUI();
       saveProviderSettings({ skipTest: true });
+      renderCliSummary();
+      loadCliModels(false);
     });
   }
 
@@ -1441,6 +1787,51 @@ const _secretAreaName =
       // Re-render so the prompt hides as soon as the user types a binary.
       renderCliPrompt();
     });
+    // A changed binary/path → re-detect it once the user leaves the field.
+    DOM.providerCliBinary.addEventListener("change", () => {
+      if (_suppressFieldEvents) return;
+      saveProviderSettings({ skipTest: true });
+      scanClis({ force: true });
+    });
+  }
+
+  if (DOM.providerCliExtraArgs) {
+    DOM.providerCliExtraArgs.addEventListener("change", () => {
+      if (_suppressFieldEvents) return;
+      saveProviderSettings({ skipTest: true });
+    });
+  }
+
+  if (DOM.providerCliModelSelect) {
+    DOM.providerCliModelSelect.addEventListener("change", () => {
+      const v = DOM.providerCliModelSelect.value;
+      if (v === CLI_MODEL_CUSTOM) {
+        if (DOM.providerCliModelCustom) {
+          DOM.providerCliModelCustom.style.display = "";
+          DOM.providerCliModelCustom.focus();
+        }
+        return;
+      }
+      if (DOM.providerCliModelCustom) DOM.providerCliModelCustom.style.display = "none";
+      providerSettings.cliModel = v;
+      saveProviderSettings({ skipTest: true });
+    });
+  }
+
+  if (DOM.providerCliModelCustom) {
+    DOM.providerCliModelCustom.addEventListener("change", () => {
+      providerSettings.cliModel = DOM.providerCliModelCustom.value.trim();
+      saveProviderSettings({ skipTest: true });
+      renderCliModelOptions();
+    });
+  }
+
+  if (DOM.cliRefreshModelsBtn) {
+    DOM.cliRefreshModelsBtn.addEventListener("click", () => loadCliModels(true));
+  }
+
+  if (DOM.cliRescanBtn) {
+    DOM.cliRescanBtn.addEventListener("click", () => scanClis({ force: true }));
   }
 
   if (DOM.cliPromptUseDefault) {
@@ -2308,9 +2699,16 @@ async function saveProviderSettings(opts) {
     cliBinary: DOM.providerCliBinary?.value?.trim() || "",
     cliKind: DOM.providerCliKind?.value || "claude",
     cliExtraArgs: DOM.providerCliExtraArgs?.value?.trim() || "",
+    cliModel: _readCliModelFromUI(),
     enabled: !!DOM.providerEnabledToggle?.checked,
     preset: DOM.providerPreset?.value || "custom",
+    mode: providerSettings.mode,
   };
+  // Blank binary = auto-detect: store the kind's default name; the bridge
+  // resolves it to an absolute path via the login-shell PATH.
+  if (!providerSettings.cliBinary && providerSettings.cliKind !== "custom") {
+    providerSettings.cliBinary = getCliKindInfo(providerSettings.cliKind).binary || "";
+  }
   if (providerSettings.source === "ollama") {
     providerSettings.baseUrl = _normalizeOllamaBaseUrl(providerSettings.baseUrl);
     if (DOM.providerBaseUrl) DOM.providerBaseUrl.value = providerSettings.baseUrl;
@@ -2366,6 +2764,7 @@ async function saveProviderSettings(opts) {
     aiProviderCliBinary: providerSettings.cliBinary,
     aiProviderCliKind: providerSettings.cliKind,
     aiProviderCliExtraArgs: providerSettings.cliExtraArgs,
+    aiProviderCliModel: providerSettings.cliModel,
     aiProviderEnabled: providerSettings.enabled,
     aiProviderPreset: providerSettings.preset,
   });
@@ -2385,6 +2784,7 @@ async function saveProviderSettings(opts) {
       cliBinary: providerSettings.cliBinary,
       cliKind: providerSettings.cliKind,
       cliExtraArgs: providerSettings.cliExtraArgs,
+      cliModel: providerSettings.cliModel,
       enabled: providerSettings.enabled,
       preset: providerSettings.preset,
     },
@@ -2448,9 +2848,13 @@ async function testProviderConnection() {
     settings.baseUrl = _normalizeOllamaBaseUrl(settings.baseUrl);
     if (DOM.providerBaseUrl) DOM.providerBaseUrl.value = settings.baseUrl;
   }
-  if (settings.source === "ide" || settings.source === "cli") {
+  if (settings.source === "cli") {
+    await testCliConnection();
+    return;
+  }
+  if (settings.source === "ide") {
     updateProviderUI(
-      "Test connection only applies to OpenAI / Anthropic / Ollama providers.",
+      "Test connection applies to API providers and Local CLI — IDE Agent runs in your IDE.",
     );
     return;
   }
@@ -2637,7 +3041,7 @@ async function installDefaultCliPackage() {
         const terminalHint = response.terminalLabel
           ? ` (${response.terminalLabel})`
           : "";
-        DOM.providerStatus.textContent = `→ Install opened in terminal${terminalHint}. Run "Check CLI" once it finishes.`;
+        DOM.providerStatus.textContent = `→ Install opened in terminal${terminalHint}. Click "Re-detect" once it finishes.`;
         addLog(
           `Opened ${info.label} install in a terminal: ${installCommand}`,
           "info",
@@ -2669,48 +3073,6 @@ async function installDefaultCliPackage() {
   } finally {
     if (DOM.cliPromptInstallBtn) DOM.cliPromptInstallBtn.disabled = false;
     if (DOM.checkCliBtn) DOM.checkCliBtn.disabled = false;
-  }
-}
-
-async function checkCliBinary() {
-  if (!DOM.checkCliBtn) return;
-  const binary = (DOM.providerCliBinary?.value || "").trim();
-  const kind = DOM.providerCliKind?.value || "claude";
-  const info = getCliKindInfo(kind);
-  if (!binary) {
-    DOM.providerStatus.textContent = "Set a CLI binary first (e.g. claude).";
-    return;
-  }
-  DOM.checkCliBtn.disabled = true;
-  DOM.providerStatus.textContent = `Checking '${binary}'…`;
-  try {
-    const response = await sendRuntimeMessage({
-      type: "CHECK_CLI_BINARY",
-      binary,
-      kind,
-    });
-    if (response?.ok) {
-      const ver = (response.version || "").trim().split(/\r?\n/)[0] || "ok";
-      DOM.providerStatus.textContent = `✓ ${kind} CLI ready · ${ver.substring(0, 80)}`;
-      addLog(`CLI ready: ${binary} (${ver.substring(0, 60)})`, "success");
-    } else {
-      const err = response?.error || "CLI check failed";
-      const installHint =
-        response?.installCommand || (response?.notFound ? info.install : "");
-      DOM.providerStatus.textContent = `✕ ${err.substring(0, 100)}${
-        installHint ? " Use Install with npm below." : ""
-      }`;
-      addLog(
-        `CLI check failed: ${err}${installHint ? ` · ${installHint}` : ""}`,
-        "error",
-      );
-      renderCliPrompt();
-    }
-  } catch (err) {
-    DOM.providerStatus.textContent = `✕ ${err.message || err}`;
-    addLog(`CLI check error: ${err.message || err}`, "error");
-  } finally {
-    DOM.checkCliBtn.disabled = false;
   }
 }
 
@@ -2818,9 +3180,11 @@ if (DOM.tabIsolationToggle) {
 // Listen for status updates
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === "STATUS_UPDATE") {
+    const wasConnected = isConnected;
     isRunning = !!message.running;
     isConnected = !!message.connected;
     updateUI();
+    if (!wasConnected && isConnected) ensureCliDetection();
     if (message.log) {
       addLog(message.log, message.logLevel || "info");
     }
@@ -2940,6 +3304,13 @@ function renderCliPrompt() {
   const info = getCliKindInfo(kind);
   const currentBinary = (DOM.providerCliBinary?.value || "").trim();
   const isDefaultBinary = !!info.binary && currentBinary === info.binary;
+  // Install help only once detection says the CLI is missing (or for a
+  // custom command); an installed CLI needs no prompt.
+  const detected = cliScanState.byKind[kind];
+  if (kind !== "custom" && (!detected || detected.found)) {
+    DOM.cliPromptBox.style.display = "none";
+    return;
+  }
 
   // If the user supplied a custom binary/path, the default npm package prompt
   // may be misleading. Keep it visible for empty/default binaries so missing
@@ -2953,7 +3324,7 @@ function renderCliPrompt() {
   if (DOM.cliPromptText) {
     const base = info.binary
       ? currentBinary
-        ? `${info.label} is set to default binary '${info.binary}'. If it is missing on PATH, install its npm package:`
+        ? `${info.label} ('${info.binary}') was not found on the bridge host. Install its npm package:`
         : `${info.label} not configured. Default binary: '${info.binary}'. Install it with npm or use the default binary:`
       : `${info.label} selected — enter the binary name or absolute path above.`;
     DOM.cliPromptText.textContent = info.authHint
@@ -3069,8 +3440,12 @@ function updateProviderUI(statusOverride) {
   _setFieldVisible(DOM.providerApiKey, isApiMode);
   _setFieldVisible(DOM.providerBaseUrl, isApiMode);
   _setFieldVisible(DOM.providerCliKind, isCliMode);
-  _setFieldVisible(DOM.providerCliBinary, isCliMode);
-  _setFieldVisible(DOM.providerCliExtraArgs, isCliMode);
+  _setFieldVisible(DOM.providerCliModelGroup, isCliMode);
+  if (DOM.cliAdvanced) {
+    DOM.cliAdvanced.style.display = isCliMode ? "" : "none";
+    // Custom commands need a binary, so keep Advanced open for them.
+    if (isCliMode && _selectedCliKind() === "custom") DOM.cliAdvanced.open = true;
+  }
   // Protocol picker is only needed in API mode + Custom preset (when
   // the user wants to point at a non-listed OpenAI-compatible endpoint).
   const presetKey = providerSettings.preset || "custom";
@@ -3129,16 +3504,23 @@ function updateProviderUI(statusOverride) {
     }
   }
 
-  // Sensible defaults for CLI inputs the first time the user picks "cli"
-  if (isCli && DOM.providerCliBinary && !DOM.providerCliBinary.value) {
-    const kindKey = DOM.providerCliKind?.value || providerSettings.cliKind || "claude";
-    const info = getCliKindInfo(kindKey);
-    DOM.providerCliBinary.value =
-      providerSettings.cliBinary || info.binary || "";
+  // Binary placeholder shows what auto-detect resolved to.
+  if (DOM.providerCliBinary) {
+    const r = cliScanState.byKind[_selectedCliKind()];
+    DOM.providerCliBinary.placeholder =
+      _selectedCliKind() === "custom"
+        ? "Binary name or absolute path (required)"
+        : r?.path
+          ? `Auto: ${r.path}`
+          : "Auto-detect on PATH";
   }
 
   // "Check CLI" button is only useful in CLI mode
   _setFieldVisible(DOM.checkCliBtn, isCli);
+  if (isCliMode) {
+    renderCliSummary();
+    ensureCliDetection();
+  }
 
   // Render the inline CLI install/help prompt (no-op for non-CLI sources)
   renderCliPrompt();
@@ -3159,7 +3541,7 @@ function updateProviderUI(statusOverride) {
     const bin = (providerSettings.cliBinary || "").trim();
     const kind = providerSettings.cliKind || "claude";
     DOM.providerStatus.textContent = bin
-      ? `Local ${kind} CLI · ${bin} (click "Check CLI" to verify)`
+      ? `Local ${kind} CLI · ${bin} — Test runs it once end to end`
       : `Local CLI selected — set the binary (e.g. claude or codex)`;
     return;
   }

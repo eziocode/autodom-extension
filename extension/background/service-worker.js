@@ -741,10 +741,21 @@ async function _fetchProviderModels(p) {
     }
 
     if (source === "ide" || source === "cli") {
-      // CLI providers: don't hardcode a list. The locally-installed CLI
-      // owns the model choice (via its own login/config). Returning []
-      // makes the server omit --model so the CLI uses its default.
-      return [];
+      // CLI providers: ask the bridge, which lists models the installed
+      // CLI reports (codex debug models, Copilot/Anthropic model APIs) or
+      // falls back to a built-in list. [] when the bridge is offline —
+      // the server then omits --model and the CLI uses its default.
+      const r = await _bridgeCliRequest(
+        "LIST_CLI_MODELS",
+        { kind: cliKind || "claude", binary: (p?.cliBinary || "").trim() },
+        25000,
+      ).catch(() => null);
+      if (!r?.ok || !Array.isArray(r.models)) return [];
+      return r.models.map((id) => ({
+        id,
+        label: id,
+        description: r.source === "live" ? `${cliKind} CLI` : `${cliKind} CLI · built-in list`,
+      }));
     }
 
     return [];
@@ -816,6 +827,7 @@ let aiProviderSettings = {
   cliBinary: "",
   cliKind: "",
   cliExtraArgs: "",
+  cliModel: "",
   // `enabled` gates whether the direct (network) provider path is taken
   // by CHAT_AI_MESSAGE. Saving credentials alone is not enough — the
   // user must explicitly opt in via the popup toggle and pass a
@@ -901,6 +913,8 @@ function _readCurrentProviderSettings() {
           "aiProviderCliBinary",
           "aiProviderCliKind",
           "aiProviderCliExtraArgs",
+    "aiProviderCliModel",
+          "aiProviderCliModel",
           "aiProviderEnabled",
           "aiProviderPreset",
         ],
@@ -918,6 +932,8 @@ function _readCurrentProviderSettings() {
               result?.aiProviderCliExtraArgs ||
               aiProviderSettings.cliExtraArgs ||
               "",
+            cliModel:
+              result?.aiProviderCliModel ?? aiProviderSettings.cliModel ?? "",
             enabled:
               result?.aiProviderEnabled === true ||
               aiProviderSettings.enabled === true,
@@ -3852,6 +3868,8 @@ async function _onWsConn_CHECK_CLI_BINARY_RESPONSE(message) {
       pending.resolve({
         ok: !!message.ok,
         version: message.version || "",
+        path: message.path || "",
+        auth: message.auth || null,
         error: message.error || null,
         notFound: message.notFound === true,
         installCommand: message.installCommand || "",
@@ -3859,6 +3877,40 @@ async function _onWsConn_CHECK_CLI_BINARY_RESPONSE(message) {
       });
     }
     return;
+}
+
+// Generic request/response relay for CLI helpers on the bridge
+// (SCAN_CLIS, LIST_CLI_MODELS, TEST_CLI). Resolves with the raw reply.
+const pendingBridgeCliRequests = new Map(); // id → { resolve, timer }
+let bridgeCliRequestId = 0;
+
+function _bridgeCliRequest(type, payload = {}, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      reject(new Error("MCP bridge not connected. Connect the bridge first — CLIs are detected and run by the bridge process, not the browser."));
+      return;
+    }
+    const id = `cli-${++bridgeCliRequestId}`;
+    const timer = setTimeout(() => {
+      if (pendingBridgeCliRequests.delete(id)) reject(new Error("Bridge did not respond in time"));
+    }, timeoutMs);
+    pendingBridgeCliRequests.set(id, { resolve, timer });
+    try {
+      ws.send(JSON.stringify({ ...payload, type, id }));
+    } catch (err) {
+      pendingBridgeCliRequests.delete(id);
+      clearTimeout(timer);
+      reject(err);
+    }
+  });
+}
+
+async function _onWsConn_BRIDGE_CLI_RESPONSE(message) {
+  const pending = pendingBridgeCliRequests.get(message.id);
+  if (!pending) return;
+  pendingBridgeCliRequests.delete(message.id);
+  clearTimeout(pending.timer);
+  pending.resolve(message);
 }
 
 async function _onWsConn_INSTALL_CLI_PACKAGE_RESPONSE(message) {
@@ -4811,6 +4863,9 @@ const _WS_CONN_MESSAGE_HANDLERS = Object.freeze({
   SELF_UPDATE_RESULT: _onWsConn_SELF_UPDATE_RESULT,
   SELF_UPDATE_PROGRESS: _onWsConn_SELF_UPDATE_PROGRESS,
   CHECK_CLI_BINARY_RESPONSE: _onWsConn_CHECK_CLI_BINARY_RESPONSE,
+  SCAN_CLIS_RESPONSE: _onWsConn_BRIDGE_CLI_RESPONSE,
+  LIST_CLI_MODELS_RESPONSE: _onWsConn_BRIDGE_CLI_RESPONSE,
+  TEST_CLI_RESPONSE: _onWsConn_BRIDGE_CLI_RESPONSE,
   INSTALL_CLI_PACKAGE_RESPONSE: _onWsConn_INSTALL_CLI_PACKAGE_RESPONSE,
   AI_CHAT_DELTA: _onWsConn_AI_CHAT_DELTA,
   AI_CHAT_RESPONSE: _onWsConn_AI_CHAT_RESPONSE,
@@ -5359,6 +5414,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  // ─── CLI scan / model list / connection test (popup → bridge) ──
+  if (
+    message.type === "SCAN_CLIS" ||
+    message.type === "LIST_CLI_MODELS" ||
+    message.type === "TEST_CLI"
+  ) {
+    const timeouts = { SCAN_CLIS: 30000, LIST_CLI_MODELS: 30000, TEST_CLI: 75000 };
+    const { type, ...payload } = message;
+    _bridgeCliRequest(type, payload, timeouts[type])
+      .then((r) => sendResponse(r))
+      .catch((err) => sendResponse({ ok: false, error: err?.message || String(err), bridgeOffline: !ws || ws.readyState !== WebSocket.OPEN }));
+    return true; // async
+  }
+
   // ─── CLI presence check (popup → bridge → spawn binary --version) ──
   if (message.type === "CHECK_CLI_BINARY") {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -5381,7 +5450,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         pendingCliChecks.delete(id);
         sendResponse({ ok: false, error: "Bridge did not respond in time" });
       }
-    }, 8000);
+    }, 30000);
     pendingCliChecks.set(id, {
       resolve: (r) => {
         clearTimeout(timer);
@@ -5645,6 +5714,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       cliBinary: incomingProvider.cliBinary || "",
       cliKind: incomingProvider.cliKind || "",
       cliExtraArgs: incomingProvider.cliExtraArgs || "",
+      cliModel: (incomingProvider.cliModel || "").trim(),
       enabled: incomingProvider.enabled === true,
       preset: incomingProvider.preset || "custom",
     };
@@ -6170,13 +6240,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 message.model || null,
               ) || "llama3.2"
             : "",
-        // CLI providers own their model choice; passing a stale UI model
-        // here makes CLIs fail with "model from --model flag is not available".
-        // Direct providers use their provider-specific model fields instead.
+        // CLI providers: only the model explicitly picked for the CLI
+        // (settings CLI model dropdown, or the chat picker when it lists
+        // CLI models). Never the shared direct-provider model field — a
+        // stale value there makes CLIs fail with "model ... not available".
         cliModel:
           aiProviderSettings.source === "cli" ||
           aiProviderSettings.source === "ide"
-            ? ""
+            ? (message.cliModel || "").trim() ||
+              (aiProviderSettings.cliModel || "").trim() ||
+              ""
             : (message.model || "").trim() ||
               (aiProviderSettings.model || "").trim() ||
               "",
@@ -11822,6 +11895,7 @@ chrome.storage.local.get(
       cliBinary: stored.aiProviderCliBinary || "",
       cliKind: stored.aiProviderCliKind || "",
       cliExtraArgs: stored.aiProviderCliExtraArgs || "",
+      cliModel: stored.aiProviderCliModel || "",
       enabled: stored.aiProviderEnabled === true,
       preset: stored.aiProviderPreset || "custom",
     };
