@@ -1442,8 +1442,13 @@ async function readLockFile() {
 }
 
 async function writeLockFile() {
+  // Write a temp file and rename it over the lock so readers (workers, the
+  // native host, readLockFile) never see a half-written file — a plain
+  // writeFile truncates first, and a reader landing in that window got
+  // "Unexpected end of JSON input".
+  const tmpPath = `${lockFilePath}.${process.pid}.tmp`;
   await fs.writeFile(
-    lockFilePath,
+    tmpPath,
     JSON.stringify(
       {
         pid: process.pid,
@@ -1459,6 +1464,12 @@ async function writeLockFile() {
     ),
     { mode: 0o600 },
   );
+  try {
+    await fs.rename(tmpPath, lockFilePath);
+  } catch (err) {
+    await fs.rm(tmpPath, { force: true }).catch(() => {});
+    throw err;
+  }
   // Defensive: ensure perms are 0600 even if the file already existed.
   try {
     await fs.chmod(lockFilePath, 0o600);
