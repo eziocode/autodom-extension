@@ -16,7 +16,7 @@ const REAL = path.resolve(__dirname, "..");
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "autodom-fleet-"));
 const DIR = path.join(ROOT, "server");
 fs.mkdirSync(DIR);
-for (const f of ["index.js", "self-restart.js", "update-utils.js", "bridge-reaper.js", "broker-spawn.js", "native-host.js", "automation-store.js", "har-export.js", "viewer-app.js", "package.json"]) {
+for (const f of ["index.js", "self-restart.js", "update-utils.js", "bridge-reaper.js", "broker-spawn.js", "native-host.js", "automation-store.js", "har-export.js", "viewer-app.js", "timing-stats.js", "cli-resolver.js", "cli-detector.js", "package.json"]) {
   fs.copyFileSync(path.join(REAL, f), path.join(DIR, f));
 }
 fs.cpSync(path.join(REAL, "atk"), path.join(DIR, "atk"), { recursive: true });

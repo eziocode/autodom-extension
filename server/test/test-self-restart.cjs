@@ -32,6 +32,9 @@ for (const f of [
   "automation-store.js",
   "har-export.js",
   "viewer-app.js",
+  "timing-stats.js",
+  "cli-resolver.js",
+  "cli-detector.js",
   "package.json",
 ]) {
   fs.copyFileSync(path.join(REAL, f), path.join(DIR, f));
