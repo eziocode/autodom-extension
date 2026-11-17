@@ -4,6 +4,25 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 7.7.1
+
+### Fixed
+- Confirm mode works again. Since the per-port broker (7.5.0), the AutoDOM
+  process your IDE talks to forwards tool calls to the broker, and the
+  confirm-mode pause only ran on the broker's own path, so with
+  `--confirm-mode` every destructive tool failed with "cannot be proxied
+  from a secondary server in confirm mode", approved or not. Your IDE's
+  AutoDOM process now asks for `confirm_action` itself and forwards the
+  approved call; the broker still refuses destructive calls that arrive
+  unconfirmed.
+- The bridge writes its lock file atomically. A worker or the native host
+  reading it mid-write could get "Unexpected end of JSON input".
+- Build is green again: the bridge tests copy the server files they need
+  (`timing-stats.js` was missing), use their own ports, stop the broker
+  they start, and match chat client ids under broker mode.
+
+---
+
 ## 7.7.0
 
 ### Fixed
