@@ -88,6 +88,15 @@ import { checkScriptSyntax } from "./codemode/sandbox.js";
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 import { writeArtifact, writeHarFiles } from "./har-export.js";
 import { buildTimingRecord, createTimingStats } from "./timing-stats.js";
+import { buildChildEnv, resolveBinary, splitArgs } from "./cli-resolver.js";
+import {
+  CLI_CATALOG,
+  detectCli,
+  extraArgsPickModel,
+  getCliInfo,
+  listCliModels,
+  scanAllClis,
+} from "./cli-detector.js";
 
 // Local Playwright/Node automation backends were intentionally removed: AutoDOM
 // is a Playwright alternative, not a wrapper, and any server-spawned automation
@@ -95,32 +104,9 @@ import { buildTimingRecord, createTimingStats } from "./timing-stats.js";
 // extension popup against the active tab (browser-extension backend).
 
 const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
-const DEFAULT_CLI_INSTALLS = Object.freeze({
-  claude: {
-    label: "Claude Code CLI",
-    binary: "claude",
-    npmPackage: "@anthropic-ai/claude-code",
-  },
-  codex: {
-    label: "Codex CLI",
-    binary: "codex",
-    npmPackage: "@openai/codex",
-  },
-  copilot: {
-    label: "GitHub Copilot CLI",
-    binary: "copilot",
-    npmPackage: "@github/copilot",
-  },
-});
-
+// CLI catalog (labels, npm packages, models) lives in cli-detector.js.
 function getDefaultCliInstall(kind) {
-  const info = DEFAULT_CLI_INSTALLS[String(kind || "").toLowerCase()];
-  return info
-    ? {
-        ...info,
-        installCommand: `npm install -g ${info.npmPackage}`,
-      }
-    : null;
+  return getCliInfo(kind);
 }
 
 // ─── Visible-terminal launcher for CLI installs ─────────────
@@ -3001,106 +2987,119 @@ function _handleAiChatAbort(_socket, message) {
   }
 }
 
-// ── CHECK_CLI_BINARY ─────────────────────────────────────────
-// CLI presence check (popup → bridge → spawn binary --version).
-// Verifies the configured local CLI binary is installed and reachable
-// so the user gets immediate feedback before sending real chat messages.
-function _handleCheckCliBinary(socket, message) {
+// ── CHECK_CLI_BINARY / SCAN_CLIS / LIST_CLI_MODELS / TEST_CLI ─
+// CLI presence + connection checks (popup → bridge). Binaries are resolved
+// through cli-resolver.js (login-shell PATH + known install dirs), so the
+// result no longer depends on which process launched the bridge.
+function _wsReply(socket, type, id, payload) {
+  try {
+    socket.send(JSON.stringify({ type, id, ...payload }));
+  } catch (_) {}
+}
+
+function _cliNotFoundMessage(binary, installInfo, searchPath) {
+  const dirs = String(searchPath || "").split(process.platform === "win32" ? ";" : ":").filter(Boolean);
+  const shown = dirs.slice(0, 8).join(", ") + (dirs.length > 8 ? ` … (+${dirs.length - 8} more)` : "");
+  return (
+    `Binary '${binary}' not found.` +
+    (installInfo ? ` Install it with: ${installInfo.installCommand}.` : " Install it or set the absolute path.") +
+    (shown ? ` Searched: ${shown}` : "")
+  );
+}
+
+async function _handleCheckCliBinary(socket, message) {
   const { id, binary, kind } = message;
   const installInfo = getDefaultCliInstall(kind);
-  const send = (payload) => {
-    try {
-      socket.send(
-        JSON.stringify({
-          type: "CHECK_CLI_BINARY_RESPONSE",
-          id,
-          ...(installInfo
-            ? {
-                installCommand: installInfo.installCommand,
-                npmPackage: installInfo.npmPackage,
-              }
-            : {}),
-          ...payload,
-        }),
-      );
-    } catch (_) {}
-  };
+  const extra = installInfo
+    ? { installCommand: installInfo.installCommand, npmPackage: installInfo.npmPackage }
+    : {};
+  const send = (payload) => _wsReply(socket, "CHECK_CLI_BINARY_RESPONSE", id, { ...extra, ...payload });
   if (!binary || typeof binary !== "string") {
     send({ ok: false, error: "Missing binary" });
     return;
   }
-  // Pick a safe "is this CLI alive?" probe per kind.
-  // claude: `claude --version` (Anthropic CLI prints e.g. "1.x.x (Claude Code)")
-  // codex:  `codex --version` (OpenAI Codex CLI)
-  // custom: `<binary> --version`
-  const args = ["--version"];
-  process.stderr.write(
-    `[AutoDOM] CLI check: spawning '${binary}' ${JSON.stringify(args)}\n`,
-  );
-  let proc;
   try {
-    proc = spawn(binary, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
-    });
-  } catch (spawnErr) {
-    send({
-      ok: false,
-      error: `Failed to spawn '${binary}': ${spawnErr.message}`,
-    });
-    return;
-  }
-  const out = [];
-  const err = [];
-  let settled = false;
-  const timer = setTimeout(() => {
-    if (settled) return;
-    settled = true;
-    try { proc.kill("SIGTERM"); } catch (_) {}
-    send({ ok: false, error: `Timed out probing '${binary}'` });
-  }, 6000);
-  proc.stdout.on("data", (d) => out.push(d));
-  proc.stderr.on("data", (d) => err.push(d));
-  proc.on("error", (e) => {
-    if (settled) return;
-    settled = true;
-    clearTimeout(timer);
-    send({
-      ok: false,
-      error:
-        e.code === "ENOENT"
-          ? `Binary '${binary}' not found on PATH.${
-              installInfo
-                ? ` Install it with: ${installInfo.installCommand}`
-                : " Install it or use the absolute path."
-            }`
-          : e.message,
-      notFound: e.code === "ENOENT",
-    });
-  });
-  proc.on("close", (code) => {
-    if (settled) return;
-    settled = true;
-    clearTimeout(timer);
-    const stdout = Buffer.concat(out).toString("utf8").trim();
-    const stderr = Buffer.concat(err).toString("utf8").trim();
-    // Some CLIs print --version to stderr; accept either.
-    const version = stdout || stderr;
-    if (code === 0 && version) {
-      send({ ok: true, version, kind });
-    } else if (code === 0) {
-      send({ ok: true, version: "(no version output)", kind });
-    } else {
+    const r = await detectCli(kind, binary, { force: !!message.force });
+    process.stderr.write(
+      `[AutoDOM] CLI check: kind=${kind} binary='${binary}' → ${r.path || "not found"}\n`,
+    );
+    if (!r.found) {
       send({
         ok: false,
-        error: `'${binary} --version' exited ${code}.${stderr ? " " + stderr.substring(0, 200) : ""}`,
+        notFound: true,
+        kind,
+        error: _cliNotFoundMessage(binary, installInfo, r.searchPath),
       });
+      return;
     }
-  });
+    if (r.warning && !r.version) {
+      send({ ok: false, kind, path: r.path, auth: r.auth, error: `'${r.path}' ${r.warning}` });
+      return;
+    }
+    send({ ok: true, kind, path: r.path, version: r.version || "(no version output)", auth: r.auth });
+  } catch (err) {
+    send({ ok: false, error: err?.message || String(err) });
+  }
+}
+
+async function _handleScanClis(socket, message) {
+  const overrides = message.overrides && typeof message.overrides === "object" ? message.overrides : {};
+  try {
+    const clis = await scanAllClis(overrides, { force: !!message.force });
+    _wsReply(socket, "SCAN_CLIS_RESPONSE", message.id, { ok: true, clis });
+  } catch (err) {
+    _wsReply(socket, "SCAN_CLIS_RESPONSE", message.id, { ok: false, error: err?.message || String(err) });
+  }
+}
+
+async function _handleListCliModels(socket, message) {
+  try {
+    const r = await listCliModels(message.kind, message.binary || "", { force: !!message.force });
+    _wsReply(socket, "LIST_CLI_MODELS_RESPONSE", message.id, { ok: true, kind: message.kind, ...r });
+  } catch (err) {
+    _wsReply(socket, "LIST_CLI_MODELS_RESPONSE", message.id, { ok: false, error: err?.message || String(err) });
+  }
+}
+
+// Real end-to-end connection test: run the configured CLI with a tiny prompt.
+async function _handleTestCli(socket, message) {
+  const started = Date.now();
+  const cfg = message.config || {};
+  const providerConfig = {
+    cliBinary: String(cfg.cliBinary || "").trim(),
+    cliKind: String(cfg.cliKind || "claude").trim().toLowerCase(),
+    cliExtraArgs: String(cfg.cliExtraArgs || ""),
+    cliModel: String(cfg.cliModel || "").trim(),
+    cliTimeoutMs: 60000,
+    cliPlannerOnly: true,
+  };
+  if (!providerConfig.cliBinary) {
+    providerConfig.cliBinary = CLI_CATALOG[providerConfig.cliKind]?.binary || "";
+  }
+  try {
+    const r = await runCliPrompt({
+      prompt: "This is a connection test. Reply with exactly one word: OK",
+      providerConfig,
+      requestId: null,
+    });
+    _wsReply(socket, "TEST_CLI_RESPONSE", message.id, {
+      ok: true,
+      reply: String(r.response || "").trim().slice(0, 200),
+      model: r.model || providerConfig.cliModel || "",
+      binary: r.binary,
+      elapsedMs: Date.now() - started,
+    });
+  } catch (err) {
+    _wsReply(socket, "TEST_CLI_RESPONSE", message.id, {
+      ok: false,
+      error: String(err?.message || err).slice(0, 2000),
+      elapsedMs: Date.now() - started,
+    });
+  }
 }
 
 // ── INSTALL_CLI_PACKAGE ──────────────────────────────────────
-function _handleInstallCliPackage(socket, message) {
+async function _handleInstallCliPackage(socket, message) {
   const { id, kind, npmPackage, binary } = message;
   const installInfo = getDefaultCliInstall(kind);
   const send = (payload) => {
@@ -3155,7 +3154,9 @@ function _handleInstallCliPackage(socket, message) {
     return;
   }
 
-  const npmBinary = process.platform === "win32" ? "npm.cmd" : "npm";
+  const npmName = process.platform === "win32" ? "npm.cmd" : "npm";
+  const npmBinary = (await resolveBinary(npmName, npmName)).path || npmName;
+  const npmEnv = await buildChildEnv();
   const args = ["install", "-g", installInfo.npmPackage];
   process.stderr.write(
     `[AutoDOM] CLI install: ${npmBinary} ${args.join(" ")}\n`,
@@ -3164,7 +3165,7 @@ function _handleInstallCliPackage(socket, message) {
   try {
     proc = spawn(npmBinary, args, {
       stdio: ["ignore", "pipe", "pipe"],
-      env: process.env,
+      env: npmEnv,
     });
   } catch (spawnErr) {
     send({
@@ -4754,6 +4755,9 @@ const _WS_MESSAGE_HANDLERS = Object.freeze({
   SELF_UPDATE: _handleSelfUpdate,
   AI_CHAT_ABORT: _handleAiChatAbort,
   CHECK_CLI_BINARY: _handleCheckCliBinary,
+  SCAN_CLIS: _handleScanClis,
+  LIST_CLI_MODELS: _handleListCliModels,
+  TEST_CLI: _handleTestCli,
   INSTALL_CLI_PACKAGE: _handleInstallCliPackage,
   AI_CHAT_REQUEST: (socket, message) =>
     userTabRequestContext.run({ userTab: true }, () =>
@@ -7390,7 +7394,15 @@ function extractCliFinalResponse(stdout) {
     return null;
   };
 
-  const extractFromRecords = (records) => {
+  const extractFromRecords = (rawRecords) => {
+    // codex exec --json (0.1xx+) wraps each turn item in an envelope:
+    // {"type":"item.completed","item":{"type":"agent_message","text":"…"}}.
+    // Unwrap so the agent_message is matched like the older flat frames.
+    const records = rawRecords.map((r) =>
+      r && typeof r === "object" && r.item && typeof r.item === "object" && typeof r.item.type === "string"
+        ? r.item
+        : r,
+    );
     let text = null;
     let model = null;
     // Prefer explicit "result"-class records first, then assistant frames,
@@ -7682,7 +7694,7 @@ async function _codexEnabledMcpServers(binary) {
     const { stdout } = await execFileAsync(binary, ["mcp", "list", "--json"], {
       timeout: 5000,
       maxBuffer: 1024 * 1024,
-      env: process.env,
+      env: await buildChildEnv(),
     });
     const list = JSON.parse(String(stdout || "[]"));
     if (Array.isArray(list)) {
@@ -7791,18 +7803,22 @@ async function _cliMcpIsolationArgs(kind, binary, userArgsJoined) {
 
 async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta, mcpTools = false }) {
   if (_isAborted(requestId)) throw new AiAbortError(requestId);
-  const binary = (providerConfig.cliBinary || "claude").trim();
   const kind = (providerConfig.cliKind || "claude").trim().toLowerCase();
-  const extraArgs = (providerConfig.cliExtraArgs || "")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
+  const configuredBinary = (providerConfig.cliBinary || CLI_CATALOG[kind]?.binary || "claude").trim();
+  // Resolve to an absolute path via the login-shell PATH + known install
+  // dirs: the bridge's own PATH depends on who launched it.
+  const resolved = configuredBinary
+    ? await resolveBinary(configuredBinary, CLI_CATALOG[kind]?.binary || "")
+    : { path: null, searchPath: "" };
+  const binary = resolved.path || configuredBinary;
+  const childEnv = await buildChildEnv();
+  const extraArgs = splitArgs(providerConfig.cliExtraArgs || "");
   const userArgsJoined = " " + extraArgs.join(" ") + " ";
   const configuredModel = (providerConfig.cliModel || "").trim();
   const pickedModel = LEGACY_CLI_MODEL_DEFAULTS.has(configuredModel)
     ? ""
     : configuredModel;
-  const userPickedModelArg = /\s--model(\s|=)/.test(userArgsJoined);
+  const userPickedModelArg = extraArgsPickModel(extraArgs);
   const modelArgs =
     pickedModel && !userPickedModelArg ? ["--model", pickedModel] : [];
   const userPickedJsonOutput =
@@ -7860,6 +7876,9 @@ async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta, mc
     const copilotToolArgs = plannerOnly ? [] : ["--allow-all-tools"];
     args = [...copilotToolArgs, ...modelArgs, "-p", prompt, ...extraArgs];
     writePromptToStdin = false;
+  } else if (kind === "gemini") {
+    args = [...modelArgs, ...extraArgs, "-p", prompt];
+    writePromptToStdin = false;
   } else {
     args = [...modelArgs, ...extraArgs];
   }
@@ -7873,7 +7892,7 @@ async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta, mc
     try {
       proc = spawn(binary, args, {
         stdio: ["pipe", "pipe", "pipe"],
-        env: process.env,
+        env: childEnv,
         detached: process.platform !== "win32",
       });
       if (requestId != null) {
@@ -7950,7 +7969,7 @@ async function runCliPrompt({ prompt, providerConfig, requestId, onTextDelta, mc
         reject,
         new Error(
           err.code === "ENOENT"
-            ? `CLI provider: binary '${binary}' not found on PATH. Install it (e.g. 'npm i -g @anthropic-ai/claude-code') or use the absolute path.`
+            ? `CLI provider: ${_cliNotFoundMessage(configuredBinary, getCliInfo(kind), resolved.searchPath)}`
             : `CLI provider error: ${err.message}`,
         ),
       );

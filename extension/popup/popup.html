@@ -298,34 +298,59 @@
                             </div>
 
                             <div class="field-group" id="providerCliKindGroup" style="display: none">
-                                <label class="field-label" for="providerCliKind">CLI</label>
+                                <div class="field-label-row">
+                                    <label class="field-label" for="providerCliKind">CLI</label>
+                                    <button id="cliRescanBtn" class="text-btn" type="button" title="Detect installed CLIs again (path, version, sign-in)">Re-detect</button>
+                                </div>
                                 <select id="providerCliKind" class="config-input">
                                     <option value="claude">Claude Code CLI</option>
                                     <option value="codex">Codex CLI</option>
                                     <option value="copilot">GitHub Copilot CLI</option>
+                                    <option value="gemini">Gemini CLI</option>
                                     <option value="custom">Custom command</option>
                                 </select>
+                                <div id="cliSummary" class="cli-summary" aria-live="polite"></div>
                             </div>
 
-                            <div class="field-group" id="providerCliBinaryGroup" style="display: none">
-                                <label class="field-label" for="providerCliBinary">Binary</label>
+                            <div class="field-group" id="providerCliModelGroup" style="display: none">
+                                <div class="field-label-row">
+                                    <label class="field-label" for="providerCliModelSelect">Model</label>
+                                    <button id="cliRefreshModelsBtn" class="text-btn" type="button" title="Ask the CLI which models it can use">Refresh models</button>
+                                </div>
+                                <select id="providerCliModelSelect" class="config-input">
+                                    <option value="">CLI default</option>
+                                </select>
                                 <input
                                     type="text"
-                                    id="providerCliBinary"
-                                    class="config-input"
-                                    placeholder="e.g. claude, /usr/local/bin/codex"
+                                    id="providerCliModelCustom"
+                                    class="config-input cli-model-custom"
+                                    placeholder="Model id, e.g. gpt-6.1-sol"
+                                    style="display: none"
                                 />
+                                <span class="field-hint" id="cliModelStatus"></span>
                             </div>
 
-                            <div class="field-group" id="providerCliExtraArgsGroup" style="display: none">
-                                <label class="field-label" for="providerCliExtraArgs">Extra args</label>
-                                <input
-                                    type="text"
-                                    id="providerCliExtraArgs"
-                                    class="config-input"
-                                    placeholder="Optional"
-                                />
-                            </div>
+                            <details class="cli-advanced" id="cliAdvanced" style="display: none">
+                                <summary>Advanced</summary>
+                                <div class="field-group" id="providerCliBinaryGroup">
+                                    <label class="field-label" for="providerCliBinary">Binary <span class="field-label-hint">(blank = auto-detect)</span></label>
+                                    <input
+                                        type="text"
+                                        id="providerCliBinary"
+                                        class="config-input"
+                                        placeholder="Auto-detect on PATH"
+                                    />
+                                </div>
+                                <div class="field-group" id="providerCliExtraArgsGroup">
+                                    <label class="field-label" for="providerCliExtraArgs">Extra args <span class="field-label-hint">(optional)</span></label>
+                                    <input
+                                        type="text"
+                                        id="providerCliExtraArgs"
+                                        class="config-input"
+                                        placeholder="Optional, e.g. --verbose"
+                                    />
+                                </div>
+                            </details>
 
                             <div id="cliPromptBox" class="cli-prompt" style="display: none">
                                 <p class="field-hint" id="cliPromptText"></p>
@@ -380,7 +405,7 @@
                                 <button
                                     id="testProviderBtn"
                                     class="secondary-btn provider-test"
-                                    title="Send a lightweight request to verify the API key, base URL, and model"
+                                    title="Send a lightweight request to verify the connection (API key / CLI end to end)"
                                 >
                                     Test
                                 </button>
@@ -388,7 +413,7 @@
                                     id="checkCliBtn"
                                     class="secondary-btn provider-check-cli"
                                     style="display: none"
-                                    title="Check that the CLI binary is installed and reachable"
+                                    title="Check that the selected CLI is installed and signed in"
                                 >
                                     Check CLI
                                 </button>

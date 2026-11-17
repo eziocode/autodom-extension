@@ -340,6 +340,7 @@
   const _modelPickerState = {
     providerSource: "ide",  // snapshotted from popup's aiProviderSource
     cliKind: "",            // snapshotted from popup's aiProviderCliKind (only when source==="ide")
+    cliModel: "",           // snapshotted from popup's aiProviderCliModel (CLI settings model)
     defaultModel: "",       // snapshotted from popup's aiProviderModel
     baseUrl: "",            // snapshotted from popup's aiProviderBaseUrl
     enabled: false,         // snapshotted from popup's aiProviderEnabled
@@ -419,7 +420,14 @@
   }
 
   function _currentModelId() {
-    if (_isCliModelProvider()) return "";
+    if (_isCliModelProvider()) {
+      // Per-chat override only when it is a model the CLI reported;
+      // otherwise the CLI model picked in settings ("" = CLI default).
+      const live = _liveModels[_catalogKey()] || [];
+      const ov = _modelPickerState.overrides[_catalogKey()] || "";
+      if (ov && live.find((m) => m.id === ov)) return ov;
+      return _modelPickerState.cliModel || "";
+    }
     const key = _catalogKey();
     const baseKey = _catalogBaseKey();
     const override =
@@ -431,7 +439,10 @@
   }
 
   function _modelsForCurrentProvider() {
-    if (_isCliModelProvider()) return [];
+    if (_isCliModelProvider()) {
+      const live = _liveModels[_catalogKey()];
+      return Array.isArray(live) ? [...live] : [];
+    }
     const key = _catalogKey();
     const baseKey = _catalogBaseKey();
     const live = _liveModels[key];
@@ -522,9 +533,11 @@
           "aiProviderModel",
           "aiProviderBaseUrl",
           "aiProviderEnabled",
+          "aiProviderCliModel",
           STORAGE_KEY_MODEL_OVERRIDES,
         ],
         (items) => {
+          _modelPickerState.cliModel = items?.aiProviderCliModel || "";
           _modelPickerState.providerSource = _normalizeProviderSource(
             items?.aiProviderSource,
           );
@@ -556,6 +569,10 @@
         }
         if (changes.aiProviderCliKind) {
           _modelPickerState.cliKind = (changes.aiProviderCliKind.newValue || "").toLowerCase();
+          providerChanged = true;
+        }
+        if (changes.aiProviderCliModel) {
+          _modelPickerState.cliModel = changes.aiProviderCliModel.newValue || "";
           providerChanged = true;
         }
         if (changes.aiProviderModel) {
@@ -628,6 +645,8 @@
     const list = _modelsForCurrentProvider();
     const id = _currentModelId();
     if (!list.length) return id; // unknown catalog — trust the stored id
+    // CLI: "" means "let the CLI use its default" — never force list[0].
+    if (_isCliModelProvider()) return id && list.find((m) => m.id === id) ? id : "";
     if (id && list.find((m) => m.id === id)) return id;
     const fallback = list[0]?.id || "";
     if (fallback) {
@@ -5672,7 +5691,8 @@
             text: text,
             context: context,
             conversationHistory: conversationHistory.slice(-20), // Last 20 messages
-            model: _currentModelId() || undefined,
+            model: _isCliModelProvider() ? undefined : _currentModelId() || undefined,
+            cliModel: _isCliModelProvider() ? _currentModelId() || undefined : undefined,
             mode: mode || undefined,
             responseStyle: _chatSettings.responseStyle || "concise",
             attachments: attachments.length > 0
