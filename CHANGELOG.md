@@ -4,6 +4,33 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 7.7.0
+
+### Fixed
+- Local CLIs are found no matter what started the bridge. The bridge used
+  the PATH it inherited, so when Chrome's native host or a Dock-launched IDE
+  started it (launchd's minimal PATH) Check CLI and chat failed with
+  "Binary 'codex' not found on PATH" even though the CLI was installed. CLIs
+  are now resolved to absolute paths through the login shell's PATH plus the
+  usual install folders (Homebrew, `~/.local/bin`, npm-global, nvm, volta,
+  bun), and run with that PATH so `#!/usr/bin/env node` scripts work. A CLI
+  that really is missing reports the folders searched.
+- Codex replies are read from the newer `item.completed` JSON envelope
+  instead of coming back as raw JSON lines.
+
+### Added
+- The Local CLI settings detect installed CLIs (Claude Code, Codex, GitHub
+  Copilot, and the new Gemini CLI kind) with path, version and sign-in state.
+- A per-CLI Model dropdown filled with the models the CLI reports (`codex
+  debug models`, Copilot and Anthropic model APIs) or a built-in list, with
+  Refresh and a Custom… entry. The chat panel's model picker lists them too.
+- Test runs the selected CLI end to end and shows its reply and timing.
+  Binary and Extra args moved under Advanced; Extra args accept quoted values.
+- Per-hop timing for bridge tool calls: `autodom_diagnostics` reports lane
+  queue, execution, transport and relay times with per-tool p50/p95.
+
+---
+
 ## 7.6.0
 
 ### Fixed
