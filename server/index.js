@@ -3819,9 +3819,11 @@ function _runInternalProxyCall(socket, message, release) {
     const params = message.params || {};
     const tier = getToolTier(message.tool, params);
     const isRawFetchTool = message.tool === "fetch_page_source" || message.tool === "browser_fetch_raw";
-    if (CONFIRM_MODE && tier === "destructive") {
+    // The worker holds destructive calls for confirm_action and sends the
+    // approved one marked `confirmed`; anything else is refused here.
+    if (CONFIRM_MODE && tier === "destructive" && message.confirmed !== true) {
       sendResult({
-        error: `${message.tool} cannot be proxied from a secondary server in confirm mode`,
+        error: `${message.tool} needs confirmation in confirm mode; the requesting AutoDOM server did not confirm it (restart that IDE's AutoDOM server so it runs a version that asks first)`,
         blocked: true,
         tier,
       });
@@ -4813,6 +4815,22 @@ function _cancelledToolResult(tool) {
   };
 }
 
+// Hostname a tool explicitly targets (navigate / raw fetch URLs), or null.
+function _toolTargetDomain(tool, params) {
+  const url = params && typeof params.url === "string" ? params.url : "";
+  if (!url) return null;
+  try {
+    if (tool === "fetch_page_source" || tool === "browser_fetch_raw") {
+      const u = new URL(url);
+      return u.protocol === "http:" || u.protocol === "https:" ? u.hostname : null;
+    }
+    if (tool === "navigate") {
+      return new URL(url.startsWith("http") ? url : "https://" + url).hostname;
+    }
+  } catch (_) {}
+  return null;
+}
+
 function callExtensionTool(tool, params, options = {}) {
   const confirmedExecution =
     options?.confirmed === true || confirmedToolContext.getStore()?.confirmed === true;
@@ -4928,6 +4946,24 @@ function callExtensionTool(tool, params, options = {}) {
 
     // Route through proxy if we are a secondary instance
     if (!isPrimaryServer) {
+      // ─── Confirm Mode (worker side) ───────────────────────
+      // This process is the MCP server the agent talks to, so it owns the
+      // confirm_action round trip: hold destructive calls here, then send
+      // the approved call on marked `confirmed`. The primary refuses
+      // unconfirmed destructive calls from secondaries in confirm mode.
+      const proxyTier = getToolTier(tool, params);
+      if (CONFIRM_MODE && proxyTier === "destructive" && !confirmedExecution) {
+        const held = _holdForConfirmation({
+          mcpCall,
+          tool,
+          params,
+          domain: _toolTargetDomain(tool, params),
+          tier: proxyTier,
+        });
+        diagLog(`toolCall CONFIRM_REQUIRED (worker) tool=${tool} confirmId=${held.confirmId}`);
+        wrappedResolve(held);
+        return;
+      }
       (async () => {
         if (workerDormant) {
           workerDormant = false;

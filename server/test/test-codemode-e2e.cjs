@@ -118,6 +118,13 @@ async function startServer(port, env) {
   const stop = () => {
     ext.close();
     proc.kill();
+    // In broker mode the port belongs to a detached --bridge-only broker
+    // that outlives the stdio worker; stop it too.
+    try {
+      const cur = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+      if (cur.pid && cur.pid !== proc.pid) process.kill(cur.pid, 'SIGKILL');
+    } catch {}
+    fs.rmSync(lockFile, { force: true });
   };
   // What the extension's scheduler does for a saved-script schedule.
   async function runScriptFromExtension(scriptId, input) {
@@ -130,11 +137,11 @@ async function startServer(port, env) {
     }
     throw new Error('no RUN_SCRIPT_RESULT');
   }
-  return { call, listTools, runScriptFromExtension, extCalls, stop };
+  return { call, listTools, runScriptFromExtension, extCalls, stop, lock, port };
 }
 
 async function plainRun() {
-  const s = await startServer(19881, {});
+  const s = await startServer(19921, {});
   try {
     const report = json(await s.call('run_code', { code: SCRIPT }));
     assert(report.ok, 'run failed: ' + JSON.stringify(report));
@@ -148,7 +155,7 @@ async function plainRun() {
 }
 
 async function confirmModeRun() {
-  const s = await startServer(19882, { AUTODOM_CONFIRM_MODE: 'true' });
+  const s = await startServer(19922, { AUTODOM_CONFIRM_MODE: 'true' });
   try {
     // navigate is destructive: the script pauses before anything runs.
     const hold1 = json(await s.call('run_code', { code: SCRIPT }));
@@ -175,8 +182,49 @@ async function confirmModeRun() {
   }
 }
 
+// A forwarded (INTERNAL_PROXY_CALL) destructive call must arrive marked
+// confirmed in confirm mode: the worker that took the MCP call holds it for
+// confirm_action first. An unconfirmed one is refused by the primary.
+async function proxyConfirmGuard() {
+  const s = await startServer(19927, { AUTODOM_CONFIRM_MODE: 'true' });
+  const peer = new WebSocket(`ws://127.0.0.1:${s.port}/?token=${encodeURIComponent(s.lock.token)}`);
+  try {
+    await new Promise((r, j) => {
+      peer.once('open', r);
+      peer.once('error', j);
+    });
+    const results = new Map();
+    peer.on('message', (m) => {
+      const raw = m.toString();
+      const msgs = raw.charCodeAt(0) === 91 ? JSON.parse(raw) : [JSON.parse(raw)];
+      for (const msg of msgs) if (msg && msg.type === 'TOOL_RESULT') results.set(msg.id, msg.result);
+    });
+    const proxied = async (id, confirmed) => {
+      peer.send(JSON.stringify({
+        type: 'INTERNAL_PROXY_CALL',
+        clientId: 'mcp_00000000000000aa',
+        id,
+        tool: 'navigate',
+        params: { url: 'https://example.test/' },
+        ...(confirmed ? { confirmed: true } : {}),
+      }));
+      for (let i = 0; i < 200 && !results.has(id); i++) await sleep(25);
+      return results.get(id);
+    };
+    const refused = await proxied('p1', false);
+    assert(refused?.blocked === true && /needs confirmation/.test(refused.error || ''), 'unconfirmed refused: ' + JSON.stringify(refused));
+    assert(!s.extCalls.some((c) => c.tool === 'navigate'), 'refused call never reached the extension');
+    const ran = await proxied('p2', true);
+    assert(ran?.success === true, 'confirmed call ran: ' + JSON.stringify(ran));
+    assert(s.extCalls.some((c) => c.tool === 'navigate' && c.confirmed), 'extension saw it confirmed');
+  } finally {
+    peer.close();
+    s.stop();
+  }
+}
+
 async function inlineApprovalRun() {
-  const s = await startServer(19883, { AUTODOM_CONFIRM_MODE: 'true' });
+  const s = await startServer(19923, { AUTODOM_CONFIRM_MODE: 'true' });
   try {
     const args = { code: SCRIPT };
     const ask1 = (await s.call('run_code', args, ELICIT_META)).result;
@@ -197,7 +245,7 @@ async function inlineApprovalRun() {
 }
 
 async function onlyModeListing() {
-  const s = await startServer(19884, { AUTODOM_CODE_MODE: 'only' });
+  const s = await startServer(19924, { AUTODOM_CODE_MODE: 'only' });
   try {
     const names = (await s.listTools()).sort().join();
     assert(
@@ -223,7 +271,7 @@ const SAVED = `
 `;
 
 async function savedScripts() {
-  const s = await startServer(19885, {});
+  const s = await startServer(19925, {});
   try {
     const bad = json(await s.call('script_save', { name: 'Broken', code: 'return (' }));
     assert(/does not parse/.test(bad.error || ''), 'syntax checked on save: ' + JSON.stringify(bad));
@@ -263,7 +311,7 @@ async function savedScripts() {
 }
 
 async function unattendedHold() {
-  const s = await startServer(19886, { AUTODOM_CONFIRM_MODE: 'true' });
+  const s = await startServer(19926, { AUTODOM_CONFIRM_MODE: 'true' });
   try {
     await s.call('script_save', { name: 'Nav', code: SAVED });
     const r = await s.runScriptFromExtension('nav', { url: 'https://example.test/' });
@@ -284,6 +332,7 @@ async function unattendedHold() {
     ['script fans out into extension calls', plainRun],
     ['confirm mode pauses and resumes the script', confirmModeRun],
     ['inline approval resumes the same script', inlineApprovalRun],
+    ['primary refuses unconfirmed forwarded destructive calls', proxyConfirmGuard],
   ]) {
     try {
       await fn();
