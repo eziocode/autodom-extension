@@ -61,18 +61,17 @@
     if (op === "arm") {
       if (rec) return error("Duplicate playback verification");
       const pin = { element: null, release() {
-        document.removeEventListener(a.eventName, captureTarget, true);
+        document.removeEventListener(a.eventName, captureTarget, { capture: true });
         clearTimeout(timer);
         records.delete(id);
         pin.element = null;
       } };
       function captureTarget(event) {
         pin.element = event.composedPath()[0];
-        document.removeEventListener(a.eventName, captureTarget, true);
       }
       const timer = setTimeout(pin.release, 5000);
       records.set(id, pin);
-      document.addEventListener(a.eventName, captureTarget, true);
+      document.addEventListener(a.eventName, captureTarget, { capture: true, once: true });
       return { ok: true };
     }
     if (op !== "observe" || !rec || !("element" in rec)) return error("Media target handoff expired");
