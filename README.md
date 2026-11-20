@@ -141,7 +141,7 @@ Optional transports, both off by default:
 
 ## Tools
 
-151 tools are registered. 126 are listed to clients by default; the 19
+153 tools are registered. Clients see 128 by default. The 19
 Playwright-compatible aliases (`browser_click`, `browser_snapshot`, ...) stay
 callable by name but are only listed with `AUTODOM_PLAYWRIGHT_COMPAT=1`, and
 the six Code Mode tools (`run_code`, `code_api`, `script_*`, below) are only
@@ -151,7 +151,7 @@ listed with `AUTODOM_CODE_MODE`.
 |---|---|
 | Observe | `take_snapshot`, `get_dom_state`, `query_elements`, `deep_query`, `extract_text`, `extract_data`, `get_html`, `get_page_info`, `take_screenshot`, `get_bounding_box`, `get_computed_style`, `check_element_state` |
 | Act | `click`, `type_text`, `fill_form`, `select_option`, `hover`, `press_key`, `scroll`, `drag_and_drop`, `double_click`, `right_click`, `middle_click`, `force_click`, `click_at_coordinates`, `key_down`, `key_up`, `click_by_index`, `type_by_index`, `upload_file` |
-| Video and images | `media_list`, `media_get_captions`, `media_sample_frames`, `media_capture_frame`, `media_control`, `image_list`, `image_get_data` |
+| Video and images | `media_list`, `media_get_captions`, `media_sample_frames`, `media_capture_frame`, `media_verify_playback`, `media_read_chunk`, `media_control`, `image_list`, `image_get_data` |
 | Navigate and wait | `navigate`, `wait_for_text`, `wait_for_element`, `wait_for_navigation`, `wait_for_network_idle`, `handle_dialog` |
 | Tabs and frames | `list_tabs`, `open_new_tab`, `switch_tab`, `close_tab`, `pin_tab`, `unpin_tab`, `get_pinned_tab`, `finish_session`, popups (`list_popups`, `switch_to_popup`, `close_popup`, `wait_for_popup`), `list_iframes`, `iframe_interact`, `list_shadow_roots`, `shadow_interact` |
 | Scripting | `execute_code`, `evaluate_script`, `execute_async_script` (deprecated), `batch_actions` |
@@ -167,9 +167,29 @@ To analyse a video, go cheapest first and stop when you have the answer:
 and marks the primary one; `media_get_captions` returns what it says (on
 YouTube, the transcript); `media_sample_frames` returns keyframes as images,
 seeking without playing, downscaled to 768 px, with blank and near-duplicate
-frames dropped (`mode: "scene"` keeps the biggest visual changes). Frames are
-never stored. Cross-origin video without CORS falls back to a screenshot of
+frames dropped (`mode: "scene"` keeps the biggest visual changes). These seek-based samples are returned immediately. Cross-origin video without CORS falls back to a screenshot of
 the player; DRM-protected video reports that its frames are unreadable.
+
+To check **actual playback**, call `media_verify_playback` while the player is
+running. Smart mode fingerprints observable frames and keeps selected thumbnails.
+Use `mode: "detailed"` when a brief visual change matters. Inspect the returned
+coverage and gaps, then pass `verificationId` and `elapsedSec` or `chunkIndex`
+to `media_read_chunk`. Follow `nextOffset` for more evidence. Timestamps
+distinguish elapsed observation time from the player's media time across seeks.
+The default observation lasts five seconds. Evidence expires after two minutes.
+Each chunk highlights a few retained images with their frame offsets. Pass an
+offset and `limit: 1` to inspect a highlight in one call. WebCodecs captures
+report whether the pixel timestamp matches the presented frame. On readable
+video, AutoDOM also checks the live surface between callbacks. `missedCallbacks`
+counts browser notifications skipped, `recoveredFrames` counts intermediate
+pixel timestamps captured, and `edgeFrames` counts additional surfaces at the
+observation boundaries. Frames recovered this way have
+`observationSource: "live-surface"` and no callback sequence number. Browsers
+using the canvas fallback mark the alignment as approximate.
+
+When a target lives in an iframe or open shadow root, inspect
+`contextHighlights` and reuse the returned target fields in the next action.
+If several frames match, select the intended document before clicking.
 
 Every tool has a safety tier, returned by `get_tool_tiers`:
 
@@ -232,7 +252,7 @@ return links.filter((h) => h.includes("/docs/")).slice(0, 10);
   tools. Most of that is the smaller tool list; leaving the tool list out, it
   read 53-79% less than the standard tools used the usual way, and about the
   same as an agent that already uses `execute_code` well.
-- Globals: `autodom.<tool>(params)` for 113 tools, `page.eval(fn, ...args)`
+- Globals: `autodom.<tool>(params)` for browser tools, `page.eval(fn, ...args)`
   (runs `fn` in the active tab through `execute_code`), `emitImage(ref)`,
   `sleep(ms)`, `console`. No `fetch`, `require`, timers or filesystem.
 - Every inner call is the same tool an MCP client would call: zod-validated,
@@ -469,6 +489,15 @@ node test/e2e.cjs
 # before a release or any dependency change
 cd server && npm audit --audit-level=high
 ```
+
+Run the playback benchmark from the repo root with `node scripts/playback-bench.mjs`.
+It needs FFmpeg with libx264, Playwright, and an extension-capable Chromium
+build. Set `CHROME_BIN` to the browser executable and `PLAYWRIGHT_PATH` if
+Playwright is installed outside Node's module search path. The benchmark
+uses a temporary profile and checks a one-frame marker in 30 and 60 fps clips.
+After each timed observation it reads every chunk, checks the fixture’s full
+timestamp sequence against pixel signatures, and checks every detailed
+thumbnail is present. It reports playback pace, decoder drops and probe cost.
 
 Adding a tool: define it in `server/index.js`, add its tier to `TOOL_TIERS`,
 add the extension handler, and update the inventory count in

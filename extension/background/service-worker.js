@@ -22,7 +22,10 @@ try {
   // media-tools.js must load BEFORE agent-tools.js so its catalog entries
   // can be spliced into the global TOOL_CATALOG at module-init time.
   if (typeof importScripts === "function" && !globalThis.AutoDOMMediaTools) {
-    importScripts("media-tools.js");
+    importScripts("playback.js", "media-tools.js");
+  }
+  if (typeof importScripts === "function" && !globalThis.AutoDOMContext) {
+    importScripts("context-targets.js");
   }
   if (typeof importScripts === "function" && !globalThis.AutoDOMWorkflow) {
     importScripts("workflow-engine.js");
@@ -1844,10 +1847,15 @@ async function _handleUnpinTabTool(clientId) {
   return { unpinned: had, clientId, ...(restored ? { restored: true } : {}) };
 }
 
+function _logPlaybackCleanupError(err) {
+  _debugWarn("[AutoDOM] Playback cleanup failed:", err?.message || err);
+}
+
 // Synthetic finish_session: end this client's session. Closes the tabs
 // AutoDOM created, ungroups/restores tabs it adopted, drops the pin.
 async function _handleFinishSessionTool(clientId) {
   if (!clientId) return { error: "finish_session requires a clientId" };
+  await globalThis.AutoDOMPlayback?.clearSession({ clientId }).catch(_logPlaybackCleanupError);
   const pinnedTab = _clientPins.get(clientId)?.tabId;
   if (pinnedTab != null) await _clearNetworkRules(pinnedTab);
   _clientPins.delete(clientId);
@@ -1977,6 +1985,7 @@ function _agentSystemPrompt(context, providerInfo, cacheKey, opts) {
     "\nAgent mode:\n" +
     "- Use the perception stack before acting: page context -> get_dom_state for indexed interactables -> take_snapshot for role/accessibility structure -> deep_query/list_iframes/list_shadow_roots/list_popups/list_tabs for hidden or external surfaces.\n" +
     "- For content inside iframes (including cross-origin) or web components: use list_iframes + iframe_interact (action='extract_text' or 'get_dom_state'), list_shadow_roots + shadow_interact, or deep_query. The extension pierces cross-origin iframes via the scripting API — never call an iframe unreachable until these tools fail.\n" +
+    "- Read contextHighlights when present. Reuse the returned target fields when acting inside a frame or shadow root. For actual playback, use media_verify_playback, then media_read_chunk for visual or caption evidence at a specific time. Report observed coverage.\n" +
     "- Identify the target with stable evidence (visible text, role/name, index, selector, frame/shadow context, current state) before clicking or typing. If the target is ambiguous, inspect more instead of guessing.\n" +
     "- Modern interactions are available: drag_and_drop, right_click, handle_dialog (accept/dismiss alerts before they hang the page), upload_file (needs absolute local path), set_attribute (toggle aria-*/hidden/disabled), check_element_state (verify before/after), take_snapshot (a11y/role tree), wait_for_network_idle (SPA readiness), and navigate {action:'back'|'forward'|'reload'}.\n" +
     "- Prefer batch_actions when you already know 2+ safe browser steps (click/type/wait/scroll); include waits/verification when the page is likely to re-render.\n" +
@@ -2128,6 +2137,14 @@ function _buildUserMessageForProvider(text, attachments, providerType) {
   // Unknown provider — fall back to text only so we never crash the loop
   // with an unsupported content shape.
   return { content: String(text || "") };
+}
+
+function _playbackImageMessage(tool, result, provider) {
+  if (tool !== "media_read_chunk" || !Array.isArray(result?.frames)) return null;
+  const images = result.frames.filter((frame) => frame.dataUrl);
+  if (!images.length) return null;
+  const label = `Playback evidence ${result.verificationId}, chunk ${result.chunkIndex}. Images follow the imageIndex order in the tool result.`;
+  return _buildUserMessageForProvider(label, images, provider);
 }
 
 // ─── Tab context injection helper ─────────────────────────────
@@ -2900,6 +2917,7 @@ async function runAgentLoop({
 
         // Execute each tool call sequentially (parallel disabled in OpenAI body)
         let _needsTabContextInjection = false;
+        const mediaMessages = [];
         for (const tc of resp.toolCalls) {
           if (isAborted()) return { done: true, payload: abortedReply() };
           const args = _safeJsonParse(tc.arguments);
@@ -2957,6 +2975,8 @@ async function runAgentLoop({
           });
           const rawResult = await executeAgentTool(tc.name, args, agentCtx);
           const result = AgentApi.truncateToolResult(tc.name, rawResult);
+          const evidence = _playbackImageMessage(tc.name, rawResult, providerType);
+          if (evidence) mediaMessages.push({ role: "user", ...evidence });
           // Re-pin the agent run to a new tab when the AI explicitly asked to.
           _maybeRepinAgentTab(tc.name, rawResult, undefined, agentCtx);
           // Track if any navigation tool ran — we'll inject tab context after.
@@ -2980,6 +3000,8 @@ async function runAgentLoop({
             content: deduper.process(tc.name, JSON.stringify(result)),
           });
         }
+        // Complete all tool replies before sending their image attachments.
+        messages.push(...mediaMessages);
         // Inject fresh tab context as a system-reminder after navigation
         if (_needsTabContextInjection) {
           const reminder = await _buildTabContextReminder(agentCtx);
@@ -3146,10 +3168,12 @@ async function runAgentLoop({
             error: rawResult?.error,
             result,
           });
+          const evidence = _playbackImageMessage(tc.name, rawResult, "anthropic");
+          const toolText = deduper.process(tc.name, JSON.stringify(result));
           toolResultBlocks.push({
             type: "tool_result",
             tool_use_id: tc.id,
-            content: deduper.process(tc.name, JSON.stringify(result)),
+            content: evidence ? [{ type: "text", text: toolText }, ...evidence.content] : toolText,
             is_error: !rawResult?.ok || !!rawResult?.error,
           });
         }
@@ -3237,6 +3261,7 @@ async function runAgentLoop({
 
     throw new Error(`Agent loop not implemented for provider: ${providerType}`);
     } finally {
+      await globalThis.AutoDOMPlayback?.clearSession(agentCtx).catch(_logPlaybackCleanupError);
       // Guarantee run-end fires even on uncaught throws, so the chat panel
       // hides its "Running…" indicator and Stop button regardless.
       endRun(runHandle.aborted);
@@ -3693,6 +3718,7 @@ chrome.tabs.onCreated.addListener((tab) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  globalThis.AutoDOMPlayback?.clearTab(tabId).catch(_logPlaybackCleanupError);
   recordAction("tab_closed", `Tab closed`, {}, tabId);
   _chatPanelReadyTabs.delete(tabId);
   // Recording tab closed → keep the steps as an unsaved draft; runs on the
@@ -5138,6 +5164,7 @@ function connectWebSocket(port) {
 }
 
 function disconnectWebSocket() {
+  globalThis.AutoDOMPlayback?.clearAll().catch(_logPlaybackCleanupError);
   stopKeepAlive();
   stopInactivityTimer();
   resolvePendingAiRequests("MCP stopped before the AI agent replied.");
@@ -5334,7 +5361,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     try {
       if (tid != null) {
         _chatPanelReadyTabs.add(tid);
-        _chatPanelInjectingTabs.delete(tid);
       }
       if (_activeAgentRun) {
         wasActive = true;
@@ -6335,54 +6361,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
         }
         if (tab && isInjectableTab(tab)) {
-          // Try sending the toggle message to the content script
-          try {
-            _debugLog(
-              "[AutoDOM SW] Sending TOGGLE_CHAT_PANEL to tab",
-              tab.id,
-              "mcpActive:",
-              isConnected,
-            );
+          if (await ensureChatPanelInjected(tab.id)) {
             await chrome.tabs.sendMessage(tab.id, {
               type: "TOGGLE_CHAT_PANEL",
               mcpActive: isConnected,
             });
-            _debugLog(
-              "[AutoDOM SW] TOGGLE_CHAT_PANEL sent successfully to tab",
-              tab.id,
-            );
-          } catch (_msgErr) {
-            // Content script not injected yet — inject it, then retry
-            _debugLog(
-              "[AutoDOM SW] Content script not found (error:",
-              _msgErr?.message,
-              "), injecting into tab",
-              tab.id,
-            );
-            try {
-              await chrome.scripting.executeScript({
-                target: { tabId: tab.id },
-                files: ["content/session-border.js"],
-              });
-              await chrome.scripting.executeScript({
-                target: { tabId: tab.id },
-                files: ["content/chat-panel.js"],
-              });
-              // Small delay to let the content script initialize
-              await new Promise((r) => setTimeout(r, 200));
-              // Retry the toggle
-              await chrome.tabs
-                .sendMessage(tab.id, {
-                  type: "TOGGLE_CHAT_PANEL",
-                  mcpActive: isConnected,
-                })
-                .catch(() => {});
-            } catch (injectErr) {
-              _debugError(
-                "[AutoDOM] Failed to inject content scripts:",
-                injectErr,
-              );
-            }
           }
           // Also send MCP status so the chat panel knows the current state
           if (isConnected) {
@@ -6471,6 +6454,9 @@ function _compactBridgeToolResult(result) {
   // Only the chat panel's tool stream consumes this; skip the work (and
   // the JSON.stringify of a multi-MB screenshot) when nobody listens.
   if (!pendingAiRequests.size) return null;
+  if (result.verificationId && Array.isArray(result.frames)) {
+    result = globalThis.AutoDOMAgent.truncateToolResult("media_read_chunk", result);
+  }
   if (typeof result === "object" && !Array.isArray(result)) {
     let bulky = 0;
     for (const k of _BULKY_RESULT_FIELDS) {
@@ -6930,14 +6916,14 @@ try {
   if (globalThis.AutoDOMWorkflow?.makeEngine) {
     workflowEngine = globalThis.AutoDOMWorkflow.makeEngine({
       getActiveTab,
-      executeInTab,
+      executeInTab: executePointerInTab,
       waitForTabComplete,
       storage: chrome.storage,
       log: _debugWarn,
       getSessionRecording: async () => sessionRecording,
       captureScreenshot: async (tabId) => {
         const tab = await chrome.tabs.get(tabId);
-        return _captureBackgroundTab(tab, { format: "jpeg", quality: 60 });
+        return _withoutActionCursor(tabId, () => _captureBackgroundTab(tab, { format: "jpeg", quality: 60 }));
       },
       openRunTab: _openWorkflowRunTab,
       closeRunTab: (tabId) => _closeRunTab(tabId),
@@ -7169,6 +7155,8 @@ try {
 
 if (chrome.webNavigation?.onCommitted) {
   chrome.webNavigation.onCommitted.addListener((details) => {
+    globalThis.AutoDOMPlayback?.clearTab(details.tabId, details.frameId || undefined, details.documentId)
+      .catch(_logPlaybackCleanupError);
     try { workflowEngine?.onNavigationCommitted(details); } catch (_) {}
   });
   chrome.webNavigation.onCompleted.addListener((details) => {
@@ -7706,15 +7694,113 @@ async function executeInFrames(tabId, func, args = [], frameIds = null, world = 
     args,
     world,
   });
-  return (results || []).map((r) => ({ frameId: r.frameId, result: r.result }));
+  return (results || []).map((r) => ({ frameId: r.frameId, documentId: r.documentId, result: r.result }));
+}
+
+// Action results carry a viewport point or DOMRect measured in the document
+// that dispatched the input. Address that same document even after a navigation.
+const _cursorDocumentByTab = new Map();
+chrome.tabs.onRemoved.addListener((tabId) => _cursorDocumentByTab.delete(tabId));
+
+function _pageDrawActionCursor(point, from) {
+  globalThis.__autodomClearActionCursor?.();
+  const id = "__autodom_action_cursor";
+  const old = document.getElementById(id);
+  if (old) old.remove();
+  const marker = document.createElement("div");
+  marker.id = id;
+  marker.setAttribute("data-autodom-ui", "");
+  marker.setAttribute("aria-hidden", "true");
+  marker.inert = true;
+  marker.style.cssText =
+    "all:initial;position:fixed!important;box-sizing:border-box!important;" +
+    "width:16px!important;height:16px!important;border-radius:100%!important;" +
+    "border:2px solid rgba(39,120,229,.85)!important;background:rgba(69,148,255,.22)!important;" +
+    "box-shadow:0 0 0 1px rgba(255,255,255,.8)!important;pointer-events:none!important;" +
+    "z-index:2147483647!important;";
+  marker.style.setProperty("left", point.x - 8 + "px", "important");
+  marker.style.setProperty("top", point.y - 8 + "px", "important");
+  document.documentElement.appendChild(marker);
+  // A modal dialog, fullscreen element or transformed root can cover or
+  // offset a fixed page element. A manual popover uses the viewport top
+  // layer and leaves the page's open menus and keyboard focus alone.
+  if (typeof marker.showPopover === "function") {
+    marker.popover = "manual";
+    try { marker.showPopover(); } catch (_) { marker.removeAttribute("popover"); }
+  }
+  const motionAllowed = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (motionAllowed) {
+    marker.animate([{ opacity: 1 }, { opacity: 0 }], { delay: 550, duration: 200, fill: "forwards" });
+  }
+  if (from && motionAllowed) {
+    marker.animate([
+      { transform: `translate(${from.x - point.x}px,${from.y - point.y}px)` },
+      { transform: "translate(0,0)" },
+    ], { duration: 240, easing: "ease-out" });
+  }
+  const clear = () => {
+    marker.remove();
+    clearTimeout(timer);
+    chrome.runtime.onMessage.removeListener(onMessage);
+    window.removeEventListener("pagehide", clear);
+    delete globalThis.__autodomClearActionCursor;
+  };
+  const onMessage = (msg) => {
+    if (msg.type === "HIDE_SESSION_BORDER" || msg.type === "AUTODOM_CLEAR_ACTION_CURSOR") clear();
+  };
+  globalThis.__autodomClearActionCursor = clear;
+  const timer = setTimeout(clear, 750);
+  chrome.runtime.onMessage.addListener(onMessage);
+  window.addEventListener("pagehide", clear, { once: true });
+}
+
+function _cursorCenter(rect) {
+  return { x: rect.x + (rect.width || 0) / 2, y: rect.y + (rect.height || 0) / 2 };
+}
+
+async function _consumeActionPointer(tabId, injection) {
+  const result = injection.result;
+  let pointer = null;
+  for (const entry of Array.isArray(result) ? result : [result]) {
+    if (!entry?._autodomPointer) continue;
+    pointer = entry._autodomPointer;
+    delete entry._autodomPointer;
+  }
+  if (pointer && isConnected) {
+    const point = _cursorCenter(pointer);
+    if (Number.isFinite(point.x) && Number.isFinite(point.y)) {
+      const target = injection.documentId
+        ? { tabId, documentIds: [injection.documentId] }
+        : { tabId, frameIds: [injection.frameId ?? 0] };
+      const address = injection.documentId ? { documentId: injection.documentId } : { frameId: injection.frameId ?? 0 };
+      const previous = _cursorDocumentByTab.get(tabId);
+      if (previous && previous.until > Date.now() &&
+          (previous.documentId !== address.documentId || previous.frameId !== address.frameId)) {
+        const { until, ...oldAddress } = previous;
+        await chrome.tabs.sendMessage(tabId, { type: "AUTODOM_CLEAR_ACTION_CURSOR" }, oldAddress).catch(() => {});
+      }
+      _cursorDocumentByTab.set(tabId, { ...address, until: Date.now() + 750 });
+      // Feedback is best-effort; a just-navigated document may be gone.
+      await chrome.scripting.executeScript({
+        target, world: "ISOLATED", func: _pageDrawActionCursor,
+        args: [point, pointer.from ? _cursorCenter(pointer.from) : null],
+      }).catch(() => {});
+    }
+  }
+  return result;
+}
+
+function executePointerInTab(tabId, func, args, world = "MAIN", frameId, documentId) {
+  return executeInTab(tabId, func, args, world, frameId, documentId, _consumeActionPointer);
 }
 
 // Inject and execute a function in the active tab's content script context
-async function executeInTab(tabId, func, args = [], world = "MAIN", frameId = 0) {
+async function executeInTab(tabId, func, args = [], world = "MAIN", frameId, documentId, onResult) {
   const injectStart = _swNow();
   try {
     const results = await chrome.scripting.executeScript({
-      target: frameId ? { tabId, frameIds: [frameId] } : { tabId },
+      target: documentId !== undefined || frameId !== undefined
+        ? await AutoDOMContext.injectionTarget(tabId, { frameId, documentId }) : { tabId },
       func,
       args,
       world,
@@ -7724,7 +7810,7 @@ async function executeInTab(tabId, func, args = [], world = "MAIN", frameId = 0)
       if (results[0].error) {
         throw new Error(results[0].error.message || "Script execution error");
       }
-      return results[0].result;
+      return onResult ? onResult(tabId, results[0]) : results[0].result;
     }
     return null;
   } catch (err) {
@@ -7957,8 +8043,8 @@ function _waitForNextLoad(tabId, timeoutMs, signal) {
 async function toolClick(params, ctx) {
   const step = { action: params?.dblClick ? "dblclick" : "click" };
   const ref = _refParam(params);
-  if (ref) return _actByRef(ref, step, ctx);
-  const res = await _actOnTarget(ctx, { selector: params?.selector ?? null, text: params?.text ?? null }, step);
+  if (ref) return _actByRef(ref, step, ctx, params);
+  const res = await _actOnTarget(ctx, { selector: params?.selector ?? null, text: params?.text ?? null }, step, params);
   if (res.error) return res;
   return { success: true, tag: res.tag, text: res.text, ..._foundIn(res) };
 }
@@ -7968,12 +8054,13 @@ async function toolTypeText(params, ctx) {
   const clearFirst = params?.clearFirst ?? params?.clear ?? false;
   const ref = _refParam(params);
   if (ref) {
-    return _actByRef(ref, { action: "fill", value: params?.text ?? "", append: !clearFirst }, ctx);
+    return _actByRef(ref, { action: "fill", value: params?.text ?? "", append: !clearFirst }, ctx, params);
   }
   const res = await _actOnTarget(
     ctx,
     { selector: params?.selector },
     { action: "fill", value: params?.text ?? "", append: !clearFirst },
+    params,
   );
   if (res.error) return res;
   return { success: true, ...(res.value !== undefined ? { value: res.value } : {}), ..._foundIn(res) };
@@ -7998,47 +8085,80 @@ function _refParam(params) {
 // Call a workflow-lib page entry point; inject the library only when the
 // entry answers { needLib } (new document or another build). The library
 // is idempotent per document, so this saves an executeScript per call.
-async function _callWfPage(tabId, fn, args, frameId = 0) {
-  const first = await executeInTab(tabId, fn, args, "ISOLATED", frameId);
+async function _callWfPage(tabId, fn, args, frameId, documentId) {
+  const first = await executePointerInTab(tabId, fn, args, "ISOLATED", frameId, documentId);
   if (!first?.needLib) return first;
-  await executeInTab(tabId, globalThis.AutoDOMWorkflow._page._pageWfLib, [], "ISOLATED", frameId);
-  return executeInTab(tabId, fn, args, "ISOLATED", frameId);
+  await executeInTab(tabId, globalThis.AutoDOMWorkflow._page._pageWfLib, [], "ISOLATED", frameId, documentId);
+  return executePointerInTab(tabId, fn, args, "ISOLATED", frameId, documentId);
 }
 
-// Run a page-library action where the target is first found: the top
-// document (open shadow roots included), then the tab's other frames.
-// The frames are only asked when the top document misses.
-async function _actOnTarget(ctx, target, step) {
-  const P = globalThis.AutoDOMWorkflow?._page;
-  if (!P) return { error: "workflow engine not loaded" };
-  const tab = await getActiveTab(ctx);
-  let res = await _callWfPage(tab.id, P._pageWfRunAction, [target, step]);
-  if (res?.miss) {
-    const frames = (await chrome.webNavigation.getAllFrames({ tabId: tab.id }).catch(() => null)) || [];
-    for (const frame of frames) {
-      if (frame.frameId === 0) continue;
-      const inFrame = await _callWfPage(tab.id, P._pageWfRunAction, [target, step], frame.frameId).catch(() => null);
-      if (inFrame && !inFrame.miss) {
-        res = { ...inFrame, via: "frame", frameId: frame.frameId };
-        break;
-      }
-    }
+// Parallel inspections of the same tab share only the in-flight read. A
+// subsequent snapshot must reflect new frames and component re-renders.
+const _pendingContextHighlights = new Map();
+function _contextHighlights(tabId) {
+  if (!_pendingContextHighlights.has(tabId)) {
+    const pending = AutoDOMContext.collect(tabId).then(result => result.contextHighlights)
+      .finally(() => _pendingContextHighlights.delete(tabId));
+    _pendingContextHighlights.set(tabId, pending);
   }
-  if (res?.ok) return res;
-  return { error: res?.miss ? `Element not found: ${target.selector || target.text}` : res?.error || "Action failed" };
+  return _pendingContextHighlights.get(tabId);
 }
 
-// Where _actOnTarget found the element, when it was not the top document.
-function _foundIn(res) {
-  if (res.via === "document") return {};
-  return { via: res.via, ...(res.frameId != null ? { frameId: res.frameId } : {}) };
+function _actionContext(target) {
+  const kind = target.hostPath?.length ? "shadow" : target.frameId ? "frame" : "document";
+  return { via: kind, ...(target.frameId != null && { frameId: target.frameId }),
+    ...(target.documentId && { documentId: target.documentId }),
+    ...(kind !== "document" && { contextHighlights: [{ kind, target }] }) };
 }
 
-async function _actByRef(ref, step, ctx) {
+// Qualified targets execute in exactly one root. An unqualified target on a
+// page with frames/shadow roots is resolved read-only before any mutation.
+async function _actOnTarget(ctx, target, step, params = {}) {
   const P = globalThis.AutoDOMWorkflow?._page;
   if (!P) return { error: "workflow engine not loaded" };
   const tab = await getActiveTab(ctx);
-  const res = await _callWfPage(tab.id, P._pageWfActOnRef, [ref, step]);
+  let scope = AutoDOMContext.scopeOf(params);
+  try {
+    const qualified = Object.keys(scope).length > 0;
+    const local = { ...target, ...scope, ...(qualified ? { hostPath: scope.hostPath ?? [] } : { checkContexts: true }) };
+    let res = await _callWfPage(tab.id, P._pageWfRunAction, [local, step], scope.frameId, scope.documentId);
+    if (res?.needsContext) {
+      const query = { mode: "query", action: step.action, selector: target.selector, text: target.selector ? "" : target.text, limit: 6 };
+      if (target.selector?.includes(">>>")) {
+        const path = target.selector.split(">>>").map(s => s.trim());
+        query.selector = path.pop();
+        query.hostPath = path;
+      }
+      const { results, contextHighlights, searchComplete } = await AutoDOMContext.collect(tab.id, query);
+      const candidates = (results || []).map(row => row.target).filter(Boolean);
+      if (candidates.length !== 1 || !searchComplete) {
+        const reason = candidates.length > 1 ? "Ambiguous target" : !searchComplete ? "Target search incomplete" : "Element not found";
+        return { error: reason + ": " + (target.selector || target.text), candidates, contextHighlights };
+      }
+      scope = candidates[0];
+      res = await _callWfPage(tab.id, P._pageWfRunAction, [{ ...scope, actionableOnly: true }, step], scope.frameId, scope.documentId);
+    }
+    if (res?.ok) return { ...res, ..._actionContext({ ...target, ...scope }) };
+    return { error: res?.miss ? "Element not found: " + (target.selector || target.text) : res?.error || "Action failed" };
+  } catch (err) {
+    return { error: err.message, ...(Object.keys(scope).length && { contextHighlights: [{ kind: "inaccessible", ...scope }] }) };
+  }
+}
+
+function _foundIn(res) {
+  if (res.via === "document" && res.frameId == null) return {};
+  return { via: res.via, ...(res.frameId != null && { frameId: res.frameId }), ...(res.documentId && { documentId: res.documentId }),
+    ...(res.contextHighlights && { contextHighlights: res.contextHighlights }) };
+}
+
+async function _actByRef(ref, step, ctx, params) {
+  const P = globalThis.AutoDOMWorkflow?._page;
+  if (!P) return { error: "workflow engine not loaded" };
+  const tab = await getActiveTab(ctx);
+  const scope = AutoDOMContext.scopeOf(params);
+  const res = Object.keys(scope).length
+    ? await _actOnTarget(ctx, { ref }, step, params)
+    : await _callWfPage(tab.id, P._pageWfActOnRef, [ref, step]);
   if (!res?.ok) {
     return {
       error: res?.error || `Action on @${ref} failed`,
@@ -8048,7 +8168,8 @@ async function _actByRef(ref, step, ctx) {
   return {
     success: true,
     ref: "@" + ref,
-    target: globalThis.AutoDOMWorkflow.describeTarget(res.after),
+    target: res.after ? globalThis.AutoDOMWorkflow.describeTarget(res.after) : res.tag,
+    ..._foundIn(res),
     ...(res.note ? { note: res.note } : {}),
   };
 }
@@ -8510,8 +8631,31 @@ async function _captureBackgroundTab(tab, params, clip, { beyondViewport = false
   return detail ? { dataUrl: await viewportShot, clipped: false } : viewportShot;
 }
 
+let actionCursorCaptureId = 0;
+async function _withoutActionCursor(tabId, capture) {
+  const style = {
+    target: { tabId, allFrames: true }, origin: "USER",
+    css: `/* capture ${++actionCursorCaptureId} */ #__autodom_action_cursor { display:none!important }`,
+  };
+  try {
+    await chrome.scripting.insertCSS(style);
+  } catch (_) {
+    // A restricted browser page cannot contain an injected cursor.
+    return capture();
+  }
+  try {
+    return await capture();
+  } finally {
+    await chrome.scripting.removeCSS(style).catch(() => {});
+  }
+}
+
 async function toolScreenshot(params, ctx) {
   const tab = await getActiveTab(ctx);
+  return _withoutActionCursor(tab.id, () => _takeScreenshot(tab, params, ctx));
+}
+
+async function _takeScreenshot(tab, params, ctx) {
 
   // Temporarily hide AutoDOM's own injected UI (chat panel, overlays,
   // stop button, run indicator) so the screenshot reflects what the
@@ -8527,6 +8671,7 @@ async function toolScreenshot(params, ctx) {
     "__autodom_run_indicator",
     "__bmcp_session_border",
     "__bmcp_session_border_badge",
+    "__autodom_action_cursor",
   ];
   const HIDE_MARK = "data-autodom-screenshot-hidden";
   const PUSH_CLASS = "__autodom_panel_open";
@@ -8975,6 +9120,15 @@ async function _captureMediaRegion(rect, params, ctx) {
 
 // 5. Take snapshot (DOM/a11y tree)
 async function toolSnapshot(params, ctx) {
+  const tab = await getActiveTab(ctx);
+  const [result, contextHighlights] = await Promise.all([
+    toolSnapshotMain(params, { ...ctx, tabId: tab.id }),
+    _contextHighlights(tab.id),
+  ]);
+  return { ...result, contextHighlights };
+}
+
+async function toolSnapshotMain(params, ctx) {
   // Features → compactSnapshotsDefault: no mode given → the compact
   // interactive list instead of the full tree.
   if (params?.mode == null && (await _getFeatures()).compactSnapshotsDefault === true) {
@@ -9116,22 +9270,11 @@ async function toolEvaluateScript(params, ctx) {
 
 // 7. Fill form
 async function toolFillForm(params, ctx) {
-  const P = globalThis.AutoDOMWorkflow?._page;
-  if (!P) return { error: "workflow engine not loaded" };
-  const tab = await getActiveTab(ctx);
-  const steps = (params?.fields || []).map((f) => [{ selector: f.selector }, { action: "fill", value: f.value }]);
-  // One round trip for the whole form; only fields the top document does
-  // not have go looking in other frames.
-  const top = await _callWfPage(tab.id, P._pageWfRunActions, [steps]);
   const results = [];
-  for (let i = 0; i < steps.length; i++) {
-    const [target, step] = steps[i];
-    const res = top?.[i]?.miss ? await _actOnTarget(ctx, target, step) : top?.[i];
-    results.push(
-      res?.ok
-        ? { selector: target.selector, success: true, ..._foundIn(res) }
-        : { selector: target.selector, error: /^Element not found/.test(res?.error || "") ? "Not found" : res?.error || "Not found" },
-    );
+  for (const field of params?.fields || []) {
+    const res = await _actOnTarget(ctx, { selector: field.selector }, { action: "fill", value: field.value }, { ...params, ...field });
+    results.push(res.ok ? { selector: field.selector, success: true, ..._foundIn(res) }
+      : { selector: field.selector, ...res });
   }
   return { success: true, results };
 }
@@ -9139,8 +9282,8 @@ async function toolFillForm(params, ctx) {
 // 8. Hover
 async function toolHover(params, ctx) {
   const ref = _refParam(params);
-  if (ref) return _actByRef(ref, { action: "hover" }, ctx);
-  const res = await _actOnTarget(ctx, { selector: params?.selector }, { action: "hover" });
+  if (ref) return _actByRef(ref, { action: "hover" }, ctx, params);
+  const res = await _actOnTarget(ctx, { selector: params?.selector }, { action: "hover" }, params);
   if (res.error) return res;
   return { success: true, tag: res.tag, ..._foundIn(res) };
 }
@@ -9149,10 +9292,10 @@ async function toolHover(params, ctx) {
 async function toolPressKey(params, ctx) {
   const key = params?.key || "Enter";
   const ref = _refParam(params);
-  if (ref) return _actByRef(ref, { action: "press", key }, ctx);
+  if (ref) return _actByRef(ref, { action: "press", key }, ctx, params);
   // No selector: the focused element, as a keyboard would.
   const target = params?.selector ? { selector: params.selector } : { active: true };
-  const res = await _actOnTarget(ctx, target, { action: "press", key });
+  const res = await _actOnTarget(ctx, target, { action: "press", key }, params);
   if (res.error) return res;
   return { success: true, key, ..._foundIn(res) };
 }
@@ -9937,8 +10080,8 @@ async function toolSelectOption(params, ctx) {
     ...(params?.index != null ? { index: Number(params.index) } : {}),
   };
   const ref = _refParam(params);
-  if (ref) return _actByRef(ref, step, ctx);
-  const res = await _actOnTarget(ctx, { selector: params?.selector }, step);
+  if (ref) return _actByRef(ref, step, ctx, params);
+  const res = await _actOnTarget(ctx, { selector: params?.selector }, step, params);
   if (res.error) return res;
   return {
     success: true,
@@ -10309,6 +10452,13 @@ async function toolGetHtml(params, ctx) {
         ? document.querySelector(selector)
         : document.documentElement;
       if (!el) return { error: `Element not found: ${selector}` };
+      const cursor = document.getElementById("__autodom_action_cursor");
+      if (cursor && el.contains(cursor)) {
+        if (el === cursor) return { html: "" };
+        const copy = el.cloneNode(true);
+        copy.querySelector("#__autodom_action_cursor")?.remove();
+        return { html: outer ? copy.outerHTML : copy.innerHTML };
+      }
       return { html: outer ? el.outerHTML : el.innerHTML };
     },
     [selector || null, outer || false],
@@ -10875,7 +11025,7 @@ async function toolCheckElementState(params, ctx) {
 async function toolDragAndDrop(params, ctx) {
   const tab = await getActiveTab(ctx);
   const { sourceSelector, targetSelector } = params;
-  return await executeInTab(
+  return await executePointerInTab(
     tab.id,
     (sourceSelector, targetSelector) => {
       const source = document.querySelector(sourceSelector);
@@ -10932,7 +11082,7 @@ async function toolDragAndDrop(params, ctx) {
         }),
       );
 
-      return { success: true };
+      return { success: true, _autodomPointer: { ...targetRect.toJSON(), from: sourceRect.toJSON() } };
     },
     [sourceSelector, targetSelector],
   );
@@ -10942,12 +11092,13 @@ async function toolDragAndDrop(params, ctx) {
 async function toolRightClick(params, ctx) {
   const tab = await getActiveTab(ctx);
   const { selector } = params;
-  return await executeInTab(
+  return await executePointerInTab(
     tab.id,
     (selector) => {
       const el = document.querySelector(selector);
       if (!el) return { error: `Element not found: ${selector}` };
       el.scrollIntoView({ behavior: "auto", block: "center" });
+      const pointer = el.getBoundingClientRect().toJSON();
       el.dispatchEvent(
         new MouseEvent("contextmenu", {
           bubbles: true,
@@ -10956,7 +11107,7 @@ async function toolRightClick(params, ctx) {
           button: 2,
         }),
       );
-      return { success: true, tag: el.tagName };
+      return { success: true, tag: el.tagName, _autodomPointer: pointer };
     },
     [selector],
   );
@@ -11602,21 +11753,37 @@ async function ensureChatPanelInjected(tabId) {
   if (_chatPanelInjectingTabs.has(tabId)) {
     return _chatPanelInjectingTabs.get(tabId);
   }
-  const injectionPromise = (async () => {
+  const injectionPromise = Promise.resolve().then(async () => {
     try {
-      await chrome.scripting.executeScript({
+      // Pin both operations to one document. Navigation between inserting
+      // CSS and mounting the panel must not leave the new document unstyled.
+      const [doc] = await chrome.scripting.executeScript({
         target: { tabId },
+        func: () => window.__autodomChatPanelLoaded?.isConnected === true,
+      });
+      if (doc?.result) {
+        if (_chatPanelInjectingTabs.get(tabId) === injectionPromise) _chatPanelReadyTabs.add(tabId);
+        return true;
+      }
+      const target = doc?.documentId ? { tabId, documentIds: [doc.documentId] } : { tabId };
+      // Browser-owned injection also works on pages that block extension
+      // stylesheet URLs or inline styles with their Content Security Policy.
+      await chrome.scripting.insertCSS({
+        target,
+        files: ["content/chat-panel.css"],
+      });
+      await chrome.scripting.executeScript({
+        target,
         files: ["common/webext-api.js", "content/chat-panel.js"],
       });
       return true;
     } catch (_) {
       // Restricted page (chrome://, file://, etc.) or tab gone — silent skip.
-      _chatPanelReadyTabs.delete(tabId);
       return false;
     } finally {
-      _chatPanelInjectingTabs.delete(tabId);
+      if (_chatPanelInjectingTabs.get(tabId) === injectionPromise) _chatPanelInjectingTabs.delete(tabId);
     }
-  })();
+  });
   _chatPanelInjectingTabs.set(tabId, injectionPromise);
   return injectionPromise;
 }
@@ -14603,6 +14770,15 @@ async function executeCodeViaCdp(tabId, code, timeoutMs) {
 // Returns ~2-5K chars instead of 500K+ for full snapshots.
 async function toolGetDomState(params, ctx) {
   const tab = await getActiveTab(ctx);
+  const [result, contextHighlights] = await Promise.all([
+    toolGetDomStateMain(params, { ...ctx, tabId: tab.id }),
+    _contextHighlights(tab.id),
+  ]);
+  return { ...result, contextHighlights };
+}
+
+async function toolGetDomStateMain(params, ctx) {
+  const tab = await getActiveTab(ctx);
   const includeHidden = params?.includeHidden || false;
   const maxElements = Math.min(200, Math.max(1, Number(params?.maxElements) || 60));
   const autoScroll = params?.autoScroll || false;
@@ -14710,6 +14886,7 @@ async function toolGetDomState(params, ctx) {
         "#__autodom_automation_stop",
         "#__bmcp_session_border",
         "#__bmcp_session_border_badge",
+        "#__autodom_action_cursor",
       ].join(",");
       const APP_CHROME_SELECTOR =
         "nav,aside,header,footer,[role='navigation']";
@@ -15194,7 +15371,7 @@ async function toolClickByIndex(params, ctx) {
   const tab = await getActiveTab(ctx);
   const { index, dblClick } = params;
 
-  return await executeInTab(
+  return await executePointerInTab(
     tab.id,
     (index, dblClick, includeHidden) => {
       function isUsable(el) {
@@ -15216,6 +15393,7 @@ async function toolClickByIndex(params, ctx) {
 
       function clickElement(el) {
         el.scrollIntoView({ behavior: "auto", block: "center" });
+        const pointer = el.getBoundingClientRect().toJSON();
         el.click();
         if (dblClick) {
           el.dispatchEvent(
@@ -15228,6 +15406,7 @@ async function toolClickByIndex(params, ctx) {
           tag: el.tagName.toLowerCase(),
           text: (el.textContent || "").trim().substring(0, 80),
           cached: true,
+          _autodomPointer: pointer,
         };
       }
 
@@ -15774,50 +15953,69 @@ async function toolListIframes(params, ctx) {
   const domBySrc = new Map();
   if (domInfo) {
     for (const d of domInfo) {
-      if (d.src) domBySrc.set(d.src, d);
+      if (d.src) domBySrc.set(d.src, domBySrc.has(d.src) ? null : d);
     }
   }
 
   return {
     mainFrameUrl: tab.url,
     iframeCount: iframes.length,
+    contextHighlights: iframes.slice(0, 32).map(f => ({ kind: "frame", frameId: f.frameId, parentFrameId: f.parentFrameId, documentId: f.documentId })).concat(iframes.length > 32 ? [{ kind: "truncated", omittedFrames: iframes.length - 32 }] : []),
     iframes: iframes.map((f) => ({
       frameId: f.frameId,
       parentFrameId: f.parentFrameId,
+      documentId: f.documentId,
       depth: frameDepthMap.get(f.frameId) ?? 1,
       url: f.url,
-      ...(domBySrc.get(f.url) || {}),
+      ...(f.parentFrameId === 0 && (domBySrc.get(f.url) || {})),
     })),
   };
 }
 
 // Execute an action inside a specific iframe
 
-function _runIframeInteractInPage(action, selector, text, value, fields, clearFirst, direction, pixels) {
+function _runIframeInteractInPage(action, selector, text, value, fields, clearFirst, direction, pixels, hostPath = []) {
+  let root = document;
+  if (!Array.isArray(hostPath)) return { error: "Invalid hostPath" };
+  for (const host of hostPath) {
+    const matches = root.querySelectorAll(host);
+    if (matches.length !== 1) return { error: "Missing or ambiguous shadow host: " + host };
+    root = matches[0].shadowRoot;
+    if (!root) return { error: "Shadow root inaccessible or closed: " + host };
+  }
+  const one = sel => {
+    const hits = root.querySelectorAll(sel);
+    if (hits.length > 1) throw new Error("Ambiguous selector in frame: " + sel);
+    return hits[0];
+  };
 
   // click
   if (action === "click") {
     let el;
     if (selector) {
-      el = document.querySelector(selector);
+      el = one(selector);
     } else if (text) {
       const walker = document.createTreeWalker(
-        document.body,
+        root.body || root,
         NodeFilter.SHOW_TEXT,
       );
       while (walker.nextNode()) {
         if (walker.currentNode.textContent.trim().includes(text)) {
-          el = walker.currentNode.parentElement;
-          break;
+          const parent = walker.currentNode.parentElement;
+          if (!parent || parent.closest("script,style,noscript,[data-autodom-ui]")) continue;
+          if (el && el !== parent) return { error: "Ambiguous text in frame: " + text };
+          el = parent;
         }
       }
     }
     if (!el)
       return { error: `Element not found in iframe: ${selector || text}` };
     el.scrollIntoView({ behavior: "auto", block: "center" });
+    const pointer = el.getBoundingClientRect().toJSON();
     el.click();
     return {
       success: true,
+      _autodomPointer: pointer,
       tag: el.tagName,
       text: el.textContent?.substring(0, 100),
     };
@@ -15825,7 +16023,7 @@ function _runIframeInteractInPage(action, selector, text, value, fields, clearFi
 
   // type
   if (action === "type") {
-    const el = document.querySelector(selector);
+    const el = one(selector);
     if (!el)
       return { error: `Element not found in iframe: ${selector}` };
     el.focus();
@@ -15835,11 +16033,7 @@ function _runIframeInteractInPage(action, selector, text, value, fields, clearFi
     }
     const nativeSetter =
       Object.getOwnPropertyDescriptor(
-        window.HTMLInputElement.prototype,
-        "value",
-      )?.set ||
-      Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype,
+        el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype,
         "value",
       )?.set;
     const newVal = (clearFirst ? "" : el.value || "") + value;
@@ -15855,7 +16049,7 @@ function _runIframeInteractInPage(action, selector, text, value, fields, clearFi
 
   // query — find elements
   if (action === "query") {
-    const els = document.querySelectorAll(selector);
+    const els = root.querySelectorAll(selector);
     const limit = 20;
     const items = [];
     for (let i = 0; i < Math.min(limit, els.length); i++) {
@@ -15876,19 +16070,19 @@ function _runIframeInteractInPage(action, selector, text, value, fields, clearFi
   // extract_text
   if (action === "extract_text") {
     if (selector) {
-      const el = document.querySelector(selector);
+      const el = one(selector);
       if (!el)
         return { error: `Element not found in iframe: ${selector}` };
       return { text: el.innerText };
     }
-    return { text: document.body.innerText };
+    return { text: (root.body || root).innerText ?? root.textContent };
   }
 
   // fill_form
   if (action === "fill_form" && fields) {
     const results = [];
     for (const field of fields) {
-      const el = document.querySelector(field.selector);
+      const el = one(field.selector);
       if (!el) {
         results.push({ selector: field.selector, error: "Not found" });
         continue;
@@ -15925,7 +16119,7 @@ function _runIframeInteractInPage(action, selector, text, value, fields, clearFi
     ];
     const seen = new Set();
     const elements = [];
-    const allEls = document.querySelectorAll(INTERACTIVE.join(","));
+    const allEls = root.querySelectorAll(INTERACTIVE.join(","));
     for (const el of allEls) {
       if (seen.has(el)) continue;
       seen.add(el);
@@ -15965,7 +16159,7 @@ function _runIframeInteractInPage(action, selector, text, value, fields, clearFi
 
   // select_option
   if (action === "select_option") {
-    const el = document.querySelector(selector);
+    const el = one(selector);
     if (!el) return { error: `Element not found in iframe: ${selector}` };
     const opt = Array.from(el.options || []).find(
       (o) => o.value === value || o.textContent.trim() === value,
@@ -15978,7 +16172,7 @@ function _runIframeInteractInPage(action, selector, text, value, fields, clearFi
 
   // scroll
   if (action === "scroll") {
-    const target = selector ? document.querySelector(selector) : document.scrollingElement || document.body;
+    const target = selector ? one(selector) : document.scrollingElement || document.body;
     if (!target) return { error: `Element not found in iframe: ${selector}` };
     const px = (typeof pixels === "number" ? pixels : 300);
     if (direction === "top") target.scrollTo({ top: 0, behavior: "auto" });
@@ -15990,17 +16184,18 @@ function _runIframeInteractInPage(action, selector, text, value, fields, clearFi
 
   // hover
   if (action === "hover") {
-    const el = document.querySelector(selector);
+    const el = one(selector);
     if (!el) return { error: `Element not found in iframe: ${selector}` };
     el.scrollIntoView({ behavior: "auto", block: "center" });
+    const pointer = el.getBoundingClientRect().toJSON();
     el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
     el.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false, cancelable: false, view: window }));
-    return { success: true, tag: el.tagName.toLowerCase() };
+    return { success: true, tag: el.tagName.toLowerCase(), _autodomPointer: pointer };
   }
 
   // check_element_state
   if (action === "check_element_state") {
-    const el = document.querySelector(selector);
+    const el = one(selector);
     if (!el) return { exists: false, selector };
     const rect = el.getBoundingClientRect();
     return {
@@ -16020,63 +16215,41 @@ async function toolIframeInteract(params, ctx) {
   const tab = await getActiveTab(ctx);
   const { frameId, action, selector, text, value, fields, clearFirst } = params;
 
-  if (frameId === undefined && !params.iframeSelector) {
+  if (frameId === undefined && !params.iframeSelector && !params.documentId) {
     return { error: "Provide frameId (from list_iframes) or iframeSelector" };
   }
 
   let targetFrameId = frameId;
+  let documentId = params.documentId;
 
-  // iframeSelector → frameId. Matching by src covers cross-origin frames;
-  // srcdoc, about:blank and same-src frames are found by tagging the
-  // frame's window, which the page can reach because they are same-origin.
+  // WindowProxy identity and the browser's frame order also work across
+  // origins, including siblings that load the same URL or redirect.
   if (targetFrameId === undefined && params.iframeSelector) {
-    const probe = `f${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const found = await executeInTab(
-      tab.id,
-      (sel, probe) => {
-        const iframe = document.querySelector(sel);
-        if (!iframe) return null;
-        let tagged = false;
-        try {
-          iframe.contentWindow.__autodomFrameProbe = probe;
-          tagged = true;
-        } catch (_) {}
-        return { src: iframe.src || "", tagged };
-      },
-      [params.iframeSelector, probe],
-    );
-    if (!found)
-      return {
-        error: `iframe not found with selector: ${params.iframeSelector}`,
-      };
-    let match = null;
-    if (found.tagged) {
-      const hits = await executeInFrames(
-        tab.id,
-        (probe) => {
-          const hit = window.__autodomFrameProbe === probe;
-          if (hit) delete window.__autodomFrameProbe;
-          return hit;
-        },
-        [probe],
-      );
-      match = hits.find((h) => h.result && h.frameId !== 0);
-    }
-    if (!match && found.src) {
-      const frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id });
-      match = frames.find((f) => f.url === found.src && f.frameId !== 0);
-    }
-    if (!match)
-      return { error: `Could not resolve a frame for iframe: ${params.iframeSelector}` };
-    targetFrameId = match.frameId;
+    const probe = await executeInTab(tab.id, sel => {
+      const matches = document.querySelectorAll(sel);
+      if (matches.length !== 1) return { error: matches.length ? "Ambiguous iframe selector: " + sel : "Iframe not found: " + sel };
+      const selected = matches[0].contentWindow;
+      for (let index = 0; index < window.length; index++) {
+        if (window[index] === selected) return { index };
+      }
+      return { error: "Selector does not identify a live iframe: " + sel };
+    }, [params.iframeSelector], "ISOLATED");
+    if (!probe || probe.error) return probe || { error: "Iframe selector unavailable" };
+    const frames = await executeInFrames(tab.id, index => {
+      return window !== window.top && window.parent === window.top && window.parent[index] === window;
+    }, [probe.index], null, "ISOLATED");
+    const matches = frames.filter(f => f.result);
+    if (matches.length !== 1) return { error: "Frame unavailable or ambiguous. Use frameId and documentId from list_iframes." };
+    targetFrameId = matches[0].frameId;
+    documentId ??= matches[0].documentId;
   }
 
   try {
     const results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id, frameIds: [targetFrameId] },
+      target: await AutoDOMContext.injectionTarget(tab.id, { frameId: targetFrameId, documentId }),
       world: "MAIN",
       func: _runIframeInteractInPage,
-      args: [action, selector, text, value, fields, clearFirst || false, params.direction, params.pixels],
+      args: [action, selector ?? null, text ?? null, value ?? null, fields ?? null, !!clearFirst, params.direction ?? null, params.pixels ?? null, params.hostPath ?? []],
     });
 
     if (results && results[0]) {
@@ -16085,7 +16258,10 @@ async function toolIframeInteract(params, ctx) {
           results[0].error.message || "Script execution error in iframe",
         );
       }
-      return { ...results[0].result, frameId: targetFrameId };
+      const actual = { frameId: results[0].frameId ?? targetFrameId, documentId: results[0].documentId ?? documentId, hostPath: params.hostPath ?? [] };
+      return { ...await _consumeActionPointer(tab.id, results[0]), ...actual, contextHighlights: [{
+        kind: actual.hostPath.length ? "shadow" : "frame", ...actual, ...(selector && { target: { ...actual, selector } }),
+      }] };
     }
     return { error: "No result from iframe script execution" };
   } catch (err) {
@@ -16098,82 +16274,34 @@ async function toolIframeInteract(params, ctx) {
 // List all elements that host an open shadow root
 async function toolListShadowRoots(params, ctx) {
   const tab = await getActiveTab(ctx);
-  return await executeInTab(
-    tab.id,
-    (maxDepth) => {
-      const results = [];
-      function findShadowHosts(root, path = "", depth = 0) {
-        if (depth > maxDepth) return;
-        const all = root.querySelectorAll("*");
-        for (const el of all) {
-          if (el.shadowRoot) {
-            const hostInfo = {
-              tag: el.tagName.toLowerCase(),
-              id: el.id || undefined,
-              className:
-                typeof el.className === "string"
-                  ? el.className.substring(0, 100)
-                  : undefined,
-              path: path || "document",
-              childElementCount: el.shadowRoot.children.length,
-              innerElementCount: el.shadowRoot.querySelectorAll("*").length,
-              // Build a selector to reach this host
-              selector: el.id
-                ? `#${CSS.escape(el.id)}`
-                : el.tagName.toLowerCase() +
-                  (el.className
-                    ? "." +
-                      el.className
-                        .toString()
-                        .split(" ")
-                        .filter(Boolean)
-                        .slice(0, 2)
-                        .join(".")
-                    : ""),
-            };
-            results.push(hostInfo);
-            // Recurse into nested shadow roots
-            findShadowHosts(
-              el.shadowRoot,
-              (path ? path + " >>> " : "") + hostInfo.selector,
-              depth + 1,
-            );
-          }
-        }
-      }
-      findShadowHosts(document, "", 0);
-      return { shadowRootCount: results.length, hosts: results };
-    },
-    [params?.maxDepth || 5],
-  );
+  const result = await AutoDOMContext.collect(tab.id, { ...params, mode: "hosts", maxDepth: params?.maxDepth ?? 5 });
+  const hosts = (result.hosts || []).map(host => ({ ...host, selector: host.hostPath.at(-1),
+    path: host.hostPath.slice(0, -1).join(" >>> ") || "document" }));
+  return { shadowRootCount: hosts.length, hosts, contextHighlights: result.contextHighlights, ...(result.error && { error: result.error }) };
 }
 
 // Interact with elements inside shadow DOMs using piercing selector
 // Piercing syntax: "host-selector >>> inner-selector" or nested "host1 >>> host2 >>> target"
 async function toolShadowInteract(params, ctx) {
   const tab = await getActiveTab(ctx);
-  const { piercingSelector, action, value, clearFirst, fields } = params;
+  const { action, value, clearFirst, fields } = params;
+  const parts = params.hostPath && params.selector
+    ? [...params.hostPath, params.selector]
+    : String(params.piercingSelector || "").split(">>>").map(part => part.trim());
 
-  if (!piercingSelector) {
+  if (parts.length < 2 || parts.some(part => typeof part !== "string" || !part)) {
     return { error: "piercingSelector is required (e.g. 'my-component >>> .inner-button')" };
   }
 
-  return await executeInTab(
+  const result = await executePointerInTab(
     tab.id,
-    (piercingSelector, action, value, clearFirst, fields, direction, pixels) => {
-      // Parse piercing selector: split on " >>> "
-      const parts = piercingSelector.split(" >>> ").map((s) => s.trim());
-      if (parts.length < 2) {
-        return {
-          error:
-            "piercingSelector must contain at least one ' >>> ' separator (e.g. 'host >>> target')",
-        };
-      }
-
+    (parts, action, value, clearFirst, fields, direction, pixels) => {
       // Traverse through shadow boundaries
       let currentRoot = document;
       for (let i = 0; i < parts.length - 1; i++) {
-        const host = currentRoot.querySelector(parts[i]);
+        const matches = currentRoot.querySelectorAll(parts[i]);
+        if (matches.length > 1) return { error: "Ambiguous shadow host: " + parts[i] };
+        const host = matches[0];
         if (!host) {
           return {
             error: `Shadow host not found: "${parts[i]}" at depth ${i}`,
@@ -16189,7 +16317,9 @@ async function toolShadowInteract(params, ctx) {
 
       // Now find the target element in the deepest shadow root
       const targetSelector = parts[parts.length - 1];
-      const el = currentRoot.querySelector(targetSelector);
+      const matches = currentRoot.querySelectorAll(targetSelector);
+      if (matches.length > 1 && !["query_all", "get_dom_state"].includes(action)) return { error: "Ambiguous shadow target: " + targetSelector };
+      const el = matches[0];
 
       if (!el) {
         return {
@@ -16212,8 +16342,10 @@ async function toolShadowInteract(params, ctx) {
 
       if (action === "click") {
         el.scrollIntoView({ behavior: "auto", block: "center" });
+        const pointer = el.getBoundingClientRect().toJSON();
         el.click();
         return {
+          _autodomPointer: pointer,
           success: true,
           tag: el.tagName.toLowerCase(),
           text: (el.textContent || "").trim().substring(0, 100),
@@ -16228,11 +16360,7 @@ async function toolShadowInteract(params, ctx) {
         }
         const nativeSetter =
           Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype,
-            "value",
-          )?.set ||
-          Object.getOwnPropertyDescriptor(
-            window.HTMLTextAreaElement.prototype,
+            el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype,
             "value",
           )?.set;
         const newVal = (clearFirst ? "" : el.value || "") + value;
@@ -16268,7 +16396,9 @@ async function toolShadowInteract(params, ctx) {
       if (action === "fill_form" && fields) {
         const results = [];
         for (const field of fields) {
-          const fieldEl = currentRoot.querySelector(field.selector);
+          const matches = currentRoot.querySelectorAll(field.selector);
+          if (matches.length > 1) { results.push({ selector: field.selector, error: "Ambiguous field" }); continue; }
+          const fieldEl = matches[0];
           if (!fieldEl) {
             results.push({ selector: field.selector, error: "Not found" });
             continue;
@@ -16359,164 +16489,28 @@ async function toolShadowInteract(params, ctx) {
 
       if (action === "hover") {
         el.scrollIntoView({ behavior: "auto", block: "center" });
+        const pointer = el.getBoundingClientRect().toJSON();
         el.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, composed: true, view: window }));
         el.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false, cancelable: false, composed: true, view: window }));
-        return { success: true, tag: el.tagName.toLowerCase() };
+        return { success: true, tag: el.tagName.toLowerCase(), _autodomPointer: pointer };
       }
 
       return { error: `Unknown shadow action: ${action}` };
     },
-    [piercingSelector, action || "query", value, clearFirst || false, fields, params.direction, params.pixels],
+    [parts, action || "query", value ?? null, !!clearFirst, fields ?? null, params.direction ?? null, params.pixels ?? null],
+    "ISOLATED", params.frameId, params.documentId,
   );
+  const target = { ...AutoDOMContext.scopeOf(params), frameId: params.frameId ?? (params.documentId ? undefined : 0), hostPath: parts.slice(0, -1), selector: parts.at(-1) };
+  return { ...result, contextHighlights: [{ kind: "shadow", target }] };
 }
 
 // Deep query: search across main DOM, all iframes, and all shadow DOMs
 async function toolDeepQuery(params, ctx) {
   const tab = await getActiveTab(ctx);
-  const { selector, text, limit } = params;
-  const maxItems = limit || 30;
-
-  // 1. Search main document (including shadow DOMs)
-  const mainResults = await executeInTab(
-    tab.id,
-    (selector, text, maxItems) => {
-      const results = [];
-
-      function searchInRoot(root, context) {
-        if (selector) {
-          const els = root.querySelectorAll(selector);
-          for (let i = 0; i < Math.min(els.length, maxItems - results.length); i++) {
-            results.push({
-              context,
-              tag: els[i].tagName.toLowerCase(),
-              text: (els[i].textContent || "").trim().substring(0, 200),
-              id: els[i].id || undefined,
-              visible: els[i].offsetParent !== null,
-              value: els[i].value || undefined,
-            });
-          }
-        }
-        if (text) {
-          const walker = document.createTreeWalker(
-            root,
-            NodeFilter.SHOW_TEXT,
-          );
-          while (walker.nextNode() && results.length < maxItems) {
-            if (walker.currentNode.textContent.trim().includes(text)) {
-              const parent = walker.currentNode.parentElement;
-              if (parent) {
-                results.push({
-                  context,
-                  tag: parent.tagName.toLowerCase(),
-                  text: walker.currentNode.textContent.trim().substring(0, 200),
-                  id: parent.id || undefined,
-                  visible: parent.offsetParent !== null,
-                });
-              }
-            }
-          }
-        }
-        // Recurse into shadow roots
-        if (results.length < maxItems) {
-          const all = root.querySelectorAll("*");
-          for (const el of all) {
-            if (el.shadowRoot && results.length < maxItems) {
-              const hostDesc =
-                el.tagName.toLowerCase() + (el.id ? `#${el.id}` : "");
-              searchInRoot(
-                el.shadowRoot,
-                context + " >>> " + hostDesc,
-              );
-            }
-          }
-        }
-      }
-
-      searchInRoot(document, "main");
-      return results;
-    },
-    [selector, text, maxItems],
-  );
-
-  // 2. Search inside iframes
-  let iframeResults = [];
-  try {
-    const frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id });
-    const iframes = (frames || []).filter((f) => f.frameId !== 0);
-
-    for (const frame of iframes) {
-      if (iframeResults.length + (mainResults || []).length >= maxItems) break;
-      try {
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: tab.id, frameIds: [frame.frameId] },
-          world: "MAIN",
-          func: (selector, text, maxItems) => {
-            const results = [];
-            function searchInRoot(root, context) {
-              if (selector) {
-                const els = root.querySelectorAll(selector);
-                for (let i = 0; i < Math.min(els.length, maxItems - results.length); i++) {
-                  results.push({
-                    context,
-                    tag: els[i].tagName.toLowerCase(),
-                    text: (els[i].textContent || "").trim().substring(0, 200),
-                    id: els[i].id || undefined,
-                    visible: els[i].offsetParent !== null,
-                    value: els[i].value || undefined,
-                  });
-                }
-              }
-              if (text) {
-                const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-                while (walker.nextNode() && results.length < maxItems) {
-                  if (walker.currentNode.textContent.trim().includes(text)) {
-                    const parent = walker.currentNode.parentElement;
-                    if (parent) results.push({ context, tag: parent.tagName.toLowerCase(), text: walker.currentNode.textContent.trim().substring(0, 200), id: parent.id || undefined, visible: parent.offsetParent !== null });
-                  }
-                }
-              }
-              if (results.length < maxItems) {
-                const all = root.querySelectorAll("*");
-                for (const el of all) {
-                  if (el.shadowRoot && results.length < maxItems) {
-                    searchInRoot(el.shadowRoot, context + " >>> " + el.tagName.toLowerCase() + (el.id ? "#" + el.id : ""));
-                  }
-                }
-              }
-            }
-            searchInRoot(document, "iframe");
-            return results;
-          },
-          args: [
-            selector,
-            text,
-            maxItems - (mainResults || []).length - iframeResults.length,
-          ],
-        });
-        if (results && results[0] && results[0].result) {
-          const framePrefix = `iframe[frameId=${frame.frameId}](${frame.url?.substring(0, 60)})`;
-          for (const item of results[0].result) {
-            iframeResults.push({
-              ...item,
-              context: item.context && item.context !== "iframe"
-                ? `${framePrefix} / ${item.context}`
-                : framePrefix,
-            });
-          }
-        }
-      } catch {
-        // Some frames may not be accessible (cross-origin without permissions)
-      }
-    }
-  } catch {
-    // webNavigation may fail on restricted pages
-  }
-
-  const allResults = [...(mainResults || []), ...iframeResults];
-  return {
-    totalFound: allResults.length,
-    results: allResults.slice(0, maxItems),
-  };
+  if (!params?.selector && !params?.text) return { error: "Provide selector or text" };
+  const result = await AutoDOMContext.collect(tab.id, { ...params, mode: "query", limit: params?.limit || 30 });
+  return { totalFound: result.results?.length || 0, results: result.results || [],
+    contextHighlights: result.contextHighlights, ...(result.error && { error: result.error }) };
 }
 
 // ─── Canvas Tools ────────────────────────────────────────────
@@ -16526,7 +16520,7 @@ async function toolCanvasInteract(params, ctx) {
   const { action, selector, x, y, maxSize, pathCommands, strokeStyle, fillStyle, lineWidth } = params;
   const canvasSel = selector || "canvas";
 
-  return await executeInTab(
+  return await executePointerInTab(
     tab.id,
     (action, canvasSel, x, y, maxSize, pathCommands, strokeStyle, fillStyle, lineWidth) => {
       const canvas = document.querySelector(canvasSel);
@@ -16569,7 +16563,7 @@ async function toolCanvasInteract(params, ctx) {
         canvas.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, clientX, clientY, view: window }));
         canvas.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, clientX, clientY, view: window }));
         canvas.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, clientX, clientY, view: window }));
-        return { success: true, canvasX: x, canvasY: y, clientX, clientY };
+        return { success: true, canvasX: x, canvasY: y, clientX, clientY, _autodomPointer: { x: clientX, y: clientY } };
       }
 
       if (action === "draw_path") {
@@ -16750,12 +16744,13 @@ async function toolDoubleClick(params, ctx) {
 async function toolMiddleClick(params, ctx) {
   const tab = await getActiveTab(ctx);
   const { selector } = params;
-  return await executeInTab(
+  return await executePointerInTab(
     tab.id,
     (selector) => {
       const el = document.querySelector(selector);
       if (!el) return { error: `Element not found: ${selector}` };
       el.scrollIntoView({ behavior: "auto", block: "center" });
+      const pointer = el.getBoundingClientRect().toJSON();
       el.dispatchEvent(
         new MouseEvent("auxclick", {
           bubbles: true,
@@ -16764,7 +16759,7 @@ async function toolMiddleClick(params, ctx) {
           button: 1,
         }),
       );
-      return { success: true, tag: el.tagName };
+      return { success: true, tag: el.tagName, _autodomPointer: pointer };
     },
     [selector],
   );
@@ -16774,15 +16769,16 @@ async function toolMiddleClick(params, ctx) {
 async function toolForceClick(params, ctx) {
   const tab = await getActiveTab(ctx);
   const { selector } = params;
-  return await executeInTab(
+  return await executePointerInTab(
     tab.id,
     (selector) => {
       const el = document.querySelector(selector);
       if (!el) return { error: `Element not found: ${selector}` };
+      const pointer = el.getBoundingClientRect().toJSON();
       // SVG and other non-HTML elements have no click() method.
       if (typeof el.click === "function") el.click();
       else el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
-      return { success: true, tag: el.tagName };
+      return { success: true, tag: el.tagName, _autodomPointer: pointer };
     },
     [selector],
   );
@@ -16805,7 +16801,7 @@ async function toolClickAtCoordinates(params, ctx) {
   const trusted = params?.trusted ?? (!IS_FIREFOX && _debuggerAttached.has(tab.id));
   // One injection: map the point into the viewport (scrolling to it when
   // needed), and dispatch synthetic events unless CDP will.
-  const hit = await executeInTab(
+  const injection = await executeInTab(
     tab.id,
     (x, y, docPoint, button, double, dispatch) => {
       if (docPoint) {
@@ -16834,7 +16830,9 @@ async function toolClickAtCoordinates(params, ctx) {
       return { x: Math.round(x), y: Math.round(y), tag: el?.tagName, id: el?.id || null };
     },
     [Number(params.x), Number(params.y), docPoint, button, double, !trusted],
+    "MAIN", undefined, undefined, (_tabId, entry) => entry,
   );
+  const hit = injection?.result;
   if (!hit) return { error: "Could not reach the page" };
   if (trusted) {
     try {
@@ -16852,6 +16850,8 @@ async function toolClickAtCoordinates(params, ctx) {
       detachDebuggerSafe(tab.id).catch(() => {});
     }
   }
+  hit._autodomPointer = { x: hit.x, y: hit.y };
+  await _consumeActionPointer(tab.id, injection);
   return { success: true, ...hit, trusted: !!trusted };
 }
 

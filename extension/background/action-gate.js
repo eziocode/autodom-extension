@@ -76,6 +76,8 @@
     "media_get_captions",
     "media_capture_frame",
     "media_sample_frames",
+    "media_verify_playback",
+    "media_read_chunk",
     "image_list",
     "image_get_data",
     "macro_record_stop",

@@ -990,6 +990,8 @@ const TOOL_TIERS = new Map([
   ["media_get_captions", "read"],
   ["media_capture_frame", "read"],
   ["media_sample_frames", "read"],
+  ["media_verify_playback", "read"],
+  ["media_read_chunk", "read"],
   ["image_list", "read"],
   ["image_get_data", "read"],
   ["media_control", "write"],
@@ -4848,6 +4850,11 @@ function callExtensionTool(tool, params, options = {}) {
   // Aborted when the MCP client cancels the request it is waiting on.
   const mcpCall = mcpRequestContext.getStore() || null;
   const clientSignal = options?.signal || mcpCall?.signal || null;
+  // Leave time to resolve the player and flush the last thumbnail after
+  // a maximum-length observation, including when relayed by another bridge.
+  const timeoutMs = tool === "media_verify_playback"
+    ? Math.max(TOOL_TIMEOUT, Math.min(30, Number(params?.durationSec) || 5) * 1000 + 5000)
+    : TOOL_TIMEOUT;
   const auditTier = getToolTier(tool, params);
   // Reset inactivity timer on every tool call
   touchActivity();
@@ -5024,9 +5031,9 @@ function callExtensionTool(tool, params, options = {}) {
           detachAbort();
           cancelOnPrimary("timeout");
           wrappedResolve({
-            error: `Tool "${tool}" timed out across proxy after ${TOOL_TIMEOUT}ms`,
+            error: `Tool "${tool}" timed out across proxy after ${timeoutMs}ms`,
           });
-        }, TOOL_TIMEOUT);
+        }, timeoutMs);
         const detachAbort = _onClientAbort(clientSignal, () => {
           if (!pendingCalls.has(id)) return;
           clearTimeout(timer);
@@ -5053,7 +5060,7 @@ function callExtensionTool(tool, params, options = {}) {
               id,
               tool,
               params,
-              timeoutMs: TOOL_TIMEOUT,
+              timeoutMs,
               ...(confirmedExecution ? { confirmed: true } : {}),
               ...isolationFrameFields(),
             }),
@@ -5180,8 +5187,8 @@ function callExtensionTool(tool, params, options = {}) {
       detachAbort();
       // Stop the extension from finishing a call nobody is waiting for.
       sendToolCancel(id, "timeout");
-      wrappedResolve({ error: `Tool "${tool}" timed out after ${TOOL_TIMEOUT}ms` });
-    }, TOOL_TIMEOUT);
+      wrappedResolve({ error: `Tool "${tool}" timed out after ${timeoutMs}ms` });
+    }, timeoutMs);
     const detachAbort = _onClientAbort(clientSignal, () => {
       if (!pendingCalls.has(id)) return;
       clearTimeout(timer);
@@ -5207,7 +5214,7 @@ function callExtensionTool(tool, params, options = {}) {
         id,
         tool,
         params,
-        timeoutMs: TOOL_TIMEOUT,
+        timeoutMs,
         ...(confirmedExecution ? { confirmed: true } : {}),
         ...isolationFrameFields(),
       });
@@ -6487,6 +6494,21 @@ const CLI_AGENT_TOOLS = [
     params: { text: "Save", limit: 20 },
   },
   {
+    name: "media_list",
+    description: "Find the primary player and frame-scoped media targets.",
+    params: {},
+  },
+  {
+    name: "media_verify_playback",
+    description: "Observe playback health and timestamped coverage without changing playback.",
+    params: { mode: "smart", durationSec: 5 },
+  },
+  {
+    name: "media_read_chunk",
+    description: "Read timestamped signatures, captions, and image availability for a chunk. This CLI planner receives text evidence.",
+    params: { verificationId: "id from media_verify_playback", chunkIndex: 0 },
+  },
+  {
     name: "batch_actions",
     description:
       "Execute up to 8 known browser actions sequentially in one call. Prefer this after get_dom_state when the next click/type/wait steps are clear.",
@@ -6706,10 +6728,22 @@ function containsManualBrowserGuidance(text) {
   );
 }
 
+// Text-only callers retain every timestamp without embedding image bytes.
+function playbackTextEvidence(value) {
+  if (!value?.verificationId || !Array.isArray(value.frames)) return value;
+  return { ...value, frames: value.frames.map(({ dataUrl, ...frame }) => ({
+    ...frame, imageAvailable: Boolean(dataUrl),
+  })) };
+}
+
 function truncateCliAgentResult(value, limit = CLI_AGENT_RESULT_LIMIT) {
   let text;
   try {
-    text = JSON.stringify(value, null, 2);
+    if (value?.contextHighlights?.length) {
+      const { contextHighlights, ...rest } = value;
+      value = { contextHighlights, ...rest };
+    }
+    text = JSON.stringify(playbackTextEvidence(value), null, 2);
   } catch (_) {
     text = String(value);
   }
@@ -6828,6 +6862,7 @@ function buildCliAgentPrompt({
     `- Do not run shell commands, terminal commands, or CLI tools. Return only the JSON decision for AutoDOM to execute.\n` +
     `- For browser actions, call tools. Never ask the user to run /dom, /click, /nav, paste DOM output, or manually click/type when a tool can do it.\n` +
     `- Perception order: use get_dom_state for indexes, take_snapshot for role/accessibility structure, then deep_query/list_iframes/list_shadow_roots/list_popups/list_tabs if the target is hidden or in another browser surface.\n` +
+    `- Use returned contextHighlights targets for scoped actions. For playback, use media_verify_playback and inspect a relevant chunk. Only claim content visible in the evidence you received.\n` +
     `- For multi-step tasks, observe first, identify the target by text/role/index/selector/state, then click/type/wait as needed.\n` +
     `- When 2+ next browser steps are known, prefer batch_actions so AutoDOM can execute them without another AI round-trip; include waits/verification when the page may re-render.\n` +
     `- After actions, verify with wait_for_network_idle, wait_for_text, check_element_state, get_page_info, get_dom_state, or take_snapshot before claiming success.\n` +
@@ -8167,8 +8202,13 @@ const SNAPSHOT_AFTER_PARAM = z
   .optional()
   .describe('Append snapshot after action: diff = changes since last snapshot, full = whole');
 
-// Shared by every tool that acts on the page. The extension attaches
-// page_changes to the result after the page settles.
+// Scoped target fields returned by nested-document inspection.
+const CONTEXT_TARGET = {
+  frameId: z.number().int().min(0).optional().describe("Frame from a returned target"),
+  documentId: z.string().optional().describe("Document identity from that target"),
+  hostPath: z.array(z.string()).optional().describe("Ordered open-shadow host selectors from that target"),
+};
+// The extension attaches page_changes after the page settles.
 const OBSERVE_PARAM = z
   .union([z.boolean(), z.number()])
   .optional()
@@ -8182,11 +8222,17 @@ function _withoutAtkParams(params = {}) {
 // Interactive snapshot as the agent should see it. "diff" shows only what
 // changed since the last snapshot of the same page; anything else records
 // the baseline so a later diff has one.
+function snapshotWithHighlights(snap, text = snap.snapshot) {
+  return snap.contextHighlights?.length
+    ? "contextHighlights " + JSON.stringify(snap.contextHighlights) + "\n" + text
+    : text;
+}
+
 function _snapshotView(snap, mode) {
   const entry = { url: snap.url, snapshot: snap.snapshot };
-  if (mode === "diff") return snapshotBaselines.update(entry).text;
-  snapshotBaselines.remember(entry);
-  return snap.snapshot;
+  const text = mode === "diff" ? snapshotBaselines.update(entry).text : snap.snapshot;
+  if (mode !== "diff" && mode !== "ax") snapshotBaselines.remember(entry);
+  return snapshotWithHighlights(snap, text);
 }
 
 // Run an action tool, then optionally append the page's interactive
@@ -8636,7 +8682,7 @@ function _registerPlaywrightCompatTool({ name, description, parameters }) {
       const result = await _callPlaywrightCompatTool(name, params);
       // Compact snapshots are plain text; JSON-escaping them wastes tokens.
       if (name === "browser_snapshot" && typeof result?.snapshot === "string") {
-        return compactResult(name, result.snapshot, params);
+        return compactResult(name, snapshotWithHighlights(result), params);
       }
       if (name === "browser_take_screenshot") return screenshotToolResult(result, params);
       if (name === "browser_console_messages" || name === "browser_network_requests" || name === "browser_evaluate") {
@@ -9271,13 +9317,14 @@ server.addTool({
 // pointer (base64 in a text block is pure token cost) and heavy results
 // get the same ATK filter their standalone tool would.
 function _compactBatchStepResult(tool, result, params) {
+  if (tool === "media_read_chunk") return playbackTextEvidence(result);
   if (result && typeof result === "object" && typeof result.screenshot === "string") {
     const { screenshot, ...rest } = result;
     return { ...rest, screenshot: `<image ${screenshot.length} chars omitted: call take_screenshot>` };
   }
   if (!hasFilter(tool) || (result && typeof result === "object" && result.error)) return result;
   const interactive = tool === "take_snapshot" && typeof result?.snapshot === "string";
-  const out = compactResult(tool, interactive ? result.snapshot : result, params);
+  const out = compactResult(tool, interactive ? snapshotWithHighlights(result) : result, params);
   return out instanceof AtkOutput ? out.text : result;
 }
 
@@ -9686,6 +9733,7 @@ server.addTool({
   description:
     "Click an element on the page by CSS selector or visible text content.",
   parameters: z.object({
+    ...CONTEXT_TARGET,
     observe: OBSERVE_PARAM,
     ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
     selector: z
@@ -9711,6 +9759,7 @@ server.addTool({
   name: "type_text",
   description: "Type text into an input or textarea element (by CSS selector or snapshot ref).",
   parameters: z.object({
+    ...CONTEXT_TARGET,
     observe: OBSERVE_PARAM,
     ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
     selector: z.string().optional().describe("CSS selector of the input element"),
@@ -9776,8 +9825,10 @@ function mediaImagesResult(result) {
   const content = [];
   const described = [];
   for (const { dataUrl, ...info } of items) {
-    if (typeof dataUrl !== "string") continue;
-    content.push(_imageBlock(dataUrl));
+    if (typeof dataUrl === "string") {
+      if (result.verificationId) info.imageIndex = content.length;
+      content.push(_imageBlock(dataUrl));
+    }
     described.push(info);
   }
   content.push({ type: "text", text: stringifyToolResult(result.frames ? { ...meta, frames: described } : meta) });
@@ -9790,6 +9841,7 @@ function mediaImagesResult(result) {
 // frame). Frames are encoded in the page, downscaled, returned once and
 // never stored.
 const MEDIA_TARGET = {
+  documentId: z.string().optional().describe("Document identity returned with the media target"),
   id: z.string().optional().describe('Media id from media_list ("m1", or "3:m1" inside a frame). Default: the primary video'),
   index: z.number().int().min(0).optional().describe("Position in media_list (top frame)"),
   selector: z.string().optional().describe("CSS selector of the element or its player container"),
@@ -9867,6 +9919,30 @@ server.addTool({
 });
 
 server.addTool({
+  name: "media_verify_playback",
+  description: "Observe actual playback without changing the player. Returns timestamped one-second chunk summaries, health, coverage, and a verificationId. Smart mode fingerprints observed frames and retains change thumbnails. Detailed mode requests an image per observed frame.",
+  parameters: z.object({
+    ...MEDIA_TARGET,
+    durationSec: z.number().min(1).max(30).optional().describe("Observation window in seconds (default 5)"),
+    mode: z.enum(["smart", "detailed"]).optional(),
+  }),
+  execute: async (params) => callExtensionTool("media_verify_playback", params),
+});
+
+server.addTool({
+  name: "media_read_chunk",
+  description: "Read timestamped frames and available images from a playback verification. Select a chunk by its index or elapsed seconds from observation start. Use nextOffset to page. Evidence expires after two minutes.",
+  parameters: z.object({
+    verificationId: z.string(),
+    chunkIndex: z.number().int().min(0).optional(),
+    elapsedSec: z.number().nonnegative().optional(),
+    offset: z.number().int().min(0).optional(),
+    limit: z.number().int().min(1).max(100).optional(),
+  }),
+  execute: async (params) => mediaImagesResult(await callExtensionTool("media_read_chunk", params)),
+});
+
+server.addTool({
   name: "image_list",
   description: "List <img> elements (including open shadow roots) with src, alt, natural size and bounding box.",
   parameters: z.object({
@@ -9939,7 +10015,7 @@ server.addTool({
     const forward = { ..._withoutAtkParams(params), mode: mode === "diff" ? "interactive" : mode };
     const result = await callExtensionTool("take_snapshot", forward);
     // ax lines are not comparable with interactive baselines: no diff.
-    if (mode === "ax" && typeof result?.snapshot === "string") return compactResult("take_snapshot", result.snapshot, params);
+    if (mode === "ax" && typeof result?.snapshot === "string") return compactResult("take_snapshot", _snapshotView(result, "ax"), params);
     if (mode !== "tree" && typeof result?.snapshot === "string") {
       return compactResult("take_snapshot", _snapshotView(result, mode), params);
     }
@@ -9971,10 +10047,12 @@ server.addTool({
   name: "fill_form",
   description: "Fill multiple form fields at once. Efficient batch operation.",
   parameters: z.object({
+    ...CONTEXT_TARGET,
     observe: OBSERVE_PARAM,
     fields: z
       .array(
         z.object({
+          ...CONTEXT_TARGET,
           selector: z.string().describe("CSS selector of the form field"),
           value: z.string().describe("Value to set"),
         }),
@@ -9993,6 +10071,7 @@ server.addTool({
   description:
     "Hover over an element to trigger hover effects, tooltips, or dropdowns.",
   parameters: z.object({
+    ...CONTEXT_TARGET,
     observe: OBSERVE_PARAM,
     ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
     selector: z.string().optional().describe("CSS selector of the element to hover"),
@@ -10009,6 +10088,7 @@ server.addTool({
   description:
     'Press a keyboard key or combination (e.g. "Enter", "Control+A", "Shift+Tab").',
   parameters: z.object({
+    ...CONTEXT_TARGET,
     observe: OBSERVE_PARAM,
     key: z
       .string()
@@ -10532,6 +10612,7 @@ server.addTool({
   description:
     "Select an option from a <select> dropdown by value, visible text, or index.",
   parameters: z.object({
+    ...CONTEXT_TARGET,
     observe: OBSERVE_PARAM,
     ref: z.string().optional().describe('Snapshot ref, e.g. "@e12"'),
     selector: z.string().optional().describe("CSS selector of the <select> element"),
@@ -11724,11 +11805,8 @@ server.addTool({
   description:
     "Act inside one iframe, chosen by frameId from list_iframes or by iframeSelector. click, type_text and the other action tools already look in frames when the top document has no match; use this to target a specific frame or to read it.",
   parameters: z.object({
+    ...CONTEXT_TARGET,
     observe: OBSERVE_PARAM,
-    frameId: z
-      .number()
-      .optional()
-      .describe("Frame ID from list_iframes (preferred)"),
     iframeSelector: z
       .string()
       .optional()
@@ -11800,9 +11878,12 @@ server.addTool({
   description:
     "Act inside shadow DOM with piercing selectors: 'host >>> inner' (nest: 'outer >>> inner-host >>> target'). Actions: click, type, query, query_all, extract_text, fill_form, get_dom_state. Find hosts with list_shadow_roots.",
   parameters: z.object({
+    ...CONTEXT_TARGET,
     observe: OBSERVE_PARAM,
+    selector: z.string().optional().describe("Element selector inside hostPath"),
     piercingSelector: z
       .string()
+      .optional()
       .describe(
         "Piercing selector using ' >>> ' to cross shadow boundaries. " +
           "Example: 'my-component >>> .inner-button' or '#app >>> settings-panel >>> input[name=email]'",
@@ -11842,6 +11923,7 @@ server.addTool({
   description:
     "Find elements anywhere: main page, all iframes, all shadow DOMs, by CSS selector and/or text. Each match reports its context (main, iframe[frameId=N], shadow path). Use when you do not know where an element lives.",
   parameters: z.object({
+    ...CONTEXT_TARGET,
     selector: z
       .string()
       .optional()

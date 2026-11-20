@@ -21,6 +21,11 @@
   // Only tools that make sense for an autonomous browser agent.
   // Big/dangerous/admin tools (eval, set_cookie, recording, perf, etc.)
   // are deliberately excluded for safety + token efficiency.
+  const contextTarget = {
+    frameId: { type: "integer", description: "Frame from a returned target" },
+    documentId: { type: "string", description: "Document identity from that target" },
+    hostPath: { type: "array", items: { type: "string" }, description: "Ordered open-shadow host selectors" },
+  };
   const TOOL_CATALOG = [
     // ── Reads ──
     {
@@ -297,7 +302,7 @@
       description: "Click an element by CSS selector.",
       parameters: {
         type: "object",
-        properties: { selector: { type: "string" } },
+        properties: { ...contextTarget, selector: { type: "string" } },
         required: ["selector"],
       },
       danger: "write",
@@ -319,6 +324,7 @@
       parameters: {
         type: "object",
         properties: {
+          ...contextTarget,
           selector: { type: "string" },
           text: { type: "string" },
           clear: {
@@ -348,13 +354,14 @@
     {
       name: "fill_form",
       description:
-        "Fill multiple form fields in one call. fields = map of selector → value.",
+        "Fill multiple form fields in one call. Each field accepts a selector, value and optional frame/shadow target.",
       parameters: {
         type: "object",
         properties: {
+          ...contextTarget,
           fields: {
-            type: "object",
-            description: "Map of CSS selector → value",
+            type: "array",
+            items: { type: "object", properties: { ...contextTarget, selector: { type: "string" }, value: { type: "string" } }, required: ["selector", "value"] },
           },
         },
         required: ["fields"],
@@ -434,6 +441,7 @@
       parameters: {
         type: "object",
         properties: {
+          ...contextTarget,
           selector: { type: "string" },
           value: { type: "string" },
         },
@@ -448,6 +456,7 @@
       parameters: {
         type: "object",
         properties: {
+          ...contextTarget,
           key: { type: "string" },
           selector: { type: "string" },
         },
@@ -473,7 +482,7 @@
       description: "Hover over an element by selector (triggers mouseenter).",
       parameters: {
         type: "object",
-        properties: { selector: { type: "string" } },
+        properties: { ...contextTarget, selector: { type: "string" } },
         required: ["selector"],
       },
     },
@@ -735,7 +744,7 @@
       parameters: {
         type: "object",
         properties: {
-          frameId: { type: "integer", description: "frameId from list_iframes (preferred)" },
+          ...contextTarget,
           iframeSelector: { type: "string", description: "CSS selector for the <iframe> element on the parent page (fallback)" },
           action: {
             type: "string",
@@ -783,6 +792,8 @@
       parameters: {
         type: "object",
         properties: {
+          ...contextTarget,
+          selector: { type: "string", description: "Element selector inside hostPath" },
           piercingSelector: {
             type: "string",
             description: "e.g. 'my-component >>> .inner-button'",
@@ -801,7 +812,6 @@
           direction: { type: "string", description: "For scroll: up/down/top/bottom" },
           pixels: { type: "integer", description: "For scroll: pixel amount" },
         },
-        required: ["piercingSelector"],
       },
       danger: "write",
     },
@@ -815,6 +825,7 @@
       parameters: {
         type: "object",
         properties: {
+          ...contextTarget,
           selector: { type: "string", description: "CSS selector to match" },
           text: { type: "string", description: "Text substring to match" },
           limit: { type: "integer", description: "Max results (default 30)" },
@@ -1181,13 +1192,22 @@
       out.rows = out.rows.slice(0, MAX_LIST_ITEMS);
       out.truncated = `Showing first ${MAX_LIST_ITEMS} rows`;
     }
+    // Images travel as provider-native image blocks. Keep timestamps and
+    // their correspondence to images available to both chat and its tool UI.
+    if (toolName === "media_read_chunk" && Array.isArray(out.frames)) {
+      let imageIndex = 0;
+      out.frames = out.frames.map(({ dataUrl, ...frame }) =>
+        dataUrl ? { ...frame, imageIndex: imageIndex++ } : frame);
+    }
     // Final stringified safety cap
     try {
       const json = JSON.stringify(out);
       if (json.length > 12000) {
         return {
-          ok: true,
+          ok: out.ok !== false && !out.error,
           truncated: true,
+          ...(out.contextHighlights?.length && { contextHighlights: out.contextHighlights }),
+          ...(out.verificationId && { verificationId: out.verificationId, nextOffset: out.nextOffset }),
           summary: truncateString(json, 12000, "result"),
         };
       }

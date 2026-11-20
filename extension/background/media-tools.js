@@ -24,9 +24,8 @@
  * Exposed via globalThis.AutoDOMMediaTools = { makeHandlers, catalog }.
  * Risk tiers for these tools live in action-gate.js (SAFE_READ/DESTRUCTIVE).
  *
- * Frames are never stored: they are drawn, downscaled and encoded in the
- * page, returned once, and dropped. Nothing is written to the page DOM
- * (media ids live in a WeakMap), so there is nothing to clean up after.
+ * Frame sampling returns images once. Playback verification retains bounded
+ * evidence in the target's isolated world until expiry or session cleanup.
  */
 (function () {
   // ─── Page-side media/image ops (serialized into the tab) ────────────
@@ -52,15 +51,21 @@
 
       // Document plus every open shadow root, bounded so a huge page
       // cannot stall the call.
+      let cachedRoots, scanTruncated = false;
       const roots = () => {
+        if (cachedRoots) return cachedRoots;
         const out = [document];
-        for (let i = 0; i < out.length && out.length < 64; i++) {
-          const w = document.createTreeWalker(out[i], NodeFilter.SHOW_ELEMENT);
-          for (let n = w.nextNode(), seen = 0; n && seen < 20000; n = w.nextNode(), seen++) {
-            if (n.shadowRoot) out.push(n.shadowRoot);
+        for (let i = 0; i < out.length; i++) {
+          const walker = document.createTreeWalker(out[i], NodeFilter.SHOW_ELEMENT);
+          let seen = 0;
+          for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+            if (++seen > 20000) { scanTruncated = true; break; }
+            if (!n.shadowRoot) continue;
+            if (out.length < 64) out.push(n.shadowRoot);
+            else scanTruncated = true;
           }
         }
-        return out;
+        return (cachedRoots = out);
       };
       const all = (sel) => roots().flatMap((r) => Array.from(r.querySelectorAll(sel)));
       const idOf = (el) => {
@@ -119,6 +124,13 @@
         if (videoOnly && el.tagName !== "VIDEO") return { error: "target is <audio>; frames need a <video>" };
         return { el };
       };
+      const shadowHosts = (el) => {
+        const hosts = [];
+        for (let host = el.getRootNode?.().host; host; host = host.getRootNode().host) {
+          hosts.unshift(host.id ? "#" + CSS.escape(host.id) : host.localName);
+        }
+        return hosts;
+      };
       const describe = (el, index) => {
         const g = geom(el);
         const src = el.currentSrc || el.src || "";
@@ -126,6 +138,7 @@
         const video = el.tagName === "VIDEO";
         return {
           id: idOf(el),
+          shadowHostPath: shadowHosts(el),
           index,
           tag: el.tagName.toLowerCase(),
           src: src.startsWith("data:") ? "data:(inline)" : src.slice(0, 300) || null,
@@ -256,7 +269,13 @@
           if (a.visibleOnly && !g.shown) continue;
           embeds.push({ provider: host.replace(/^www\./, ""), src: f.src.slice(0, 300), visible: g.shown, bbox: g.bbox });
         }
-        return { url: location.href, media: shown.slice(0, clamp(Number(a.limit) || 50, 1, 200)), embeds };
+        const limit = clamp(Number(a.limit) || 50, 1, 200);
+        const page = shown.slice(0, limit);
+        // Preserve the selected primary even on pages with many inline previews.
+        const rank = m => m.tag === "audio" ? -1 : m.score;
+        const best = shown.reduce((best, m) => !best || rank(m) > rank(best) ? m : best, null);
+        if (best && !page.includes(best)) page[page.length - 1] = best;
+        return { url: location.href, media: page, embeds, truncated: scanTruncated || shown.length > limit };
       };
 
       const control = () => {
@@ -310,7 +329,7 @@
         return {
           ok: true,
           action: a.action || "toggle",
-          id: idOf(el),
+          id: idOf(el), shadowHostPath: shadowHosts(el),
           state: { currentTime: r2(el.currentTime), paused: el.paused, muted: el.muted, volume: el.volume, playbackRate: el.playbackRate },
         };
       };
@@ -389,7 +408,7 @@
         }
         return {
           ok: true,
-          id: idOf(el),
+          id: idOf(el), shadowHostPath: shadowHosts(el),
           source,
           tracks: tracks.map((t, i) => ({ index: i, kind: t.kind, label: t.label, language: t.language, mode: t.mode })),
           track: ti,
@@ -407,7 +426,7 @@
         if (el.readyState < 1 || !el.videoWidth || !el.videoHeight) {
           return { ok: false, error: "video has no metadata yet (not loaded); play it or seek once, then retry", readyState: el.readyState };
         }
-        const video = { id: idOf(el), duration: Number.isFinite(el.duration) ? r2(el.duration) : null, width: el.videoWidth, height: el.videoHeight };
+        const video = { id: idOf(el), shadowHostPath: shadowHosts(el), duration: Number.isFinite(el.duration) ? r2(el.duration) : null, width: el.videoWidth, height: el.videoHeight };
         const runId = a.runId || "";
         const deadline = performance.now() + clamp(Number(a.deadlineMs) || 22000, 2000, 25000);
         const budget = clamp(Number(a.maxBytes) || 4_000_000, 100_000, 16_000_000);
@@ -595,6 +614,19 @@
 
       switch (op) {
         case "list": return list();
+        case "primary":
+        case "locate": {
+          const p = pick(false);
+          if (p.error) return { ok: false, error: p.error };
+          return { ok: true, id: idOf(p.el), tag: p.el.tagName, score: score(p.el),
+            shadowHostPath: shadowHosts(p.el) };
+        }
+        case "bindPlayback": {
+          const p = pick(false); // resolve the previously returned WeakMap id again
+          if (p.error) return { ok: false, error: p.error };
+          p.el.dispatchEvent(new Event(a.eventName, { bubbles: true, composed: true }));
+          return { ok: true };
+        }
         case "control": return control();
         case "captions": return await captions();
         case "frames": return await frames();
@@ -782,10 +814,10 @@
     const media = [];
     const embeds = [];
     const scanned = [];
-    for (const { frameId, result } of frames) {
+    for (const { frameId, documentId, result } of frames) {
       if (!result || !Array.isArray(result.media)) continue;
       if (frameId && result.media.length) scanned.push(result.url || "");
-      for (const m of result.media) media.push(frameId ? { ...m, id: `${frameId}:${m.id}`, frameId } : m);
+      for (const m of result.media) media.push({ ...m, ...(documentId && { documentId }), ...(frameId && { id: `${frameId}:${m.id}`, frameId }) });
       embeds.push(...(result.embeds || []));
     }
     const sameDoc = (u, v) => {
@@ -798,7 +830,8 @@
       }
     };
     let primary = null;
-    for (const m of media) if (m.score > 0 && (!primary || m.score > primary.score)) primary = m;
+    const rank = m => m.tag === "audio" ? -1 : m.score;
+    for (const m of media) if (!primary || rank(m) > rank(primary)) primary = m;
     for (const m of media) {
       if (m === primary) m.primary = true;
       delete m.score;
@@ -806,22 +839,73 @@
     const unscanned = embeds
       .filter((e) => !scanned.some((u) => sameDoc(u, e.src)))
       .map((e) => ({ ...e, note: "player frame shows no <video> yet (it may load on click)" }));
+    const highlights = media.filter(m => m.frameId || m.shadowHostPath?.length)
+      .sort((a, b) => Number(!!b.primary) - Number(!!a.primary)).map(mediaHighlight);
+    for (const e of unscanned) highlights.push({ kind: "frame", reason: "Embedded player has no detected media",
+      provider: e.provider, tool: "list_iframes", target: {} });
+    if (frames.some(f => f.result?.truncated) || highlights.length > 8) {
+      highlights.splice(8);
+      highlights.push({ kind: "truncated", reason: "Media scan or highlight limit" });
+    }
     return {
       count: media.length,
       primary: primary ? primary.id : null,
       media,
+      ...(highlights.length && { contextHighlights: highlights }),
+      ...(frames.some(f => f.result?.truncated) && { truncated: true }),
       ...(unscanned.length && { embeds: unscanned }),
     };
+  }
+
+  function mediaHighlight(m) {
+    return { kind: m.shadowHostPath?.length ? "shadow" : "frame", frameId: m.frameId || 0, ...(m.documentId && { documentId: m.documentId }),
+      hostPath: m.shadowHostPath || [], reason: m.primary ? "primary player" : "media in nested context",
+      tool: "media_verify_playback", target: { id: m.id, ...(m.documentId && { documentId: m.documentId }) } };
   }
 
   function makeHandlers(ctx) {
     const { getActiveTab, executeInTab, executeInFrames, captureRegion, onCallCancel, sendToOffscreen } = ctx;
 
+    globalThis.AutoDOMPlayback?.configure(executeInTab);
+
     // One _pageMedia op in the frame the target names, else the top frame.
     async function run(tab, op, args) {
+      if (args.documentId) {
+        return executeInTab(tab.id, _pageMedia, [op, args], "MAIN", args.frameId, args.documentId, (_id, injection) => {
+          args.frameId = injection.frameId;
+          return injection.result;
+        });
+      }
       if (args.frameId == null || !executeInFrames) return executeInTab(tab.id, _pageMedia, [op, args]);
       const [r] = await executeInFrames(tab.id, _pageMedia, [op, args], [args.frameId]);
+      if (r?.documentId) args.documentId = r.documentId;
       return r ? r.result : { ok: false, error: `frame ${args.frameId} is gone (call media_list again)` };
+    }
+
+    async function target(tab, params) {
+      const args = _mediaTarget(params);
+      if (args.id != null || args.index != null || args.selector || args.documentId || !executeInFrames) return args;
+      let candidates;
+      try { candidates = await executeInFrames(tab.id, _pageMedia, ["primary", {}]); }
+      catch (_) { return args; } // all-frame injection unavailable; top-frame call returns its own error
+      let best = null;
+      for (const candidate of candidates) {
+        if (!candidate.result?.ok) continue;
+        const rank = candidate.result.tag === "AUDIO" ? -1 : candidate.result.score;
+        if (!best || rank > best.rank) best = { rank, candidate };
+      }
+      if (!best) return args;
+      const { frameId, documentId, result } = best.candidate;
+      return { ...args, id: result.id, frameId, documentId, shadowHostPath: result.shadowHostPath };
+    }
+
+    function scoped(result, args) {
+      const id = result?.id || result?.video?.id || args.id;
+      const hostPath = result?.shadowHostPath || result?.video?.shadowHostPath || args.shadowHostPath;
+      if (!result || !id || !(args.frameId || hostPath?.length)) return result;
+      const scopedId = args.frameId ? `${args.frameId}:${id}` : id;
+      return { ...result, contextHighlights: [mediaHighlight({ ...args, id: scopedId,
+        shadowHostPath: hostPath })] };
     }
 
     // The page cannot read a cross-origin video's pixels, but the tab's
@@ -854,17 +938,36 @@
 
     async function sampleFrames(params, callCtx, single) {
       const tab = await getActiveTab(callCtx);
-      const args = { ..._mediaTarget(params), single, runId: Math.random().toString(36).slice(2) };
+      const args = { ...await target(tab, params), single, runId: Math.random().toString(36).slice(2) };
       const detach = onCallCancel ? onCallCancel(callCtx, () => run(tab, "cancel", args).catch(() => {})) : () => {};
       try {
         const res = await run(tab, "frames", args);
-        return res && res.tainted ? await viewportFrames(tab, args, res, callCtx) : res;
+        return scoped(res && res.tainted ? await viewportFrames(tab, args, res, callCtx) : res, args);
       } finally {
         detach();
       }
     }
 
     return {
+      media_verify_playback: async (params, callCtx) => {
+        const tab = await getActiveTab(callCtx);
+        const args = await target(tab, params);
+        let found;
+        if (!args.documentId && executeInFrames) {
+          const [result] = await executeInFrames(tab.id, _pageMedia, ["locate", args], [args.frameId || 0]);
+          found = result?.result;
+          args.documentId = result?.documentId;
+        } else {
+          found = await run(tab, "locate", args);
+        }
+        if (!found?.ok) return found || { ok: false, error: "Media target unavailable" };
+        const bindTarget = eventName => run(tab, "bindPlayback", {
+          frameId: args.frameId, documentId: args.documentId, id: found.id, eventName
+        });
+        return scoped(await globalThis.AutoDOMPlayback.verify({ tab, args, found, callCtx, executeInTab, onCallCancel, bindTarget }),
+          { ...args, id: found.id, shadowHostPath: found.shadowHostPath });
+      },
+      media_read_chunk: (params, callCtx) => globalThis.AutoDOMPlayback.read(params, callCtx),
       media_list: async (params, callCtx) => {
         const tab = await getActiveTab(callCtx);
         const args = { visibleOnly: !!params?.visibleOnly, limit: params?.limit };
@@ -879,11 +982,13 @@
       },
       media_control: async (params, callCtx) => {
         const tab = await getActiveTab(callCtx);
-        return run(tab, "control", _mediaTarget(params));
+        const args = await target(tab, params);
+        return scoped(await run(tab, "control", args), args);
       },
       media_get_captions: async (params, callCtx) => {
         const tab = await getActiveTab(callCtx);
-        return run(tab, "captions", _mediaTarget(params));
+        const args = await target(tab, params);
+        return scoped(await run(tab, "captions", args), args);
       },
       media_capture_frame: (params, callCtx) => sampleFrames(params, callCtx, true),
       media_sample_frames: (params, callCtx) => sampleFrames(params, callCtx, false),
@@ -971,6 +1076,7 @@
   // ─── Tool catalog (exposed to the in-panel agent) ───────────────────
   // The MCP server declares the same tools with zod in server/index.js.
   const TARGET = {
+    documentId: { type: "string", description: "Pin media target to this browser document from media_list." },
     id: { type: "string", description: "Media id from media_list (\"m1\", or \"3:m1\" inside a frame). Default: the primary video." },
     index: { type: "integer", description: "Position in media_list (top frame)" },
     selector: { type: "string", description: "CSS selector of the element or its player container" },
@@ -1048,6 +1154,22 @@
         },
         additionalProperties: false,
       },
+    },
+    {
+      name: "media_verify_playback",
+      description: "Observe real playback without changing player state. Returns timestamped one-second chunk summaries, coverage, gaps and decoder drops. Read images and captions on demand with media_read_chunk.",
+      parameters: { type: "object", properties: { ...TARGET,
+        mode: { type: "string", enum: ["smart", "detailed"], description: "Smart signs each frame and retains change/anomaly thumbnails. Detailed requests WebP for each observed frame." },
+        durationSec: { type: "number", minimum: 1, maximum: 30, description: "Observation window in seconds (default 5)." }
+      }, additionalProperties: false },
+    },
+    {
+      name: "media_read_chunk",
+      description: "Read playback evidence by elapsed wall time or chunk index. Follow nextOffset for more frames. Evidence expires after two minutes.",
+      parameters: { type: "object", properties: { verificationId: { type: "string" },
+        chunkIndex: { type: "integer", minimum: 0 }, elapsedSec: { type: "number", minimum: 0 },
+        offset: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1, maximum: 100 }
+      }, required: ["verificationId"], additionalProperties: false },
     },
     {
       name: "image_list",

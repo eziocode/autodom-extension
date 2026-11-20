@@ -31,8 +31,7 @@
   // chrome.scripting.executeScript; the SW may inject it more than once
   // per tab (e.g. on toggle after navigation). Bail out if we've already
   // installed our DOM + listeners for this realm.
-  if (window.__autodomChatPanelLoaded) return;
-  window.__autodomChatPanelLoaded = true;
+  if (window.__autodomChatPanelLoaded?.isConnected) return;
 
   // True when chat-panel.js is loaded by sidepanel/index.html — the
   // panel renders into the side-panel page's <body> directly, never
@@ -50,7 +49,6 @@
   }
 
   const PANEL_ID = "__autodom_chat_panel";
-  const STYLE_ID = "__autodom_chat_style";
   const INLINE_OVERLAY_ID = "__autodom_inline_overlay";
   const AUTOMATION_OVERLAY_ID = "__autodom_automation_overlay";
   const FLOATING_STOP_ID = "__autodom_automation_stop";
@@ -120,11 +118,22 @@
 
   _log("Content script loading...");
 
-  // Prevent double injection
-  if (document.getElementById(PANEL_ID)) {
-    _log("Panel already exists, skipping injection");
-    return;
-  }
+  // Extension reload creates a fresh isolated world in the existing page.
+  // The previous world's UI can survive its runtime listeners.
+  const previousPanel = document.getElementById(PANEL_ID);
+  const upgradingLegacyPanel = previousPanel && !previousPanel.hasAttribute("data-autodom-ui");
+  const staleRoots = [
+    "#" + PANEL_ID, "#" + INLINE_OVERLAY_ID, "#" + AUTOMATION_OVERLAY_ID, "#" + FLOATING_STOP_ID,
+    "#__autodom_run_indicator", ":root > .autodom-inline-backdrop", "#__autodom_sidepanel_overrides",
+    "#__autodom_chat_style", "#__autodom_chat_style_link", "#__autodom_chat_style_inline", "#__autodom_chat_style_critical",
+  ];
+  for (const stale of document.querySelectorAll(staleRoots.join(","))) stale.remove();
+  document.documentElement.classList.remove("__autodom_panel_open", "__autodom_panel_resizing");
+
+  const panel = document.createElement("div");
+  panel.id = PANEL_ID;
+  panel.setAttribute("data-autodom-ui", "");
+  let automationOverlay, floatingStop, runIndicator, sideStyle;
 
   // ─── State ───────────────────────────────────────────────────
   let isOpen = false;
@@ -1027,7 +1036,7 @@
   }
 
   function persistChatState(immediate = false, flushLongLived = false) {
-    if (_contextInvalidated) return;
+    if (_contextInvalidated || !panel.isConnected) return;
     if (immediate) {
       _pendingChatStateSnapshot = _buildChatStateSnapshot();
       _flushChatStatePersist(flushLongLived);
@@ -1150,99 +1159,13 @@
     });
   }
 
-  // ─── Inject Styles ─────────────────────────────────────────
-  // Performance: the ~3.5K-line CSS that used to live as a JS template
-  // literal is now in extension/content/chat-panel.css so the browser
-  // parses it from a cached file instead of re-evaluating a 100KB
-  // string on every panel mount (sidepanel open AND every content-
-  // script injection). Side-panel mode loads the link directly via
-  // sidepanel/index.html. Content-script mode injects the link itself
-  // here, fronted by a tiny critical-CSS guard that hides the panel /
-  // inline overlay until the stylesheet finishes loading — no FOUC
-  // even when the panel mounts in the host page's DOM (no Shadow DOM).
-  // The avatar SVG-data URL is provided to CSS via a custom property
-  // (--autodom-avatar) set on the panel/overlay roots a few lines below
-  // (the ID-scoped selector in panel.style is enough; CSS uses var()).
-  if (!SIDE_PANEL_MODE && !document.getElementById(STYLE_ID + "_link")) {
-    const guard = document.createElement("style");
-    guard.id = STYLE_ID + "_critical";
-    // Hide the panel + overlay roots AND suppress transitions until the
-    // real CSS loads.  opacity:0 + visibility:hidden is belt-and-
-    // suspenders — some browsers can flash a single frame of
-    // visibility:hidden fixed-position content on high-z layers.
-    // transition:none prevents the slide-in / page-push animation from
-    // playing when restoring a previously-open panel on refresh.
-    guard.textContent =
-      "#" + PANEL_ID + ",#" + INLINE_OVERLAY_ID +
-      "{opacity:0!important;visibility:hidden!important;transition:none!important}" +
-      "html.__autodom_panel_open{transition:none!important}";
-    document.documentElement.appendChild(guard);
-
-    const link = document.createElement("link");
-    link.id = STYLE_ID + "_link";
-    link.rel = "stylesheet";
-    try {
-      // getURL is plain string-building and keeps "working" in a script
-      // orphaned by an extension reload, but the page may no longer load
-      // our resources then — Chrome logs "Unsafe attempt to load URL
-      // chrome-extension://… from frame with URL …". runtime.id is the
-      // reliable liveness check: it is undefined once the context is gone.
-      if (!chrome.runtime?.id) throw new Error("extension context invalidated");
-      link.href = chrome.runtime.getURL("content/chat-panel.css");
-    } catch (_) {
-      _contextInvalidated = true;
-      // Extension context invalidated mid-injection. Fall back to
-      // doing nothing — the next reload will recover.
-      try { guard.remove(); } catch (_) {}
-      return;
-    }
-    const reveal = () => {
-      try {
-        // Phase 1: remove the visibility cloak but keep transitions
-        // suppressed so a restored-open panel appears instantly
-        // instead of sliding in.
-        guard.textContent =
-          "#" + PANEL_ID + ",#" + INLINE_OVERLAY_ID +
-          "{transition:none!important}" +
-          "html.__autodom_panel_open{transition:none!important}";
-      } catch (_) {}
-      // Phase 2: after the browser has painted the settled layout,
-      // drop the transition lock so future open/close animates normally.
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          try { guard.remove(); } catch (_) {}
-        });
-      });
-    };
-    link.addEventListener("load", reveal, { once: true });
-    // The <link> can be refused by the page (or fail in a partial install).
-    // Content scripts may still read their own web-accessible files, so
-    // inline the CSS as a <style> instead; reveal either way so the panel is
-    // never left permanently invisible.
-    link.addEventListener("error", () => {
-      if (!chrome.runtime?.id) return reveal();
-      fetch(link.href)
-        .then((r) => (r.ok ? r.text() : Promise.reject(new Error(String(r.status)))))
-        .then((css) => {
-          const style = document.createElement("style");
-          style.id = STYLE_ID + "_inline";
-          style.textContent = css;
-          document.documentElement.appendChild(style);
-          try { link.remove(); } catch (_) {}
-        })
-        .catch(() => {})
-        .finally(reveal);
-    }, { once: true });
-    document.documentElement.appendChild(link);
-  }
-
+  // The worker inserts chat-panel.css before injecting this script. The
+  // native side panel loads the same packaged stylesheet in its own HTML.
 
   // Toggle button removed — it was obscuring the page.
   // Panel is opened via popup button, Ctrl+Shift+K, or service worker message.
 
   // ─── Chat Panel ────────────────────────────────────────────
-  const panel = document.createElement("div");
-  panel.id = PANEL_ID;
   panel.setAttribute("role", "complementary");
   panel.setAttribute("aria-label", "AutoDOM AI Chat");
   // CSS expects --autodom-avatar to resolve to the SVG-data-URL form
@@ -1473,7 +1396,7 @@
   // `inset: 0` and hides the in-panel resize handle / close button so
   // the side-panel chrome is the single source of truth.
   if (SIDE_PANEL_MODE) {
-    const sideStyle = document.createElement("style");
+    sideStyle = document.createElement("style");
     sideStyle.id = "__autodom_sidepanel_overrides";
     sideStyle.textContent = `
       html, body {
@@ -1719,6 +1642,22 @@
     </div>
   `;
   document.documentElement.appendChild(inlineOverlay);
+
+  // Versions with ID-based teardown can still run a delayed status poll
+  // after an upgrade and remove the new UI. Preserve the bound nodes and
+  // restore them once if that legacy cleanup runs in this document.
+  if (upgradingLegacyPanel) {
+    const observer = new MutationObserver((records) => {
+      if (!records.some(rec => Array.from(rec.removedNodes).includes(panel))) return;
+      observer.disconnect();
+      if (panel.isConnected || !chrome.runtime?.id || _contextInvalidated || document.getElementById(PANEL_ID)) return;
+      for (const root of [panel, inlineBackdrop, inlineOverlay]) {
+        if (!root.isConnected) document.documentElement.appendChild(root);
+      }
+      persistChatState(true);
+    });
+    observer.observe(document.documentElement, { childList: true });
+  }
 
   // ─── DOM References ────────────────────────────────────────
   const messagesContainer = document.getElementById("__autodom_messages");
@@ -2348,9 +2287,10 @@
   // Both elements live on document.documentElement and are mounted
   // lazily so they survive in-page DOM churn from the agent.
   function _ensureAutomationOverlay() {
-    let overlay = document.getElementById(AUTOMATION_OVERLAY_ID);
-    if (!overlay) {
+    let overlay = automationOverlay;
+    if (!overlay?.isConnected) {
       overlay = document.createElement("div");
+      automationOverlay = overlay;
       overlay.id = AUTOMATION_OVERLAY_ID;
       overlay.setAttribute("aria-hidden", "true");
       document.documentElement.appendChild(overlay);
@@ -2359,9 +2299,10 @@
   }
 
   function _ensureFloatingStop() {
-    let btn = document.getElementById(FLOATING_STOP_ID);
-    if (!btn) {
+    let btn = floatingStop;
+    if (!btn?.isConnected) {
       btn = document.createElement("button");
+      floatingStop = btn;
       btn.id = FLOATING_STOP_ID;
       btn.type = "button";
       btn.setAttribute("aria-label", "Stop automation");
@@ -2561,6 +2502,7 @@
   }
 
   function _updateAutomationUi() {
+    if (!panel.isConnected || _contextInvalidated) return;
     // Keep the in-bar force-stop visually armed while a run is active,
     // so the user has an obvious "kill switch" affordance.
     try {
@@ -2572,14 +2514,11 @@
       if (!isOpen) {
         _ensureFloatingStop();
       } else {
-        const btn = document.getElementById(FLOATING_STOP_ID);
-        if (btn) btn.remove();
+        floatingStop?.remove();
       }
     } else {
-      const overlay = document.getElementById(AUTOMATION_OVERLAY_ID);
-      if (overlay) overlay.remove();
-      const btn = document.getElementById(FLOATING_STOP_ID);
-      if (btn) btn.remove();
+      automationOverlay?.remove();
+      floatingStop?.remove();
     }
   }
 
@@ -2662,7 +2601,7 @@
   // already lives inside another popup container and shouldn't reflow
   // the host document.
   function _setHtmlPushed(pushed) {
-    if (inlineMode) return;
+    if (!panel.isConnected || inlineMode) return;
     try {
       document.documentElement.classList.toggle(
         "__autodom_panel_open",
@@ -3194,19 +3133,6 @@
     _loadModelPickerState();
   }, 1800);
 
-  // Fresh content-script load (hard refresh, SPA route change, first
-  // inject). Ask the SW whether any agent run is still active so this
-  // page can restore the overlay / stop affordances immediately.
-  try {
-    chrome.runtime.sendMessage(
-      { type: "PANEL_LOADED_RESET_RUN" },
-      (resp) => {
-        try { void chrome.runtime.lastError; } catch (_) {}
-        _applyAgentRunState(resp);
-      },
-    );
-  } catch (_) {}
-
   // ─── Settings entry point ──────────────────────────────────
   // The header gear opens an inline overlay that hosts popup.html
   // (extension settings, including the Chat tab where verbose /
@@ -3678,7 +3604,9 @@
     if (_contextInvalidated) return;
     const wasOpen = isOpen;
     const wasInline = inlineMode;
-    try { persistChatState(true, true); } catch (_) {}
+    if (panel.isConnected) {
+      try { persistChatState(true, true); } catch (_) {}
+    }
     _contextInvalidated = true;
     if (_mcpInactiveCloseTimer) {
       clearTimeout(_mcpInactiveCloseTimer);
@@ -3703,17 +3631,11 @@
       inlineBackdrop.classList.remove("visible");
       inlineOverlay.classList.remove("visible");
     }
-    // Remove injected DOM so the fresh content script can re-inject
-    try {
-      const p = document.getElementById(PANEL_ID);
-      if (p) p.remove();
-      const s = document.getElementById(STYLE_ID);
-      if (s) s.remove();
-      const io = document.getElementById(INLINE_OVERLAY_ID);
-      if (io) io.remove();
-      const bd = document.querySelector(".autodom-inline-backdrop");
-      if (bd) bd.remove();
-    } catch (_) {}
+    // A replacement realm may already own the page's IDs.
+    if (panel.isConnected) document.documentElement.classList.remove("__autodom_panel_open", "__autodom_panel_resizing");
+    for (const el of [panel, inlineOverlay, inlineBackdrop, automationOverlay, floatingStop, runIndicator, sideStyle]) {
+      el?.remove();
+    }
   }
 
   function checkConnectionStatus(_unused) {
@@ -4729,9 +4651,9 @@
   // page refresh. Attached to documentElement so host CSS can't nest it.
   const RUN_INDICATOR_ID = "__autodom_run_indicator";
   function _ensureRunIndicator() {
-    let el = document.getElementById(RUN_INDICATOR_ID);
-    if (el) return el;
-    el = document.createElement("div");
+    if (runIndicator?.isConnected) return runIndicator;
+    const el = document.createElement("div");
+    runIndicator = el;
     el.id = RUN_INDICATOR_ID;
     el.className = "autodom-run-indicator";
     el.setAttribute("role", "status");
@@ -4771,6 +4693,7 @@
     return el;
   }
   function _showRunIndicator(labelText) {
+    if (!panel.isConnected || _contextInvalidated) return;
     // Features → Overlays → "Automation running" off: no on-page pill.
     // The in-panel force-stop stays armed, so a run is still stoppable.
     if (!_features.overlayAutomationRunning) {
@@ -4786,8 +4709,7 @@
     el.classList.add("visible");
   }
   function _hideRunIndicator() {
-    const el = document.getElementById(RUN_INDICATOR_ID);
-    if (el) el.classList.remove("visible");
+    runIndicator?.classList.remove("visible");
   }
 
   function showTyping() {
@@ -9196,6 +9118,7 @@
   })();
 
   document.addEventListener("keydown", (e) => {
+    if (!panel.isConnected || _contextInvalidated) return;
     if (!_hasManifestCommands) {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === "K") {
         e.preventDefault();
@@ -9275,10 +9198,6 @@
   }
   if (restored.wasOpen) {
     // Re-open panel instantly without the slide-in transition.
-    // When the guard <style> is present (fresh injection) it already
-    // suppresses transitions; this inline override covers the
-    // re-injection path where the CSS link already existed and no
-    // guard was created.
     panel.style.setProperty("transition", "none", "important");
     document.documentElement.style.setProperty("transition", "none", "important");
     isMcpActive = true;
@@ -9349,4 +9268,18 @@
   window.addEventListener("popstate", _onUrlChange);
   // hashchange for hash-based routers
   window.addEventListener("hashchange", _onUrlChange);
+
+  window.__autodomChatPanelLoaded = panel;
+  // Fresh content-script load (hard refresh, SPA route change, first
+  // inject). Ask the SW whether any agent run is still active so this
+  // page can restore the overlay / stop affordances immediately.
+  try {
+    chrome.runtime.sendMessage(
+      { type: "PANEL_LOADED_RESET_RUN" },
+      (resp) => {
+        try { void chrome.runtime.lastError; } catch (_) {}
+        _applyAgentRunState(resp);
+      },
+    );
+  } catch (_) {}
 })();

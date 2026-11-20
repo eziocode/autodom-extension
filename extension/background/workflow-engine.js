@@ -33,7 +33,7 @@
   // globalThis.__autodomWfLib once per document (idempotent).
   function _pageWfLib() {
     // Keep in sync with WF_LIB_VERSION checks in the entry points below.
-    const VERSION = 6;
+    const VERSION = 7;
     if (globalThis.__autodomWfLib && globalThis.__autodomWfLib.v === VERSION) {
       return { ok: true, cached: true };
     }
@@ -422,16 +422,18 @@
       try { el.scrollIntoView({ block: "center", inline: "nearest" }); } catch (_) {}
       const action = step.action;
       if (action === "click" || action === "dblclick") {
+        const r = el.getBoundingClientRect();
         for (const t of ["pointerover", "mouseover", "pointerdown", "mousedown"]) mouse(el, t);
         try { el.focus({ preventScroll: true }); } catch (_) {}
         for (const t of ["pointerup", "mouseup"]) mouse(el, t);
         el.click();
         if (action === "dblclick") mouse(el, "dblclick");
-        return { ok: true };
+        return { ok: true, _autodomPointer: { x: r.x + r.width / 2, y: r.y + r.height / 2 } };
       }
       if (action === "hover") {
+        const r = el.getBoundingClientRect();
         for (const t of ["pointerover", "pointerenter", "mouseover", "mouseenter", "mousemove"]) mouse(el, t);
-        return { ok: true };
+        return { ok: true, _autodomPointer: { x: r.x + r.width / 2, y: r.y + r.height / 2 } };
       }
       if (action === "fill") {
         const value = String(step.value == null ? "" : step.value);
@@ -874,9 +876,62 @@
       };
       return scan(document, 0);
     };
+    const acceptsAction = (el, action) => {
+      if (!visible(el) || (el.checkVisibility && !el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }))) return false;
+      if (el.closest("[inert]") || (action !== "hover" && el.closest(':disabled,[aria-disabled="true"]'))) return false;
+      if (action === "fill") return !el.readOnly && (el.isContentEditable || el.matches("input,textarea,select"));
+      return action !== "select" || el.localName === "select" || typeof el.click === "function";
+    };
     // Throws on an invalid selector; runAction reports it.
-    const find = (target) => {
+    const find = (target, step) => {
       const t = target || {};
+      if (t.hostPath !== undefined) {
+        if (!Array.isArray(t.hostPath)) return { error: "hostPath must be an array of host selectors" };
+        let root = document;
+        for (const hostSelector of t.hostPath) {
+          const hosts = root.querySelectorAll(hostSelector);
+          if (hosts.length !== 1) return { error: "Missing or ambiguous shadow host: " + hostSelector };
+          root = hosts[0].shadowRoot;
+          if (!root) return { error: "Shadow root inaccessible or closed: " + hostSelector };
+        }
+        let el;
+        if (t.ref) {
+          el = byRef(t.ref);
+          if (el?.getRootNode() !== root) return null;
+        } else if (t.active) {
+          el = root.activeElement;
+        } else if (t.selector) {
+          const hits = root.querySelectorAll(t.selector);
+          if (hits.length > 1) return { error: "Ambiguous selector in target root: " + t.selector };
+          el = hits[0];
+        } else if (t.text) {
+          const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+          for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+            const parent = node.parentElement;
+            if (!parent || parent.closest(UI_SEL + ",script,style,noscript") || !node.textContent.includes(t.text)) continue;
+            if (el && el !== parent) return { error: "Ambiguous text in target root: " + t.text };
+            el = parent;
+          }
+        }
+        if (el && t.actionableOnly && !acceptsAction(el, step?.action)) return { error: "Target no longer actionable" };
+        return el ? { el, via: root === document ? "document" : "shadow" } : null;
+      }
+      if (t.checkContexts && !t.ref && !t.active) {
+        // Pages with multiple roots need the worker's read-only cross-frame
+        // probe. Flat pages can confirm uniqueness and act in this same call.
+        if (window.frames.length || !t.selector || t.selector.includes(">>>")) return { needsContext: true };
+        const nodes = document.createTreeWalker(document, NodeFilter.SHOW_ELEMENT);
+        let visited = 0;
+        for (let node = nodes.nextNode(); node; node = nodes.nextNode()) {
+          if (++visited > 1800 || node.shadowRoot ||
+              (node.localName.includes("-") && globalThis.chrome?.dom?.openOrClosedShadowRoot?.(node))) {
+            return { needsContext: true };
+          }
+        }
+        const hits = document.querySelectorAll(t.selector);
+        if (hits.length > 1) return { needsContext: true };
+        return hits.length && acceptsAction(hits[0], step?.action) ? { el: hits[0], via: "document" } : null;
+      }
       if (t.ref) {
         const el = byRef(t.ref);
         return el ? { el, via: "ref" } : null;
@@ -917,11 +972,12 @@
     const runAction = (target, step) => {
       let hit;
       try {
-        hit = find(target);
+        hit = find(target, step);
       } catch (e) {
         return { ok: false, error: "Invalid selector: " + ((target && target.selector) || "") };
       }
       if (!hit) return { ok: false, miss: true };
+      if (hit.needsContext || hit.error) return { ok: false, ...hit };
       const el = hit.el;
       const res = step && step.action ? act(el, step) : { ok: true };
       return {
@@ -1042,6 +1098,11 @@
       // Structure only: attribute and text churn (animations, clocks) must
       // not keep the page "busy".
       state.mo = new MutationObserver((records) => {
+        // Drawing or expiring our pointer alone does not change page state.
+        records = records.filter((rec) =>
+          [...rec.addedNodes, ...rec.removedNodes].some((node) => node.id !== "__autodom_action_cursor")
+        );
+        if (!records.length) return;
         state.last = performance.now();
         state.mutations += records.length;
         // A toast can come and go inside one settle window.
@@ -1141,7 +1202,7 @@
   // VERSION in _pageWfLib (each function is serialized on its own).
   function _pageWfStartRecording(nonce, opts) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? L.startRecording(nonce, opts) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 7 ? L.startRecording(nonce, opts) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfStopRecording() {
     const L = globalThis.__autodomWfLib;
@@ -1149,43 +1210,43 @@
   }
   function _pageWfRunStep(step, timeoutMs) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? L.runStep(step, timeoutMs) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 7 ? L.runStep(step, timeoutMs) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfActOnRef(ref, step) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? L.actOnRef(ref, step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 7 ? L.actOnRef(ref, step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfRunAction(target, step) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? L.runAction(target, step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 7 ? L.runAction(target, step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfRunActions(list) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? L.runActions(list) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 7 ? L.runActions(list) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfAdoptAx() {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? L.adoptAx() : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 7 ? L.adoptAx() : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfObserveArm() {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? L.observeArm() : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 7 ? L.observeArm() : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfObserveCollect(final) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? L.observeCollect(final) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 7 ? L.observeCollect(final) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfCandidates(limit) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? { ok: true, candidates: L.candidates(limit) } : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 7 ? { ok: true, candidates: L.candidates(limit) } : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfResolveOnly(step) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? L.resolveOnly(step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 7 ? L.resolveOnly(step) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfMark(limit, nearBbox, opts) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? L.markCandidates(limit, nearBbox, opts) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 7 ? L.markCandidates(limit, nearBbox, opts) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfClearMarks() {
     const L = globalThis.__autodomWfLib;
@@ -1193,11 +1254,11 @@
   }
   function _pageWfRemoveStorage(origin, local, session) {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? L.removeStorage(origin, local, session) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+    return L && L.v === 7 ? L.removeStorage(origin, local, session) : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfDigest() {
     const L = globalThis.__autodomWfLib;
-    return L && L.v === 6 ? L.digest() : { needLib: true };
+    return L && L.v === 7 ? L.digest() : { needLib: true };
   }
   // Fast-mode settle: resolve once the DOM has been quiet for idleMs (no
   // mutations), or after capMs at the latest. Self-contained, no library.

@@ -118,3 +118,33 @@ test("page helpers: macro install then stop captures clicks", async () => {
   assert.equal(stopRes.events[0].type, "click");
   assert.ok(stopRes.events[0].selector.includes("#go"));
 });
+
+test("omitted media targets route to global primary including child document and shadow host", async () => {
+  const calls = [];
+  const h = loadMediaTools().makeHandlers({
+    getActiveTab: async () => ({ id: 5 }),
+    executeInFrames: async (_tabId, _fn, [op]) => {
+      assert.equal(op, "primary");
+      return [
+        { frameId: 0, documentId: "doc-top", result: { ok: true, tag: "VIDEO", id: "m1", score: 25 } },
+        { frameId: 7, documentId: "doc-child", result: { ok: true, tag: "VIDEO", id: "m2", score: 200, shadowHostPath: ["#player"] } }
+      ];
+    },
+    executeInTab: async (tabId, _fn, [op, args], world, frameId, doc) => {
+      calls.push({ tabId, op, world, frameId, doc, id: args.id });
+      return { ok: true, id: args.id };
+    }
+  });
+  for (const tool of ["media_control", "media_get_captions", "media_capture_frame", "media_sample_frames"]) {
+    const result = await h[tool]({}, {});
+    assert.equal(calls.at(-1).frameId, 7);
+    assert.equal(calls.at(-1).doc, "doc-child");
+    assert.equal(calls.at(-1).id, "m2");
+    assert.equal(result.contextHighlights[0].target.id, "7:m2");
+    assert.equal(result.contextHighlights[0].target.documentId, "doc-child");
+    assert.deepEqual(Array.from(result.contextHighlights[0].hostPath), ["#player"]);
+  }
+  await h.media_control({ id: "m1", documentId: "pinned" }, {});
+  assert.equal(calls.at(-1).frameId, undefined);
+  assert.equal(calls.at(-1).doc, "pinned");
+});

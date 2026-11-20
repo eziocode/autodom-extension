@@ -465,12 +465,34 @@ test("baselines compare same-size shots and map regions to page CSS px", async (
   assert.equal(res.other.comparable, false);
 });
 
+test("playback chunk images reach vision providers while the tool transcript preserves timestamps", () => {
+  const sw = loadSw();
+  sw.run(`globalThis.chunk = { ok: true, verificationId: "v", chunkIndex: 2, frames: [
+    { mediaTime: 1, imageStatus: "not-selected" },
+    { mediaTime: 1.03, dataUrl: "data:image/webp;base64,AQID" },
+  ] }`);
+  const meta = sw.run('AutoDOMAgent.truncateToolResult("media_read_chunk", chunk)');
+  assert.equal(meta.frames.length, 2);
+  assert.equal(meta.frames[1].imageIndex, 0);
+  assert.equal(meta.frames[1].mediaTime, 1.03);
+  assert.ok(!JSON.stringify(meta).includes("base64"));
+  const get = provider => sw.run(`_playbackImageMessage("media_read_chunk", chunk, "${provider}")`);
+  assert.equal(get("openai").content[1].image_url.url, "data:image/webp;base64,AQID");
+  assert.equal(get("anthropic").content[0].source.media_type, "image/webp");
+  assert.equal(get("ollama").images[0], "AQID");
+});
+
 test("click_at_coordinates maps screenshot pixels to the page and can send trusted input", async () => {
   const sw = await ready();
   const seen = [];
-  sw.chrome.scripting.executeScript = async ({ args }) => {
+  const markers = [];
+  sw.chrome.scripting.executeScript = async ({ func, args, target }) => {
+    if (func.name === "_pageDrawActionCursor") {
+      markers.push({ args, target });
+      return [{ result: null }];
+    }
     seen.push(args);
-    return [{ result: { x: 50, y: 60, tag: "CANVAS", id: "map" } }];
+    return [{ documentId: "doc-a", frameId: 0, result: { x: 50, y: 60, tag: "CANVAS", id: "map" } }];
   };
   const none = await sw.tool("click_at_coordinates", { x: 10, y: 10, from: "screenshot", observe: false });
   assert.match(none.result.error, /No screenshot of this tab/);
@@ -486,6 +508,10 @@ test("click_at_coordinates maps screenshot pixels to the page and can send trust
   const trusted = await sw.tool("click_at_coordinates", { x: 5, y: 5, trusted: true, double: true, observe: false });
   assert.equal(trusted.result.trusted, true, JSON.stringify(trusted.result));
   assert.equal(seen.at(-1)[5], false, "no synthetic events when CDP clicks");
+  assert.deepEqual(JSON.parse(JSON.stringify(markers)), [
+    { args: [{ x: 50, y: 60 }, null], target: { tabId: 1, documentIds: ["doc-a"] } },
+    { args: [{ x: 50, y: 60 }, null], target: { tabId: 1, documentIds: ["doc-a"] } },
+  ], "both synthetic and trusted feedback use the dispatched point and document");
   const mouse = sw.cdp.filter((c) => c.method === "Input.dispatchMouseEvent").map((c) => [c.params.type, c.params.x, c.params.y, c.params.clickCount ?? 0]);
   assert.deepEqual(JSON.parse(JSON.stringify(mouse)), [
     ["mouseMoved", 50, 60, 0],
@@ -711,4 +737,80 @@ test("a finished download reports its saved path, size and type", async () => {
   assert.deepEqual(JSON.parse(JSON.stringify(r.result)), {
     id: 3, filename: "/Users/me/Downloads/leads.csv", url: "https://crm.test/export", state: "complete", mime: "text/csv", bytes: 2048,
   });
+});
+
+test("lazy panel mount inserts packaged CSS before JS in the same document", async () => {
+  const sw = await ready();
+  const calls = [];
+  let mounted = false;
+  const target = { tabId: 1, documentIds: ["panel-doc"] };
+  sw.chrome.scripting.executeScript = async (spec) => {
+    if (spec.func) return [{ documentId: "panel-doc", result: mounted }];
+    calls.push(["script", spec]);
+    mounted = true;
+    return [{}];
+  };
+  sw.chrome.scripting.insertCSS = async (spec) => calls.push(["style", spec]);
+  const mountedTwice = await sw.run("Promise.all([ensureChatPanelInjected(1), ensureChatPanelInjected(1)])");
+  assert.deepEqual(Array.from(mountedTwice), [true, true]);
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
+    ["style", { target, files: ["content/chat-panel.css"] }],
+    ["script", { target, files: ["common/webext-api.js", "content/chat-panel.js"] }],
+  ]);
+  assert.equal(await sw.run("ensureChatPanelInjected(1)"), true);
+  assert.equal(calls.length, 2);
+  const chat = readFileSync(resolve(bgDir, "../content/chat-panel.js"), "utf8");
+  assert.doesNotMatch(chat, /getURL\(["']content\/chat-panel\.css/);
+});
+
+test("panel retries both CSS and JS on the new document after navigation during injection", async () => {
+  const sw = await ready();
+  const calls = [];
+  let documentId = "before";
+  sw.chrome.scripting.executeScript = async (spec) => {
+    if (spec.func) return [{ documentId, result: false }];
+    calls.push(["script", spec.target.documentIds[0]]);
+    if (!spec.target.documentIds.includes(documentId)) throw new Error("Document no longer exists");
+    return [{}];
+  };
+  sw.chrome.scripting.insertCSS = async (spec) => {
+    calls.push(["style", spec.target.documentIds[0]]);
+    documentId = "after";
+  };
+  assert.equal(await sw.run("ensureChatPanelInjected(1)"), false);
+  assert.equal(await sw.run("ensureChatPanelInjected(1)"), true);
+  assert.deepEqual(calls, [["style", "before"], ["script", "before"], ["style", "after"], ["script", "after"]]);
+});
+
+test("cursor follows the dispatch document and stays off during disconnect", async () => {
+  const sw = await ready();
+  const draws = [];
+  sw.chrome.scripting.executeScript = async (spec) => {
+    draws.push(JSON.parse(JSON.stringify({ target: spec.target, args: spec.args, world: spec.world })));
+    return [{}];
+  };
+  const result = await sw.run(`_consumeActionPointer(1, {
+    frameId: 7, documentId: "frame-doc", result: { success: true,
+      _autodomPointer: { x: 10, y: 30, width: 20, height: 20, from: { x: 0, y: 2, width: 4, height: 4 } }
+    } })`);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), { success: true });
+  assert.deepEqual(draws, [{
+    target: { tabId: 1, documentIds: ["frame-doc"] }, world: "ISOLATED",
+    args: [{ x: 20, y: 40 }, { x: 2, y: 4 }],
+  }]);
+  await sw.run('isConnected = false; _consumeActionPointer(1, { result: { _autodomPointer: { x: 3, y: 5 } } })');
+  assert.equal(draws.length, 1);
+});
+
+test("capture hides pointers across frames and restores the rule after a failed capture", async () => {
+  const sw = await ready();
+  const css = [];
+  sw.chrome.scripting.insertCSS = async spec => css.push(["insert", spec]);
+  sw.chrome.scripting.removeCSS = async spec => css.push(["remove", spec]);
+  await assert.rejects(sw.run('_withoutActionCursor(1, () => { throw new Error("capture failed") })'), /capture failed/);
+  assert.deepEqual(css.map(([method]) => method), ["insert", "remove"]);
+  assert.equal(css[0][1], css[1][1]);
+  assert.deepEqual(JSON.parse(JSON.stringify(css[0][1].target)), { tabId: 1, allFrames: true });
+  assert.equal(css[0][1].origin, "USER");
+  assert.match(css[0][1].css, /#__autodom_action_cursor/);
 });

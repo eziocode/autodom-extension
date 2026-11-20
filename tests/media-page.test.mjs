@@ -130,7 +130,7 @@ function makePage(elements, extra = {}) {
   vm.createContext(ctx);
   vm.runInContext(src, ctx);
   const M = ctx.AutoDOMMediaTools;
-  return { M, run: (op, a) => M._pageHelpers._pageMedia(op, a) };
+  return { document, M, run: (op, a) => M._pageHelpers._pageMedia(op, a) };
 }
 
 const plain = (v) => JSON.parse(JSON.stringify(v));
@@ -301,4 +301,17 @@ test("_mergeMediaLists: frame-prefixed ids, one primary, scanned embeds dropped"
   assert.ok(merged.media.every((m) => !("score" in m)));
   assert.deepEqual(merged.embeds.map((e) => e.provider), ["vimeo.com"]);
   assert.deepEqual(plain(M._mediaTarget({ id: "7:m1", count: 2 })), { id: "m1", frameId: 7, count: 2 });
+});
+
+test("playback handoff resolves the issued id again; a replacement at the old position receives no event", async () => {
+  const oldPlayer = new FakeMedia("VIDEO");
+  const replacement = new FakeMedia("VIDEO");
+  let dispatches = 0;
+  replacement.dispatchEvent = () => { dispatches++; };
+  const { document, run } = makePage([oldPlayer]);
+  const initial = await run("locate", { index: 0 });
+  document.light[0] = replacement;
+  const handoff = await run("bindPlayback", { id: initial.id, eventName: "opaque" });
+  assert.equal(handoff.ok, false);
+  assert.equal(dispatches, 0);
 });

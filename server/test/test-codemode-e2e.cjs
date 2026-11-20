@@ -55,6 +55,13 @@ function fakeExtension(msg) {
       return { url: 'https://example.test/', title: 'Example Domain' };
     case 'execute_code':
       return { success: true, result: ['https://example.test/a', 'https://example.test/b'] };
+    case 'media_verify_playback':
+      return { ok: true, verificationId: 'capture-1', chunks: [{ chunkIndex: 0 }] };
+    case 'media_read_chunk':
+      return { ok: true, verificationId: 'capture-1', chunkIndex: 0, frames: [
+        { mediaTime: 2, imageStatus: 'not-selected' },
+        { mediaTime: 2.03, dataUrl: 'data:image/webp;base64,AQID' },
+      ], nextOffset: null };
     case '__finish_session':
       return { ok: true, closed: 1 };
     default:
@@ -149,6 +156,13 @@ async function plainRun() {
     assert(report.result.links[0] === 'https://example.test/a', 'links: ' + JSON.stringify(report.result));
     assert(report.logs?.[0] === 'links: 2', 'logs: ' + JSON.stringify(report.logs));
     assert(s.extCalls.map((c) => c.tool).join() === 'navigate,get_page_info,execute_code', 'ext saw ' + JSON.stringify(s.extCalls));
+    const verified = json(await s.call('media_verify_playback', { mode: 'smart', durationSec: 30 }));
+    const page = await s.call('media_read_chunk', { verificationId: verified.verificationId, elapsedSec: 0.5 });
+    const blocks = page.result.content;
+    assert(blocks.length === 2 && blocks[0].type === 'image' && blocks[0].mimeType === 'image/webp', 'missing WebP image block');
+    const frames = JSON.parse(blocks[1].text).frames;
+    assert(frames.length === 2 && frames[0].imageIndex == null && frames[1].imageIndex === 0, 'frame/image correspondence');
+    assert(!blocks[1].text.includes('base64'), 'image bytes leaked into text');
   } finally {
     s.stop();
   }

@@ -24,7 +24,7 @@ export const RESULT_TYPES = {
     /** Use index with click_by_index / type_by_index. */
     elements: Array<{ index: number; tag: string; text?: string; type?: string; name?: string; placeholder?: string;
       href?: string; role?: string; ariaLabel?: string; value?: string; [k: string]: any }>;
-    autoScrolled?: boolean; diagnostics?: Record<string, any>;
+    contextHighlights?: Array<Record<string, any>>; autoScrolled?: boolean; diagnostics?: Record<string, any>;
   }`,
   get_page_info: `{ title: string; url: string; lang?: string; readyState?: string; forms?: number; links?: number;
     images?: number; tabId: number; windowId: number; [k: string]: any }`,
@@ -65,6 +65,10 @@ export const RESULT_TYPES = {
   media_get_captions: `{ ok: true; id: string; source: "track" | "youtube-transcript" | "dom-visible" | "none";
     tracks: Array<{ index: number; kind: string; label: string; language: string; mode: string }>; track: number;
     cues: Array<{ start: number; end: number | null; text: string }>; active: string[]; truncated?: true }`,
+  media_verify_playback: `{ ok: true; verificationId: string; chunks: Array<{ chunkIndex: number; [k: string]: any }>;
+    contextHighlights?: Array<Record<string, any>>; [k: string]: any }`,
+  media_read_chunk: `{ ok: true; verificationId: string; chunkIndex: number; nextOffset: number | null;
+    frames: Array<{ imageIndex?: number; [k: string]: any }>; images?: Array<{ imageRef: string; mimeType: string }>; [k: string]: any }`,
   media_sample_frames: `{ ok: true; video: { id: string; duration: number | null; width: number; height: number };
     /** images[i] is frames[i]; pass imageRef to emitImage() */ images: Array<{ imageRef: string; mimeType: string }>; imageRef: string;
     frames: Array<{ t: number; requestedT?: number; width: number; height: number; bytes: number; hash?: string; dark?: true }>;
@@ -88,7 +92,7 @@ export const AREAS = [
   ["tabs", ["list_tabs", "open_new_tab", "switch_tab", "close_tab", "pin_tab", "unpin_tab", "get_pinned_tab", "finish_session",
     "wait_for_new_tab", "wait_for_request", "list_popups", "switch_to_popup", "close_popup", "wait_for_popup", "list_iframes", "iframe_interact",
     "list_shadow_roots", "shadow_interact", "list_downloads", "wait_for_download"]],
-  ["media", ["media_list", "media_control", "media_get_captions", "media_capture_frame", "media_sample_frames", "image_list",
+  ["media", ["media_list", "media_control", "media_get_captions", "media_capture_frame", "media_sample_frames", "media_verify_playback", "media_read_chunk", "image_list",
     "image_get_data"]],
   ["script", ["execute_code", "browser_fetch_raw", "webmcp_list_tools", "webmcp_call_tool"]],
   ["debug", ["get_console_logs", "get_network_requests", "har_start", "har_status", "har_entries", "har_stop", "performance_start_trace",
