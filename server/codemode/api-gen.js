@@ -150,6 +150,36 @@ export function buildApi(definitions, { jsonSchemaFor, tierOf, include }) {
   entries.sort((a, b) => a.name.localeCompare(b.name));
   const byName = new Map(entries.map((e) => [e.name, e]));
 
+  // Words that say nothing about which tool is meant.
+  const STOP = new Set(["a", "an", "the", "to", "of", "and", "or", "for", "in", "on", "with", "my", "me", "it", "is", "by", "from", "this", "that"]);
+  const termsOf = (query) =>
+    String(query || "")
+      .toLowerCase()
+      .split(/[^a-z0-9_]+/)
+      .filter((t) => t && !STOP.has(t));
+  const rank = (query, limit, area) => {
+    const terms = termsOf(query);
+    if (!terms.length) return { total: 0, hits: [] };
+    const scored = [];
+    for (const e of entries) {
+      if (area && e.area !== area) continue;
+      const name = e.name.toLowerCase();
+      const nameTokens = name.split("_");
+      const descWords = e.description.toLowerCase().split(/[^a-z0-9_]+/).filter(Boolean);
+      let score = 0;
+      // Whole words and word starts only: "form" must not match "performance".
+      for (const t of terms) {
+        if (name === t) score += 10;
+        else if (nameTokens.includes(t)) score += 6;
+        else if (t.length >= 3 && nameTokens.some((w) => w.startsWith(t))) score += 4;
+        if (descWords.includes(t) || (t.length >= 3 && descWords.some((w) => w.startsWith(t)))) score += 1;
+      }
+      if (score > 0) scored.push({ score, entry: e });
+    }
+    scored.sort((a, b) => b.score - a.score || a.entry.name.localeCompare(b.entry.name));
+    return { total: scored.length, hits: scored.slice(0, Math.max(1, limit)) };
+  };
+
   const declare = (list) => `declare const autodom: {\n${list.map((e) => e.decl).join("\n")}\n};`;
 
   return {
@@ -179,27 +209,12 @@ export function buildApi(definitions, { jsonSchemaFor, tierOf, include }) {
       return { text: found.length ? declare(found.map((n) => byName.get(n))) : "", missing };
     },
     /** Best matches for a free-text query, by name and description terms. */
-    search: (query, limit = 8) => {
-      const terms = String(query || "")
-        .toLowerCase()
-        .split(/[^a-z0-9_]+/)
-        .filter(Boolean);
-      if (!terms.length) return [];
-      const scored = [];
-      for (const e of entries) {
-        const name = e.name.toLowerCase();
-        const desc = e.description.toLowerCase();
-        let score = 0;
-        for (const t of terms) {
-          if (name === t) score += 10;
-          else if (name.includes(t)) score += 4;
-          if (desc.includes(t)) score += 1;
-        }
-        if (score > 0) scored.push([score, e]);
-      }
-      scored.sort((a, b) => b[0] - a[0] || a[1].name.localeCompare(b[1].name));
-      return scored.slice(0, limit).map(([, e]) => e.name);
-    },
+    search: (query, limit = 8) => rank(query, limit).hits.map((h) => h.entry.name),
+    /**
+     * Ranked matches as entries, for scripts: { total, hits: [{entry, score}] }.
+     * `area` narrows to one area.
+     */
+    find: (query, { limit = 8, area } = {}) => rank(query, limit, area),
   };
 }
 
@@ -212,6 +227,18 @@ declare const page: {
 /** Attach a screenshot to the run_code result. ref comes from autodom.take_screenshot(). */
 declare function emitImage(ref: { imageRef: string } | string): void;
 declare function sleep(ms: number): Promise<void>;
+/** Look up the autodom.* API from inside the script (these lookups are not tool calls). */
+declare const codemode: {
+  /** Best matches for words describing what you want to do, e.g. codemode.search("fill form field"). */
+  search(query: string, opts?: { limit?: number; area?: string }): Promise<{
+    total: number;
+    results: { name: string; tier: "read" | "write" | "destructive"; area: string; summary: string; returnsAny: boolean }[];
+  }>;
+  /** TypeScript declarations: tool name(s), or { area } / { query }. Unknown names are listed in a comment. */
+  describe(target: string | string[] | { area: string } | { query: string }): Promise<string>;
+  /** One line per tool grouped by area (name [tier] summary), or only one area. */
+  index(area?: string): Promise<string>;
+};
 /** run_code {input} / a saved script's run input (schedule variables). Frozen; {} when none. */
 declare const input: Readonly<Record<string, any>>;
 // console.log/info/warn/error are captured and returned as logs.

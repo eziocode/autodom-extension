@@ -675,3 +675,90 @@ test("code mode: each call carries its run/seq for undo and records what can be 
   assert.match(calls[1].irreversible, /clicks/);
   assert.deepEqual(calls[2].undoable, ["cookie"]);
 });
+
+test("code mode: scripts look up the API with codemode.search / describe / index", async () => {
+  const { codeMode, calls } = fakeServer();
+  const { report } = await codeMode.run({
+    code: `
+      const found = await codemode.search("click an element");
+      const typed = await codemode.search("screenshot", { limit: 1 });
+      const decl = await codemode.describe(["autodom.click", "nope"]);
+      const area = await codemode.describe({ area: "observe" });
+      const byQuery = await codemode.describe({ query: "screenshot" });
+      const index = await codemode.index();
+      const none = await codemode.search("");
+      await autodom.click({ selector: "#a" });
+      return { found, typed, decl, byQuery, hasIndex: index.includes("click [write]"), none, areaHasDecl: area.includes("declare const autodom") };`,
+  });
+  assert.equal(report.ok, true, JSON.stringify(report));
+  const r = report.result;
+  assert.equal(r.found.results[0].name, "click");
+  assert.deepEqual(Object.keys(r.found.results[0]).sort(), ["area", "name", "returnsAny", "summary", "tier"]);
+  assert.equal(r.found.results[0].tier, "write");
+  assert.ok(r.found.total >= 1);
+  assert.deepEqual(r.typed.results.map((x) => x.name), ["take_screenshot"]);
+  assert.equal(r.typed.results[0].returnsAny, false, "its result type is declared");
+  assert.match(r.decl, /click\(p: \{/);
+  assert.match(r.decl, /Unknown: nope/);
+  assert.match(r.byQuery, /take_screenshot\(\): Promise</);
+  assert.equal(r.hasIndex, true);
+  assert.deepEqual(r.none, { total: 0, results: [] });
+  assert.deepEqual(calls.map((c) => c[0]), ["click"], "lookups are not tool calls");
+});
+
+test("code mode: lookups take no call number and are not recorded or replayed", async () => {
+  const updates = [];
+  const { codeMode } = fakeServer({ defs: [heldDef()], onRunUpdate: (r, rp) => updates.push([r, rp]), suspendTtlMs: 40 });
+  const held = await codeMode.run({
+    code: `await codemode.search("submit"); await autodom.click({ selector: "#a" }); await codemode.describe("click"); await autodom.submit({ form: "f" }); return 1;`,
+  });
+  assert.equal(held.suspended, true);
+  await new Promise((r) => setTimeout(r, 120));
+  const [record, replay] = updates.at(-1);
+  assert.deepEqual(record.calls.map((c) => [c.seq, c.tool]), [[0, "click"], [1, "submit"]], "no entries for lookups");
+  assert.deepEqual(Object.keys(replay.outcomes), ["0"]);
+  const second = fakeServer({ defs: [heldDef()] });
+  const again = await second.codeMode.replay({ record, replay });
+  assert.equal(again.suspended, true, JSON.stringify(again.report));
+  assert.equal(again.report.replayed, 1);
+  assert.deepEqual(second.calls.map((c) => c[0]), ["submit"]);
+});
+
+test("code mode: lookup errors are InvalidParams and a lookup counts toward the host-call limit", async () => {
+  const { codeMode } = fakeServer();
+  const { report } = await codeMode.run({
+    code: `
+      const errs = [];
+      for (const f of [() => codemode.search("x", { area: "nope" }), () => codemode.describe(42), () => codemode.describe([]), () => codemode.describe({ area: "nope" }), () => codemode.index("nope"), () => codemode.describe(Array.from({ length: 41 }, (_, i) => "t" + i))]) {
+        try { await f(); errs.push("no error"); } catch (e) { errs.push(e.name); }
+      }
+      return errs;`,
+  });
+  assert.deepEqual(report.result, Array(6).fill("InvalidParams"));
+  const many = await fakeServer().codeMode.run({ code: `let n = 0; while (true) { await codemode.search("click"); n++; }` });
+  assert.match(many.report.stopped.reason, /Call limit reached/);
+});
+
+test("code mode: search ranks name tokens above descriptions and ignores filler words", () => {
+  const defs = [
+    { name: "get_page_info", description: "Get page URL and title. Cheap.", parameters: z.object({}), execute: async () => "" },
+    { name: "set_cookie", description: "Set a cookie on the page.", parameters: z.object({}), execute: async () => "" },
+    { name: "type_text", description: "Type text into an element on the page.", parameters: z.object({}), execute: async () => "" },
+  ];
+  const { codeMode } = fakeServer({ defs });
+  const api = (q) => codeMode.describe({ query: q });
+  assert.match(api("page"), /get_page_info/, "a name token matches");
+  const order = (q) => [...api(q).matchAll(/^\s+(\w+)\(/gm)].map((m) => m[1]);
+  assert.equal(order("the cookie")[0], "set_cookie", "'the' is dropped, 'cookie' decides");
+  assert.equal(order("page title")[0], "get_page_info");
+
+  const more = fakeServer({
+    defs: [
+      { name: "fill_form", description: "Fill multiple form fields at once.", parameters: z.object({}), execute: async () => "" },
+      { name: "performance_start_trace", description: "Start a performance trace of the page.", parameters: z.object({}), execute: async () => "" },
+    ],
+  }).codeMode;
+  const names = [...more.describe({ query: "fill form field" }).matchAll(/^\s+(\w+)\(/gm)].map((m) => m[1]);
+  assert.deepEqual(names, ["fill_form"], "'form' is not found inside 'performance'");
+  assert.match(more.describe({ query: "perf" }), /performance_start_trace/, "a word start still matches");
+});
