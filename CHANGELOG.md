@@ -4,6 +4,14 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## 8.0.1
+
+### Fixed
+- The Code Mode token benchmark (`scripts/codemode-bench/bench.mjs`) no
+  longer crashes at the end of a run. Each test server is now stopped
+  before its temporary folder is removed, so the results print. No
+  change to the extension or the server.
+
 ## 8.0.0
 
 ### Changed
