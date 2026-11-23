@@ -8,6 +8,8 @@
 //                           decisions (one JSON object per line)
 //   scripts/<id>.json       saved Code Mode scripts (run_code {script}); the
 //                           server is their only copy
+//   runs/<runId>.json       run records of run_code scripts (call log,
+//                           status, logs, result preview); newest 50 kept
 
 import { promises as fs, createReadStream } from "fs";
 import { createInterface } from "node:readline";
@@ -104,6 +106,83 @@ export async function deleteScriptFile(id, home = autodomHome()) {
   } catch {
     return false;
   }
+}
+
+// ─── Code Mode run records ───────────────────────────────────
+
+export const CODE_RUNS_KEEP = 50;
+const RUN_ID = /^code_[a-z0-9]{1,20}_[a-z0-9]{1,20}$/;
+
+export const isCodeRunId = (id) => RUN_ID.test(String(id || ""));
+
+function codeRunFile(runId, home) {
+  if (!isCodeRunId(runId)) throw new Error(`Not a run_code run id: ${runId}`);
+  return join(home, "runs", `${runId}.json`);
+}
+
+export async function saveCodeRun(record, home = autodomHome()) {
+  const file = codeRunFile(record?.runId, home);
+  await fs.mkdir(dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(record) + "\n", { encoding: "utf8", mode: 0o600 });
+  await fs.rename(tmp, file);
+  return file;
+}
+
+/** The run record, or null when there is none with that id. */
+export async function readCodeRun(runId, home = autodomHome()) {
+  if (!isCodeRunId(runId)) return null;
+  try {
+    return JSON.parse(await fs.readFile(codeRunFile(runId, home), "utf8"));
+  } catch (err) {
+    if (err.code === "ENOENT" || err instanceof SyntaxError) return null;
+    throw err;
+  }
+}
+
+async function codeRunIds(home) {
+  try {
+    return (await fs.readdir(join(home, "runs")))
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => f.slice(0, -5))
+      .filter(isCodeRunId)
+      .sort()
+      .reverse(); // ids sort by start time; newest first
+  } catch {
+    return [];
+  }
+}
+
+/** Newest first. Each record is returned whole; callers trim it. */
+export async function listCodeRuns({ limit = 20, scriptId } = {}, home = autodomHome()) {
+  const max = Math.max(1, Math.min(200, Math.trunc(Number(limit) || 20)));
+  const out = [];
+  for (const id of await codeRunIds(home)) {
+    if (out.length >= max) break;
+    const r = await readCodeRun(id, home).catch(() => null);
+    if (!r || (scriptId && r.scriptId !== scriptId)) continue;
+    out.push(r);
+  }
+  return out;
+}
+
+/**
+ * Delete the oldest finished records beyond `keep`. Running and paused
+ * runs are never deleted here. Returns how many were removed.
+ */
+export async function pruneCodeRuns(keep = CODE_RUNS_KEEP, { isLive = () => false } = {}, home = autodomHome()) {
+  const ids = await codeRunIds(home);
+  let removed = 0;
+  for (const id of ids.slice(Math.max(0, keep))) {
+    if (isLive(id)) continue;
+    try {
+      await fs.unlink(codeRunFile(id, home));
+      removed++;
+    } catch {
+      // Already gone.
+    }
+  }
+  return removed;
 }
 
 export async function readRoutineFile(path) {
