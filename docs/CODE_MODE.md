@@ -23,9 +23,9 @@ Each task runs four ways:
 
 | Approach | Tools listed | Transcript |
 |---|---|---|
-| classic | 117 (default) | The standard tools the usual way: `navigate`, `take_snapshot` or `get_dom_state`, `extract_text`, `click_by_index`, ... |
-| classic+exec | 117 (default) | The standard tools, using `execute_code` wherever it helps. The strongest baseline without Code Mode. For `hn_top5` the classic run already does this. |
-| code (hybrid) | 123 (`AUTODOM_CODE_MODE=1`) | `code_api` once, then one `run_code` script |
+| classic | 117 (`AUTODOM_CODE_MODE=0`) | The standard tools the usual way: `navigate`, `take_snapshot` or `get_dom_state`, `extract_text`, `click_by_index`, ... |
+| classic+exec | 117 (`AUTODOM_CODE_MODE=0`) | The standard tools, using `execute_code` wherever it helps. The strongest baseline without Code Mode. For `hn_top5` the classic run already does this. |
+| code (hybrid) | 123 (`AUTODOM_CODE_MODE=1`, the default) | `code_api` once, then one `run_code` script |
 | code | 14 (`AUTODOM_CODE_MODE=only`) | The same `code_api` and `run_code` calls |
 
 It counts the bytes the model would read. Every request carries the tool list

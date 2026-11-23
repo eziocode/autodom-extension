@@ -92,6 +92,7 @@ import {
   snapshotBaselines,
 } from "./atk/index.js";
 import { CODE_MODE_TOOL_NAMES, CODE_ONLY_LISTED, createCodeMode, stricterPageEval } from "./codemode/index.js";
+import { codeModeListing } from "./codemode/listing.js";
 import { checkScriptSyntax } from "./codemode/sandbox.js";
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 import { writeArtifact, writeHarFiles } from "./har-export.js";
@@ -8348,15 +8349,12 @@ function _jsonSchemaForTool(parameters) {
 // The Playwright-compatible aliases duplicate core tools and cost ~6KB of
 // schema on every session. They stay callable by name; only clients that
 // discover tools by listing need AUTODOM_PLAYWRIGHT_COMPAT=1.
-// Code Mode (run_code / code_api) is opt-in while it matures and always
-// callable by name. AUTODOM_CODE_MODE=1 (or hybrid) lists it next to every
-// tool; =only lists just the Code Mode set, so the model reaches the browser
-// through scripts and the tools/list payload stays small.
-function _codeModeListing(env = process.env) {
-  const v = String(env.AUTODOM_CODE_MODE || "").toLowerCase();
-  if (v === "only") return "only";
-  return v === "1" || v === "hybrid" || v === "true" ? "hybrid" : "off";
-}
+// Code Mode (run_code / code_api / script_*) is listed next to every tool by
+// default (hybrid) and is always callable by name. AUTODOM_CODE_MODE=only
+// lists just the Code Mode set, so the model reaches the browser through
+// scripts and the tools/list payload stays small; =0 hides it again. The
+// rule lives in codemode/listing.js.
+const _codeModeListing = codeModeListing;
 
 function _listedToolDefinitions(env = process.env) {
   const codeMode = _codeModeListing(env);

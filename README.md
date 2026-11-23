@@ -141,11 +141,12 @@ Optional transports, both off by default:
 
 ## Tools
 
-153 tools are registered. Clients see 128 by default. The 19
+153 tools are registered. Clients see 134 by default. The 19
 Playwright-compatible aliases (`browser_click`, `browser_snapshot`, ...) stay
-callable by name but are only listed with `AUTODOM_PLAYWRIGHT_COMPAT=1`, and
-the six Code Mode tools (`run_code`, `code_api`, `script_*`, below) are only
-listed with `AUTODOM_CODE_MODE`.
+callable by name but are only listed with `AUTODOM_PLAYWRIGHT_COMPAT=1`. The
+six Code Mode tools (`run_code`, `code_api`, `script_*`, below) are listed by
+default; `AUTODOM_CODE_MODE=0` hides them (128 tools, they stay callable by
+name) and `AUTODOM_CODE_MODE=only` lists just them.
 
 | Area | Tools |
 |---|---|
@@ -228,7 +229,9 @@ return links.filter((h) => h.includes("/docs/")).slice(0, 10);
   `{area}` or `{query}` gives exact TypeScript declarations. The most used
   tools (`get_dom_state`, `navigate`, `click`, `list_tabs`, `query_elements`,
   ...) declare their result type; the index marks the rest `(returns any)`.
-- `AUTODOM_CODE_MODE=1` lists `run_code` and `code_api` next to every tool.
+- By default `run_code`, `code_api` and the `script_*` tools are listed next
+  to every tool, and the server instructions suggest one `run_code` script for
+  multi-step work. `AUTODOM_CODE_MODE=0` (or `off`) hides them again.
   `AUTODOM_CODE_MODE=only` lists just the Code Mode tools plus
   `confirm_action`, `cancel_action`, `recall`, `finish_session` and the
   `schedule_*` tools (about 8 KB of `tools/list`, against 63 KB); every other tool stays
@@ -398,7 +401,7 @@ Output and tool listing:
 | `AUTODOM_OUTPUT` | compact | `full`: disable ATK compaction |
 | `AUTODOM_TRUST_PROJECT_FILTERS` | `0` | `1`: honour a project-local `.autodom/filters.json` |
 | `AUTODOM_PLAYWRIGHT_COMPAT` | `0` | `1`: list the Playwright-compatible aliases |
-| `AUTODOM_CODE_MODE` | `0` | `1`: also list `run_code` and `code_api` (Code Mode); `only`: list just the Code Mode set |
+| `AUTODOM_CODE_MODE` | list them | `0`/`off`: hide `run_code`, `code_api` and `script_*` from `tools/list` (still callable); `only`: list just the Code Mode set. Any other value lists them. |
 | `AUTODOM_CODE_PAGE_EVAL` | `allow` | `ask`: each `page.eval` in a `run_code` script needs `confirm_action`; `deny`: refuse it |
 | `AUTODOM_SCRIPT_SAVE` | `allow` | `ask`: each `script_save` needs `confirm_action`; `deny`: refuse saves |
 
