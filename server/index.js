@@ -75,6 +75,9 @@ import {
   listCodeRuns,
   pruneCodeRuns,
   isCodeRunId,
+  saveCodeRunReplay,
+  readCodeRunReplay,
+  deleteCodeRunReplay,
 } from "./automation-store.js";
 import { decideReap } from "./bridge-reaper.js";
 import { ensureBroker } from "./broker-spawn.js";
@@ -9363,7 +9366,7 @@ const codeMode = createCodeMode({
   parseHeld: _parseHeld,
   hidden: PLAYWRIGHT_COMPAT_NAMES,
   onHoldDiscarded: (confirmId) => pendingConfirmations.delete(confirmId),
-  onRunUpdate: (record) => _persistCodeRun(record),
+  onRunUpdate: (record, replay) => _persistCodeRun(record, replay),
   invoke: (def, params, { signal, context }) =>
     mcpRequestContext.run({ signal: signal || null, tool: def.name, params, execute: def.execute }, () =>
       def.execute(params, context),
@@ -9375,10 +9378,15 @@ const codeMode = createCodeMode({
 const _codeRunWrites = new Map(); // runId -> last write promise
 const CODE_RUN_TERMINAL = new Set(["completed", "error", "stopped", "cancelled"]);
 
-function _persistCodeRun(record) {
+function _persistCodeRun(record, replay) {
   if (process.env.AUTODOM_CODE_RUNS === "0") return;
   const prev = _codeRunWrites.get(record.runId) || Promise.resolve();
   const next = prev
+    // Replay state first: a record that says resumable must have it.
+    .then(() => {
+      if (replay) return saveCodeRunReplay(record.runId, replay);
+      if (replay === null) return deleteCodeRunReplay(record.runId);
+    })
     .then(() => saveCodeRun(record))
     .then(() => {
       if (CODE_RUN_TERMINAL.has(record.status)) return pruneCodeRuns(undefined, { isLive: codeMode.isLive });
@@ -9390,10 +9398,15 @@ function _persistCodeRun(record) {
   _codeRunWrites.set(record.runId, next);
 }
 
-// A record left running/paused by a bridge that has since exited.
+// A record left running/paused by a bridge that has since exited. A
+// resumable paused run stays paused: run_code {resume} rebuilds it.
 function _liveCodeRun(record) {
-  if (record && (record.status === "running" || record.status === "paused") && !codeMode.isLive(record.runId)) {
-    const { pending, ...rest } = record;
+  if (!record || codeMode.isLive(record.runId)) return record;
+  if (record.status === "paused" && record.resumable) {
+    return { ...record, note: `Paused at ${record.pending?.tool || "a call"} waiting for approval. Resume with run_code {resume:"${record.runId}"}; finished calls are not run again.` };
+  }
+  if (record.status === "running" || record.status === "paused") {
+    const { pending, resumable, ...rest } = record;
     return { ...rest, status: "interrupted", note: "The AutoDOM bridge that ran this script exited before it finished." };
   }
   return record;
@@ -9416,6 +9429,8 @@ function _codeRunListEntry(r) {
     durationMs: r.durationMs,
     calls: calls.length,
     ...(r.pending ? { pending: r.pending } : {}),
+    ...(r.status === "paused" && r.resumable ? { resumable: true } : {}),
+    ...(r.resumes ? { resumes: r.resumes } : {}),
     ...(r.error ? { error: r.error.message } : r.stopped ? { error: r.stopped.reason } : {}),
   };
 }
@@ -9468,13 +9483,18 @@ server.addTool({
     "Run a JavaScript script (async function body: await, return) that drives the browser through autodom.<tool>(params), the same tools as MCP, " +
     "plus page.eval(fn, ...args) to run fn in the active tab. Chain steps, branch and filter in one call; only the return value and console.log come back. " +
     "Call code_api first for the API. Sandboxed: no fetch/require/timers. Guardrails and approvals apply to every inner call: a held call pauses the script " +
-    "(confirm_action resumes it and returns its result; cancel_action makes that call throw ApprovalDenied in the script).",
+    "(confirm_action resumes it and returns its result; cancel_action makes that call throw ApprovalDenied in the script). " +
+    "If the approval expired or the bridge restarted, resume:<runId> replays the script: finished calls return their recorded results without running again, and the held call asks for approval again.",
   parameters: z.object({
     code: z
       .string()
       .optional()
       .describe("Async function body. Example: await autodom.navigate({url}); return await page.eval(() => document.title);"),
     script: z.string().optional().describe("Run a saved script (script_save) by id instead of code"),
+    resume: z
+      .string()
+      .optional()
+      .describe("runId of a paused run (run_list kind:code shows resumable ones) to rebuild by replay; its code, input and allow are reused"),
     input: z.record(z.string(), z.any()).optional().describe("Exposed to the script as the global `input`"),
     allow: z
       .enum(["read", "write", "destructive"])
@@ -9489,8 +9509,32 @@ server.addTool({
       .describe("Wall-clock limit for the whole script (default 60000, or the saved script's)"),
     verbose: VERBOSE_PARAM,
   }),
-  execute: async ({ code, script, input, allow, timeoutMs, verbose }, context) => {
-    if (!code === !script) return JSON.stringify({ error: "Give exactly one of code or script." });
+  execute: async ({ code, script, resume, input, allow, timeoutMs, verbose }, context) => {
+    if ([code, script, resume].filter(Boolean).length !== 1) {
+      return JSON.stringify({ error: "Give exactly one of code, script or resume." });
+    }
+    if (resume) {
+      if (!isCodeRunId(resume)) return JSON.stringify({ error: `${resume} is not a run_code runId.` });
+      if (codeMode.isLive(resume)) {
+        const live = await _readCodeRunNow(resume);
+        return JSON.stringify({
+          error: "That run is still paused in this bridge; answer its hold instead.",
+          ...(live?.pending?.confirmId ? { confirmId: live.pending.confirmId, hint: "confirm_action or cancel_action with this confirmId" } : {}),
+        });
+      }
+      await _codeRunWrites.get(resume);
+      const record = await readCodeRun(resume);
+      if (!record) return JSON.stringify({ error: `No run_code run ${resume} (only the newest 50 are kept).` });
+      const replay = await readCodeRunReplay(resume);
+      if (!replay) {
+        return JSON.stringify({ error: `Run ${resume} is ${record.status} and has no replay state, so it cannot be resumed.` });
+      }
+      if (allow || timeoutMs || input) diagLog(`run_code resume ${resume}: allow/timeoutMs/input ignored; the run's own are used`);
+      const signal = context?.mcpReq?.signal || mcpRequestContext.getStore()?.signal || null;
+      const out = await codeMode.replay({ record, replay, signal, context, meta: { verbose } });
+      if (out?.error) return JSON.stringify({ error: out.error });
+      return _codeModeOutput(out);
+    }
     let saved = null;
     if (script) {
       saved = await readScriptFile(script);
@@ -9684,6 +9728,7 @@ server.addTool({
     if (!pending) {
       return JSON.stringify({
         error: `No pending confirmation with id ${confirmId}. It may have expired (5 min timeout) or already been confirmed/cancelled.`,
+        hint: "A run_code script paused at an approval can be resumed after that with run_code {resume: runId} (run_list kind:code lists resumable runs).",
       });
     }
     pendingConfirmations.delete(confirmId);

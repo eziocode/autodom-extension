@@ -20,6 +20,18 @@
 // tool call with its redacted params, outcome and timing, logs, result
 // preview). It is handed to onRunUpdate when the run starts, pauses,
 // resumes and ends, so the server can keep it for run_list / run_get.
+//
+// Replay. While a run is paused it also hands over its replay state: the
+// script, its input and the outcome (value or error) of every call so far.
+// A paused run whose live sandbox is gone (approval expired, bridge
+// restarted) can then be resumed with replay(): the script runs again from
+// the top, calls that already finished get their recorded outcome instead
+// of running again, and the call that was waiting for approval runs for
+// real, so it is held and asks for approval again through the normal path.
+// Every call must match the recorded tool and arguments at its position;
+// otherwise the replay stops (diverged). Nondeterministic values belong in
+// step(name, fn), which records fn's result once and replays it.
+import { createHash } from "node:crypto";
 import { AtkOutput } from "../atk/index.js";
 import { redactParams } from "../automation-store.js";
 import { buildApi, tierAllows } from "./api-gen.js";
@@ -80,6 +92,20 @@ const SUSPEND_TTL_MS = 300000;
 const MAX_RECORD_CALLS = 500;
 const MAX_RECORD_CODE = 100000;
 const MAX_RECORD_RESULT = 2000;
+// Replay state limits (serialized characters).
+const MAX_REPLAY_VALUE = 1000000;
+const MAX_REPLAY_TOTAL = 8000000;
+
+// Sorted keys, so equal arguments always hash the same.
+function stableStringify(value) {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(",")}}`;
+}
+
+const hashArgs = (args) => createHash("sha256").update(stableStringify(args ?? null)).digest("hex").slice(0, 32);
 
 function newRunId() {
   // Sortable by start time, unique within the millisecond.
@@ -148,8 +174,10 @@ function deferred() {
  * @param {Set<string>} [deps.hidden]                 extra names to leave unbound (e.g. Playwright aliases)
  * @param {number} [deps.suspendTtlMs]
  * @param {(confirmId: number) => void} [deps.onHoldDiscarded]  a paused run ended with this hold undecided
- * @param {(record: object) => void} [deps.onRunUpdate]  a run started, paused, resumed or ended;
- *        gets a snapshot of its run record
+ * @param {(record: object, replay?: object|null) => void} [deps.onRunUpdate]  a run started,
+ *        paused, resumed or ended; gets a snapshot of its run record, plus its replay state
+ *        (an object to keep while it is paused, null once it can no longer be resumed,
+ *        undefined when unchanged)
  */
 export function createCodeMode({
   getDefinitions,
@@ -169,16 +197,66 @@ export function createCodeMode({
   const live = new Map(); // runId -> run state, until the run ends
   let runSeq = 0;
 
+  // Why this run could not be rebuilt by replay, or null when it can.
+  function unresumableReason(state) {
+    if (state.unattended) return "unattended runs stop at approvals";
+    if (state.unresumable) return state.unresumable;
+    if (state.record.callsTruncated) return "too many calls to record";
+    if (state.record.calls.some((c) => c.state === "running")) return "a call was still running when the run paused";
+    return null;
+  }
+
+  function replayState(state) {
+    return {
+      runId: state.record.runId,
+      code: state.source,
+      input: state.input ?? {},
+      allow: state.allow,
+      ...(state.timeoutMs ? { timeoutMs: state.timeoutMs } : {}),
+      outcomes: Object.fromEntries(state.outcomes),
+    };
+  }
+
   function emitRecord(state) {
     if (!onRunUpdate) return;
     const r = state.record;
     r.updatedAt = new Date().toISOString();
+    let replay;
+    if (r.status === "paused") {
+      const reason = unresumableReason(state);
+      r.resumable = !reason;
+      if (reason) r.unresumableReason = reason;
+      else delete r.unresumableReason;
+      replay = reason ? null : replayState(state);
+    } else if (r.status !== "running") {
+      delete r.resumable;
+      replay = null;
+    }
     try {
       // A copy: the record keeps changing while the run goes on.
-      onRunUpdate(JSON.parse(JSON.stringify(r)));
+      onRunUpdate(JSON.parse(JSON.stringify(r)), replay);
     } catch (_) {
       // Keeping the record must never break the run.
     }
+  }
+
+  // Keep a finished call's outcome for replay ({v} value or {e} error).
+  function saveOutcome(state, seq, outcome) {
+    let size;
+    try {
+      size = JSON.stringify(outcome).length;
+    } catch (_) {
+      state.unresumable = `the outcome of call ${seq + 1} cannot be recorded`;
+      return;
+    }
+    if (size > MAX_REPLAY_VALUE || state.outcomeBytes + size > MAX_REPLAY_TOTAL) {
+      state.unresumable = `the outcome of call ${seq + 1} is too large to keep for a resume`;
+      return;
+    }
+    state.outcomeBytes += size;
+    state.outcomes.set(seq, outcome);
+    // A parallel call that finishes while the run is paused.
+    if (state.record.status === "paused") emitRecord(state);
   }
 
   // One structured entry per tool call (the string callLog stays as the
@@ -213,6 +291,38 @@ export function createCodeMode({
    *        call stops the run and its confirmation is dropped instead of pausing
    */
   async function run({ code, allow = "destructive", timeoutMs, signal, context, meta, input, unattended = false } = {}) {
+    return start({ code, allow, timeoutMs, signal, context, meta, input, unattended });
+  }
+
+  /**
+   * Rebuild a paused run whose live sandbox is gone, from its run record and
+   * replay state (see the replay note at the top). Resolves like run(): the
+   * script's next hold (normally the call that was waiting) or its end.
+   * Returns { error } when the run cannot be resumed.
+   */
+  async function replay({ record, replay: saved, signal, context, meta } = {}) {
+    if (!record || !saved || saved.runId !== record.runId) return { error: "No replay state for that run." };
+    if (live.has(record.runId)) return { error: "That run is still live in this bridge; answer its hold with confirm_action or cancel_action." };
+    if (record.status !== "paused" || !record.resumable) {
+      return { error: `That run is ${record.status}${record.unresumableReason ? ` (${record.unresumableReason})` : ""}; only a resumable paused run can be resumed.` };
+    }
+    if (record.calls.some((c) => c.state === "running")) return { error: "A call was still running when the run paused, so it cannot be replayed safely." };
+    const outcomes = new Map(Object.entries(saved.outcomes || {}).map(([k, v]) => [Number(k), v]));
+    return start(
+      {
+        code: saved.code,
+        allow: saved.allow || record.allow,
+        timeoutMs: saved.timeoutMs || record.timeoutMs,
+        input: saved.input,
+        signal,
+        context,
+        meta: { ...meta, ...(record.scriptId ? { scriptId: record.scriptId } : {}), trigger: record.trigger },
+      },
+      { record, calls: record.calls, outcomes },
+    );
+  }
+
+  async function start({ code, allow, timeoutMs, signal, context, meta, input, unattended = false }, resumeFrom = null) {
     ensureApi();
     const state = {
       id: ++runSeq,
@@ -234,17 +344,29 @@ export function createCodeMode({
       outcome: null,
       wake: null,
       ttl: null,
+      input,
+      timeoutMs,
+      outcomes: new Map(), // seq -> {v} | {e}, for replay
+      outcomeBytes: 0,
+      unresumable: null,
+      expired: false,
+      // When resuming: the recorded calls and their outcomes to replay.
+      replay: resumeFrom ? { calls: resumeFrom.calls, outcomes: resumeFrom.outcomes } : null,
+      replayed: 0,
     };
     const source = String(code || "");
+    state.source = source;
+    const prior = resumeFrom?.record;
     state.record = {
-      runId: newRunId(),
+      runId: prior ? prior.runId : newRunId(),
       kind: "code",
       status: "running",
       trigger: meta?.trigger || (unattended ? "unattended" : "mcp"),
       ...(meta?.scriptId ? { scriptId: meta.scriptId } : {}),
       allow,
       ...(timeoutMs ? { timeoutMs } : {}),
-      startedAt: new Date().toISOString(),
+      startedAt: prior ? prior.startedAt : new Date().toISOString(),
+      ...(prior ? { resumes: (prior.resumes || 0) + 1, resumedAt: new Date().toISOString() } : {}),
       code: source.length > MAX_RECORD_CODE ? `${source.slice(0, MAX_RECORD_CODE)}…` : source,
       ...(source.length > MAX_RECORD_CODE ? { codeTruncated: true } : {}),
       ...(input && Object.keys(input).length ? { input: redactParams(input) } : {}),
@@ -288,6 +410,20 @@ export function createCodeMode({
     state.active = null;
 
     const r = state.record;
+    if (state.expired && !unresumableReason(state)) {
+      // The live sandbox is gone but the run can be rebuilt by replay.
+      if (r.pending) {
+        delete r.pending.confirmId;
+        r.pending.expired = true;
+      }
+      r.status = "paused";
+      r.expiredAt = new Date().toISOString();
+      if (out.logs?.length) r.logs = out.logs;
+      live.delete(r.runId);
+      emitRecord(state);
+      state.wake?.();
+      return;
+    }
     // A call still waiting for approval never ran.
     for (const c of r.calls) if (c.state === "pending") c.state = "discarded";
     r.status = out.ok ? "completed" : out.stopped ? (/^Cancelled/.test(out.stopped.reason || "") ? "cancelled" : "stopped") : "error";
@@ -349,7 +485,12 @@ export function createCodeMode({
     suspended.set(hold.confirmId, state);
     clearTimeout(state.ttl);
     state.ttl = setTimeout(() => {
-      state.ctl?.stop("Approval expired; the script was discarded");
+      state.expired = true;
+      state.ctl?.stop(
+        unresumableReason(state)
+          ? "Approval expired; the script was discarded"
+          : `Approval expired; resume the script with run_code {resume:"${state.record.runId}"}`,
+      );
     }, suspendTtlMs);
     state.ttl.unref?.();
     const { held } = hold;
@@ -368,9 +509,11 @@ export function createCodeMode({
       message:
         `${held.message || `${hold.tool} needs approval.`} ` +
         "The run_code script is paused at this call: confirm_action runs it and resumes the script (you get the script's result), " +
-        "cancel_action makes the call throw ApprovalDenied inside the script.",
+        "cancel_action makes the call throw ApprovalDenied inside the script." +
+        (state.unattended ? "" : ` If the approval expires or the bridge restarts, run_code {resume:"${state.record.runId}"} rebuilds the script (finished calls are not run again).`),
       suspended: true,
       runId: state.record.runId,
+      ...(state.replayed ? { replayed: state.replayed } : {}),
       ...freshActivity(state),
     };
     return { suspended: true, report, images: [], meta: state.meta };
@@ -384,6 +527,8 @@ export function createCodeMode({
     if (out.stopped) report.stopped = out.stopped;
     Object.assign(report, freshActivity(state));
     report.runId = state.record.runId;
+    if (state.replayed) report.replayed = state.replayed;
+    if (state.record.status === "paused" && state.expired) report.resumable = true;
     report.ms = out.ms;
     if (out.pausedMs) report.pausedMs = out.pausedMs;
     const images = state.emitted.map((ref) => {
@@ -485,6 +630,89 @@ export function createCodeMode({
   }
 
   async function hostCall(state, op, args) {
+    if (op === "__step") return stepDecide(state, args);
+    if (op === "__stepRecord") return stepRecord(state, args);
+    if (op === "__emitImage") return callTool(state, op, args);
+
+    const seq = state.record.calls.length;
+    const old = state.replay?.calls[seq];
+    // A recorded call that finished: hand back its outcome, do not run it.
+    // A recorded call that was waiting for approval runs for real (and is
+    // held again).
+    if (old && old.state !== "pending") return replayCall(state, seq, op, args, old);
+
+    const argsHash = hashArgs(args);
+    if (old && (old.tool !== op || old.argsHash !== argsHash)) diverge(state, seq, op, old);
+    try {
+      const value = await callTool(state, op, args, argsHash);
+      saveOutcome(state, seq, { v: value === undefined ? null : value });
+      return value;
+    } catch (err) {
+      if (err instanceof ToolCallError) {
+        saveOutcome(state, seq, { e: { name: err.name, message: err.message, ...(err.details !== undefined ? { details: err.details } : {}) } });
+      }
+      throw err;
+    }
+  }
+
+  function diverge(state, seq, op, old) {
+    state.unresumable = "replay diverged";
+    throw new StopRun(
+      `Replay diverged at call ${seq + 1}: the run recorded ${old.tool}${old.name ? `("${old.name}")` : ""} there, ` +
+        `the script now called ${op} with different arguments. Something nondeterministic (time, random, page state read with page.eval?) ` +
+        "changed the script's path; wrap such values in step(name, fn). Calls before this one were not run again.",
+      { seq, recorded: old.tool, called: op },
+    );
+  }
+
+  function replayCall(state, seq, op, args, old) {
+    if (old.tool !== op || old.argsHash !== hashArgs(args)) diverge(state, seq, op, old);
+    const outcome = state.replay.outcomes.get(seq);
+    if (!outcome) {
+      state.unresumable = "replay state is incomplete";
+      throw new StopRun(`Cannot replay call ${seq + 1} (${op}): its outcome was not recorded.`);
+    }
+    state.record.calls.push({ ...old, replayed: true });
+    state.callLog.push(`${op} replayed`);
+    state.replayed++;
+    state.outcomes.set(seq, outcome);
+    state.outcomeBytes += JSON.stringify(outcome).length;
+    if (outcome.e) throw new ToolCallError(outcome.e.name, outcome.e.message, outcome.e.details);
+    return outcome.v;
+  }
+
+  // step(name, fn): fn runs once; its result is recorded and replayed.
+  function stepDecide(state, args) {
+    const name = String(args?.name ?? "");
+    const seq = state.record.calls.length;
+    const old = state.replay?.calls[seq];
+    if (old) {
+      if (old.tool !== "__step" || old.name !== name) diverge(state, seq, `step("${name}")`, old);
+      const outcome = state.replay.outcomes.get(seq);
+      if (outcome && "v" in outcome) {
+        state.record.calls.push({ ...old, replayed: true });
+        state.replayed++;
+        state.outcomes.set(seq, outcome);
+        return { replay: true, value: outcome.v };
+      }
+      // Recorded but never finished: run it again.
+      state.record.calls.push({ seq, tool: "__step", name, state: "running", at: new Date().toISOString() });
+      return { replay: false, seq };
+    }
+    const entry = recordCall(state, { tool: "__step", name, state: "running" });
+    return { replay: false, seq: entry.seq };
+  }
+
+  function stepRecord(state, args) {
+    const seq = Number(args?.seq);
+    const entry = state.record.calls[seq];
+    if (!entry || entry.tool !== "__step") throw new ToolCallError("ToolError", "step: unknown step");
+    entry.state = "applied";
+    saveOutcome(state, seq, { v: args?.value ?? null });
+    return null;
+  }
+
+  async function callTool(state, op, args, argsHash) {
     if (op === "__emitImage") {
       const ref = args?.ref;
       if (!state.images.has(ref)) throw new ToolCallError("ToolError", `Unknown image ref ${JSON.stringify(ref)}`);
@@ -493,14 +721,14 @@ export function createCodeMode({
     }
     const def = defsByName.get(op);
     if (!def) {
-      recordCall(state, { tool: String(op), state: "unknown" });
+      recordCall(state, { tool: String(op), argsHash, state: "unknown" });
       throw new ToolCallError("UnknownTool", `No tool "${op}" in the Code Mode API. Call code_api to list tools.`);
     }
 
     const tier = tierOf(op, args || {});
     if (!tierAllows(state.allow, tier)) {
       state.callLog.push(`${op} denied(${tier})`);
-      recordCall(state, { tool: op, tier, state: "denied" });
+      recordCall(state, { tool: op, tier, argsHash, state: "denied" });
       throw new ToolCallError(
         "TierDenied",
         `${op} is a ${tier} tool and this run was started with allow:"${state.allow}". Re-run with a higher allow if intended.`,
@@ -513,7 +741,7 @@ export function createCodeMode({
       if (!parsed.success) {
         state.callLog.push(`${op} invalid`);
         const message = `${op}: ${zodIssues(parsed.error)}`;
-        recordCall(state, { tool: op, tier, params: redactParams(params), state: "invalid", error: message });
+        recordCall(state, { tool: op, tier, argsHash, params: redactParams(params), state: "invalid", error: message });
         throw new ToolCallError("InvalidParams", message);
       }
       params = parsed.data;
@@ -523,7 +751,7 @@ export function createCodeMode({
       params = { ...params, verbose: true };
     }
 
-    const entry = recordCall(state, { tool: op, tier, params: redactParams(params), state: "running" });
+    const entry = recordCall(state, { tool: op, tier, argsHash, params: redactParams(params), state: "running" });
     const t0 = Date.now();
     let raw;
     try {
@@ -623,6 +851,7 @@ export function createCodeMode({
 
   return {
     run,
+    replay,
     resume,
     deny,
     /** True when confirmId is the hold a paused script is waiting on. */
@@ -652,7 +881,7 @@ export function createCodeMode({
 
 const GLOBALS_HINT =
   "// run_code globals: autodom.<tool>(params) | page.eval(fn, ...args) runs fn in the active tab | " +
-  "emitImage(ref) attaches a screenshot | input (run_code {input}) | sleep(ms) | console.log. A failed call throws (name ToolError/InvalidParams/TierDenied/ApprovalDenied). " +
+  "emitImage(ref) attaches a screenshot | input (run_code {input}) | sleep(ms) | step(name, fn) records fn's result once (use it for Date.now()/Math.random() so a resumed run replays the same value) | console.log. A failed call throws (name ToolError/InvalidParams/TierDenied/ApprovalDenied). " +
   "No fetch/require/timers. Return only what you need.";
 
 function buildPrelude(names) {
@@ -670,6 +899,15 @@ globalThis.page = Object.freeze({
     return r && typeof r === "object" && r.success === true ? r.result : r;
   },
 });
+globalThis.step = async (name, fn) => {
+  if (typeof fn !== "function") throw new TypeError("step(name, fn): fn must be a function");
+  const d = await __invoke("__step", { name: String(name) });
+  if (d.replay) return d.value;
+  const v = await fn();
+  const stored = v === undefined ? null : JSON.parse(JSON.stringify(v));
+  await __invoke("__stepRecord", { seq: d.seq, value: stored });
+  return stored;
+};
 globalThis.emitImage = (ref) => {
   __invoke("__emitImage", { ref: typeof ref === "string" ? ref : ref && ref.imageRef }).catch(() => {});
 };

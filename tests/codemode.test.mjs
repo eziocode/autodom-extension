@@ -77,6 +77,7 @@ function fakeServer(overrides = {}) {
       return def.execute(params);
     },
     onRunUpdate: overrides.onRunUpdate,
+    ...(overrides.suspendTtlMs ? { suspendTtlMs: overrides.suspendTtlMs } : {}),
   });
   return { codeMode, calls };
 }
@@ -524,4 +525,120 @@ test("code run store: save, read, list newest first, prune keeps live runs", asy
   assert.equal(removed, 1, "the live (oldest) run is kept");
   assert.deepEqual((await store.listCodeRuns({}, home)).map((r) => r.runId), [ids[3], ids[2], ids[0]]);
   assert.equal((await store.readCodeRun(ids[2], home)).status, "completed");
+});
+
+const REPLAY_SCRIPT = `
+  const t = await step("t", () => Math.random());
+  await autodom.click({ selector: "#a" });
+  const info = await autodom.get_page_info();
+  try { await autodom.fails(); } catch (e) { console.log("caught " + e.name); }
+  const r = await autodom.submit({ form: info.title });
+  return { t, r, title: info.title };`;
+
+async function pausedThenExpired() {
+  const updates = [];
+  const first = fakeServer({ defs: [heldDef()], suspendTtlMs: 40, onRunUpdate: (r, rp) => updates.push([r, rp]) });
+  const out = await first.codeMode.run({ code: REPLAY_SCRIPT, input: { k: "v" } });
+  assert.equal(out.suspended, true);
+  assert.match(out.report.message, /run_code \{resume:"code_/);
+  await new Promise((r) => setTimeout(r, 120));
+  const [record, replay] = updates.at(-1);
+  return { first, updates, record, replay, runId: out.report.runId };
+}
+
+test("code mode replay: an expired hold stays paused and resumable", async () => {
+  const { first, updates, record, replay, runId } = await pausedThenExpired();
+  assert.equal(first.codeMode.isLive(runId), false);
+  assert.equal(first.codeMode.isSuspended(7), false);
+  assert.equal(record.status, "paused");
+  assert.equal(record.resumable, true);
+  assert.equal(record.pending.expired, true);
+  assert.equal(record.pending.confirmId, undefined, "the old confirmId is dead");
+  assert.equal(record.calls.at(-1).state, "pending", "the held call is still waiting");
+  assert.ok(replay && replay.code.includes("step(") && replay.input.k === "v");
+  assert.deepEqual(Object.keys(replay.outcomes).map(Number), [0, 1, 2, 3], "outcomes of the finished calls");
+  assert.equal(replay.outcomes[3].e.name, "ToolError");
+  assert.ok(updates.some(([r, rp]) => r.status === "paused" && rp), "replay state is handed over at the pause too");
+});
+
+test("code mode replay: finished calls are not run again and the held call asks again", async () => {
+  const { record, replay } = await pausedThenExpired();
+  const firstT = replay.outcomes[0].v;
+  // A fresh bridge: nothing in memory.
+  const updates = [];
+  const second = fakeServer({ defs: [heldDef()], onRunUpdate: (r, rp) => updates.push([r, rp]) });
+  const held = await second.codeMode.replay({ record, replay });
+  assert.equal(held.suspended, true, JSON.stringify(held.report));
+  assert.equal(held.report.confirmId, 7, "a new hold through the normal path");
+  assert.equal(held.report.runId, record.runId);
+  assert.equal(held.report.replayed, 4);
+  assert.deepEqual(held.report.params, { form: "Example" }, "built from the replayed page_info result");
+  assert.deepEqual(second.calls.map((c) => c[0]), ["submit"], "click, get_page_info and fails were not run again");
+
+  const done = await second.codeMode.resume(7, { value: JSON.stringify({ success: true }) });
+  assert.equal(done.report.ok, true, JSON.stringify(done.report));
+  assert.equal(done.report.result.t, firstT, "step() returned the recorded value");
+  assert.equal(done.report.result.title, "Example");
+  assert.deepEqual(held.report.logs, ["caught ToolError"], "a recorded error is thrown again (logged before the hold)");
+  const [last, lastReplay] = updates.at(-1);
+  assert.equal(last.status, "completed");
+  assert.equal(last.resumes, 1);
+  assert.equal(lastReplay, null, "replay state is dropped once the run ends");
+  assert.deepEqual(last.calls.map((c) => [c.tool, c.state, !!c.replayed]), [
+    ["__step", "applied", true],
+    ["click", "applied", true],
+    ["get_page_info", "applied", true],
+    ["fails", "error", true],
+    ["submit", "applied", false],
+  ]);
+});
+
+test("code mode replay: a changed call stops the run as diverged", async () => {
+  const { record, replay } = await pausedThenExpired();
+  const second = fakeServer({ defs: [heldDef()] });
+  const tampered = { ...replay, code: replay.code.replace('"#a"', '"#b"') };
+  const out = await second.codeMode.replay({ record, replay: tampered });
+  assert.equal(out.suspended, false);
+  assert.equal(out.report.ok, false);
+  assert.match(out.report.stopped.reason, /Replay diverged at call 2/);
+  assert.deepEqual(second.calls, [], "nothing ran");
+});
+
+test("code mode replay: refuses runs that cannot be resumed", async () => {
+  const { record, replay } = await pausedThenExpired();
+  const second = fakeServer({ defs: [heldDef()] });
+  assert.match((await second.codeMode.replay({ record: { ...record, status: "completed" }, replay })).error, /only a resumable paused run/);
+  assert.match((await second.codeMode.replay({ record: { ...record, resumable: false }, replay })).error, /only a resumable/);
+  const inFlight = { ...record, calls: record.calls.map((c, i) => (i === 1 ? { ...c, state: "running" } : c)) };
+  assert.match((await second.codeMode.replay({ record: inFlight, replay })).error, /still running/);
+  assert.match((await second.codeMode.replay({ record, replay: { ...replay, runId: "code_x_y" } })).error, /No replay state/);
+  assert.deepEqual(second.calls, []);
+});
+
+test("code mode replay: a declined hold is not resumable from a stopped run", async () => {
+  const updates = [];
+  const { codeMode } = fakeServer({ defs: [heldDef()], onRunUpdate: (r, rp) => updates.push([r, rp]) });
+  const run = await codeMode.run({ code: `await autodom.submit(); return 1;` });
+  codeMode.cancel(run.report.runId);
+  await new Promise((r) => setTimeout(r, 20));
+  const [record, replay] = updates.at(-1);
+  assert.equal(record.status, "cancelled");
+  assert.equal(replay, null);
+});
+
+test("code run store: replay state files live and die with the run", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "autodom-replay-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const id = "code_000000001_aaaaaa";
+  await assert.rejects(store.saveCodeRunReplay("../x", {}, home), /run id/);
+  await store.saveCodeRun({ runId: id, status: "paused" }, home);
+  await store.saveCodeRunReplay(id, { runId: id, code: "return 1", outcomes: {} }, home);
+  assert.equal((await store.readCodeRunReplay(id, home)).code, "return 1");
+  assert.deepEqual((await store.listCodeRuns({}, home)).map((r) => r.runId), [id], "replay files are not listed as runs");
+  assert.equal(await store.deleteCodeRunReplay(id, home), true);
+  assert.equal(await store.readCodeRunReplay(id, home), null);
+  await store.saveCodeRunReplay(id, { runId: id }, home);
+  await store.saveCodeRun({ runId: "code_000000002_bbbbbb", status: "completed" }, home);
+  assert.equal(await store.pruneCodeRuns(1, {}, home), 1);
+  assert.equal(await store.readCodeRunReplay(id, home), null, "pruning a run removes its replay state");
 });
