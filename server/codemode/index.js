@@ -15,7 +15,13 @@
 // the script, which carries on; declining makes the call throw ApprovalDenied
 // inside the script. Either way the caller gets the script's next outcome:
 // its result, or the next hold.
+//
+// Every run also keeps a run record (runId, code, status, one entry per
+// tool call with its redacted params, outcome and timing, logs, result
+// preview). It is handed to onRunUpdate when the run starts, pauses,
+// resumes and ends, so the server can keep it for run_list / run_get.
 import { AtkOutput } from "../atk/index.js";
+import { redactParams } from "../automation-store.js";
 import { buildApi, tierAllows } from "./api-gen.js";
 import { runInSandbox, StopRun } from "./sandbox.js";
 
@@ -69,6 +75,29 @@ const MAX_CALL_LOG = 60;
 const MAX_SUSPENDED_RUNS = 8;
 // Matches the lifetime of a held confirmation.
 const SUSPEND_TTL_MS = 300000;
+// Run record limits. The sandbox caps host calls at 200, so the call list
+// normally holds every call.
+const MAX_RECORD_CALLS = 500;
+const MAX_RECORD_CODE = 100000;
+const MAX_RECORD_RESULT = 2000;
+
+function newRunId() {
+  // Sortable by start time, unique within the millisecond.
+  const rand = Math.random().toString(36).slice(2, 8).padEnd(6, "0");
+  return `code_${Date.now().toString(36).padStart(9, "0")}_${rand}`;
+}
+
+function preview(value) {
+  if (value === undefined) return undefined;
+  let text;
+  try {
+    text = JSON.stringify(value);
+  } catch (_) {
+    text = String(value);
+  }
+  if (text === undefined) return undefined;
+  return text.length > MAX_RECORD_RESULT ? `${text.slice(0, MAX_RECORD_RESULT)}…` : text;
+}
 
 class ToolCallError extends Error {
   constructor(name, message, details) {
@@ -119,6 +148,8 @@ function deferred() {
  * @param {Set<string>} [deps.hidden]                 extra names to leave unbound (e.g. Playwright aliases)
  * @param {number} [deps.suspendTtlMs]
  * @param {(confirmId: number) => void} [deps.onHoldDiscarded]  a paused run ended with this hold undecided
+ * @param {(record: object) => void} [deps.onRunUpdate]  a run started, paused, resumed or ended;
+ *        gets a snapshot of its run record
  */
 export function createCodeMode({
   getDefinitions,
@@ -129,12 +160,39 @@ export function createCodeMode({
   hidden = new Set(),
   suspendTtlMs = SUSPEND_TTL_MS,
   onHoldDiscarded,
+  onRunUpdate,
 }) {
   let api = null;
   let defsByName = null;
   let prelude = null;
   const suspended = new Map(); // confirmId -> run state
+  const live = new Map(); // runId -> run state, until the run ends
   let runSeq = 0;
+
+  function emitRecord(state) {
+    if (!onRunUpdate) return;
+    const r = state.record;
+    r.updatedAt = new Date().toISOString();
+    try {
+      // A copy: the record keeps changing while the run goes on.
+      onRunUpdate(JSON.parse(JSON.stringify(r)));
+    } catch (_) {
+      // Keeping the record must never break the run.
+    }
+  }
+
+  // One structured entry per tool call (the string callLog stays as the
+  // compact form the model sees).
+  function recordCall(state, entry) {
+    const calls = state.record.calls;
+    if (calls.length >= MAX_RECORD_CALLS) {
+      state.record.callsTruncated = true;
+      return { ...entry };
+    }
+    const e = { seq: calls.length, ...entry, at: new Date().toISOString() };
+    calls.push(e);
+    return e;
+  }
 
   const include = (def) =>
     def && typeof def.execute === "function" && !def._meta && !CODE_MODE_EXCLUDED.has(def.name) && !hidden.has(def.name);
@@ -177,9 +235,26 @@ export function createCodeMode({
       wake: null,
       ttl: null,
     };
+    const source = String(code || "");
+    state.record = {
+      runId: newRunId(),
+      kind: "code",
+      status: "running",
+      trigger: meta?.trigger || (unattended ? "unattended" : "mcp"),
+      ...(meta?.scriptId ? { scriptId: meta.scriptId } : {}),
+      allow,
+      ...(timeoutMs ? { timeoutMs } : {}),
+      startedAt: new Date().toISOString(),
+      code: source.length > MAX_RECORD_CODE ? `${source.slice(0, MAX_RECORD_CODE)}…` : source,
+      ...(source.length > MAX_RECORD_CODE ? { codeTruncated: true } : {}),
+      ...(input && Object.keys(input).length ? { input: redactParams(input) } : {}),
+      calls: [],
+    };
+    live.set(state.record.runId, state);
+    emitRecord(state);
 
     runInSandbox({
-      code: String(code || ""),
+      code: source,
       // Double-encoded so the value is parsed as data, never evaluated as code.
       prelude: `${prelude}\nglobalThis.input = Object.freeze(JSON.parse(${JSON.stringify(JSON.stringify(input ?? {}))}));`,
       call: (op, args) => hostCall(state, op, args),
@@ -211,6 +286,26 @@ export function createCodeMode({
     }
     state.queue = [];
     state.active = null;
+
+    const r = state.record;
+    // A call still waiting for approval never ran.
+    for (const c of r.calls) if (c.state === "pending") c.state = "discarded";
+    r.status = out.ok ? "completed" : out.stopped ? (/^Cancelled/.test(out.stopped.reason || "") ? "cancelled" : "stopped") : "error";
+    r.endedAt = new Date().toISOString();
+    r.durationMs = out.ms;
+    if (out.pausedMs) r.pausedMs = out.pausedMs;
+    delete r.pending;
+    if (out.ok) {
+      const p = preview(out.result);
+      if (p !== undefined) r.result = p;
+    }
+    if (out.error) r.error = { name: out.error.name, message: String(out.error.message || "").slice(0, 2000) };
+    if (out.stopped) r.stopped = { reason: out.stopped.reason, ...(out.stopped.info ? { info: out.stopped.info } : {}) };
+    if (out.logs?.length) r.logs = out.logs;
+    if (out.logsTruncated) r.logsTruncated = true;
+    live.delete(r.runId);
+    emitRecord(state);
+
     state.wake?.();
   }
 
@@ -258,6 +353,9 @@ export function createCodeMode({
     }, suspendTtlMs);
     state.ttl.unref?.();
     const { held } = hold;
+    state.record.status = "paused";
+    state.record.pending = { confirmId: hold.confirmId, tool: hold.tool, seq: hold.entry?.seq };
+    emitRecord(state);
     const report = {
       // Field order matters: the MCP layer recognises a hold by this prefix.
       confirmRequired: true,
@@ -272,6 +370,7 @@ export function createCodeMode({
         "The run_code script is paused at this call: confirm_action runs it and resumes the script (you get the script's result), " +
         "cancel_action makes the call throw ApprovalDenied inside the script.",
       suspended: true,
+      runId: state.record.runId,
       ...freshActivity(state),
     };
     return { suspended: true, report, images: [], meta: state.meta };
@@ -284,6 +383,7 @@ export function createCodeMode({
     if (out.error) report.error = out.error;
     if (out.stopped) report.stopped = out.stopped;
     Object.assign(report, freshActivity(state));
+    report.runId = state.record.runId;
     report.ms = out.ms;
     if (out.pausedMs) report.pausedMs = out.pausedMs;
     const images = state.emitted.map((ref) => {
@@ -301,6 +401,8 @@ export function createCodeMode({
     const hold = state.active;
     state.active = null;
     if (!state.queue.length) state.ctl?.resume();
+    state.record.status = "running";
+    delete state.record.pending;
     return { state, hold };
   }
 
@@ -314,6 +416,8 @@ export function createCodeMode({
     if (!taken) return null;
     const { state, hold } = taken;
     if (context) state.context = context;
+    if (hold.entry) hold.entry.state = "approved";
+    emitRecord(state);
     if (error) hold.waiter.reject(new ToolCallError("ToolError", `${hold.tool}: ${error?.message || error}`));
     else hold.waiter.resolve({ approvedValue: value });
     return nextOutcome(state, signal);
@@ -325,6 +429,8 @@ export function createCodeMode({
     if (!taken) return null;
     const { state, hold } = taken;
     state.callLog.push(`${hold.tool} declined`);
+    if (hold.entry) hold.entry.state = "declined";
+    emitRecord(state);
     hold.waiter.reject(
       new ToolCallError("ApprovalDenied", reason || `${hold.tool} was not approved; it did not run.`, { confirmId }),
     );
@@ -386,11 +492,15 @@ export function createCodeMode({
       return null;
     }
     const def = defsByName.get(op);
-    if (!def) throw new ToolCallError("UnknownTool", `No tool "${op}" in the Code Mode API. Call code_api to list tools.`);
+    if (!def) {
+      recordCall(state, { tool: String(op), state: "unknown" });
+      throw new ToolCallError("UnknownTool", `No tool "${op}" in the Code Mode API. Call code_api to list tools.`);
+    }
 
     const tier = tierOf(op, args || {});
     if (!tierAllows(state.allow, tier)) {
       state.callLog.push(`${op} denied(${tier})`);
+      recordCall(state, { tool: op, tier, state: "denied" });
       throw new ToolCallError(
         "TierDenied",
         `${op} is a ${tier} tool and this run was started with allow:"${state.allow}". Re-run with a higher allow if intended.`,
@@ -402,7 +512,9 @@ export function createCodeMode({
       const parsed = def.parameters.safeParse(params);
       if (!parsed.success) {
         state.callLog.push(`${op} invalid`);
-        throw new ToolCallError("InvalidParams", `${op}: ${zodIssues(parsed.error)}`);
+        const message = `${op}: ${zodIssues(parsed.error)}`;
+        recordCall(state, { tool: op, tier, params: redactParams(params), state: "invalid", error: message });
+        throw new ToolCallError("InvalidParams", message);
       }
       params = parsed.data;
     }
@@ -411,12 +523,14 @@ export function createCodeMode({
       params = { ...params, verbose: true };
     }
 
+    const entry = recordCall(state, { tool: op, tier, params: redactParams(params), state: "running" });
     const t0 = Date.now();
     let raw;
     try {
       raw = await invoke(def, params, { signal: state.abort.signal, context: state.context });
     } catch (err) {
       state.callLog.push(`${op} threw ${Date.now() - t0}ms`);
+      Object.assign(entry, { state: "threw", ms: Date.now() - t0, error: String(err?.message || err).slice(0, 500) });
       throw new ToolCallError("ToolError", `${op}: ${err?.message || err}`);
     }
     let ms = Date.now() - t0;
@@ -426,6 +540,7 @@ export function createCodeMode({
       if (state.unattended) {
         // Nobody to ask. The hold must not outlive the run either.
         state.callLog.push(`${op} held ${ms}ms`);
+        Object.assign(entry, { state: "held", ms });
         if (held.confirmId) onHoldDiscarded?.(held.confirmId);
         throw new StopRun(`${op} needs approval`, {
           tool: held.tool || op,
@@ -438,6 +553,7 @@ export function createCodeMode({
       }
       if (!held.confirmId || suspended.size >= MAX_SUSPENDED_RUNS) {
         state.callLog.push(`${op} held ${ms}ms`);
+        Object.assign(entry, { state: "held", ms });
         throw new StopRun(`${op} needs approval`, {
           confirmId: held.confirmId,
           tool: held.tool || op,
@@ -447,16 +563,24 @@ export function createCodeMode({
         });
       }
       state.callLog.push(`${op} held`);
-      const hold = { confirmId: held.confirmId, tool: op, tier, held, waiter: deferred() };
+      Object.assign(entry, { state: "pending", confirmId: held.confirmId });
+      const hold = { confirmId: held.confirmId, tool: op, tier, held, waiter: deferred(), entry };
       state.queue.push(hold);
       if (!state.active) state.ctl?.pause();
       state.wake?.();
-      const decided = await hold.waiter.promise; // rejects on decline / failure
+      let decided;
+      try {
+        decided = await hold.waiter.promise; // rejects on decline / failure
+      } catch (err) {
+        if (entry.state === "approved") Object.assign(entry, { state: "threw", error: String(err?.message || err).slice(0, 500) });
+        throw err;
+      }
       raw = decided.approvedValue;
       ms = 0;
       // Approved calls are logged as their own entry when they come back.
       state.callLog.push(`${op} approved`);
       if (parseHeld(raw) || parseHeld(tryParseJson(raw instanceof AtkOutput ? raw.text : raw))) {
+        Object.assign(entry, { state: "held", error: "approved but held again; not run" });
         throw new ToolCallError("ToolError", `${op} was approved but held again; not run.`);
       }
     }
@@ -465,9 +589,12 @@ export function createCodeMode({
     if (value && typeof value === "object" && !Array.isArray(value) && typeof value.error === "string" && value.success !== true) {
       state.callLog.push(`${op} error ${ms}ms`);
       const { error, ...details } = value;
+      Object.assign(entry, { state: "error", ...(held ? {} : { ms }), error: String(error).slice(0, 500) });
       throw new ToolCallError("ToolError", `${op}: ${error}`, Object.keys(details).length ? details : undefined);
     }
     if (!held) state.callLog.push(`${op} ${ms}ms`);
+    entry.state = "applied";
+    if (!held) entry.ms = ms;
     return value;
   }
 
@@ -501,6 +628,15 @@ export function createCodeMode({
     /** True when confirmId is the hold a paused script is waiting on. */
     isSuspended: (confirmId) => suspended.get(confirmId)?.active?.confirmId === confirmId,
     suspendedCount: () => new Set(suspended.values()).size,
+    /** True while the run with this runId is running or paused. */
+    isLive: (runId) => live.has(runId),
+    /** Stop a running or paused run. False when it is not live. */
+    cancel: (runId) => {
+      const state = live.get(runId);
+      if (!state) return false;
+      state.ctl?.stop("Cancelled with run_cancel");
+      return true;
+    },
     describe,
     /** Full TypeScript declaration (globals + every bound tool). */
     dts: () => ensureApi().dts(),

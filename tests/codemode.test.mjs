@@ -76,6 +76,7 @@ function fakeServer(overrides = {}) {
       calls.push([def.name, params]);
       return def.execute(params);
     },
+    onRunUpdate: overrides.onRunUpdate,
   });
   return { codeMode, calls };
 }
@@ -438,4 +439,89 @@ test("script store: save, read, list, delete under AUTODOM_HOME", async (t) => {
   assert.equal(await store.deleteScriptFile("a_one", home), true);
   assert.equal(await store.deleteScriptFile("a_one", home), false);
   assert.equal(await store.readScriptFile("a_one", home), null);
+});
+
+test("code mode: run record tracks calls, the pause and the outcome", async () => {
+  const updates = [];
+  const login = {
+    name: "login",
+    description: "Log in.",
+    parameters: z.object({ user: z.string(), password: z.string() }),
+    execute: async () => JSON.stringify({ success: true }),
+  };
+  const { codeMode } = fakeServer({ defs: [heldDef(), login], onRunUpdate: (r) => updates.push(r) });
+  const first = await codeMode.run({
+    code: `await autodom.click({ selector: "#a" });
+      try { await autodom.fails(); } catch (_) {}
+      await autodom.login({ user: "u", password: "hunter2" });
+      await autodom.submit({ form: "f1" });
+      console.log("done");
+      return { ok: 1 };`,
+    input: { token: "secret", q: "x" },
+  });
+  const runId = first.report.runId;
+  assert.match(runId, /^code_[a-z0-9]+_[a-z0-9]+$/);
+  assert.ok(store.isCodeRunId(runId));
+  assert.equal(updates[0].status, "running");
+  assert.deepEqual(updates[0].input, { token: "[REDACTED]", q: "x" });
+  const paused = updates.at(-1);
+  assert.equal(paused.status, "paused");
+  assert.deepEqual(paused.pending, { confirmId: 7, tool: "submit", seq: 3 });
+  assert.deepEqual(paused.calls.map((c) => [c.tool, c.state]), [["click", "applied"], ["fails", "error"], ["login", "applied"], ["submit", "pending"]]);
+  assert.deepEqual(paused.calls[2].params, { user: "u", password: "[REDACTED]" }, "params are redacted");
+  assert.ok(!JSON.stringify(updates.map((u) => u.calls)).includes("hunter2"), "secrets in params never reach the call log");
+  assert.equal(codeMode.isLive(runId), true);
+
+  const done = await codeMode.resume(7, { value: JSON.stringify({ success: true }) });
+  assert.equal(done.report.runId, runId);
+  const last = updates.at(-1);
+  assert.equal(last.status, "completed");
+  assert.equal(last.pending, undefined);
+  assert.equal(last.calls[3].state, "applied");
+  assert.equal(last.result, '{"ok":1}');
+  assert.deepEqual(last.logs, ["done"]);
+  assert.ok(last.endedAt && last.durationMs >= 0);
+  assert.equal(codeMode.isLive(runId), false);
+});
+
+test("code mode: declined, denied and cancelled runs are recorded", async () => {
+  const updates = [];
+  const { codeMode } = fakeServer({ defs: [heldDef()], onRunUpdate: (r) => updates.push(r) });
+  await codeMode.run({ code: `try { await autodom.submit(); } catch (_) {} return 1;` });
+  await codeMode.deny(7);
+  assert.equal(updates.at(-1).calls[0].state, "declined");
+  assert.equal(updates.at(-1).status, "completed");
+
+  const denied = await codeMode.run({ code: `await autodom.navigate({ url: "x" });`, allow: "read" });
+  assert.equal(updates.at(-1).runId, denied.report.runId);
+  assert.equal(updates.at(-1).status, "error");
+  assert.equal(updates.at(-1).calls[0].state, "denied");
+
+  const paused = await codeMode.run({ code: `await autodom.submit(); return 2;` });
+  assert.equal(codeMode.cancel(paused.report.runId), true);
+  await new Promise((r) => setTimeout(r, 20));
+  const rec = updates.at(-1);
+  assert.equal(rec.runId, paused.report.runId);
+  assert.equal(rec.status, "cancelled");
+  assert.equal(rec.calls[0].state, "discarded", "a hold that was never decided did not run");
+  assert.equal(codeMode.isSuspended(7), false);
+  assert.equal(codeMode.cancel(paused.report.runId), false);
+});
+
+test("code run store: save, read, list newest first, prune keeps live runs", async (t) => {
+  const home = await mkdtemp(join(tmpdir(), "autodom-runs-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  await assert.rejects(store.saveCodeRun({ runId: "../x" }, home), /run id/);
+  assert.equal(await store.readCodeRun("../etc/passwd", home), null);
+  const ids = ["code_000000001_aaaaaa", "code_000000002_bbbbbb", "code_000000003_cccccc", "code_000000004_dddddd"];
+  for (const [i, runId] of ids.entries()) {
+    await store.saveCodeRun({ runId, status: i === 0 ? "paused" : "completed", scriptId: i % 2 ? "s1" : undefined }, home);
+  }
+  assert.deepEqual((await store.listCodeRuns({}, home)).map((r) => r.runId), [...ids].reverse());
+  assert.deepEqual((await store.listCodeRuns({ scriptId: "s1" }, home)).map((r) => r.runId), [ids[3], ids[1]]);
+  assert.deepEqual((await store.listCodeRuns({ limit: 1 }, home)).map((r) => r.runId), [ids[3]]);
+  const removed = await store.pruneCodeRuns(2, { isLive: (id) => id === ids[0] }, home);
+  assert.equal(removed, 1, "the live (oldest) run is kept");
+  assert.deepEqual((await store.listCodeRuns({}, home)).map((r) => r.runId), [ids[3], ids[2], ids[0]]);
+  assert.equal((await store.readCodeRun(ids[2], home)).status, "completed");
 });

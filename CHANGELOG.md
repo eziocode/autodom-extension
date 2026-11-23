@@ -4,6 +4,25 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
+## Unreleased
+
+### Added
+- `run_code` runs now leave a run record in `~/.autodom/runs/`: the script,
+  its status, one entry per tool call (params redacted, outcome, time),
+  console logs and a preview of the result. The newest 50 are kept, and
+  running or paused runs are never pruned. Every `run_code` answer carries
+  its `runId`.
+  - `run_list` lists them under `codeRuns`. Use `kind` to show only workflow
+    runs or only script runs, and `scriptId` for one saved script's runs.
+  - `run_get` and `run_report_view` take a `code_…` runId.
+  - `run_cancel` stops a script that is running or paused.
+  - A record left running when the bridge exited shows as `interrupted`.
+  - `AUTODOM_CODE_RUNS=0` turns the records off.
+  - The script source is stored as written, the same way `script_save`
+    keeps it.
+
+---
+
 ## 7.7.1
 
 ### Fixed

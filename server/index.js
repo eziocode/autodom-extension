@@ -70,6 +70,11 @@ import {
   readScriptFile,
   listScriptFiles,
   deleteScriptFile,
+  saveCodeRun,
+  readCodeRun,
+  listCodeRuns,
+  pruneCodeRuns,
+  isCodeRunId,
 } from "./automation-store.js";
 import { decideReap } from "./bridge-reaper.js";
 import { ensureBroker } from "./broker-spawn.js";
@@ -9358,11 +9363,77 @@ const codeMode = createCodeMode({
   parseHeld: _parseHeld,
   hidden: PLAYWRIGHT_COMPAT_NAMES,
   onHoldDiscarded: (confirmId) => pendingConfirmations.delete(confirmId),
+  onRunUpdate: (record) => _persistCodeRun(record),
   invoke: (def, params, { signal, context }) =>
     mcpRequestContext.run({ signal: signal || null, tool: def.name, params, execute: def.execute }, () =>
       def.execute(params, context),
     ),
 });
+
+// run_code run records go to ~/.autodom/runs. Writes for one run are
+// chained so a later snapshot never lands before an earlier one.
+const _codeRunWrites = new Map(); // runId -> last write promise
+const CODE_RUN_TERMINAL = new Set(["completed", "error", "stopped", "cancelled"]);
+
+function _persistCodeRun(record) {
+  if (process.env.AUTODOM_CODE_RUNS === "0") return;
+  const prev = _codeRunWrites.get(record.runId) || Promise.resolve();
+  const next = prev
+    .then(() => saveCodeRun(record))
+    .then(() => {
+      if (CODE_RUN_TERMINAL.has(record.status)) return pruneCodeRuns(undefined, { isLive: codeMode.isLive });
+    })
+    .catch((err) => diagLog(`code run record write failed id=${record.runId}: ${err.message}`))
+    .finally(() => {
+      if (_codeRunWrites.get(record.runId) === next) _codeRunWrites.delete(record.runId);
+    });
+  _codeRunWrites.set(record.runId, next);
+}
+
+// A record left running/paused by a bridge that has since exited.
+function _liveCodeRun(record) {
+  if (record && (record.status === "running" || record.status === "paused") && !codeMode.isLive(record.runId)) {
+    const { pending, ...rest } = record;
+    return { ...rest, status: "interrupted", note: "The AutoDOM bridge that ran this script exited before it finished." };
+  }
+  return record;
+}
+
+async function _readCodeRunNow(runId) {
+  await _codeRunWrites.get(runId);
+  return _liveCodeRun(await readCodeRun(runId));
+}
+
+function _codeRunListEntry(r) {
+  const calls = r.calls || [];
+  return {
+    runId: r.runId,
+    kind: "code",
+    status: r.status,
+    trigger: r.trigger,
+    ...(r.scriptId ? { scriptId: r.scriptId } : {}),
+    startedAt: r.startedAt,
+    durationMs: r.durationMs,
+    calls: calls.length,
+    ...(r.pending ? { pending: r.pending } : {}),
+    ...(r.error ? { error: r.error.message } : r.stopped ? { error: r.stopped.reason } : {}),
+  };
+}
+
+function _codeRunSummaryText(r) {
+  const lines = [
+    `run_code ${r.runId}${r.scriptId ? ` (script ${r.scriptId})` : ""} — ${r.status}` +
+      (r.durationMs != null ? ` in ${(r.durationMs / 1000).toFixed(1)}s` : ""),
+  ];
+  const marks = { applied: "✓", approved: "✓", pending: "⏸", declined: "⊘", discarded: "⊘", denied: "⊘" };
+  for (const c of r.calls || []) {
+    lines.push(`${marks[c.state] || "✗"} ${c.seq + 1}. ${c.tool} ${c.state}${c.ms != null ? ` ${c.ms}ms` : ""}${c.error ? ` — ${c.error}` : ""}`);
+  }
+  if (r.error) lines.push("", `${r.error.name}: ${r.error.message}`);
+  else if (r.stopped) lines.push("", r.stopped.reason);
+  if (r.result !== undefined) lines.push("", `result: ${r.result}`);
+  return lines.join("\n");
+}
 
 // run_code's answer: a hold (pause) goes out as plain JSON starting with
 // confirmRequired so _askForApproval and clients recognise it; a finished
@@ -9505,7 +9576,7 @@ async function _runSavedScriptUnattended(scriptId, { input = {}, trigger = "sche
         timeoutMs: script.timeoutMs || 60000,
         input,
         unattended: true,
-        meta: { scriptId: script.id },
+        meta: { scriptId: script.id, trigger },
       });
     } finally {
       // Close what the run opened (its own isolation client only).
@@ -11206,29 +11277,73 @@ server.addTool({
 
 server.addTool({
   name: "run_list",
-  description: "List recent workflow runs (manual, MCP and scheduled) with status, duration, heal count and error.",
+  description:
+    "List recent runs with status, duration and error: workflow runs (manual, MCP and scheduled; heal count) and run_code script runs (codeRuns: call count, script id, pending approval). kind narrows to one.",
   parameters: z.object({
+    kind: z.enum(["all", "workflow", "code"]).optional().default("all"),
     workflowId: z.string().optional(),
+    scriptId: z.string().optional().describe("Only run_code runs of this saved script"),
     limit: z.coerce.number().optional().default(20),
   }),
-  execute: async (params) => stringifyToolResult(await callExtensionTool("run_list", params)),
+  execute: async ({ kind = "all", scriptId, ...params }) => {
+    const wantCode = kind !== "workflow" && !params.workflowId;
+    const wantWorkflow = kind !== "code" && !scriptId;
+    let out = { ok: true };
+    if (wantWorkflow) {
+      try {
+        const got = await callExtensionTool("run_list", params);
+        if (kind === "workflow") return stringifyToolResult(got);
+        out = { ...out, ...got, ok: true };
+        if (got?.ok === false) out.workflowError = got.error || "run_list failed";
+      } catch (err) {
+        if (kind === "workflow") throw err;
+        out.workflowError = err.message;
+      }
+    }
+    if (wantCode) {
+      const records = await listCodeRuns({ limit: params.limit, scriptId });
+      out.codeRuns = records.map((r) => _codeRunListEntry(_liveCodeRun(r)));
+    }
+    return stringifyToolResult(out);
+  },
 });
 
 server.addTool({
   name: "run_get",
-  description: "Get a workflow run report (per-step result, locator strategy used, heals, before/after page diffs, failure reason, and what can be undone), or with batchId the combined report of a workflow_run_many batch.",
+  description:
+    "Get a workflow run report (per-step result, locator strategy used, heals, before/after page diffs, failure reason, and what can be undone), or with batchId the combined report of a workflow_run_many batch. " +
+    "A run_code runId (code_...) returns its run record: code, status, every tool call (redacted params, outcome, ms), logs, result preview.",
   parameters: z.object({
     runId: z.string().optional(),
     batchId: z.string().optional(),
   }),
-  execute: async (params) => stringifyToolResult(await callExtensionTool("run_get", params)),
+  execute: async (params) => {
+    if (params.runId && isCodeRunId(params.runId)) {
+      const record = await _readCodeRunNow(params.runId);
+      if (!record) return stringifyToolResult({ ok: false, error: `No run_code run ${params.runId} (only the newest 50 are kept).` });
+      return stringifyToolResult({ ok: true, ...record });
+    }
+    return stringifyToolResult(await callExtensionTool("run_get", params));
+  },
 });
 
 server.addTool({
   name: "run_cancel",
-  description: "Cancel a running workflow, a whole batch (batchId), or all running workflows when neither is given. Steps that already ran are not undone; see run_undo.",
+  description:
+    "Cancel a running workflow, a whole batch (batchId), or all running workflows when neither is given. A run_code runId (code_...) stops that script, running or paused. Steps that already ran are not undone; see run_undo.",
   parameters: z.object({ runId: z.string().optional(), batchId: z.string().optional() }),
-  execute: async (params) => stringifyToolResult(await callExtensionTool("run_cancel", params)),
+  execute: async (params) => {
+    if (params.runId && isCodeRunId(params.runId)) {
+      const cancelled = codeMode.cancel(params.runId);
+      return stringifyToolResult({
+        ok: cancelled,
+        cancelled: cancelled ? [params.runId] : [],
+        ...(cancelled ? {} : { error: "That run_code run is not running or paused." }),
+        note: "Stopping a run does not undo tool calls that already ran.",
+      });
+    }
+    return stringifyToolResult(await callExtensionTool("run_cancel", params));
+  },
 });
 
 // ─── MCP App viewer (ui://autodom/viewer.html) ────────────────
@@ -11265,6 +11380,12 @@ server.addTool({
     batchId: z.string().optional(),
   }),
   execute: async (params) => {
+    if (params.runId && isCodeRunId(params.runId)) {
+      // The viewer renders workflow reports; a script run is shown as text.
+      const record = await _readCodeRunNow(params.runId);
+      if (!record) return stringifyToolResult({ ok: false, error: `No run_code run ${params.runId}.` });
+      return { content: [{ type: "text", text: _codeRunSummaryText(record) }] };
+    }
     const got = await callExtensionTool("run_get", params);
     if (!got?.ok) return stringifyToolResult(got);
     if (params.batchId) {
