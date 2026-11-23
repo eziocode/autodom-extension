@@ -39,6 +39,21 @@ All notable changes to AutoDOM are documented in this file.
     and neither can one whose call outcomes exceed 1 MB each or 8 MB in
     total. Screenshots taken before the pause can't be attached after a
     resume.
+- `page.eval` in `run_code` scripts can be gated on its own. It (and
+  `autodom.execute_code`) runs JavaScript in the page with the page's full
+  network and cookie access, which the script sandbox never has, but it
+  shared the `allow` tier with `navigate`, so a script could not be allowed
+  to navigate and refused page JavaScript.
+  - `pageEval: "allow" | "ask" | "deny"` on `run_code` and `script_save`.
+    `deny` throws `PageEvalDenied` in the script; `ask` holds each call for
+    `confirm_action` (cancel makes it throw `ApprovalDenied`). An
+    unattended run stops at the first held call.
+  - `AUTODOM_CODE_PAGE_EVAL` sets it for the whole server. A run or saved
+    script can only make it stricter, never looser, and an unknown value
+    denies.
+  - The policy is kept in the run record and through a replay resume.
+    Refusals are written to the audit log as blocked.
+  - Default is unchanged (`allow`).
 - `run_code` scripts can look up the `autodom.*` API themselves, so a model
   does not need `code_api` or a long tool list in its context:
   - `codemode.search("fill form field", { limit, area })` returns ranked

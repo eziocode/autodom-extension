@@ -221,7 +221,9 @@ export function buildApi(definitions, { jsonSchemaFor, tierOf, include }) {
 export const GLOBALS_DTS = `// Globals available to run_code scripts (async function body: await + return).
 declare const page: {
   /** Run fn in the active tab's page (MAIN world) and return its JSON result.
-   *  fn is serialized with toString(): it cannot close over script variables; pass them as args (JSON). */
+   *  fn is serialized with toString(): it cannot close over script variables; pass them as args (JSON).
+   *  Runs with the page's full network and cookie access, so a run or the server can refuse it
+   *  (throws PageEvalDenied) or hold each call for approval (pageEval: "deny" | "ask"). Same as autodom.execute_code. */
   eval<T = any>(fn: ((...args: any[]) => T | Promise<T>) | string, ...args: any[]): Promise<T>;
 };
 /** Attach a screenshot to the run_code result. ref comes from autodom.take_screenshot(). */
@@ -242,5 +244,5 @@ declare const codemode: {
 /** run_code {input} / a saved script's run input (schedule variables). Frozen; {} when none. */
 declare const input: Readonly<Record<string, any>>;
 // console.log/info/warn/error are captured and returned as logs.
-// A failed tool call throws Error { name: "ToolError" | "InvalidParams" | "TierDenied", message, tool, details? }.
+// A failed tool call throws Error { name: "ToolError" | "InvalidParams" | "TierDenied" | "PageEvalDenied" | "ApprovalDenied", message, tool, details? }.
 // No fetch, require, timers or filesystem: reach the browser only through autodom.* and page.eval.`;

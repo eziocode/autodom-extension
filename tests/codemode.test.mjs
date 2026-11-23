@@ -12,7 +12,7 @@ const store = await import("../server/automation-store.js");
 const { mkdtemp, rm, readFile: readFileFs } = await import("node:fs/promises");
 const { tmpdir } = await import("node:os");
 const { join } = await import("node:path");
-const { createCodeMode, CODE_MODE_EXCLUDED } = await import("../server/codemode/index.js");
+const { createCodeMode, CODE_MODE_EXCLUDED, stricterPageEval } = await import("../server/codemode/index.js");
 const { schemaToTs } = await import("../server/codemode/api-gen.js");
 const { RESULT_TYPES, AREAS } = await import("../server/codemode/result-types.js");
 const { AtkOutput } = await import("../server/atk/index.js");
@@ -77,6 +77,9 @@ function fakeServer(overrides = {}) {
       return def.execute(params);
     },
     onRunUpdate: overrides.onRunUpdate,
+    ...(overrides.pageEvalPolicy ? { pageEvalPolicy: overrides.pageEvalPolicy } : {}),
+    ...(overrides.holdPageEval ? { holdPageEval: overrides.holdPageEval } : {}),
+    ...(overrides.onPageEvalDenied ? { onPageEvalDenied: overrides.onPageEvalDenied } : {}),
     ...(overrides.suspendTtlMs ? { suspendTtlMs: overrides.suspendTtlMs } : {}),
   });
   return { codeMode, calls };
@@ -761,4 +764,111 @@ test("code mode: search ranks name tokens above descriptions and ignores filler 
   const names = [...more.describe({ query: "fill form field" }).matchAll(/^\s+(\w+)\(/gm)].map((m) => m[1]);
   assert.deepEqual(names, ["fill_form"], "'form' is not found inside 'performance'");
   assert.match(more.describe({ query: "perf" }), /performance_start_trace/, "a word start still matches");
+});
+
+test("code mode: stricterPageEval only ever tightens, and unknown values deny", () => {
+  assert.equal(stricterPageEval(undefined, undefined), "allow");
+  assert.equal(stricterPageEval("allow", "ask"), "ask");
+  assert.equal(stricterPageEval("ask", "allow"), "ask");
+  assert.equal(stricterPageEval("ask", "deny"), "deny");
+  assert.equal(stricterPageEval("deny", "allow"), "deny");
+  assert.equal(stricterPageEval("allow", "sure"), "deny");
+  assert.equal(stricterPageEval("typo", undefined), "deny");
+});
+
+test("code mode: pageEval deny refuses page.eval and autodom.execute_code, other tools still run", async () => {
+  const denied = [];
+  const updates = [];
+  const { codeMode, calls } = fakeServer({ onPageEvalDenied: (i) => denied.push(i), onRunUpdate: (r) => updates.push(r) });
+  const { report } = await codeMode.run({
+    pageEval: "deny",
+    code: `
+      const out = [];
+      try { await page.eval(() => document.title); out.push("ran"); } catch (e) { out.push(e.name); }
+      try { await autodom.execute_code({ code: "1" }); out.push("ran"); } catch (e) { out.push(e.name); }
+      out.push((await autodom.click({ selector: "#a" })).clicked);
+      return out;`,
+  });
+  assert.deepEqual(report.result, ["PageEvalDenied", "PageEvalDenied", "#a"]);
+  assert.deepEqual(calls.map((c) => c[0]), ["click"], "execute_code never reached the tool");
+  assert.equal(denied.length, 2);
+  assert.match(denied[0].why, /pageEval option/);
+  const rec = updates.at(-1);
+  assert.equal(rec.pageEval, "deny");
+  assert.deepEqual(rec.calls.map((c) => [c.tool, c.state]), [["execute_code", "denied"], ["execute_code", "denied"], ["click", "applied"]]);
+  assert.match(report.calls.join(" "), /execute_code denied\(pageEval\)/);
+});
+
+test("code mode: the server policy wins over a looser run option", async () => {
+  const denied = [];
+  const { codeMode, calls } = fakeServer({ pageEvalPolicy: () => "deny", onPageEvalDenied: (i) => denied.push(i) });
+  const { report } = await codeMode.run({
+    pageEval: "allow",
+    code: `try { await page.eval(() => 1); return "ran"; } catch (e) { return [e.name, /AUTODOM_CODE_PAGE_EVAL/.test(e.message)]; }`,
+  });
+  assert.deepEqual(report.result, ["PageEvalDenied", true]);
+  assert.deepEqual(calls, []);
+  assert.match(denied[0].why, /AUTODOM_CODE_PAGE_EVAL/);
+});
+
+test("code mode: default allows page.eval as before", async () => {
+  const { codeMode, calls } = fakeServer();
+  const { report } = await codeMode.run({ code: `return await page.eval(() => document.title);` });
+  assert.equal(report.ok, true, JSON.stringify(report));
+  assert.deepEqual(calls.map((c) => c[0]), ["execute_code"]);
+});
+
+test("code mode: pageEval ask holds each page.eval; approving runs it, declining throws ApprovalDenied", async () => {
+  const held = [];
+  const { codeMode, calls } = fakeServer({
+    pageEvalPolicy: () => "ask",
+    holdPageEval: async (def, params) => {
+      held.push([def.name, params]);
+      return { confirmRequired: true, confirmId: 40 + held.length, tool: def.name, tier: "destructive", message: "page.eval needs approval", params };
+    },
+  });
+  const first = await codeMode.run({ code: `await autodom.click({ selector: "#a" }); const t = await page.eval(() => document.title); return t;` });
+  assert.equal(first.suspended, true, JSON.stringify(first.report));
+  assert.equal(first.report.tool, "execute_code");
+  assert.equal(first.report.confirmId, 41);
+  assert.deepEqual(calls.map((c) => c[0]), ["click"], "page.eval did not run before approval");
+  const done = await codeMode.resume(41, { value: JSON.stringify({ success: true, result: "Example" }) });
+  assert.equal(done.report.ok, true, JSON.stringify(done.report));
+  assert.equal(done.report.result, "Example");
+
+  const second = await codeMode.run({ code: `try { await page.eval(() => 1); return "ran"; } catch (e) { return e.name; }` });
+  assert.equal(second.report.confirmId, 42);
+  const no = await codeMode.deny(42);
+  assert.equal(no.report.result, "ApprovalDenied");
+  assert.deepEqual(calls.map((c) => c[0]), ["click"], "execute_code itself was never invoked by the script path");
+});
+
+test("code mode: ask without a hold hook, or in an unattended run, never runs page.eval", async () => {
+  const noHook = fakeServer({ pageEvalPolicy: () => "ask" });
+  const a = await noHook.codeMode.run({ code: `try { await page.eval(() => 1); return "ran"; } catch (e) { return e.name; }` });
+  assert.equal(a.report.result, "PageEvalDenied", "ask without a way to ask denies");
+  const withHook = fakeServer({
+    pageEvalPolicy: () => "ask",
+    holdPageEval: async (def, params) => ({ confirmRequired: true, confirmId: 77, tool: def.name, tier: "destructive", message: "needs approval", params }),
+  });
+  const b = await withHook.codeMode.run({ code: `await page.eval(() => 1); return "ran";`, unattended: true });
+  assert.equal(b.report.ok, false);
+  assert.match(b.report.stopped.reason, /needs approval/);
+  assert.deepEqual(withHook.calls, []);
+});
+
+test("code mode: pageEval is kept through a pause and a replay", async () => {
+  const updates = [];
+  const first = fakeServer({ defs: [heldDef()], pageEvalPolicy: () => "allow", suspendTtlMs: 40, onRunUpdate: (r, rp) => updates.push([r, rp]) });
+  await first.codeMode.run({ pageEval: "deny", code: `try { await page.eval(() => 1); } catch (e) { console.log(e.name); } await autodom.submit(); try { await page.eval(() => 2); return "ran"; } catch (e) { return e.name; }` });
+  await new Promise((r) => setTimeout(r, 120));
+  const [record, replay] = updates.at(-1);
+  assert.equal(record.pageEval, "deny");
+  assert.equal(replay.pageEval, "deny");
+  const second = fakeServer({ defs: [heldDef()] });
+  const held = await second.codeMode.replay({ record, replay });
+  assert.equal(held.suspended, true, JSON.stringify(held.report));
+  const done = await second.codeMode.resume(7, { value: JSON.stringify({ success: true }) });
+  assert.equal(done.report.result, "PageEvalDenied", "a resumed run keeps its policy");
+  assert.deepEqual(second.calls.map((c) => c[0]), ["submit"]);
 });
