@@ -4666,6 +4666,9 @@ async function _runBridgeTool(message, entry, clientId, toolName, params) {
         _runInToolLanes(toolName, params, ctx, () => {
           if (entry.state !== "cancelled") entry.state = "running";
           entry.runningAt = _swNow();
+          // run_code scripts ask for undo data per call ({runId, seq}); it is
+          // captured in handleToolCall, after every policy gate passed.
+          if (message.captureUndo && typeof message.captureUndo === "object") ctx.captureUndo = message.captureUndo;
           return handleToolCallWithRecording(toolName, params, message.id, callMeta, ctx);
         }),
       );
@@ -6934,6 +6937,9 @@ try {
       getFeatures: _getFeatures,
       broadcastState: _broadcastToolbarState,
       onWorkflowSaved: _mirrorWorkflowToServer,
+      // run_undo writes to each recorded call's tab. The bridge checked the
+      // caller's tab; every other destination gets the same checks here.
+      checkUndoTarget: _checkUndoTarget,
     });
     for (const [name, fn] of Object.entries(workflowEngine.handlers)) {
       TOOL_HANDLERS.set(name, fn);
@@ -7313,6 +7319,12 @@ async function handleToolCall(tool, params, id, ctx) {
     const handler = TOOL_HANDLERS.get(tool);
     if (!handler) return { error: `Unknown tool: ${tool}` };
     _throwIfCancelled(ctx);
+    // Undo capture reads the page, so only once the call is allowed to run.
+    const undoInfo = ctx?.captureUndo;
+    if (undoInfo) {
+      delete ctx.captureUndo;
+      return await _withUndoCapture(undoInfo, tool, params, ctx, () => _runToolHandler(tool, handler, params, ctx));
+    }
     return await _runToolHandler(tool, handler, params, ctx);
   } catch (err) {
     if (err?.cancelled) return _cancelledResult(err.reason);
@@ -8117,6 +8129,8 @@ async function _actOnTarget(ctx, target, step, params = {}) {
   const P = globalThis.AutoDOMWorkflow?._page;
   if (!P) return { error: "workflow engine not loaded" };
   const tab = await getActiveTab(ctx);
+  const undo = ctx?.undo && _UNDO_FIELD_ACTIONS.has(step?.action) ? ctx.undo : null;
+  if (undo) step = { ...step, undo: true };
   let scope = AutoDOMContext.scopeOf(params);
   try {
     const qualified = Object.keys(scope).length > 0;
@@ -8138,11 +8152,134 @@ async function _actOnTarget(ctx, target, step, params = {}) {
       scope = candidates[0];
       res = await _callWfPage(tab.id, P._pageWfRunAction, [{ ...scope, actionableOnly: true }, step], scope.frameId, scope.documentId);
     }
-    if (res?.ok) return { ...res, ..._actionContext({ ...target, ...scope }) };
+    if (res?.ok) {
+      if (undo) {
+        undo.fields.push({ action: step.action, prev: res.prev, after: res.after, origin: res.origin, afterHash: res.afterHash, frameId: scope.frameId ?? null });
+        for (const k of ["prev", "after", "origin", "afterHash"]) delete res[k];
+      }
+      return { ...res, ..._actionContext({ ...target, ...scope }) };
+    }
     return { error: res?.miss ? "Element not found: " + (target.selector || target.text) : res?.error || "Action failed" };
   } catch (err) {
     return { error: err.message, ...(Object.keys(scope).length && { contextHighlights: [{ kind: "inaccessible", ...scope }] }) };
   }
+}
+
+// ─── Undo capture for run_code scripts ──────────────────────
+// The server marks a script's tool calls with captureUndo {runId, seq}.
+// Around such a call this records what is needed to reverse it (the
+// field's previous value, the cookie / storage value / attribute it
+// overwrote, storage keys and cookies it added, navigation) in the
+// workflow engine's RAM-only undo store, and tells the script's run
+// record what can be undone (result.__undo, stripped by the server).
+const _UNDO_FIELD_ACTIONS = new Set(["fill", "select", "check"]);
+const _UNDO_TOOLS = new Set([
+  "click", "double_click", "type_text", "type_by_index", "fill_form", "select_option", "press_key",
+  "navigate", "set_storage", "set_attribute", "set_cookie", "delete_cookie", "clear_cookies",
+  "upload_file", "drag_and_drop",
+]);
+
+function _pageReadStorageValue(area, key) {
+  try {
+    const st = area === "session" ? sessionStorage : localStorage;
+    return { origin: location.origin, previous: st.getItem(key) };
+  } catch (e) {
+    return { error: String(e?.message || e) };
+  }
+}
+function _pageReadAttribute(selector, attribute) {
+  let el;
+  try { el = document.querySelector(selector); } catch (_) { return { error: "invalid selector" }; }
+  if (!el) return { error: "not found" };
+  return { origin: location.origin, previous: el.getAttribute(attribute) };
+}
+
+// The cookie set_cookie will write: same name, path (default "/") and
+// domain (a domain cookie when params.domain is given, else host-only).
+async function _cookieSetTarget(params, cookieUrl) {
+  const u = new URL(cookieUrl);
+  const path = params.path || "/";
+  const domain = params.domain ? String(params.domain).replace(/^\./, "").toLowerCase() : null;
+  const all = await chrome.cookies.getAll({ name: params.name, domain: domain || u.hostname });
+  const hit = (all || []).find((c) =>
+    c.path === path &&
+    (domain ? !c.hostOnly && String(c.domain).replace(/^\./, "").toLowerCase() === domain : c.hostOnly && c.domain === u.hostname));
+  return { url: `${u.protocol}//${domain || u.hostname}${path}`, previous: hit || null };
+}
+
+async function _undoPreState(tool, params, tab) {
+  const pre = {};
+  const cookieUrl = params?.url || tab.url;
+  // A failed read is not "there was no cookie": no undo op then.
+  try {
+    if (tool === "set_cookie" && params?.name) {
+      const t = await _cookieSetTarget(params, cookieUrl);
+      pre.cookies = [{ url: t.url, name: params.name, previous: t.previous }];
+    } else if (tool === "delete_cookie" && params?.name) {
+      // chrome.cookies.remove({url, name}) removes what get({url, name}) finds.
+      const previous = await chrome.cookies.get({ url: cookieUrl, name: params.name });
+      pre.cookies = previous ? [{ url: cookieUrl, name: params.name, previous }] : [];
+    } else if (tool === "clear_cookies") {
+      const all = await chrome.cookies.getAll({ url: cookieUrl });
+      pre.cookies = (all || []).slice(0, 200).map((c) => ({ url: cookieUrl, name: c.name, previous: c }));
+    }
+  } catch (err) {
+    pre.error = `could not read the cookies before the call (${err?.message || err})`;
+    delete pre.cookies;
+    return pre;
+  }
+  if (tool === "set_cookie" || tool === "delete_cookie" || tool === "clear_cookies") {
+    return pre;
+  } else if (tool === "set_storage" && (params?.type === "local" || params?.type === "session" || !params?.type) && params?.key && !params?.clear) {
+    const area = params.type === "session" ? "session" : "local";
+    const r = await executeInTab(tab.id, _pageReadStorageValue, [area, String(params.key)], "ISOLATED").catch(() => null);
+    if (r && !r.error) pre.storage = { origin: r.origin, area, key: String(params.key), previous: r.previous };
+  } else if (tool === "set_attribute" && params?.selector && params?.attribute) {
+    const r = await executeInTab(tab.id, _pageReadAttribute, [String(params.selector), String(params.attribute)], "ISOLATED").catch(() => null);
+    if (r && !r.error) pre.attribute = { origin: r.origin, selector: String(params.selector), attribute: String(params.attribute), previous: r.previous };
+  }
+  return pre;
+}
+
+function _undoLabel(tool, params) {
+  const target = params?.selector || (params?.ref ? `@${String(params.ref).replace(/^@/, "")}` : "") || params?.url || params?.name || params?.key || "";
+  return `${tool}${target ? ` ${String(target).slice(0, 120)}` : ""}`;
+}
+
+async function _withUndoCapture(info, tool, params, ctx, run) {
+  const WF = globalThis.AutoDOMWorkflow;
+  if (!_UNDO_TOOLS.has(tool) || !WF?.undoOpsForToolCall || !workflowEngine?.appendCodeUndo) return run();
+  let tab = null;
+  try { tab = await getActiveTab(ctx); } catch (_) {}
+  if (!tab) return run();
+  const digest = async (tabId) => {
+    const d = await _callWfPage(tabId, WF._page._pageWfDigest, []).catch(() => null);
+    return d && !d.needLib ? d : null;
+  };
+  const before = await digest(tab.id);
+  const pre = await _undoPreState(tool, params, tab).catch(() => ({}));
+  ctx.undo = { fields: [] };
+  let result;
+  try {
+    result = await run();
+  } finally {
+    const fields = ctx.undo.fields;
+    delete ctx.undo;
+    ctx._undoFields = fields;
+  }
+  const executed = result && typeof result === "object" && !result.error && !result.approvalRequired && !result.confirmRequired && !result.blocked;
+  if (!executed) return result;
+  try {
+    const after = await digest(tab.id);
+    const { ops, irreversible } = WF.undoOpsForToolCall({ tool, params, fields: ctx._undoFields, pre, before, after });
+    if (ops.length) {
+      await workflowEngine.appendCodeUndo(info.runId, { index: Number(info.seq), label: _undoLabel(tool, params), tabId: tab.id, ops });
+    }
+    result.__undo = { ...(ops.length ? { undoable: [...new Set(ops.map((o) => o.type))] } : {}), ...(irreversible ? { irreversible } : {}) };
+  } catch (err) {
+    result.__undo = { irreversible: `undo capture failed: ${err?.message || err}` };
+  }
+  return result;
 }
 
 function _foundIn(res) {
@@ -8156,9 +8293,13 @@ async function _actByRef(ref, step, ctx, params) {
   if (!P) return { error: "workflow engine not loaded" };
   const tab = await getActiveTab(ctx);
   const scope = AutoDOMContext.scopeOf(params);
+  if (ctx?.undo && _UNDO_FIELD_ACTIONS.has(step?.action) && !Object.keys(scope).length) step = { ...step, undo: true };
   const res = Object.keys(scope).length
     ? await _actOnTarget(ctx, { ref }, step, params)
     : await _callWfPage(tab.id, P._pageWfActOnRef, [ref, step]);
+  if (res?.ok && !Object.keys(scope).length && ctx?.undo && _UNDO_FIELD_ACTIONS.has(step?.action)) {
+    ctx.undo.fields.push({ action: step.action, prev: res.prev, after: res.after, origin: res.origin, afterHash: res.afterHash, frameId: null });
+  }
   if (!res?.ok) {
     return {
       error: res?.error || `Action on @${ref} failed`,
@@ -11629,6 +11770,20 @@ async function _bridgePolicyCheck(tool, params, ctx) {
     rule,
     message: `Your approval rule asks before ${tier} actions on ${rule.match} (${tool} on ${host || "this page"}).`,
   };
+}
+
+// null when run_undo may write to tabId for this caller, else the reason.
+async function _checkUndoTarget(tabId, callCtx, { ownedOnly = false } = {}) {
+  if (callCtx?.tabId != null && tabId === callCtx.tabId) return null; // checked by the bridge
+  const Tab = _AutoDOMTabGroup();
+  if (ownedOnly && callCtx?.isolated && callCtx.clientId && Tab?.ownsTab && !Tab.ownsTab(callCtx.clientId, tabId)) {
+    return "that tab is not one of this client's AutoDOM tabs";
+  }
+  const sub = _makeCallContext({ origin: callCtx?.origin || "bridge", clientId: callCtx?.clientId ?? null, tabId });
+  const r = await _bridgePolicyCheck("run_undo", {}, sub);
+  if (!r) return null;
+  if (r.approvalRequired) return `${r.message} Pin that tab (pin_tab) and run run_undo again for its calls, so it can be approved.`;
+  return r.error || "blocked by policy";
 }
 
 // Administrator blockedUrlPatterns (chrome.storage.managed) for the page

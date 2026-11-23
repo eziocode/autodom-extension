@@ -272,6 +272,12 @@ export function createCodeMode({
     return e;
   }
 
+  function applyUndoInfo(entry, u) {
+    if (!u || typeof u !== "object") return;
+    if (Array.isArray(u.undoable) && u.undoable.length) entry.undoable = u.undoable.map(String).slice(0, 10);
+    if (u.irreversible) entry.irreversible = String(u.irreversible).slice(0, 300);
+  }
+
   const include = (def) =>
     def && typeof def.execute === "function" && !def._meta && !CODE_MODE_EXCLUDED.has(def.name) && !hidden.has(def.name);
 
@@ -556,12 +562,13 @@ export function createCodeMode({
    * script's next outcome. Pass `error` instead when running the call threw.
    * Returns null when confirmId does not belong to a paused run.
    */
-  async function resume(confirmId, { value, error, signal, context } = {}) {
+  async function resume(confirmId, { value, error, signal, context, undo } = {}) {
     const taken = takeSuspended(confirmId);
     if (!taken) return null;
     const { state, hold } = taken;
     if (context) state.context = context;
     if (hold.entry) hold.entry.state = "approved";
+    if (hold.entry && undo) applyUndoInfo(hold.entry, undo);
     emitRecord(state);
     if (error) hold.waiter.reject(new ToolCallError("ToolError", `${hold.tool}: ${error?.message || error}`));
     else hold.waiter.resolve({ approvedValue: value });
@@ -755,7 +762,12 @@ export function createCodeMode({
     const t0 = Date.now();
     let raw;
     try {
-      raw = await invoke(def, params, { signal: state.abort.signal, context: state.context });
+      raw = await invoke(def, params, {
+        signal: state.abort.signal,
+        context: state.context,
+        // What the extension can reverse for this call (run_undo).
+        undo: { runId: state.record.runId, seq: entry.seq, report: (u) => applyUndoInfo(entry, u) },
+      });
     } catch (err) {
       state.callLog.push(`${op} threw ${Date.now() - t0}ms`);
       Object.assign(entry, { state: "threw", ms: Date.now() - t0, error: String(err?.message || err).slice(0, 500) });
@@ -856,6 +868,12 @@ export function createCodeMode({
     deny,
     /** True when confirmId is the hold a paused script is waiting on. */
     isSuspended: (confirmId) => suspended.get(confirmId)?.active?.confirmId === confirmId,
+    /** The run and call a paused script's hold belongs to, or null. */
+    holdCall: (confirmId) => {
+      const state = suspended.get(confirmId);
+      const hold = state?.active?.confirmId === confirmId ? state.active : null;
+      return hold?.entry ? { runId: state.record.runId, seq: hold.entry.seq } : null;
+    },
     suspendedCount: () => new Set(suspended.values()).size,
     /** True while the run with this runId is running or paused. */
     isLive: (runId) => live.has(runId),

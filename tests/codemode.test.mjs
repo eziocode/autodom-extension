@@ -642,3 +642,36 @@ test("code run store: replay state files live and die with the run", async (t) =
   assert.equal(await store.pruneCodeRuns(1, {}, home), 1);
   assert.equal(await store.readCodeRunReplay(id, home), null, "pruning a run removes its replay state");
 });
+
+test("code mode: each call carries its run/seq for undo and records what can be reversed", async () => {
+  const seen = [];
+  const updates = [];
+  const defs = [
+    { name: "type_text", description: "Type.", parameters: z.object({ selector: z.string(), text: z.string() }), execute: async () => JSON.stringify({ success: true }) },
+    { name: "click", description: "Click.", parameters: z.object({ selector: z.string() }), execute: async () => JSON.stringify({ success: true }) },
+    heldDef(),
+  ];
+  const codeMode = createCodeMode({
+    getDefinitions: () => defs,
+    jsonSchemaFor: (p) => z.toJSONSchema(p, { io: "input" }),
+    tierOf: () => "write",
+    parseHeld: (v) => (v && typeof v === "object" && v.confirmRequired ? v : null),
+    onRunUpdate: (r) => updates.push(r),
+    invoke: async (def, params, ctx) => {
+      seen.push([def.name, ctx.undo.runId, ctx.undo.seq]);
+      if (def.name === "type_text") ctx.undo.report({ undoable: ["field"] });
+      if (def.name === "click") ctx.undo.report({ irreversible: "clicks and key presses cannot be undone automatically" });
+      return def.execute(params);
+    },
+  });
+  const held = await codeMode.run({ code: `await autodom.type_text({ selector: "#q", text: "x" }); await autodom.click({ selector: "#go" }); await autodom.submit(); return 1;` });
+  const runId = held.report.runId;
+  assert.deepEqual(seen, [["type_text", runId, 0], ["click", runId, 1], ["submit", runId, 2]]);
+  assert.deepEqual(codeMode.holdCall(7), { runId, seq: 2 }, "the approved call is captured under its own seq");
+  assert.equal(codeMode.holdCall(99), null);
+  await codeMode.resume(7, { value: JSON.stringify({ success: true }), undo: { undoable: ["cookie"] } });
+  const calls = updates.at(-1).calls;
+  assert.deepEqual(calls[0].undoable, ["field"]);
+  assert.match(calls[1].irreversible, /clicks/);
+  assert.deepEqual(calls[2].undoable, ["cookie"]);
+});

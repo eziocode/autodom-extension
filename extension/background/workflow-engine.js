@@ -527,12 +527,16 @@
 
     // What the field held before a step changed it, so a run can be undone.
     // Sensitive fields only record whether they were empty (never the value).
+    // Longer values are not kept: restoring a cut-off prefix would delete
+    // the rest of the text.
+    const MAX_PREV_CHARS = 20000;
     const prevOf = (el, step) => {
       try {
         if (step.action === "fill") {
           const cur = el.isContentEditable && !isField(el) ? el.textContent || "" : String(el.value == null ? "" : el.value);
           if (isSensitive(el)) return cur === "" ? { kind: "value", value: "" } : { kind: "none", reason: "sensitive field had a value" };
-          return { kind: "value", value: cur.slice(0, 2000) };
+          if (cur.length > MAX_PREV_CHARS) return { kind: "none", reason: `previous value too long to keep (${cur.length} characters)` };
+          return { kind: "value", value: cur };
         }
         if (step.action === "select") return { kind: "value", value: String(el.value == null ? "" : el.value) };
         if (step.action === "check") {
@@ -540,6 +544,39 @@
         }
       } catch (_) {}
       return null;
+    };
+
+    // What a field holds now, as compared by undo (value, or checked state).
+    const currentOf = (el, action) => {
+      if (action === "check") return "checked" in el ? String(!!el.checked) : String(el.getAttribute("aria-checked") === "true");
+      return el.isContentEditable && !isField(el) ? el.textContent || "" : String(el.value == null ? "" : el.value);
+    };
+    // FNV-1a: lets undo check "still what the call wrote" without keeping it.
+    const hashOf = (str) => {
+      let h = 0x811c9dc5;
+      for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193) >>> 0;
+      }
+      return h.toString(16) + ":" + str.length;
+    };
+    // Undo info for a run_code call: where it acted and what it left behind.
+    const undoInfoOf = (el, step) => ({
+      after: describe(el),
+      origin: location.origin,
+      afterHash: hashOf(currentOf(el, step.action)),
+    });
+    // Put a field back, but only on the same origin and only when it still
+    // holds what the call wrote (otherwise the user or page changed it).
+    const restoreField = (origin, locator, expectedHash, step) => {
+      if (origin && location.origin !== origin) return { ok: false, conflict: true, error: "page origin changed (" + location.origin + "); not restored" };
+      const hit = resolve(locator);
+      if (!hit) return { ok: false, error: "element not found" };
+      if (expectedHash && hashOf(currentOf(hit.el, step.action)) !== expectedHash) {
+        return { ok: false, conflict: true, error: "the field changed after the call; not restored" };
+      }
+      const res = act(hit.el, step);
+      return { ...res, strategy: hit.strategy };
     };
 
     // Resolve without acting (dry run). Reports what a run would do.
@@ -647,6 +684,7 @@
       const res = act(hit.el, step);
       return {
         ...res,
+        ...(prev ? { origin: location.origin, afterHash: hashOf(currentOf(hit.el, step.action)) } : {}),
         strategy: hit.strategy,
         ambiguous: !!hit.ambiguous,
         matches: hit.count,
@@ -660,7 +698,7 @@
       if (!el) return { ok: false, error: "stale or unknown ref: " + ref };
       const prev = prevOf(el, step);
       const res = act(el, step);
-      return { ...res, strategy: "ref", after: describe(el), ...(prev ? { prev } : {}) };
+      return { ...res, strategy: "ref", after: describe(el), ...(step.undo ? undoInfoOf(el, step) : {}), ...(prev ? { prev } : {}) };
     };
 
     // Cheap page digest for before/after step diffs.
@@ -979,9 +1017,12 @@
       if (!hit) return { ok: false, miss: true };
       if (hit.needsContext || hit.error) return { ok: false, ...hit };
       const el = hit.el;
+      // step.undo: also report what the field held before (run_code undo).
+      const prev = step && step.undo ? prevOf(el, step) : null;
       const res = step && step.action ? act(el, step) : { ok: true };
       return {
         ...res,
+        ...(step && step.undo ? { ...undoInfoOf(el, step), ...(prev ? { prev } : {}) } : {}),
         via: hit.via,
         tag: el.tagName,
         text: norm(el.textContent).slice(0, 100),
@@ -1183,6 +1224,7 @@
       observeArm,
       observeCollect,
       runStep,
+      restoreField,
       resolveOnly,
       markCandidates,
       clearMarks,
@@ -1211,6 +1253,12 @@
   function _pageWfRunStep(step, timeoutMs) {
     const L = globalThis.__autodomWfLib;
     return L && L.v === 7 ? L.runStep(step, timeoutMs) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+  }
+  function _pageWfRestoreField(origin, locator, expectedHash, step) {
+    const L = globalThis.__autodomWfLib;
+    return L && L.v === 7 && L.restoreField
+      ? L.restoreField(origin, locator, expectedHash, step)
+      : { ok: false, needLib: true, error: "workflow lib not loaded" };
   }
   function _pageWfActOnRef(ref, step) {
     const L = globalThis.__autodomWfLib;
@@ -1255,6 +1303,28 @@
   function _pageWfRemoveStorage(origin, local, session) {
     const L = globalThis.__autodomWfLib;
     return L && L.v === 7 ? L.removeStorage(origin, local, session) : { ok: false, needLib: true, error: "workflow lib not loaded" };
+  }
+  // Undo of a run_code set_storage call. Self-contained (no page library).
+  function _pageWfRestoreStorageValue(origin, area, key, previous) {
+    if (origin && location.origin !== origin) return { ok: false, error: "page origin changed (" + location.origin + ")" };
+    try {
+      const st = area === "session" ? sessionStorage : localStorage;
+      if (previous === null || previous === undefined) st.removeItem(key);
+      else st.setItem(key, previous);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: String((e && e.message) || e) };
+    }
+  }
+  // Undo of a run_code set_attribute call. Self-contained (no page library).
+  function _pageWfRestoreAttribute(origin, selector, attribute, previous) {
+    if (origin && location.origin !== origin) return { ok: false, error: "page origin changed (" + location.origin + ")" };
+    let el;
+    try { el = document.querySelector(selector); } catch (_) { return { ok: false, error: "invalid selector" }; }
+    if (!el) return { ok: false, error: "element not found: " + selector };
+    if (previous === null || previous === undefined) el.removeAttribute(attribute);
+    else el.setAttribute(attribute, previous);
+    return { ok: true };
   }
   function _pageWfDigest() {
     const L = globalThis.__autodomWfLib;
@@ -1545,6 +1615,64 @@
     return `${c.ref ? `@${c.ref} ` : ""}${role}${name ? ` "${String(name).slice(0, 80)}"` : ""}${extra.length ? ` [${extra.join(" ")}]` : ""}`;
   }
 
+  // Undo ops for one run_code tool call, from what the service worker saw
+  // around it: field values the page library reported (fields), state read
+  // before the call (pre: cookies / storage value / attribute), and page
+  // digests before and after. Same op shapes as workflow runs, plus cookie,
+  // storage_value and attribute.
+  const UNDO_FIELD_ACTIONS = new Set(["fill", "select", "check"]);
+  function undoOpsForToolCall({ tool, params, fields, pre, before, after }) {
+    const ops = [];
+    const notes = [];
+    const origin = (u) => { try { return new URL(u).origin; } catch (_) { return ""; } };
+    const pathOf = (u) => { try { return new URL(u).pathname; } catch (_) { return ""; } };
+    if (pre && pre.error) notes.push(pre.error);
+    for (const f of fields || []) {
+      if (!UNDO_FIELD_ACTIONS.has(f.action) || !f.after) continue;
+      if (f.frameId != null && f.frameId !== 0) { notes.push("field inside a frame"); continue; }
+      if (!f.prev || f.prev.kind === "none") { notes.push((f.prev && f.prev.reason) || "previous value unknown"); continue; }
+      ops.push({
+        type: "field",
+        step: { action: f.action, locator: f.after, value: f.prev.value },
+        ...(f.origin ? { origin: f.origin } : {}),
+        ...(f.afterHash ? { expectedHash: f.afterHash } : {}),
+      });
+    }
+    for (const c of (pre && pre.cookies) || []) ops.push({ type: "cookie", url: c.url, name: c.name, previous: c.previous || null });
+    if (pre && pre.storage) ops.push({ type: "storage_value", ...pre.storage });
+    if (pre && pre.attribute) ops.push({ type: "attribute", ...pre.attribute });
+    const diff = diffDigest(before, after);
+    const sameOrigin = before && after && origin(before.url) && origin(before.url) === origin(after.url);
+    if (diff && sameOrigin) {
+      // The tool's own pre-read already covers what it changed.
+      const skipStorage = tool === "set_storage";
+      const skipCookies = tool === "set_cookie" || tool === "delete_cookie" || tool === "clear_cookies";
+      const local = skipStorage ? [] : (diff.localStorage && diff.localStorage.added) || [];
+      const session = skipStorage ? [] : (diff.sessionStorage && diff.sessionStorage.added) || [];
+      if (local.length || session.length) ops.push({ type: "storage", origin: origin(after.url), local, session });
+      // document.cookie only shows cookies whose path matches the URL, so a
+      // path change makes existing cookies look new: infer nothing then.
+      const samePath = pathOf(before.url) === pathOf(after.url);
+      const names = skipCookies || !samePath ? [] : (diff.cookies && diff.cookies.added) || [];
+      if (names.length) ops.push({ type: "cookies", url: after.url, names });
+    }
+    if (diff && diff.url) {
+      const action = params && params.action;
+      if (tool === "navigate" && action === "reload") {
+        // Nothing to step back to.
+      } else {
+        ops.push({ type: "navigation", from: diff.url.from, to: diff.url.to, ...(tool === "navigate" && action === "back" ? { direction: "forward" } : {}) });
+      }
+    }
+    if (["click", "double_click", "press_key", "drag_and_drop", "type_by_index", "upload_file"].includes(tool)) {
+      notes.push(tool === "type_by_index" ? "type_by_index has no stable locator (type_text with a ref can be undone)"
+        : tool === "upload_file" ? "file inputs cannot be reset" : "clicks and key presses cannot be undone automatically");
+    }
+    if (tool === "set_storage" && !(pre && pre.storage)) notes.push("only single-key local/session storage writes can be undone");
+    if (tool === "clear_cookies" && !((pre && pre.cookies) || []).length) notes.push("no cookies were captured before clearing");
+    return { ops, ...(notes.length ? { irreversible: [...new Set(notes)].join("; ") } : {}) };
+  }
+
   function diffDigest(before, after) {
     if (!before || !after) return null;
     const delta = (a, b) => ({
@@ -1755,7 +1883,11 @@
   const MAX_RUNS = 200; // hard ceiling; features.runHistoryLimit picks the real cap
   const UNDO_KEY = "autodom.runUndo";
   const MAX_UNDO_RUNS = 20;
-  const UNDO_GROUP = { field: "fields", storage: "storage", cookies: "cookies", navigation: "navigation" };
+  const CODE_UNDO_KEY = "autodom.codeRunUndo";
+  const UNDO_GROUP = {
+    field: "fields", storage: "storage", cookies: "cookies", navigation: "navigation",
+    cookie: "cookies", storage_value: "storage", attribute: "fields",
+  };
   const MAY_CHANGE_PAGE = new Set(["click", "dblclick", "press"]);
   // Finished runs / batches stay in memory for live run_get views, then
   // fall back to the persisted history.
@@ -2379,6 +2511,8 @@
         ops.push({
           type: "field",
           step: { action: step.action, locator: (res.after || step.locator), value: res.prev.value },
+          ...(res.origin ? { origin: res.origin } : {}),
+          ...(res.afterHash ? { expectedHash: res.afterHash } : {}),
         });
       }
       const sameOrigin = before && after && originOf(before.url) && originOf(before.url) === originOf(after.url);
@@ -2386,7 +2520,8 @@
         const local = (diff.localStorage && diff.localStorage.added) || [];
         const session = (diff.sessionStorage && diff.sessionStorage.added) || [];
         if (local.length || session.length) ops.push({ type: "storage", origin: originOf(after.url), local, session });
-        const names = (diff.cookies && diff.cookies.added) || [];
+        const pathOf = (u) => { try { return new URL(u).pathname; } catch (_) { return ""; } };
+        const names = pathOf(before.url) === pathOf(after.url) ? (diff.cookies && diff.cookies.added) || [] : [];
         if (names.length) ops.push({ type: "cookies", url: after.url, names });
       }
       if (diff && diff.url) ops.push({ type: "navigation", from: diff.url.from, to: diff.url.to });
@@ -2404,8 +2539,32 @@
     }
     async function getUndo(runId) {
       if (!storage.session) return null;
-      const got = await storage.session.get(UNDO_KEY);
-      return ((got && got[UNDO_KEY]) || {})[runId] || null;
+      const key = isCodeRun(runId) ? CODE_UNDO_KEY : UNDO_KEY;
+      const got = await storage.session.get(key);
+      return ((got && got[key]) || {})[runId] || null;
+    }
+    const isCodeRun = (runId) => /^code_[a-z0-9]+_[a-z0-9]+$/.test(String(runId || ""));
+
+    // run_code scripts: one undo step per tool call, appended as calls run.
+    // RAM only (session storage), like workflow undo; their own 20-run cap.
+    let codeUndoChain = Promise.resolve();
+    function appendCodeUndo(runId, step) {
+      if (!storage.session || !isCodeRun(runId)) return Promise.resolve(false);
+      const write = async () => {
+        const got = await storage.session.get(CODE_UNDO_KEY);
+        const map = (got && got[CODE_UNDO_KEY]) || {};
+        const info = map[runId] || { kind: "code", steps: [], createdAt: Date.now() };
+        info.steps = info.steps.filter((st) => st.index !== step.index).concat([step]).sort((a, b) => a.index - b.index);
+        info.tabId = step.tabId;
+        map[runId] = info;
+        const keep = Object.entries(map).sort((a, b) => b[1].createdAt - a[1].createdAt).slice(0, MAX_UNDO_RUNS);
+        await storage.session.set({ [CODE_UNDO_KEY]: Object.fromEntries(keep) });
+        return true;
+      };
+      // Serialized: parallel calls of one script must not lose each other's steps.
+      const next = codeUndoChain.then(write, write);
+      codeUndoChain = next.catch(() => {});
+      return next;
     }
 
     // ── live run bookkeeping ──
@@ -2940,13 +3099,15 @@
       };
     }
 
-    async function runUndo(params) {
+    async function runUndo(params, callCtx) {
       const info = await getUndo(params && params.runId);
       if (!info) {
         return { ok: false, error: "No undo data for this run. It is kept in memory for the 20 most recent runs and is lost when the browser closes." };
       }
+      const codeRun = isCodeRun(params.runId);
+      const tabAlive = async (id) => { try { await chrome.tabs.get(id); return true; } catch (_) { return false; } };
       const tabId = params.tabId != null ? params.tabId : info.tabId;
-      try { await chrome.tabs.get(tabId); } catch (_) {
+      if (!codeRun && !(await tabAlive(tabId))) {
         return { ok: false, error: "The tab this run used is gone, so its changes cannot be reversed from here." };
       }
       const wanted = new Set(["fields", "storage", "cookies"]);
@@ -2956,15 +3117,30 @@
       const plan = info.steps.filter((st) => !only || only.has(st.index)).slice().reverse();
       const results = [];
       for (const st of plan) {
+        // A script can use several tabs: each call keeps its own.
+        const stTab = params.tabId != null ? params.tabId : st.tabId != null ? st.tabId : tabId;
+        const alive = codeRun ? await tabAlive(stTab) : true;
+        const refused = alive && ctx.checkUndoTarget ? await ctx.checkUndoTarget(stTab, callCtx, { ownedOnly: codeRun }) : null;
         for (const op of st.ops) {
           const group = UNDO_GROUP[op.type];
           const item = { step: st.index + 1, what: st.label, type: op.type };
           if (!wanted.has(group)) { results.push({ ...item, status: "skipped", reason: `${group} not included` }); continue; }
+          if (refused) { results.push({ ...item, status: "refused", reason: refused }); continue; }
           if (params.dryRun === true) { results.push({ ...item, status: "would_undo" }); continue; }
+          const tabId = stTab;
+          if (!alive && op.type !== "cookie" && op.type !== "cookies") { results.push({ ...item, status: "failed", reason: "the tab this call used is gone" }); continue; }
           try {
             if (op.type === "field") {
-              const r = await execLib(tabId, _pageWfRunStep, [op.step, 2000]);
-              results.push({ ...item, status: r && r.ok ? "undone" : "failed", ...(r && r.ok ? {} : { reason: (r && r.error) || "target not found" }) });
+              // Bound ops restore only on their origin and only an unchanged
+              // field; older ones (no origin) replay as before.
+              const r = op.origin || op.expectedHash
+                ? await execLib(tabId, _pageWfRestoreField, [op.origin || "", op.step.locator, op.expectedHash || null, { action: op.step.action, value: op.step.value }])
+                : await execLib(tabId, _pageWfRunStep, [op.step, 2000]);
+              results.push({
+                ...item,
+                status: r && r.ok ? "undone" : r && r.conflict ? "conflict" : "failed",
+                ...(r && r.ok ? {} : { reason: (r && r.error) || "target not found" }),
+              });
             } else if (op.type === "storage") {
               const r = await execLib(tabId, _pageWfRemoveStorage, [op.origin, op.local, op.session]);
               results.push({ ...item, status: r && r.ok ? "undone" : "failed", detail: r && r.ok ? `${r.removed} key(s) removed` : (r && r.error) });
@@ -2975,23 +3151,50 @@
               }
               results.push({ ...item, status: removed ? "undone" : "failed", detail: `${removed}/${op.names.length} cookie(s) removed` });
             } else if (op.type === "navigation") {
-              await chrome.tabs.goBack(tabId);
+              if (op.direction === "forward") await chrome.tabs.goForward(tabId);
+              else await chrome.tabs.goBack(tabId);
               await settle(tabId, 300);
-              results.push({ ...item, status: "undone", detail: `back from ${op.to}` });
+              results.push({ ...item, status: "undone", detail: `${op.direction === "forward" ? "forward" : "back"} from ${op.to}` });
+            } else if (op.type === "cookie") {
+              const p = op.previous;
+              if (!p) {
+                await chrome.cookies.remove({ url: op.url, name: op.name });
+                results.push({ ...item, status: "undone", detail: `cookie ${op.name} removed` });
+              } else {
+                const host = String(p.domain || "").replace(/^\./, "");
+                const url = `${p.secure ? "https" : "http"}://${host}${p.path || "/"}`;
+                await chrome.cookies.set({
+                  url, name: p.name, value: p.value, path: p.path,
+                  ...(p.hostOnly ? {} : { domain: p.domain }),
+                  secure: p.secure, httpOnly: p.httpOnly,
+                  ...(p.sameSite && p.sameSite !== "unspecified" ? { sameSite: p.sameSite } : {}),
+                  ...(p.session ? {} : { expirationDate: p.expirationDate }),
+                  ...(p.storeId ? { storeId: p.storeId } : {}),
+                });
+                results.push({ ...item, status: "undone", detail: `cookie ${op.name} restored` });
+              }
+            } else if (op.type === "storage_value") {
+              const r = await exec(tabId, _pageWfRestoreStorageValue, [op.origin, op.area, op.key, op.previous]);
+              results.push({ ...item, status: r && r.ok ? "undone" : "failed", ...(r && r.ok ? {} : { reason: (r && r.error) || "restore failed" }) });
+            } else if (op.type === "attribute") {
+              const r = await exec(tabId, _pageWfRestoreAttribute, [op.origin, op.selector, op.attribute, op.previous]);
+              results.push({ ...item, status: r && r.ok ? "undone" : "failed", ...(r && r.ok ? {} : { reason: (r && r.error) || "restore failed" }) });
             }
           } catch (err) {
             results.push({ ...item, status: "failed", reason: String((err && err.message) || err) });
           }
         }
       }
-      const live = (await runGet({ runId: params.runId })) || {};
+      const live = codeRun ? {} : (await runGet({ runId: params.runId })) || {};
       const irreversible = (live.steps || [])
         .filter((x) => x.irreversible && (!only || only.has(x.index)))
         .map((x) => ({ step: x.index + 1, what: `${x.action} ${x.target}`, why: x.irreversible }));
       const undone = results.filter((r) => r.status === "undone").length;
+      const conflicts = results.filter((r) => r.status === "conflict").length;
       return {
-        ok: !results.some((r) => r.status === "failed"),
+        ok: !results.some((r) => r.status === "failed" || r.status === "conflict" || r.status === "refused"),
         dryRun: params.dryRun === true,
+        ...(conflicts ? { conflicts } : {}),
         undone,
         results,
         irreversible,
@@ -3134,6 +3337,7 @@
       onNavigationCommitted,
       onNavigationCompleted,
       noteAgentTool,
+      appendCodeUndo,
       runWorkflow,
       findWorkflow,
       getWorkflow,
@@ -3208,6 +3412,7 @@
     pickHeuristic,
     compactLine,
     diffDigest,
+    undoOpsForToolCall,
     toPlaywright,
     toMarkdown,
     parseRoutine,
@@ -3233,6 +3438,9 @@
       _pageWfMark,
       _pageWfClearMarks,
       _pageWfRemoveStorage,
+      _pageWfRestoreStorageValue,
+      _pageWfRestoreField,
+      _pageWfRestoreAttribute,
       _pageWfQuiet,
     },
   };
