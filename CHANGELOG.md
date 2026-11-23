@@ -20,6 +20,25 @@ All notable changes to AutoDOM are documented in this file.
   - `AUTODOM_CODE_RUNS=0` turns the records off.
   - The script source is stored as written, the same way `script_save`
     keeps it.
+- A `run_code` script that is paused for an approval can be resumed after
+  the approval expired or the bridge restarted: `run_code {resume: runId}`.
+  - The script runs again from the top. Calls that already finished return
+    their recorded result or error without running again.
+  - The held call runs for real, so it asks for approval again through the
+    normal path. A resume never approves anything by itself.
+  - If a call no longer matches the recorded tool and arguments at its
+    position, the resume stops as diverged.
+  - New `step(name, fn)` global: `fn` runs once and its result is replayed,
+    for `Date.now()` and `Math.random()`.
+  - An expired hold now leaves the run `paused` and resumable instead of
+    discarding it. `run_list` marks resumable runs.
+  - While paused, the code, unredacted input and call results are kept in
+    `~/.autodom/runs/<runId>.replay.json` (mode 0600). The file is deleted
+    as soon as the run ends.
+  - Limits: a run with a call still in flight at the pause can't be resumed,
+    and neither can one whose call outcomes exceed 1 MB each or 8 MB in
+    total. Screenshots taken before the pause can't be attached after a
+    resume.
 
 ---
 

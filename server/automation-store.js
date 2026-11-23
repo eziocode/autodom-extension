@@ -10,6 +10,9 @@
 //                           server is their only copy
 //   runs/<runId>.json       run records of run_code scripts (call log,
 //                           status, logs, result preview); newest 50 kept
+//   runs/<runId>.replay.json  while a script is paused: its code, input and
+//                           call outcomes, so it can be resumed by replay;
+//                           deleted as soon as the run ends
 
 import { promises as fs, createReadStream } from "fs";
 import { createInterface } from "node:readline";
@@ -129,6 +132,40 @@ export async function saveCodeRun(record, home = autodomHome()) {
   return file;
 }
 
+function codeRunReplayFile(runId, home) {
+  if (!isCodeRunId(runId)) throw new Error(`Not a run_code run id: ${runId}`);
+  return join(home, "runs", `${runId}.replay.json`);
+}
+
+/** Replay state of a paused run (holds the unredacted input and call results). */
+export async function saveCodeRunReplay(runId, replay, home = autodomHome()) {
+  const file = codeRunReplayFile(runId, home);
+  await fs.mkdir(dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(replay), { encoding: "utf8", mode: 0o600 });
+  await fs.rename(tmp, file);
+  return file;
+}
+
+export async function readCodeRunReplay(runId, home = autodomHome()) {
+  if (!isCodeRunId(runId)) return null;
+  try {
+    return JSON.parse(await fs.readFile(codeRunReplayFile(runId, home), "utf8"));
+  } catch (err) {
+    if (err.code === "ENOENT" || err instanceof SyntaxError) return null;
+    throw err;
+  }
+}
+
+export async function deleteCodeRunReplay(runId, home = autodomHome()) {
+  try {
+    await fs.unlink(codeRunReplayFile(runId, home));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** The run record, or null when there is none with that id. */
 export async function readCodeRun(runId, home = autodomHome()) {
   if (!isCodeRunId(runId)) return null;
@@ -181,6 +218,7 @@ export async function pruneCodeRuns(keep = CODE_RUNS_KEEP, { isLive = () => fals
     } catch {
       // Already gone.
     }
+    await deleteCodeRunReplay(id, home);
   }
   return removed;
 }
