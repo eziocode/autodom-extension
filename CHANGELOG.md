@@ -6,6 +6,21 @@ All notable changes to AutoDOM are documented in this file.
 
 ## Unreleased
 
+### Changed
+- **Code Mode is listed by default.** `run_code`, `code_api` and the
+  `script_*` tools now appear in `tools/list` next to every other tool
+  (134 tools, was 128; about 4.7 KB more), and the server instructions
+  suggest one `run_code` script for multi-step work. Before, they were only
+  listed with `AUTODOM_CODE_MODE=1`.
+  - `AUTODOM_CODE_MODE=0` (or `off`, `false`, `no`) restores the old list;
+    the tools stay callable by name either way. `only` is unchanged. Any
+    other value lists them, so a typo cannot hide tools.
+  - Nothing runs differently unless a model chooses `run_code`. Every inner
+    call still goes through the same guardrails and approvals, and the new
+    `AUTODOM_CODE_PAGE_EVAL` and `AUTODOM_SCRIPT_SAVE` policies apply.
+  - The benchmark in `docs/CODE_MODE.md` pins its classic baseline to
+    `AUTODOM_CODE_MODE=0`.
+
 ### Added
 - `run_code` runs now leave a run record in `~/.autodom/runs/`: the script,
   its status, one entry per tool call (params redacted, outcome, time),

@@ -104,7 +104,11 @@ test("tools/list is client-safe: no $schema, object roots, no -32601 probes", as
   assert.ok(report.toolNames.includes("token_stats"), "token_stats tool missing");
   assert.ok(!report.toolNames.includes("browser_click"), "compat aliases should be hidden from tools/list");
   assert.ok(report.toolNames.includes("verify_artifact_counts"), "non-alias catalog tools stay listed");
-  assert.equal(report.toolCount, 128, "153 registered minus 19 hidden Playwright aliases and 6 opt-in Code Mode tools");
+  // Code Mode is listed by default (AUTODOM_CODE_MODE=0 hides it: 128 tools).
+  for (const name of ["run_code", "code_api", "script_save", "script_list", "script_get", "script_delete"]) {
+    assert.ok(report.toolNames.includes(name), `${name} should be listed by default`);
+  }
+  assert.equal(report.toolCount, 134, "153 registered minus the 19 hidden Playwright aliases");
   // listChanged is advertised false because nothing ever emits the
   // corresponding notification.
   assert.equal(report.capabilities.tools.listChanged, false);

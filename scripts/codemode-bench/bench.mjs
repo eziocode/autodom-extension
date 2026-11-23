@@ -210,7 +210,8 @@ function sameAnswer(taskId, a, b) {
 }
 
 // ─── Run ────────────────────────────────────────────────────
-const classic = await startServer(19961, {});
+// Code Mode is listed by default now; the classic baseline must not list it.
+const classic = await startServer(19961, { AUTODOM_CODE_MODE: "0" });
 const code = await startServer(19962, { AUTODOM_CODE_MODE: "only" });
 const hybrid = await startServer(19963, { AUTODOM_CODE_MODE: "1" });
 const rows = [];

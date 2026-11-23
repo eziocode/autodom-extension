@@ -1,6 +1,6 @@
 // Shared by the bridge tests: the real server on a free port plus a fake
 // extension on its WebSocket that answers TOOL_CALL frames, driven over MCP
-// stdio. Returns { call(tool, args), frames, stop() }.
+// stdio. Returns { call(tool, args), tools(), instructions, frames, stop() }.
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -19,7 +19,7 @@ export async function startBridge(onToolCall, extraEnv = {}) {
   const home = await mkdtemp(join(tmpdir(), "autodom-undo-e2e-"));
   const PORT = nextPort();
   const child = spawn(process.execPath, [resolve(root, "server/index.js"), "--port", String(PORT)], {
-    env: { ...process.env, AUTODOM_HOME: home, AUTODOM_BROKER: "0", AUTODOM_CODE_MODE: "1", AUTODOM_AUDIT: "0", AUTODOM_ALLOWED_EXTENSION_ORIGINS: EXT_ORIGIN, ...extraEnv },
+    env: { ...process.env, AUTODOM_HOME: home, AUTODOM_BROKER: "0", AUTODOM_AUDIT: "0", AUTODOM_ALLOWED_EXTENSION_ORIGINS: EXT_ORIGIN, ...extraEnv },
     stdio: ["pipe", "pipe", "pipe"],
   });
   // An unread stderr pipe fills up and stalls the server.
@@ -49,7 +49,7 @@ export async function startBridge(onToolCall, extraEnv = {}) {
       waiting.set(id, (m) => (clearTimeout(t), res(m)));
       child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
     });
-  await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "undo-e2e", version: "1" } });
+  const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "undo-e2e", version: "1" } });
   child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 
   // The fake extension.
@@ -91,6 +91,7 @@ export async function startBridge(onToolCall, extraEnv = {}) {
     clearTimeout(force);
     await rm(home, { recursive: true, force: true });
   };
-  return { call, frames, stop };
+  const tools = async () => (await rpc("tools/list", {})).result.tools.map((t) => t.name);
+  return { call, frames, stop, tools, instructions: init.result?.instructions || "" };
 }
 
