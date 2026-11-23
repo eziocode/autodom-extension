@@ -9385,15 +9385,23 @@ server.addTool({
 // allow (default) | ask (each call needs confirm_action) | deny. A script
 // or run can ask for a stricter policy, never a looser one. An unknown
 // value denies, so a typo cannot open it up.
-function _pageEvalPolicy() {
-  const raw = String(process.env.AUTODOM_CODE_PAGE_EVAL || "allow").trim().toLowerCase();
+const _policyWarned = new Set();
+function _envPolicy(envName) {
+  const raw = String(process.env[envName] || "allow").trim().toLowerCase();
   if (raw === "allow" || raw === "ask" || raw === "deny") return raw;
-  if (!_pageEvalPolicy.warned) {
-    _pageEvalPolicy.warned = true;
-    diagLog(`AUTODOM_CODE_PAGE_EVAL=${JSON.stringify(raw)} is not allow|ask|deny; treating it as deny`);
+  if (!_policyWarned.has(envName)) {
+    _policyWarned.add(envName);
+    diagLog(`${envName}=${JSON.stringify(raw)} is not allow|ask|deny; treating it as deny`);
   }
   return "deny";
 }
+const _pageEvalPolicy = () => _envPolicy("AUTODOM_CODE_PAGE_EVAL");
+
+// script_save: AUTODOM_SCRIPT_SAVE = allow (default) | ask (the save is held
+// for confirm_action, with the script's code in the hold) | deny. A saved
+// script reruns without a model and can be scheduled, so a person may want
+// to review what a model persists. Scripts already on disk still run.
+const _scriptSavePolicy = () => _envPolicy("AUTODOM_SCRIPT_SAVE");
 
 const codeMode = createCodeMode({
   pageEvalPolicy: _pageEvalPolicy,
@@ -9709,7 +9717,8 @@ async function _runSavedScriptUnattended(scriptId, { input = {}, trigger = "sche
 server.addTool({
   name: "script_save",
   description:
-    "Save a run_code script so it can rerun without a model: run_code {script:id} or schedule_create {scriptId}. Scheduled runs are unattended: a call that needs approval stops them. Saving an existing id replaces it.",
+    "Save a run_code script so it can rerun without a model: run_code {script:id} or schedule_create {scriptId}. Scheduled runs are unattended: a call that needs approval stops them. Saving an existing id replaces it. " +
+    "The server can require approval (AUTODOM_SCRIPT_SAVE=ask: confirm_action saves it) or refuse saves (deny).",
   parameters: z.object({
     name: z.string().min(1).describe("Human-readable name"),
     code: z.string().min(1).describe("The script (same as run_code code)"),
@@ -9730,6 +9739,38 @@ server.addTool({
     const syntax = await checkScriptSyntax(code);
     if (syntax) return JSON.stringify({ error: `Script does not parse: ${syntax}` });
     const existing = await readScriptFile(scriptId);
+    // Policy: after the id and syntax checks, so nobody is asked to approve
+    // a script that could not be saved anyway. An approved save runs again
+    // under confirmedToolContext and goes straight through.
+    const policy = _scriptSavePolicy();
+    if (policy !== "allow" && confirmedToolContext.getStore()?.confirmed !== true) {
+      if (policy === "deny") {
+        const error =
+          "Saving scripts is turned off on this server (AUTODOM_SCRIPT_SAVE=deny). A person can set it to ask or allow, or put the script in ~/.autodom/scripts/<id>.json.";
+        _auditToolCall({
+          tool: "script_save",
+          params: { id: scriptId, name, allow, pageEval, timeoutMs, code },
+          tier: "destructive",
+          result: { blocked: true, error },
+        });
+        return JSON.stringify({ error, blocked: true });
+      }
+      const bytes = Buffer.byteLength(code);
+      return JSON.stringify(
+        _holdForConfirmation({
+          tool: "script_save",
+          params: { id: scriptId, name, description, allow, pageEval: pageEval || "allow", timeoutMs, code },
+          domain: null,
+          tier: "destructive",
+          rule: null,
+          reason:
+            `A model wants to save the run_code script "${name}" as ${scriptId}` +
+            (existing ? `, replacing the saved script of that id (${Buffer.byteLength(existing.code || "")} -> ${bytes} bytes)` : ` (${bytes} bytes)`) +
+            ` with allow:${allow}${pageEval && pageEval !== "allow" ? `, pageEval:${pageEval}` : ""}. ` +
+            "A saved script can be rerun without a model (run_code {script}) and scheduled to run unattended, so read its code (params.code) before approving.",
+        }),
+      );
+    }
     const now = new Date().toISOString();
     const script = {
       id: scriptId,
