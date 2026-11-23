@@ -44,10 +44,17 @@ function makeEnv(opts = {}) {
       async goBack(id) {
         log.goBack.push(id);
       },
+      async goForward(id) {
+        (log.goForward = log.goForward || []).push(id);
+      },
     },
     cookies: {
       async remove(details) {
         log.cookies.push(details);
+        return details;
+      },
+      async set(details) {
+        (log.cookieSets = log.cookieSets || []).push(details);
         return details;
       },
     },
@@ -85,7 +92,7 @@ function makeEnv(opts = {}) {
       log.runSteps.push({ tabId, action: step.action, value: step.value, id: step.locator && step.locator.id });
       if (step.locator && page.missing.has(step.locator.id)) return { ok: false, notFound: true, error: "element not found" };
       const prev = page.prev[step.locator && step.locator.id];
-      return { ok: true, strategy: "id", after: step.locator, ...(prev ? { prev } : {}) };
+      return { ok: true, strategy: "id", after: step.locator, ...(prev ? { prev, origin: new URL(tabs[tabId].url).origin, afterHash: "h1" } : {}) };
     }
     if (fn === P._pageWfResolveOnly) {
       const [step] = args;
@@ -105,6 +112,17 @@ function makeEnv(opts = {}) {
     }
     if (fn === P._pageWfClearMarks) {
       log.clears++;
+      return { ok: true };
+    }
+    if (fn === P._pageWfRestoreField) {
+      const [origin, locator, expectedHash, step] = args;
+      (log.restoredFields = log.restoredFields || []).push({ tabId, origin, value: step.value, id: locator && locator.id });
+      if (page.changedFields && page.changedFields.has(locator && locator.id)) return { ok: false, conflict: true, error: "the field changed after the call; not restored" };
+      if (origin && origin !== new URL(tabs[tabId].url).origin) return { ok: false, conflict: true, error: "page origin changed; not restored" };
+      return { ok: true, expectedHash };
+    }
+    if (fn === P._pageWfRestoreStorageValue || fn === P._pageWfRestoreAttribute) {
+      (log.restores = log.restores || []).push([fn === P._pageWfRestoreAttribute ? "attribute" : "storage", tabId, ...args]);
       return { ok: true };
     }
     if (fn === P._pageWfRemoveStorage) {
@@ -133,6 +151,7 @@ function makeEnv(opts = {}) {
       log.closed.push(id);
       delete tabs[id];
     },
+    ...(opts.checkUndoTarget ? { checkUndoTarget: opts.checkUndoTarget } : {}),
     ...(opts.visionPick ? { visionPick: async (a) => (log.vision.push(a), opts.visionPick(a)) } : {}),
   });
   return { engine, storage, log, page, tabs, W, maxOpen: () => maxOpen };
@@ -264,7 +283,9 @@ test("undo: reverses fields, storage and cookies; click and sensitive fields are
   ]);
   const run = await env.engine.handlers.workflow_run({ id });
   assert.equal(run.status, "passed");
-  assert.deepEqual(plain(run.steps.map((s) => s.undoable || null)), [["field"], null, ["storage", "cookies", "navigation"]]);
+  // /login -> /home: path changed, so "sid" may only have become visible;
+  // no cookie removal is inferred.
+  assert.deepEqual(plain(run.steps.map((s) => s.undoable || null)), [["field"], null, ["storage", "navigation"]]);
   assert.match(run.steps[1].irreversible, /sensitive/);
   assert.match(run.steps[2].irreversible === undefined ? "n/a" : "x", /n\/a/, "a click with undo ops is not 'irreversible'");
 
@@ -272,7 +293,6 @@ test("undo: reverses fields, storage and cookies; click and sensitive fields are
   assert.equal(preview.dryRun, true);
   assert.deepEqual(plain(preview.results.map((r) => [r.step, r.type, r.status])), [
     [3, "storage", "would_undo"],
-    [3, "cookies", "would_undo"],
     [3, "navigation", "skipped"],
     [1, "field", "would_undo"],
   ]);
@@ -281,15 +301,15 @@ test("undo: reverses fields, storage and cookies; click and sensitive fields are
 
   const done = await env.engine.handlers.run_undo({ runId: run.runId });
   assert.equal(done.ok, true, JSON.stringify(done));
-  assert.equal(done.undone, 3);
-  assert.deepEqual(plain(env.log.runSteps.slice(before)), [{ tabId: 7, action: "fill", value: "old@x.test", id: "user" }]);
+  assert.equal(done.undone, 2);
+  assert.deepEqual(plain(env.log.restoredFields.slice(0)), [{ tabId: 7, origin: "https://x.test", value: "old@x.test", id: "user" }], "bound to the run's origin");
   assert.deepEqual(plain(env.log.removed), [["https://x.test", ["token"], ["tmp"]]]);
-  assert.deepEqual(plain(env.log.cookies), [{ url: "https://x.test/home", name: "sid" }]);
+  assert.deepEqual(plain(env.log.cookies), []);
   assert.equal(env.log.goBack.length, 0, "navigation is opt-in");
   assert.deepEqual(plain(done.irreversible.map((x) => x.step)), [2]);
 
   const nav = await env.engine.handlers.run_undo({ runId: run.runId, navigation: true, steps: [2] });
-  assert.equal(nav.undone, 3);
+  assert.equal(nav.undone, 2);
   assert.deepEqual(plain(env.log.goBack), [7]);
 
   const unknown = await env.engine.handlers.run_undo({ runId: "run_nope" });
@@ -377,4 +397,142 @@ test("parallel runs: long batches return a batchId and can be cancelled", async 
   assert.ok(final.runs.filter((r) => r.status === "cancelled").length >= 3, "runs that never started are cancelled, not left queued");
   assert.equal(final.running, 0);
   assert.equal((await env.engine.handlers.workflow_run_many({ runs: [] })).ok, false);
+});
+
+// ─── run_code script undo ────────────────────────────────────
+
+test("undoOpsForToolCall: ops per tool call, with what cannot be undone", () => {
+  const { W } = makeEnv();
+  const d = (over = {}) => ({ url: "https://x.test/a", title: "", textHash: 1, elementCount: 1, storageKeys: [], sessionKeys: [], cookieNames: [], ...over });
+  const loc = { tag: "input", id: "q" };
+
+  const typed = W.undoOpsForToolCall({ tool: "type_text", fields: [{ action: "fill", prev: { kind: "value", value: "old" }, after: loc }], before: d(), after: d() });
+  assert.deepEqual(plain(typed), { ops: [{ type: "field", step: { action: "fill", locator: loc, value: "old" } }] });
+
+  const secret = W.undoOpsForToolCall({ tool: "type_text", fields: [{ action: "fill", prev: { kind: "none", reason: "sensitive field had a value" }, after: loc }] });
+  assert.deepEqual(plain(secret), { ops: [], irreversible: "sensitive field had a value" });
+
+  const framed = W.undoOpsForToolCall({ tool: "fill_form", fields: [{ action: "fill", prev: { kind: "value", value: "" }, after: loc, frameId: 3 }] });
+  assert.match(framed.irreversible, /frame/);
+
+  const cookie = W.undoOpsForToolCall({
+    tool: "set_cookie",
+    pre: { cookies: [{ url: "https://x.test/", name: "sid", previous: null }] },
+    before: d(), after: d({ cookieNames: ["sid"] }),
+  });
+  assert.deepEqual(plain(cookie.ops), [{ type: "cookie", url: "https://x.test/", name: "sid", previous: null }], "no duplicate 'cookies added' op");
+
+  const store = W.undoOpsForToolCall({
+    tool: "set_storage",
+    pre: { storage: { origin: "https://x.test", area: "local", key: "k", previous: "1" } },
+    before: d(), after: d({ storageKeys: ["k"] }),
+  });
+  assert.deepEqual(plain(store.ops.map((o) => o.type)), ["storage_value"]);
+
+  const click = W.undoOpsForToolCall({ tool: "click", before: d(), after: d({ url: "https://x.test/b", storageKeys: ["t"] }) });
+  assert.deepEqual(plain(click.ops.map((o) => o.type)), ["storage", "navigation"]);
+  assert.match(click.irreversible, /clicks/);
+
+  const back = W.undoOpsForToolCall({ tool: "navigate", params: { action: "back" }, before: d(), after: d({ url: "https://x.test/prev" }) });
+  assert.equal(back.ops[0].direction, "forward");
+  const reload = W.undoOpsForToolCall({ tool: "navigate", params: { action: "reload" }, before: d(), after: d({ url: "https://x.test/a#x" }) });
+  assert.deepEqual(plain(reload.ops), []);
+  const crossed = W.undoOpsForToolCall({ tool: "click", before: d(), after: d({ url: "https://y.test/", storageKeys: ["z"] }) });
+  assert.deepEqual(plain(crossed.ops.map((o) => o.type)), ["navigation"], "another origin's keys are never removed");
+});
+
+test("run_undo for a script run: per-call tabs, cookie/storage/attribute restore, own store", async () => {
+  const env = makeEnv();
+  env.tabs[8] = { id: 8, url: "https://y.test/", status: "complete" };
+  const runId = "code_000000001_aaaaaa";
+  const add = (index, tabId, ops) => env.engine.appendCodeUndo(runId, { index, label: `call ${index}`, tabId, ops });
+  await Promise.all([
+    add(0, 7, [{ type: "field", step: { action: "fill", locator: { tag: "input", id: "user" }, value: "old" } }]),
+    add(1, 8, [{ type: "cookie", url: "https://y.test/", name: "sid", previous: { name: "sid", value: "v0", domain: ".y.test", path: "/", secure: true, httpOnly: true, hostOnly: false, session: false, expirationDate: 99, sameSite: "lax" } }]),
+    add(2, 8, [{ type: "cookie", url: "https://y.test/", name: "new", previous: null }]),
+    add(3, 7, [{ type: "storage_value", origin: "https://x.test", area: "local", key: "k", previous: null }, { type: "attribute", origin: "https://x.test", selector: "#a", attribute: "data-x", previous: "1" }]),
+  ]);
+  const stored = env.storage.session.data["autodom.codeRunUndo"][runId];
+  assert.deepEqual(stored.steps.map((s) => s.index), [0, 1, 2, 3], "parallel appends are not lost");
+  assert.equal(env.storage.session.data["autodom.runUndo"], undefined, "script undo has its own store");
+
+  const preview = await env.engine.handlers.run_undo({ runId, dryRun: true });
+  assert.deepEqual(plain(preview.results.map((r) => [r.step, r.type, r.status])), [
+    [4, "storage_value", "would_undo"],
+    [4, "attribute", "would_undo"],
+    [3, "cookie", "would_undo"],
+    [2, "cookie", "would_undo"],
+    [1, "field", "would_undo"],
+  ]);
+
+  const done = await env.engine.handlers.run_undo({ runId });
+  assert.equal(done.ok, true, JSON.stringify(done));
+  assert.equal(done.undone, 5);
+  assert.deepEqual(plain(env.log.restores), [
+    ["storage", 7, "https://x.test", "local", "k", null],
+    ["attribute", 7, "https://x.test", "#a", "data-x", "1"],
+  ]);
+  assert.deepEqual(plain(env.log.cookies), [{ url: "https://y.test/", name: "new" }]);
+  assert.equal(env.log.cookieSets.length, 1);
+  assert.deepEqual(plain(env.log.cookieSets[0]), {
+    url: "https://y.test/", name: "sid", value: "v0", path: "/", domain: ".y.test", secure: true, httpOnly: true, sameSite: "lax", expirationDate: 99,
+  });
+  assert.deepEqual(plain(env.log.runSteps.at(-1)), { tabId: 7, action: "fill", value: "old", id: "user" });
+
+  delete env.tabs[8];
+  const cookieOnly = await env.engine.handlers.run_undo({ runId, steps: [1] });
+  assert.equal(cookieOnly.ok, true, "cookies are restored by URL even when the tab is gone");
+  delete env.tabs[7];
+  const gone = await env.engine.handlers.run_undo({ runId, steps: [3] });
+  assert.equal(gone.ok, false);
+  assert.match(gone.results[0].reason, /tab this call used is gone/);
+  const unknown = await env.engine.handlers.run_undo({ runId: "code_000000009_zzzzzz" });
+  assert.match(unknown.error, /No undo data/);
+  assert.equal(await env.engine.appendCodeUndo("run_abc", { index: 0, ops: [] }), false, "only code_ run ids");
+});
+
+test("run_undo: every destination tab is policy-checked; refused calls change nothing", async () => {
+  const seen = [];
+  const env = makeEnv({
+    checkUndoTarget: async (tabId, callCtx, o) => {
+      seen.push([tabId, callCtx && callCtx.clientId, !!(o && o.ownedOnly)]);
+      return tabId === 8 ? "USER_TAKEOVER: the user has taken control of this tab" : null;
+    },
+  });
+  env.tabs[8] = { id: 8, url: "https://y.test/", status: "complete" };
+  const runId = "code_000000002_bbbbbb";
+  await env.engine.appendCodeUndo(runId, { index: 0, label: "a", tabId: 7, ops: [{ type: "storage_value", origin: "https://x.test", area: "local", key: "k", previous: null }] });
+  await env.engine.appendCodeUndo(runId, { index: 1, label: "b", tabId: 8, ops: [{ type: "cookie", url: "https://y.test/", name: "sid", previous: null }, { type: "storage_value", origin: "https://y.test", area: "local", key: "z", previous: "1" }] });
+
+  const r = await env.engine.handlers.run_undo({ runId }, { clientId: "codex", tabId: 7, isolated: true });
+  assert.equal(r.ok, false);
+  assert.deepEqual(plain(r.results.map((x) => [x.step, x.type, x.status])), [
+    [2, "cookie", "refused"],
+    [2, "storage_value", "refused"],
+    [1, "storage_value", "undone"],
+  ]);
+  assert.match(r.results[0].reason, /USER_TAKEOVER/);
+  assert.deepEqual(plain(env.log.cookies), [], "no cookie was removed for the refused tab");
+  assert.deepEqual(plain(env.log.restores.map((x) => x[1])), [7], "only the allowed tab was written to");
+  assert.ok(seen.every(([, client, owned]) => client === "codex" && owned === true), "caller context and script-run ownership are passed on");
+  assert.deepEqual(seen.map((x) => x[0]).sort(), [7, 8], "each recorded tab was checked");
+});
+
+test("run_undo: a field that changed or moved to another origin is a conflict, not a write", async () => {
+  const env = makeEnv();
+  env.page.changedFields = new Set(["edited"]);
+  const runId = "code_000000003_cccccc";
+  const field = (id) => ({ type: "field", origin: "https://x.test", expectedHash: "h1", step: { action: "fill", locator: { tag: "input", id }, value: "old" } });
+  await env.engine.appendCodeUndo(runId, { index: 0, label: "ok", tabId: 7, ops: [field("fine")] });
+  await env.engine.appendCodeUndo(runId, { index: 1, label: "edited", tabId: 7, ops: [field("edited")] });
+  env.tabs[7].url = "https://elsewhere.test/page";
+  const moved = await env.engine.handlers.run_undo({ runId, steps: [0] });
+  assert.equal(moved.ok, false);
+  assert.equal(moved.results[0].status, "conflict");
+  assert.match(moved.results[0].reason, /origin changed/);
+  env.tabs[7].url = "https://x.test/page";
+  const both = await env.engine.handlers.run_undo({ runId });
+  assert.deepEqual(plain(both.results.map((x) => [x.step, x.status])), [[2, "conflict"], [1, "undone"]]);
+  assert.equal(both.conflicts, 1);
+  assert.equal(both.ok, false);
 });

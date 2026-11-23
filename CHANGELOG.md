@@ -39,6 +39,47 @@ All notable changes to AutoDOM are documented in this file.
     and neither can one whose call outcomes exceed 1 MB each or 8 MB in
     total. Screenshots taken before the pause can't be attached after a
     resume.
+- `run_undo` works on `run_code` script runs (`code_…` runIds).
+  - The extension records, per script call, how to reverse it:
+    - a typed value, select or checkbox it changed (sensitive fields only
+      if they were empty)
+    - a cookie it set, overwrote, deleted or cleared
+    - a single local or session storage key it wrote
+    - an attribute it set
+    - storage keys and cookies it added
+    - the navigation it caused
+  - `run_get` shows what each call can undo, or why it can't. `run_undo`
+    lists the calls that cannot be undone: clicks and key presses,
+    `type_by_index`, uploads, calls inside a frame, and
+    `set_storage {clear}`.
+  - Like workflow undo, the data stays in browser memory (session storage)
+    for the 20 most recent script runs and is lost when the browser
+    closes.
+  - `steps` takes call seq numbers. A running or paused script must be
+    stopped before it can be undone (`dryRun` works anytime).
+  - Needs the matching extension version: an older extension ignores the
+    request and records nothing.
+  - Safety rules for restoring (these also apply to workflow undo):
+    - A typed value, select or checkbox is put back only on the page's
+      origin and only if the field still holds what the call wrote.
+      Otherwise the step is reported as a `conflict` and nothing is written.
+    - A previous value longer than 20,000 characters is not kept (it was cut
+      to 2,000 before, so undo would have deleted the rest). The call is
+      listed as irreversible instead.
+    - Cookies "added" by navigation are no longer inferred when the URL
+      path changed, because cookies scoped to the new path only look new.
+    - The cookie read before `set_cookie` is the one the call writes
+      (same name, path and domain). If that read fails, the call is
+      reported as irreversible.
+  - For a script run, each recorded tab gets the same takeover, managed
+    policy and approval-rule checks as the caller's tab, plus an ownership
+    check for isolated clients. Refused calls are listed as `refused` and
+    change nothing.
+  - Undo data is captured only after a call has passed those checks, so a
+    denied or held call reads nothing from the page.
+  - A script that is running or paused can't be undone (`dryRun` works).
+    Stop it with `run_cancel` first; cancelling a paused run saved for a
+    resume ends it and deletes its replay state.
 
 ---
 

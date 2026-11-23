@@ -722,6 +722,14 @@ function frameClientId() {
   _chatClientUsed = true;
   return CHAT_CLIENT_ID;
 }
+// A run_code script's tool call: { runId, seq } so the extension records
+// undo data for it, and { undo } is filled with what it reported.
+const codeUndoContext = new AsyncLocalStorage();
+
+function codeUndoFrameFields(store = codeUndoContext.getStore()) {
+  return store?.runId ? { captureUndo: { runId: store.runId, seq: store.seq } } : {};
+}
+
 function isolationFrameFields() {
   const bypass = userTabRequestContext.getStore()?.userTab === true;
   return {
@@ -3926,6 +3934,9 @@ function _runInternalProxyCall(socket, message, release) {
       ...(Number.isFinite(message.isolationIdleMs)
         ? { isolationIdleMs: message.isolationIdleMs }
         : {}),
+      ...(message.captureUndo && typeof message.captureUndo === "object"
+        ? { captureUndo: { runId: String(message.captureUndo.runId), seq: Number(message.captureUndo.seq) } }
+        : {}),
     });
   };
 
@@ -4853,6 +4864,9 @@ function _toolTargetDomain(tool, params) {
 }
 
 function callExtensionTool(tool, params, options = {}) {
+  // Read now, in the caller's async context: the reply is resolved from the
+  // socket's message handler, where codeUndoContext.getStore() is empty.
+  const undoStore = codeUndoContext.getStore() || null;
   const confirmedExecution =
     options?.confirmed === true || confirmedToolContext.getStore()?.confirmed === true;
   // Aborted when the MCP client cancels the request it is waiting on.
@@ -4876,6 +4890,12 @@ function callExtensionTool(tool, params, options = {}) {
   return new Promise((resolve, reject) => {
     const wrappedResolve = (rawResult, hopTiming) => {
       let result = rawResult;
+      // Undo summary for a run_code call: into its context, never to callers.
+      if (result && typeof result === "object" && !Array.isArray(result) && "__undo" in result) {
+        const { __undo, ...rest } = result;
+        if (undoStore && __undo && typeof __undo === "object") undoStore.undo = __undo;
+        result = rest;
+      }
       let timingRec = null;
       if (marks.sentAt != null) {
         timingRec = buildTimingRecord({
@@ -5071,6 +5091,7 @@ function callExtensionTool(tool, params, options = {}) {
               timeoutMs,
               ...(confirmedExecution ? { confirmed: true } : {}),
               ...isolationFrameFields(),
+              ...codeUndoFrameFields(undoStore),
             }),
           );
         } catch (err) {
@@ -5225,6 +5246,7 @@ function callExtensionTool(tool, params, options = {}) {
         timeoutMs,
         ...(confirmedExecution ? { confirmed: true } : {}),
         ...isolationFrameFields(),
+        ...codeUndoFrameFields(undoStore),
       });
     } catch (err) {
       pendingCalls.delete(id);
@@ -9367,10 +9389,21 @@ const codeMode = createCodeMode({
   hidden: PLAYWRIGHT_COMPAT_NAMES,
   onHoldDiscarded: (confirmId) => pendingConfirmations.delete(confirmId),
   onRunUpdate: (record, replay) => _persistCodeRun(record, replay),
-  invoke: (def, params, { signal, context }) =>
-    mcpRequestContext.run({ signal: signal || null, tool: def.name, params, execute: def.execute }, () =>
-      def.execute(params, context),
-    ),
+  invoke: (def, params, { signal, context, undo }) => {
+    const call = () =>
+      mcpRequestContext.run({ signal: signal || null, tool: def.name, params, execute: def.execute }, () =>
+        def.execute(params, context),
+      );
+    if (!undo?.runId) return call();
+    const store = { runId: undo.runId, seq: undo.seq };
+    return codeUndoContext.run(store, async () => {
+      try {
+        return await call();
+      } finally {
+        if (store.undo) undo.report?.(store.undo);
+      }
+    });
+  },
 });
 
 // run_code run records go to ~/.autodom/runs. Writes for one run are
@@ -9467,14 +9500,16 @@ function _codeModeOutput(out) {
 // back to the script and return the script's next outcome.
 async function _resumeCodeModeRun(confirmId, pending, context) {
   const signal = context?.mcpReq?.signal || null;
+  const at = codeMode.holdCall(confirmId);
+  const store = at ? { runId: at.runId, seq: at.seq } : {};
   let value;
   let error;
   try {
-    value = await _runApprovedCall(pending, context, null);
+    value = await codeUndoContext.run(store, () => _runApprovedCall(pending, context, null));
   } catch (err) {
     error = err;
   }
-  return _codeModeOutput(await codeMode.resume(confirmId, { value, error, signal, context }));
+  return _codeModeOutput(await codeMode.resume(confirmId, { value, error, signal, context, undo: store.undo }));
 }
 
 server.addTool({
@@ -11272,16 +11307,47 @@ server.addTool({
 server.addTool({
   name: "run_undo",
   description:
-    "Reverse a workflow run where safe: typed values, selects, checkboxes restored (sensitive fields only if they were empty); storage keys/cookies it added removed; navigation:true steps back. Clicks, submits and server-side effects cannot be undone (listed as irreversible). dryRun:true previews. Kept for the 20 most recent runs.",
+    "Reverse a workflow run, or a run_code script run (code_... runId), where safe: typed values, selects, checkboxes restored (sensitive fields only if they were empty); storage keys/cookies it added removed; " +
+    "for scripts also cookies, single storage keys and attributes it overwrote or deleted put back; navigation:true steps back. Clicks, submits and server-side effects cannot be undone (listed as irreversible). " +
+    "dryRun:true previews. Undo data lives in browser memory for the 20 most recent workflow runs and, separately, the 20 most recent script runs.",
   parameters: z.object({
     runId: z.string(),
-    steps: z.array(z.number().int()).optional().describe("Only these 0-based step indexes"),
+    steps: z.array(z.number().int()).optional().describe("Only these 0-based step indexes (for a script run: call seq numbers from run_get)"),
     include: z.array(z.enum(["fields", "storage", "cookies", "navigation"])).optional().describe("Default: fields, storage, cookies"),
     navigation: z.boolean().optional().describe("Also step the tab back through navigations"),
     dryRun: z.boolean().optional().default(false),
     tabId: z.number().optional(),
   }),
-  execute: async (params) => stringifyToolResult(await callExtensionTool("run_undo", params)),
+  execute: async (params) => {
+    if (!isCodeRunId(params.runId)) return stringifyToolResult(await callExtensionTool("run_undo", params));
+    const record = await _readCodeRunNow(params.runId);
+    if (!record) return stringifyToolResult({ ok: false, error: `No run_code run ${params.runId}.` });
+    // A paused run (live, or saved for a resume) would carry on as though
+    // the undone calls still stood: it must end first.
+    if ((codeMode.isLive(params.runId) || record.status === "paused" || record.status === "running") && params.dryRun !== true) {
+      return stringifyToolResult({
+        ok: false,
+        error: `That script is ${record.status}; stop it with run_cancel {runId:"${params.runId}"} before undoing it (a cancelled run can no longer be resumed).`,
+      });
+    }
+    const got = await callExtensionTool("run_undo", params);
+    // The script's own record knows which calls changed something that
+    // cannot be reversed.
+    const only = Array.isArray(params.steps) ? new Set(params.steps) : null;
+    const irreversible = (record.calls || [])
+      .filter((c) => (c.state === "applied" || c.state === "approved") && c.tier && c.tier !== "read" && c.tool !== "__step")
+      .filter((c) => !only || only.has(c.seq))
+      .filter((c) => c.irreversible || !c.undoable)
+      .map((c) => ({ step: c.seq + 1, what: c.tool, why: c.irreversible || "no undo data was recorded for this call" }));
+    if (got && typeof got === "object" && got.ok === false && /No undo data/.test(got.error || "")) {
+      return stringifyToolResult({
+        ok: false,
+        error: "No undo data for this script run in the browser. It is kept in memory for the 20 most recent script runs and is lost when the browser closes; the run may also have changed nothing that can be reversed.",
+        irreversible,
+      });
+    }
+    return stringifyToolResult({ ...got, irreversible });
+  },
 });
 
 server.addTool({
@@ -11379,7 +11445,29 @@ server.addTool({
   parameters: z.object({ runId: z.string().optional(), batchId: z.string().optional() }),
   execute: async (params) => {
     if (params.runId && isCodeRunId(params.runId)) {
-      const cancelled = codeMode.cancel(params.runId);
+      let cancelled = codeMode.cancel(params.runId);
+      if (!cancelled) {
+        // Paused and saved for a resume, but no longer live in this bridge:
+        // end it on disk, which also drops its replay state.
+        await _codeRunWrites.get(params.runId);
+        const record = await readCodeRun(params.runId);
+        if (record && (record.status === "paused" || record.status === "running")) {
+          const now = new Date().toISOString();
+          const ended = {
+            ...record,
+            status: "cancelled",
+            endedAt: now,
+            updatedAt: now,
+            stopped: { reason: "Cancelled with run_cancel" },
+            calls: (record.calls || []).map((c) => (c.state === "pending" ? { ...c, state: "discarded" } : c)),
+          };
+          delete ended.pending;
+          delete ended.resumable;
+          _persistCodeRun(ended, null);
+          await _codeRunWrites.get(params.runId);
+          cancelled = true;
+        }
+      }
       return stringifyToolResult({
         ok: cancelled,
         cancelled: cancelled ? [params.runId] : [],
