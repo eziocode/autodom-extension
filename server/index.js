@@ -8378,7 +8378,7 @@ function _serverInstructions(env = process.env) {
   return (
     base +
     (codeMode === "only"
-      ? " Drive the browser with run_code scripts: call code_api first for the autodom.* API, then do the whole task in as few run_code calls as you can."
+      ? " Drive the browser with run_code scripts: call code_api first for the autodom.* API (a script can also look tools up itself with codemode.search / codemode.describe), then do the whole task in as few run_code calls as you can."
       : " For multi-step browser work prefer one run_code script over many tool calls; code_api returns its autodom.* API.")
   );
 }
@@ -9517,7 +9517,7 @@ server.addTool({
   description:
     "Run a JavaScript script (async function body: await, return) that drives the browser through autodom.<tool>(params), the same tools as MCP, " +
     "plus page.eval(fn, ...args) to run fn in the active tab. Chain steps, branch and filter in one call; only the return value and console.log come back. " +
-    "Call code_api first for the API. Sandboxed: no fetch/require/timers. Guardrails and approvals apply to every inner call: a held call pauses the script " +
+    "Call code_api first for the API, or look tools up from inside the script: codemode.search(words), codemode.describe(names | {area} | {query}), codemode.index(area?) (not tool calls). Sandboxed: no fetch/require/timers. Guardrails and approvals apply to every inner call: a held call pauses the script " +
     "(confirm_action resumes it and returns its result; cancel_action makes that call throw ApprovalDenied in the script). " +
     "If the approval expired or the bridge restarted, resume:<runId> replays the script: finished calls return their recorded results without running again, and the held call asks for approval again.",
   parameters: z.object({
@@ -9734,7 +9734,7 @@ server.addTool({
 server.addTool({
   name: "code_api",
   description:
-    "TypeScript API for run_code. No args: globals plus one line per tool, grouped by area. {tools:[names]}, {area} or {query}: exact declarations with param and result types.",
+    "TypeScript API for run_code. No args: globals plus one line per tool, grouped by area. {tools:[names]}, {area} or {query}: exact declarations with param and result types. Inside a script the same lookups are codemode.index / describe / search.",
   parameters: z.object({
     tools: z.array(z.string()).optional().describe("Tool names to declare in full"),
     area: z

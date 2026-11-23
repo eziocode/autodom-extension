@@ -39,6 +39,20 @@ All notable changes to AutoDOM are documented in this file.
     and neither can one whose call outcomes exceed 1 MB each or 8 MB in
     total. Screenshots taken before the pause can't be attached after a
     resume.
+- `run_code` scripts can look up the `autodom.*` API themselves, so a model
+  does not need `code_api` or a long tool list in its context:
+  - `codemode.search("fill form field", { limit, area })` returns ranked
+    matches (`name`, `tier`, `area`, `summary`, `returnsAny`).
+  - `codemode.describe("click")`, `describe(["click", "type_text"])`,
+    `describe({ area })` or `describe({ query })` return the TypeScript
+    declarations.
+  - `codemode.index(area?)` returns one line per tool, grouped by area.
+  - Lookups are not tool calls: no call number, no entry in the run
+    record, nothing to replay. They do count toward the 200 host calls per
+    run, and bad arguments throw `InvalidParams`.
+  - Search now matches whole words and word starts in tool names and
+    descriptions and ignores filler words, so "form" no longer finds
+    `performance_*`. This also changes `code_api {query}`.
 - `run_undo` works on `run_code` script runs (`code_…` runIds).
   - The extension records, per script call, how to reverse it:
     - a typed value, select or checkbox it changed (sensitive fields only

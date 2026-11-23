@@ -95,6 +95,10 @@ const MAX_RECORD_RESULT = 2000;
 // Replay state limits (serialized characters).
 const MAX_REPLAY_VALUE = 1000000;
 const MAX_REPLAY_TOTAL = 8000000;
+// codemode.search / describe limits.
+const MAX_SEARCH_RESULTS = 25;
+const MAX_DESCRIBE_NAMES = 40;
+const MAX_DESCRIBE_CHARS = 120000;
 
 // Sorted keys, so equal arguments always hash the same.
 function stableStringify(value) {
@@ -637,6 +641,7 @@ export function createCodeMode({
   }
 
   async function hostCall(state, op, args) {
+    if (op === "__search" || op === "__describe" || op === "__index") return discover(op, args);
     if (op === "__step") return stepDecide(state, args);
     if (op === "__stepRecord") return stepRecord(state, args);
     if (op === "__emitImage") return callTool(state, op, args);
@@ -686,6 +691,53 @@ export function createCodeMode({
     state.outcomeBytes += JSON.stringify(outcome).length;
     if (outcome.e) throw new ToolCallError(outcome.e.name, outcome.e.message, outcome.e.details);
     return outcome.v;
+  }
+
+  // codemode.search / describe / index: look up the API from inside a script.
+  // Pure metadata: not a tool call, so it takes no call number and is not
+  // recorded or replayed (a resumed script gets the same answers while the
+  // tool set is unchanged; if it changed and the script took another path,
+  // the replay stops as diverged).
+  function discover(op, args) {
+    const a = ensureApi();
+    const bad = (message) => {
+      throw new ToolCallError("InvalidParams", message);
+    };
+    const bare = (n) => String(n).replace(/^autodom\./, "");
+    const capped = (text) =>
+      text.length > MAX_DESCRIBE_CHARS ? `${text.slice(0, MAX_DESCRIBE_CHARS)}\n// ... cut at ${MAX_DESCRIBE_CHARS} characters; describe fewer tools` : text;
+    if (op === "__search") {
+      const query = typeof args?.query === "string" ? args.query : "";
+      const area = args?.area === undefined || args.area === null ? undefined : String(args.area);
+      if (area && !a.areas().includes(area)) bad(`Unknown area ${JSON.stringify(area)}. Areas: ${a.areas().join(", ")}`);
+      const limit = Math.max(1, Math.min(MAX_SEARCH_RESULTS, Math.trunc(Number(args?.limit) || 8)));
+      const { total, hits } = a.find(query, { limit, area });
+      return {
+        total,
+        results: hits.map(({ entry: e }) => ({ name: e.name, tier: e.tier, area: e.area, summary: e.summary, returnsAny: !e.typed })),
+      };
+    }
+    if (op === "__index") {
+      const area = args?.area === undefined || args.area === null ? undefined : String(args.area);
+      if (area && !a.areas().includes(area)) bad(`Unknown area ${JSON.stringify(area)}. Areas: ${a.areas().join(", ")}`);
+      return capped(a.index(area));
+    }
+    // __describe
+    const t = args?.target;
+    if (typeof t === "string" || Array.isArray(t)) {
+      const names = (Array.isArray(t) ? t : [t]).map(bare);
+      if (!names.length || names.some((n) => !n)) bad("describe(target): give a tool name, an array of names, { area } or { query }");
+      if (names.length > MAX_DESCRIBE_NAMES) bad(`describe: at most ${MAX_DESCRIBE_NAMES} tools at a time (use { area } for a whole area)`);
+      return capped(describe({ tools: names }));
+    }
+    if (t && typeof t === "object") {
+      if (typeof t.area === "string") {
+        if (!a.areas().includes(t.area)) bad(`Unknown area ${JSON.stringify(t.area)}. Areas: ${a.areas().join(", ")}`);
+        return capped(describe({ area: t.area }));
+      }
+      if (typeof t.query === "string" && t.query.trim()) return capped(describe({ query: t.query }));
+    }
+    return bad("describe(target): give a tool name, an array of names, { area } or { query }");
   }
 
   // step(name, fn): fn runs once; its result is recorded and replayed.
@@ -899,7 +951,7 @@ export function createCodeMode({
 
 const GLOBALS_HINT =
   "// run_code globals: autodom.<tool>(params) | page.eval(fn, ...args) runs fn in the active tab | " +
-  "emitImage(ref) attaches a screenshot | input (run_code {input}) | sleep(ms) | step(name, fn) records fn's result once (use it for Date.now()/Math.random() so a resumed run replays the same value) | console.log. A failed call throws (name ToolError/InvalidParams/TierDenied/ApprovalDenied). " +
+  "codemode.search(words) / codemode.describe(names | {area} | {query}) / codemode.index(area?) look up this API from inside a script | emitImage(ref) attaches a screenshot | input (run_code {input}) | sleep(ms) | step(name, fn) records fn's result once (use it for Date.now()/Math.random() so a resumed run replays the same value) | console.log. A failed call throws (name ToolError/InvalidParams/TierDenied/ApprovalDenied). " +
   "No fetch/require/timers. Return only what you need.";
 
 function buildPrelude(names) {
@@ -916,6 +968,11 @@ globalThis.page = Object.freeze({
     const r = await __invoke("execute_code", { code: src });
     return r && typeof r === "object" && r.success === true ? r.result : r;
   },
+});
+globalThis.codemode = Object.freeze({
+  search: (query, opts) => __invoke("__search", { query: String(query ?? ""), ...(opts && typeof opts === "object" ? { limit: opts.limit, area: opts.area } : {}) }),
+  describe: (target) => __invoke("__describe", { target }),
+  index: (area) => __invoke("__index", { area }),
 });
 globalThis.step = async (name, fn) => {
   if (typeof fn !== "function") throw new TypeError("step(name, fn): fn must be a function");
