@@ -143,10 +143,16 @@ async function startServer(port, env) {
     }
     throw new Error(`no response to ${method}`);
   }
-  const stop = () => {
+  // Wait for the server to exit before deleting its home: it may still be
+  // writing there, and removing a directory under a live writer fails.
+  const stop = async () => {
     ext.close();
+    const exited = new Promise((res) => proc.once("exit", res));
     proc.kill();
-    rmSync(home, { recursive: true, force: true });
+    const killer = setTimeout(() => proc.kill("SIGKILL"), 3000);
+    await exited;
+    clearTimeout(killer);
+    rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   };
   return { request, fake, stop };
 }
@@ -244,9 +250,9 @@ try {
     rows.push({ task: task.id, goal: task.goal, runs });
   }
 } finally {
-  classic.stop();
-  code.stop();
-  hybrid.stop();
+  await classic.stop();
+  await code.stop();
+  await hybrid.stop();
 }
 
 const fmt = (n) => n.toLocaleString("en-US");
