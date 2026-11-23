@@ -95,6 +95,19 @@ const MAX_RECORD_RESULT = 2000;
 // Replay state limits (serialized characters).
 const MAX_REPLAY_VALUE = 1000000;
 const MAX_REPLAY_TOTAL = 8000000;
+// page.eval (the execute_code tool) runs arbitrary JS in the page with its
+// full network and cookie access, which the sandbox itself never has. Its
+// policy is separate from the tier ceiling: allow | ask | deny.
+const PAGE_EVAL_TOOL = "execute_code";
+const PAGE_EVAL_RANK = { allow: 0, ask: 1, deny: 2 };
+const PAGE_EVAL_MODES = Object.keys(PAGE_EVAL_RANK);
+// The stricter of two policies. An unknown value is treated as deny.
+export function stricterPageEval(a, b) {
+  const norm = (v) => (v === undefined || v === null || v === "" ? "allow" : PAGE_EVAL_RANK[v] === undefined ? "deny" : v);
+  const x = norm(a);
+  const y = norm(b);
+  return PAGE_EVAL_RANK[y] > PAGE_EVAL_RANK[x] ? y : x;
+}
 // codemode.search / describe limits.
 const MAX_SEARCH_RESULTS = 25;
 const MAX_DESCRIBE_NAMES = 40;
@@ -178,12 +191,19 @@ function deferred() {
  * @param {Set<string>} [deps.hidden]                 extra names to leave unbound (e.g. Playwright aliases)
  * @param {number} [deps.suspendTtlMs]
  * @param {(confirmId: number) => void} [deps.onHoldDiscarded]  a paused run ended with this hold undecided
+ * @param {() => string} [deps.pageEvalPolicy]  server-wide page.eval policy: allow | ask | deny
+ * @param {(def: object, params: object) => object} [deps.holdPageEval]  hold a page.eval call for approval
+ *        (returns the confirmRequired object); without it, "ask" behaves like "deny"
+ * @param {(info: object) => void} [deps.onPageEvalDenied]  a page.eval call was refused by policy
  * @param {(record: object, replay?: object|null) => void} [deps.onRunUpdate]  a run started,
  *        paused, resumed or ended; gets a snapshot of its run record, plus its replay state
  *        (an object to keep while it is paused, null once it can no longer be resumed,
  *        undefined when unchanged)
  */
 export function createCodeMode({
+  pageEvalPolicy = () => "allow",
+  holdPageEval,
+  onPageEvalDenied,
   getDefinitions,
   jsonSchemaFor,
   tierOf,
@@ -216,6 +236,7 @@ export function createCodeMode({
       code: state.source,
       input: state.input ?? {},
       allow: state.allow,
+      ...(state.pageEval !== "allow" ? { pageEval: state.pageEval } : {}),
       ...(state.timeoutMs ? { timeoutMs: state.timeoutMs } : {}),
       outcomes: Object.fromEntries(state.outcomes),
     };
@@ -300,8 +321,8 @@ export function createCodeMode({
    * @param {boolean} [opts.unattended] nobody can approve (a scheduled run): a held
    *        call stops the run and its confirmation is dropped instead of pausing
    */
-  async function run({ code, allow = "destructive", timeoutMs, signal, context, meta, input, unattended = false } = {}) {
-    return start({ code, allow, timeoutMs, signal, context, meta, input, unattended });
+  async function run({ code, allow = "destructive", timeoutMs, signal, context, meta, input, unattended = false, pageEval } = {}) {
+    return start({ code, allow, timeoutMs, signal, context, meta, input, unattended, pageEval });
   }
 
   /**
@@ -322,6 +343,7 @@ export function createCodeMode({
       {
         code: saved.code,
         allow: saved.allow || record.allow,
+        pageEval: saved.pageEval || record.pageEval,
         timeoutMs: saved.timeoutMs || record.timeoutMs,
         input: saved.input,
         signal,
@@ -332,9 +354,14 @@ export function createCodeMode({
     );
   }
 
-  async function start({ code, allow, timeoutMs, signal, context, meta, input, unattended = false }, resumeFrom = null) {
+  async function start({ code, allow, timeoutMs, signal, context, meta, input, unattended = false, pageEval }, resumeFrom = null) {
     ensureApi();
+    // Never looser than the server's policy, whatever the run asks for.
+    const serverPolicy = stricterPageEval("allow", pageEvalPolicy());
+    const effectivePageEval = stricterPageEval(serverPolicy, pageEval);
     const state = {
+      pageEval: effectivePageEval,
+      pageEvalFromServer: serverPolicy !== "allow" && serverPolicy === effectivePageEval,
       id: ++runSeq,
       allow,
       unattended,
@@ -374,6 +401,7 @@ export function createCodeMode({
       trigger: meta?.trigger || (unattended ? "unattended" : "mcp"),
       ...(meta?.scriptId ? { scriptId: meta.scriptId } : {}),
       allow,
+      ...(effectivePageEval !== "allow" ? { pageEval: effectivePageEval } : {}),
       ...(timeoutMs ? { timeoutMs } : {}),
       startedAt: prior ? prior.startedAt : new Date().toISOString(),
       ...(prior ? { resumes: (prior.resumes || 0) + 1, resumedAt: new Date().toISOString() } : {}),
@@ -810,11 +838,31 @@ export function createCodeMode({
       params = { ...params, verbose: true };
     }
 
+    // page.eval gate: separate from the tier ceiling (see PAGE_EVAL_TOOL).
+    let askForPageEval = false;
+    if (op === PAGE_EVAL_TOOL && state.pageEval !== "allow") {
+      if (state.pageEval === "ask" && holdPageEval) {
+        askForPageEval = true;
+      } else {
+        const why = state.pageEvalFromServer ? "the server policy (AUTODOM_CODE_PAGE_EVAL)" : "this run's pageEval option";
+        state.callLog.push(`${op} denied(pageEval)`);
+        recordCall(state, { tool: op, tier, argsHash, params: redactParams(params), state: "denied", error: "page.eval is not allowed" });
+        try {
+          onPageEvalDenied?.({ tool: op, params, tier, runId: state.record.runId, why });
+        } catch (_) {}
+        throw new ToolCallError(
+          "PageEvalDenied",
+          `page.eval / execute_code runs JavaScript in the page with its full network and cookie access, and ${why} does not allow it. ` +
+            "Use the autodom.* tools instead (get_html, extract_text, click, type_text, ...).",
+        );
+      }
+    }
+
     const entry = recordCall(state, { tool: op, tier, argsHash, params: redactParams(params), state: "running" });
     const t0 = Date.now();
     let raw;
     try {
-      raw = await invoke(def, params, {
+      raw = askForPageEval ? await holdPageEval(def, params) : await invoke(def, params, {
         signal: state.abort.signal,
         context: state.context,
         // What the extension can reverse for this call (run_undo).
@@ -951,7 +999,7 @@ export function createCodeMode({
 
 const GLOBALS_HINT =
   "// run_code globals: autodom.<tool>(params) | page.eval(fn, ...args) runs fn in the active tab | " +
-  "codemode.search(words) / codemode.describe(names | {area} | {query}) / codemode.index(area?) look up this API from inside a script | emitImage(ref) attaches a screenshot | input (run_code {input}) | sleep(ms) | step(name, fn) records fn's result once (use it for Date.now()/Math.random() so a resumed run replays the same value) | console.log. A failed call throws (name ToolError/InvalidParams/TierDenied/ApprovalDenied). " +
+  "codemode.search(words) / codemode.describe(names | {area} | {query}) / codemode.index(area?) look up this API from inside a script | emitImage(ref) attaches a screenshot | input (run_code {input}) | sleep(ms) | step(name, fn) records fn's result once (use it for Date.now()/Math.random() so a resumed run replays the same value) | console.log. A failed call throws (name ToolError/InvalidParams/TierDenied/PageEvalDenied/ApprovalDenied). " +
   "No fetch/require/timers. Return only what you need.";
 
 function buildPrelude(names) {

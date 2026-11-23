@@ -234,6 +234,13 @@ return links.filter((h) => h.includes("/docs/")).slice(0, 10);
   `schedule_*` tools (about 8 KB of `tools/list`, against 63 KB); every other tool stays
   callable by name. Both add a line to the server instructions pointing the
   model at `run_code`.
+- `page.eval` (and `autodom.execute_code`) runs JavaScript in the page with
+  the page's full network and cookie access, which the script sandbox itself
+  never has. It is gated separately from the tier ceiling (`allow`): set
+  `pageEval: "deny"` on a run or saved script to refuse it (the script gets
+  `PageEvalDenied`), or `"ask"` to hold each call for `confirm_action`.
+  `AUTODOM_CODE_PAGE_EVAL=allow|ask|deny` sets it for the whole server; a run
+  or script can only make it stricter, and an unknown value denies.
 - Saved scripts: `script_save {name, code}` stores a script that worked in
   `~/.autodom/scripts/<id>.json` (syntax-checked, not run). Rerun it with
   `run_code {script: id, input}`; the script reads `input`. `script_list`,
@@ -386,6 +393,7 @@ Output and tool listing:
 | `AUTODOM_TRUST_PROJECT_FILTERS` | `0` | `1`: honour a project-local `.autodom/filters.json` |
 | `AUTODOM_PLAYWRIGHT_COMPAT` | `0` | `1`: list the Playwright-compatible aliases |
 | `AUTODOM_CODE_MODE` | `0` | `1`: also list `run_code` and `code_api` (Code Mode); `only`: list just the Code Mode set |
+| `AUTODOM_CODE_PAGE_EVAL` | `allow` | `ask`: each `page.eval` in a `run_code` script needs `confirm_action`; `deny`: refuse it |
 
 Tool gating:
 

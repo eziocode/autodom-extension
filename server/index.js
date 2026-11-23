@@ -91,7 +91,7 @@ import {
   recallText,
   snapshotBaselines,
 } from "./atk/index.js";
-import { CODE_MODE_TOOL_NAMES, CODE_ONLY_LISTED, createCodeMode } from "./codemode/index.js";
+import { CODE_MODE_TOOL_NAMES, CODE_ONLY_LISTED, createCodeMode, stricterPageEval } from "./codemode/index.js";
 import { checkScriptSyntax } from "./codemode/sandbox.js";
 import { createHmac, randomBytes, timingSafeEqual } from "crypto";
 import { writeArtifact, writeHarFiles } from "./har-export.js";
@@ -9381,7 +9381,35 @@ server.addTool({
 // call per step; see codemode/index.js. Each inner call runs through the
 // tool's own execute() under its own request context, so a hold records the
 // inner tool (confirm_action re-runs that one call, not the script).
+// page.eval / execute_code in run_code scripts: AUTODOM_CODE_PAGE_EVAL =
+// allow (default) | ask (each call needs confirm_action) | deny. A script
+// or run can ask for a stricter policy, never a looser one. An unknown
+// value denies, so a typo cannot open it up.
+function _pageEvalPolicy() {
+  const raw = String(process.env.AUTODOM_CODE_PAGE_EVAL || "allow").trim().toLowerCase();
+  if (raw === "allow" || raw === "ask" || raw === "deny") return raw;
+  if (!_pageEvalPolicy.warned) {
+    _pageEvalPolicy.warned = true;
+    diagLog(`AUTODOM_CODE_PAGE_EVAL=${JSON.stringify(raw)} is not allow|ask|deny; treating it as deny`);
+  }
+  return "deny";
+}
+
 const codeMode = createCodeMode({
+  pageEvalPolicy: _pageEvalPolicy,
+  holdPageEval: (def, params) =>
+    _holdForConfirmation({
+      tool: def.name,
+      params,
+      domain: null,
+      tier: "destructive",
+      rule: null,
+      reason:
+        "A run_code script wants to run JavaScript in the page (page.eval). That code gets the page's full network and cookie access, which the script sandbox itself does not have.",
+      mcpCall: { tool: def.name, params, execute: def.execute },
+    }),
+  onPageEvalDenied: ({ tool, params, tier, why }) =>
+    _auditToolCall({ tool, params, tier, result: { blocked: true, error: `page.eval refused by ${why}` } }),
   getDefinitions: () => toolDefinitions,
   jsonSchemaFor: _jsonSchemaForTool,
   tierOf: getToolTier,
@@ -9535,6 +9563,13 @@ server.addTool({
       .enum(["read", "write", "destructive"])
       .optional()
       .describe("Highest tool tier the script may call (default destructive, or the saved script's). read = inspection only. page.eval and navigate are destructive."),
+    pageEval: z
+      .enum(["allow", "ask", "deny"])
+      .optional()
+      .describe(
+        "page.eval / autodom.execute_code runs JS in the page with its full network and cookie access (the script sandbox has none). " +
+          "deny = refuse it (PageEvalDenied), ask = each call needs confirm_action. Default allow, or the saved script's; the server's AUTODOM_CODE_PAGE_EVAL can only make it stricter.",
+      ),
     timeoutMs: z
       .number()
       .int()
@@ -9544,7 +9579,7 @@ server.addTool({
       .describe("Wall-clock limit for the whole script (default 60000, or the saved script's)"),
     verbose: VERBOSE_PARAM,
   }),
-  execute: async ({ code, script, resume, input, allow, timeoutMs, verbose }, context) => {
+  execute: async ({ code, script, resume, input, allow, pageEval, timeoutMs, verbose }, context) => {
     if ([code, script, resume].filter(Boolean).length !== 1) {
       return JSON.stringify({ error: "Give exactly one of code, script or resume." });
     }
@@ -9564,7 +9599,7 @@ server.addTool({
       if (!replay) {
         return JSON.stringify({ error: `Run ${resume} is ${record.status} and has no replay state, so it cannot be resumed.` });
       }
-      if (allow || timeoutMs || input) diagLog(`run_code resume ${resume}: allow/timeoutMs/input ignored; the run's own are used`);
+      if (allow || timeoutMs || input || pageEval) diagLog(`run_code resume ${resume}: allow/pageEval/timeoutMs/input ignored; the run's own are used`);
       const signal = context?.mcpReq?.signal || mcpRequestContext.getStore()?.signal || null;
       const out = await codeMode.replay({ record, replay, signal, context, meta: { verbose } });
       if (out?.error) return JSON.stringify({ error: out.error });
@@ -9579,6 +9614,8 @@ server.addTool({
     const out = await codeMode.run({
       code: saved ? saved.code : code,
       allow: allow || saved?.allow || "destructive",
+      // A run can only tighten what the saved script says, never loosen it.
+      pageEval: stricterPageEval(saved?.pageEval, pageEval),
       timeoutMs: timeoutMs || saved?.timeoutMs || 60000,
       input,
       signal,
@@ -9609,6 +9646,7 @@ function _scriptView(s) {
     name: s.name,
     ...(s.description ? { description: s.description } : {}),
     allow: s.allow,
+    ...(s.pageEval && s.pageEval !== "allow" ? { pageEval: s.pageEval } : {}),
     timeoutMs: s.timeoutMs,
     bytes: Buffer.byteLength(s.code || ""),
     updatedAt: s.updatedAt,
@@ -9652,6 +9690,7 @@ async function _runSavedScriptUnattended(scriptId, { input = {}, trigger = "sche
       out = await codeMode.run({
         code: script.code,
         allow: script.allow || "destructive",
+        pageEval: script.pageEval,
         timeoutMs: script.timeoutMs || 60000,
         input,
         unattended: true,
@@ -9677,9 +9716,13 @@ server.addTool({
     id: z.string().optional().describe("Defaults to a slug of name"),
     description: z.string().optional(),
     allow: z.enum(["read", "write", "destructive"]).optional().default("destructive"),
+    pageEval: z
+      .enum(["allow", "ask", "deny"])
+      .optional()
+      .describe("page.eval policy for this script (default allow). A scheduled run cannot approve, so ask stops it at the first page.eval."),
     timeoutMs: z.number().int().min(1000).max(300000).optional().default(60000),
   }),
-  execute: async ({ name, code, id, description, allow, timeoutMs }) => {
+  execute: async ({ name, code, id, description, allow, pageEval, timeoutMs }) => {
     const scriptId = id || _slug(name);
     if (!/^[A-Za-z0-9_-]{1,80}$/.test(scriptId)) {
       return JSON.stringify({ error: "id must be 1-80 characters of A-Z, a-z, 0-9, _ or -" });
@@ -9693,6 +9736,7 @@ server.addTool({
       name,
       ...(description ? { description } : {}),
       allow,
+      ...(pageEval && pageEval !== "allow" ? { pageEval } : {}),
       timeoutMs,
       code,
       createdAt: existing?.createdAt || now,
