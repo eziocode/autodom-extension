@@ -39,6 +39,19 @@ All notable changes to AutoDOM are documented in this file.
     and neither can one whose call outcomes exceed 1 MB each or 8 MB in
     total. Screenshots taken before the pause can't be attached after a
     resume.
+- `AUTODOM_SCRIPT_SAVE=allow|ask|deny` sets a policy for `script_save`. A
+  saved script reruns without a model and can be scheduled, so a person may
+  want to review what a model persists.
+  - `ask` holds the save for `confirm_action`. The hold carries the whole
+    script (`params.code`) and its limits, and says when it would replace a
+    saved script (old and new size). Approving saves exactly what the hold
+    showed; `cancel_action` saves nothing.
+  - `deny` refuses saves and writes a `blocked` entry to the audit log.
+  - A bad id or a script that does not parse is reported before anything is
+    held. An unknown value denies.
+  - Scripts already in `~/.autodom/scripts` still run and can still be
+    scheduled; `script_delete` and `schedule_create` are not covered.
+  - Default is unchanged (`allow`).
 - `page.eval` in `run_code` scripts can be gated on its own. It (and
   `autodom.execute_code`) runs JavaScript in the page with the page's full
   network and cookie access, which the script sandbox never has, but it
