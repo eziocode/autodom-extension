@@ -4,7 +4,7 @@ All notable changes to AutoDOM are documented in this file.
 
 ---
 
-## Unreleased
+## 8.0.0
 
 ### Changed
 - **Code Mode is listed by default.** `run_code`, `code_api` and the
